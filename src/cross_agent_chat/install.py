@@ -116,7 +116,11 @@ def _owned_hook(value: object) -> bool:
         tokens = shlex.split(command)
     except ValueError:
         return False
-    return any(token in {"_register", "_unregister", "_codex-stop"} for token in tokens)
+    return (
+        len(tokens) >= 2
+        and Path(tokens[0]).name == SERVER_NAME
+        and tokens[1] in {"_register", "_unregister", "_codex-stop"}
+    )
 
 
 def _hook_group(executable: Path, provider: str, device: str, event: str) -> dict[str, object]:
@@ -497,16 +501,19 @@ class Installer:
         except (OSError, plistlib.InvalidFileException, SettingsError, RuntimeError):
             return False
 
-    def _broker_is_healthy(self) -> bool:
+    def broker_is_healthy(self) -> bool:
         service = f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"
-        loaded = subprocess.run(
-            ["launchctl", "print", service],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-            check=False,
-        )
+        try:
+            loaded = subprocess.run(
+                ["launchctl", "print", service],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
         if loaded.returncode != 0:
             return False
         try:
@@ -523,7 +530,7 @@ class Installer:
         return response == {"schema_version": 1, "status": "READY"}
 
     def verify(self) -> bool:
-        return self.verify_configuration() and self._broker_is_healthy()
+        return self.verify_configuration() and self.broker_is_healthy()
 
     def activate(self) -> None:
         domain = f"gui/{os.getuid()}"

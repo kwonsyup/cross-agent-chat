@@ -18,7 +18,13 @@ from cross_agent_chat.core import (
     bounded_message,
     resolve_target,
 )
-from cross_agent_chat.runtime import canonical_source_alias, local_targets
+from cross_agent_chat.runtime import (
+    Target,
+    canonical_source_alias,
+    local_targets,
+    pre_effect_error,
+    send_local,
+)
 
 
 def route(
@@ -201,31 +207,95 @@ def test_pending_or_unknown_intent_blocks_duplicate_send(tmp_path: Path) -> None
     )
 
 
-def test_route_staleness_is_separate_from_message_age(tmp_path: Path) -> None:
-    item = route(tmp_path)
-    stale = replace(
-        item,
-        last_seen=(datetime.now(UTC) - timedelta(minutes=20)).isoformat(),
-    )
+def test_pre_effect_rejection_does_not_block_fresh_intent(tmp_path: Path) -> None:
+    source = route(tmp_path, project="source")
+    target = route(tmp_path)
+    store = IntentStore(tmp_path / "state")
+    event_id = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
 
-    assert stale.is_recent(ttl_seconds=900) is False
+    store.mark(event_id, "PRE_EFFECT_REJECTED")
+
+    assert store.begin(source, target, source_alias=source.alias, payload_digest="b" * 64)
 
 
-def test_live_generation_bound_courier_remains_discoverable_after_route_ttl(
+def test_live_route_discovery_does_not_apply_an_age_ttl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "state"
-    stale = replace(
+    live = replace(
         route(tmp_path, pid=os.getpid()),
         last_seen=(datetime.now(UTC) - timedelta(hours=1)).isoformat(),
     )
-    Registry(root).upsert(stale)
-
+    Registry(root).upsert(live)
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_socket",
         lambda *_args, **_kwargs: {"status": "READY"},
     )
 
-    targets = local_targets(root)
+    assert [target.alias for target in local_targets(root)] == [live.alias]
 
-    assert [target.alias for target in targets] == [stale.alias]
+
+def test_local_pre_effect_response_closes_intent_and_allows_fresh_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = route(tmp_path, project="source", pid=os.getpid())
+    target = route(tmp_path, project="target", pid=os.getpid())
+    Registry(root).upsert(source)
+    Registry(root).upsert(target)
+    resolved = Target(
+        alias=target.alias,
+        provider=target.provider,
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key="b" * 64,
+        remote=False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [resolved])
+
+    def reject(_path: Path, payload: dict[str, object]) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "PRE_EFFECT_REJECTED",
+            "provider": "codex",
+            "error": "target changed before SendMessage",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", reject)
+
+    with pytest.raises(ChatError, match="target changed"):
+        send_local(root, source, target.alias, "hello")
+
+    rejected = IntentStore(root).intents()[0]
+    assert rejected.status == "PRE_EFFECT_REJECTED"
+    assert IntentStore(root).begin(
+        source,
+        target,
+        source_alias=source.alias,
+        payload_digest="c" * 64,
+    )
+
+
+def test_pre_effect_response_parser_rejects_untrusted_variants() -> None:
+    event_id = str(uuid4())
+    response: dict[str, object] = {
+        "schema_version": 1,
+        "event_id": event_id,
+        "status": "PRE_EFFECT_REJECTED",
+        "provider": "claude",
+        "error": "target changed before SendMessage",
+    }
+
+    assert pre_effect_error(response, event_id, "claude") == response["error"]
+    for changed in (
+        response | {"provider": "codex"},
+        response | {"error": "line one\nline two"},
+        response | {"error": "x" * 257},
+        response | {"extra": True},
+    ):
+        assert pre_effect_error(changed, event_id, "claude") is None

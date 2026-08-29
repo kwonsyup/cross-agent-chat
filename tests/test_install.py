@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from cross_agent_chat.install import Installer, SettingsError
+from cross_agent_chat.install import Installer, SettingsError, _owned_hook
 
 
 def test_setup_preserves_unrelated_provider_configuration(tmp_path: Path) -> None:
@@ -43,6 +43,13 @@ def test_setup_is_idempotent_and_local_only(tmp_path: Path) -> None:
 
     assert {path: path.read_bytes() for path in first.changed_paths} == snapshot
     assert not (home / ".local/state/cross-agent-chat/peers.json").exists()
+
+
+def test_hook_ownership_requires_exact_cross_agent_chat_command() -> None:
+    assert _owned_hook(
+        {"hooks": [{"command": "/opt/cross-agent-chat _register --provider claude"}]}
+    )
+    assert not _owned_hook({"hooks": [{"command": "other-tool _register --provider claude"}]})
 
 
 def test_setup_installs_owned_background_broker(tmp_path: Path) -> None:
@@ -352,6 +359,22 @@ def test_verify_requires_loaded_responsive_background_broker(
         lambda *_args, **_kwargs: {"schema_version": 1, "status": "READY"},
     )
     assert installer.verify()
+
+
+def test_broker_health_reports_timeout_as_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.install.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(["launchctl"], 5)
+        ),
+    )
+
+    assert not installer.broker_is_healthy()
 
 
 def test_uninstall_removes_owned_runtime_state_and_backups(tmp_path: Path) -> None:

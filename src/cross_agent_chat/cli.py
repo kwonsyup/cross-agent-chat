@@ -227,10 +227,14 @@ def run(arguments: argparse.Namespace) -> int:
         )
     elif command == "doctor":
         installer = _installer(arguments.device)
-        healthy = installer.verify()
+        integration_healthy = installer.verify_configuration()
+        broker_healthy = installer.broker_is_healthy()
+        healthy = integration_healthy and broker_healthy
         doctor_result = {
             "version": __version__,
-            "integration": "healthy" if healthy else "needs setup",
+            "integration": "healthy" if integration_healthy else "needs setup",
+            "local_broker": "healthy" if broker_healthy else "unavailable",
+            "remote_trust": "tailscale_acl",
             "next": "start fresh Claude/Codex sessions" if healthy else "cross-agent-chat setup",
         }
         print(

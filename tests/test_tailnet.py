@@ -14,6 +14,7 @@ import pytest
 from cross_agent_chat.cli import parser
 from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, session_key
 from cross_agent_chat.runtime import (
+    Target,
     authorize_remote,
     receive_remote,
     remote_targets,
@@ -391,6 +392,132 @@ def test_remote_send_uses_tailnet_broker_without_ssh_configuration(
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     assert "hello" not in (tmp_path / "intents.json").read_text()
+
+
+def test_remote_pre_effect_rejection_is_safe_and_does_not_block_fresh_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    address = "100.64.0.11"
+    target_alias = "claude@studio:api:api-a1"
+    generation = str(uuid4())
+
+    def request(
+        _address: str,
+        payload: dict[str, object],
+        **_: object,
+    ) -> dict[str, object]:
+        if payload.get("operation") == "peers":
+            return {
+                "schema_version": 1,
+                "peers": [
+                    {
+                        "alias": target_alias,
+                        "provider": "claude",
+                        "device": "studio",
+                        "project": "api",
+                        "status": "available",
+                        "generation": generation,
+                        "session_key": "a" * 64,
+                    }
+                ],
+            }
+        envelope = json.loads(str(payload["envelope"]))
+        return {
+            "schema_version": 1,
+            "event_id": envelope["event_id"],
+            "status": "PRE_EFFECT_REJECTED",
+            "provider": "claude",
+            "error": "peer-controlled wording must not escape",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [address])
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="source",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(source)
+
+    with pytest.raises(ChatError, match="remote target rejected") as caught:
+        send(tmp_path, source, target_alias, "hello")
+
+    assert "peer-controlled" not in str(caught.value)
+    intent = IntentStore(tmp_path).intents()[0]
+    assert intent.status == "PRE_EFFECT_REJECTED"
+    assert IntentStore(tmp_path).begin_identity(
+        source_key=session_key(source.provider, source.session_id),
+        source_generation=source.generation,
+        source_alias=source.alias,
+        target_key="a" * 64,
+        target_generation=generation,
+        payload_digest="b" * 64,
+    )
+
+
+def test_remote_receiver_sanitizes_pre_effect_provider_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(target)
+    public_target = Target(
+        alias=target.alias,
+        provider=target.provider,
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=session_key(target.provider, target.session_id),
+        remote=False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    event_id = str(uuid4())
+    source_generation = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=source_generation,
+        target_alias=target.alias,
+        generation=target.generation,
+        message="hello",
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+
+    def authorize(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        return {key: value for key, value in payload.items() if key != "operation"} | {
+            "status": "AUTHORIZED"
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", authorize)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda *_args, **_kwargs: {
+            "schema_version": 1,
+            "event_id": event_id,
+            "status": "PRE_EFFECT_REJECTED",
+            "provider": "codex",
+            "error": "internal path and peer-shaped text",
+        },
+    )
+
+    response = receive_remote(tmp_path, envelope, "100.64.0.11")
+
+    assert response == {
+        "schema_version": 1,
+        "event_id": event_id,
+        "status": "PRE_EFFECT_REJECTED",
+        "provider": "codex",
+        "error": "remote destination rejected before provider effect",
+    }
 
 
 def test_wrapped_message_limit_rejects_before_intent_creation(

@@ -1,4 +1,4 @@
-"""Local broker exposed to trusted Tailnet peers by Tailscale Serve."""
+"""Local broker reachable by Tailnet nodes permitted by the user's ACL policy."""
 
 from __future__ import annotations
 

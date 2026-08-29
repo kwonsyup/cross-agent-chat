@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 
 from cross_agent_chat.codex import CodexCourier, deliver_at_stop
-from cross_agent_chat.core import ChatError
+from cross_agent_chat.core import ChatError, UnknownDeliveryError
 from cross_agent_chat.runtime import codex_stop
 
 
@@ -46,14 +46,15 @@ def test_queue_has_no_age_expiration() -> None:
     assert courier.peek()[0]["event_id"] == event_id
 
 
-def test_queue_rejects_duplicate_and_capacity_overflow() -> None:
+def test_queue_is_idempotent_for_exact_repeats_and_rejects_conflicts() -> None:
     courier = CodexCourier(
         alias="codex@studio:api:123456789abc", generation=str(uuid4()), capacity=2
     )
     first = str(uuid4())
-    courier.accept(first, "one")
-    with pytest.raises(ChatError, match="already pending"):
-        courier.accept(first, "one")
+    first_receipt = courier.accept(first, "one")
+    assert courier.accept(first, "one") == first_receipt
+    with pytest.raises(UnknownDeliveryError, match="conflicts"):
+        courier.accept(first, "different")
     courier.accept(str(uuid4()), "two")
     with pytest.raises(ChatError, match="full"):
         courier.accept(str(uuid4()), "three")
