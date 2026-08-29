@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from cross_agent_chat.install import Installer, SettingsError, _owned_hook
+from cross_agent_chat.install import Installer, InstallReport, SettingsError, _owned_hook
 
 
 def test_setup_preserves_unrelated_provider_configuration(tmp_path: Path) -> None:
@@ -273,6 +273,24 @@ def test_install_allows_bounded_launchd_throttle_recovery(
     installer.install()
 
     assert checks == 22
+
+
+def test_upgrade_install_stops_old_couriers_before_reloading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    calls: list[str] = []
+    report = InstallReport(changed_paths=(), backup=tmp_path / "backup")
+    monkeypatch.setattr(installer, "setup", lambda: report)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: calls.append("stop"))
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: calls.append("remove"))
+    monkeypatch.setattr(installer, "activate", lambda: calls.append("activate"))
+    monkeypatch.setattr(installer, "verify", lambda: True)
+
+    assert installer.install() == report
+    assert calls == ["stop", "remove", "activate"]
 
 
 def test_uninstall_removes_only_owned_background_surfaces(

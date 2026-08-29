@@ -12,6 +12,8 @@ from uuid import uuid4
 import pytest
 
 from cross_agent_chat.claude_runtime import (
+    AGENTS_TIMEOUT_SECONDS,
+    DISCOVERY_TIMEOUT_SECONDS,
     SEND_TIMEOUT_SECONDS,
     claude_binary,
     courier_environment,
@@ -22,11 +24,14 @@ from cross_agent_chat.claude_runtime import (
 )
 from cross_agent_chat.core import ChatError, Route, UnknownDeliveryError
 from cross_agent_chat.remote import parse_remote_envelope
-from cross_agent_chat.runtime import REMOTE_TIMEOUT_SECONDS, courier_accept
+from cross_agent_chat.runtime import ACCEPT_TIMEOUT_SECONDS, REMOTE_TIMEOUT_SECONDS, courier_accept
 
 
 def test_remote_transport_outlives_claude_delivery_window() -> None:
-    assert REMOTE_TIMEOUT_SECONDS > SEND_TIMEOUT_SECONDS
+    assert ACCEPT_TIMEOUT_SECONDS >= (
+        2 * AGENTS_TIMEOUT_SECONDS + DISCOVERY_TIMEOUT_SECONDS + SEND_TIMEOUT_SECONDS
+    )
+    assert REMOTE_TIMEOUT_SECONDS > ACCEPT_TIMEOUT_SECONDS
 
 
 def test_claude_courier_preserves_session_auth_without_unrelated_secrets() -> None:

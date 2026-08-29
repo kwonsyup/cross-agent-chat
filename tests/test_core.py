@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,8 +20,11 @@ from cross_agent_chat.core import (
     resolve_target,
 )
 from cross_agent_chat.runtime import (
+    HEALTH_TIMEOUT_SECONDS,
     Target,
+    _local_target,
     canonical_source_alias,
+    courier_health,
     local_targets,
     pre_effect_error,
     send_local,
@@ -229,10 +233,152 @@ def test_live_route_discovery_does_not_apply_an_age_ttl(
     Registry(root).upsert(live)
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_socket",
-        lambda *_args, **_kwargs: {"status": "READY"},
+        lambda *_args, **_kwargs: {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": live.generation,
+            "alias": live.alias,
+        },
     )
 
     assert [target.alias for target in local_targets(root)] == [live.alias]
+
+
+def test_local_route_health_checks_run_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    routes = [
+        route(tmp_path, pid=os.getpid(), project="one"),
+        route(tmp_path, pid=os.getpid(), project="two"),
+    ]
+    for item in routes:
+        Registry(root).upsert(item)
+    by_generation = {item.generation: item for item in routes}
+    rendezvous = threading.Barrier(2)
+
+    def health(_path: Path, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        assert timeout == HEALTH_TIMEOUT_SECONDS
+        rendezvous.wait(timeout=5)
+        item = by_generation[str(payload["generation"])]
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": item.generation,
+            "alias": item.alias,
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", health)
+
+    assert [target.alias for target in local_targets(root)] == [item.alias for item in routes]
+
+
+def test_courier_health_emits_exact_ready_contract(tmp_path: Path) -> None:
+    item = route(tmp_path, pid=os.getpid())
+
+    assert courier_health(item) == {
+        "schema_version": 1,
+        "status": "READY",
+        "generation": item.generation,
+        "alias": item.alias,
+    }
+
+
+def test_claude_courier_health_reports_current_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+    agent = {
+        "session_id": item.session_id,
+        "name": "Gate Health",
+        "kind": "interactive",
+        "cwd": item.cwd,
+    }
+    monkeypatch.setattr("cross_agent_chat.runtime.exact_agent", lambda *_: agent)
+
+    assert courier_health(item) == {
+        "schema_version": 1,
+        "status": "READY",
+        "generation": item.generation,
+        "alias": f"claude@{item.device}:{item.project}:Gate Health",
+    }
+
+
+def test_claude_courier_health_reports_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.exact_agent",
+        lambda *_: (_ for _ in ()).throw(ChatError("gone")),
+    )
+
+    assert courier_health(item) == {
+        "schema_version": 1,
+        "status": "UNAVAILABLE",
+        "generation": item.generation,
+    }
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"generation": str(uuid4())},
+        {"schema_version": 2},
+        {"status": "UNAVAILABLE"},
+        {"alias": "invalid/alias"},
+        {"alias": "codex@other:project:123456789abc"},
+    ],
+)
+def test_invalid_local_health_response_drops_only_that_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: dict[str, object]
+) -> None:
+    root = tmp_path / "state"
+    item = route(tmp_path, pid=os.getpid(), project="bad")
+    healthy = route(tmp_path, pid=os.getpid(), project="healthy")
+    Registry(root).upsert(item)
+    Registry(root).upsert(healthy)
+    response: dict[str, object] = {
+        "schema_version": 1,
+        "status": "READY",
+        "generation": item.generation,
+        "alias": item.alias,
+    }
+    response.update(changed)
+
+    def health(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        if payload["generation"] == item.generation:
+            return response
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": healthy.generation,
+            "alias": healthy.alias,
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", health)
+
+    assert _local_target(root, item) is None
+    assert [target.alias for target in local_targets(root)] == [healthy.alias]
+
+
+def test_claude_health_alias_must_match_route_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+    Registry(root).upsert(item)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda *_args, **_kwargs: {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": item.generation,
+            "alias": "claude@other-device:other-project:Gate Health",
+        },
+    )
+
+    assert local_targets(root) == []
 
 
 def test_local_pre_effect_response_closes_intent_and_allows_fresh_send(
@@ -257,7 +403,7 @@ def test_local_pre_effect_response_closes_intent_and_allows_fresh_send(
     )
     monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [resolved])
 
-    def reject(_path: Path, payload: dict[str, object]) -> dict[str, object]:
+    def reject(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
         return {
             "schema_version": 1,
             "event_id": payload["event_id"],
