@@ -14,6 +14,7 @@ import pytest
 from cross_agent_chat.cli import parser
 from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, session_key
 from cross_agent_chat.runtime import (
+    REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     Target,
     authorize_remote,
     receive_remote,
@@ -250,12 +251,15 @@ def test_remote_receive_requires_source_authorization_before_provider_effect(
         lambda *_args, **_kwargs: {"schema_version": 1, "status": "DENIED"},
     )
 
-    def provider_boundary(_path: Path, payload: dict[str, object]) -> dict[str, object]:
+    def provider_boundary(
+        _path: Path, payload: dict[str, object], **_: object
+    ) -> dict[str, object]:
         if payload.get("operation") == "health":
             return {
                 "schema_version": 1,
                 "status": "READY",
                 "generation": target.generation,
+                "alias": target.alias,
             }
         pytest.fail("provider delivery ran before source authorization")
 
@@ -305,7 +309,7 @@ def test_remote_targets_are_discovered_without_peer_configuration(
     def request(address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         assert address == "100.64.0.11"
         assert payload == {"schema_version": 1, "operation": "peers"}
-        assert timeout == 5.0
+        assert timeout == REMOTE_DISCOVERY_TIMEOUT_SECONDS
         return {
             "schema_version": 1,
             "peers": [

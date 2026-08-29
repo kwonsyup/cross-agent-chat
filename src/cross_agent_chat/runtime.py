@@ -18,7 +18,9 @@ from typing import Final, cast
 from uuid import uuid4
 
 from cross_agent_chat.claude_runtime import (
+    AGENTS_TIMEOUT_SECONDS,
     COURIER_ENV_KEYS,
+    DISCOVERY_TIMEOUT_SECONDS,
     SEND_TIMEOUT_SECONDS,
     claude_alias,
     courier_environment,
@@ -50,8 +52,16 @@ from cross_agent_chat.transport import remote_envelope
 
 MAX_FRAME_BYTES: Final = 64 * 1024
 SOCKET_TIMEOUT_SECONDS: Final = 5.0
+HEALTH_TIMEOUT_SECONDS: Final = AGENTS_TIMEOUT_SECONDS + 2.0
+REMOTE_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS + 5.0
+ACCEPT_TIMEOUT_SECONDS: Final = (
+    2 * AGENTS_TIMEOUT_SECONDS + DISCOVERY_TIMEOUT_SECONDS + SEND_TIMEOUT_SECONDS + 5.0
+)
+AUTHORIZE_TIMEOUT_SECONDS: Final = 20.0
 COURIER_READY_SECONDS: Final = 3.0
-REMOTE_TIMEOUT_SECONDS: Final = SEND_TIMEOUT_SECONDS + 15.0
+REMOTE_TIMEOUT_SECONDS: Final = (
+    HEALTH_TIMEOUT_SECONDS + AUTHORIZE_TIMEOUT_SECONDS + ACCEPT_TIMEOUT_SECONDS + 5.0
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,8 +104,6 @@ def socket_path(root: Path, route: Route) -> Path:
     directory = Path("/tmp") / f"cross-agent-chat-{os.getuid()}"
     ensure_private_dir(directory)
     identity = f"{root.resolve()}:{route.provider}:{route.session_id}:{route.generation}"
-    import hashlib
-
     digest = hashlib.sha256(identity.encode()).hexdigest()
     return directory / f"{digest[:32]}.sock"
 
@@ -131,9 +139,18 @@ def emit_frame(connection: socket.socket, payload: dict[str, object]) -> None:
     connection.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode())
 
 
-def request_socket(path: Path, payload: dict[str, object]) -> dict[str, object]:
+def emit_frame_safely(connection: socket.socket, payload: dict[str, object]) -> None:
+    try:
+        emit_frame(connection, payload)
+    except OSError:
+        return
+
+
+def request_socket(
+    path: Path, payload: dict[str, object], *, timeout: float = SOCKET_TIMEOUT_SECONDS
+) -> dict[str, object]:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(SOCKET_TIMEOUT_SECONDS)
+    client.settimeout(timeout)
     try:
         require_socket(path)
         client.connect(str(path))
@@ -239,6 +256,7 @@ def _spawn_courier(root: Path, route: Route) -> None:
         if process.poll() is not None:
             raise ChatError("session courier exited before becoming ready")
         try:
+            remaining = max(0.1, deadline - time.monotonic())
             response = request_socket(
                 path,
                 {
@@ -246,9 +264,11 @@ def _spawn_courier(root: Path, route: Route) -> None:
                     "operation": "health",
                     "generation": route.generation,
                 },
+                timeout=remaining,
             )
             if response.get("status") == "READY":
                 return
+            time.sleep(0.02)
         except UnknownDeliveryError:
             time.sleep(0.02)
     process.terminate()
@@ -376,6 +396,29 @@ def pre_effect_error(response: dict[str, object], event_id: str, provider: Provi
     return error
 
 
+def courier_health(route: Route) -> dict[str, object]:
+    alias = route.alias
+    if route.provider == "claude":
+        try:
+            alias = claude_alias(
+                route.device,
+                route.project,
+                exact_agent(route.session_id, route.cwd),
+            )
+        except ChatError:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "status": "UNAVAILABLE",
+                "generation": route.generation,
+            }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "READY",
+        "generation": route.generation,
+        "alias": alias,
+    }
+
+
 def courier_server(
     *,
     provider: str,
@@ -425,7 +468,7 @@ def courier_server(
                 connection.settimeout(SOCKET_TIMEOUT_SECONDS)
                 try:
                     raw = json.loads(read_frame(connection))
-                except (UnicodeDecodeError, json.JSONDecodeError, ChatError):
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError):
                     continue
                 if not isinstance(raw, dict):
                     continue
@@ -437,33 +480,20 @@ def courier_server(
                     continue
                 operation = request.get("operation")
                 if operation == "health":
-                    ready = True
-                    if provider == "claude":
-                        try:
-                            exact_agent(route.session_id, route.cwd)
-                        except ChatError:
-                            ready = False
-                    emit_frame(
-                        connection,
-                        {
-                            "schema_version": SCHEMA_VERSION,
-                            "status": "READY" if ready else "UNAVAILABLE",
-                            "generation": route.generation,
-                        },
-                    )
+                    emit_frame_safely(connection, courier_health(route))
                 elif operation == "shutdown":
-                    emit_frame(connection, {"schema_version": 1, "status": "STOPPED"})
+                    emit_frame_safely(connection, {"schema_version": 1, "status": "STOPPED"})
                     stopping = True
                 elif operation == "accept":
                     event_id = request.get("event_id")
                     message = request.get("message")
                     if not isinstance(event_id, str) or not isinstance(message, str):
                         continue
-                    emit_frame(connection, courier_accept(route, courier, event_id, message))
+                    emit_frame_safely(connection, courier_accept(route, courier, event_id, message))
                 elif operation == "peek":
                     if courier is None:
                         continue
-                    emit_frame(
+                    emit_frame_safely(
                         connection,
                         {
                             "schema_version": 1,
@@ -483,7 +513,7 @@ def courier_server(
                     try:
                         typed_ids = [cast(str, item) for item in identifiers]
                         courier.acknowledge(typed_ids)
-                        emit_frame(
+                        emit_frame_safely(
                             connection,
                             {"schema_version": 1, "status": "ACKNOWLEDGED", "event_ids": typed_ids},
                         )
@@ -516,50 +546,59 @@ def shutdown_couriers(root: Path) -> None:
                 "operation": "shutdown",
                 "generation": route.generation,
             },
+            timeout=ACCEPT_TIMEOUT_SECONDS + 1.0,
         )
         if response != {"schema_version": SCHEMA_VERSION, "status": "STOPPED"}:
             raise ChatError("courier shutdown failed")
 
 
-def local_targets(root: Path) -> list[Target]:
-    targets: list[Target] = []
-    for route in Registry(root).routes():
-        if not route.process_is_live():
-            continue
-        try:
-            response = request_socket(
-                socket_path(root, route),
-                {"schema_version": 1, "operation": "health", "generation": route.generation},
-            )
-        except UnknownDeliveryError:
-            continue
-        if response.get("status") != "READY":
-            continue
-        alias = route.alias
-        if route.provider == "claude":
-            try:
-                alias = claude_alias(
-                    route.device,
-                    route.project,
-                    exact_agent(route.session_id, route.cwd),
-                )
-            except ChatError:
-                continue
-        targets.append(
-            Target(
-                alias=alias,
-                provider=route.provider,
-                device=route.device,
-                project=route.project,
-                generation=route.generation,
-                session_key=session_key(route.provider, route.session_id),
-                remote=False,
-                session_id=route.session_id,
-                cwd=route.cwd,
-                pid=route.pid,
-            )
+def _local_target(root: Path, route: Route) -> Target | None:
+    try:
+        response = request_socket(
+            socket_path(root, route),
+            {"schema_version": 1, "operation": "health", "generation": route.generation},
+            timeout=HEALTH_TIMEOUT_SECONDS,
         )
-    return targets
+    except UnknownDeliveryError:
+        return None
+    alias = response.get("alias")
+    if (
+        set(response) != {"schema_version", "status", "generation", "alias"}
+        or response.get("schema_version") != SCHEMA_VERSION
+        or response.get("status") != "READY"
+        or response.get("generation") != route.generation
+        or not isinstance(alias, str)
+    ):
+        return None
+    if route.provider == "codex":
+        if alias != route.alias:
+            return None
+    elif not alias.startswith(f"claude@{route.device}:{route.project}:"):
+        return None
+    try:
+        return Target(
+            alias=valid_name(alias, "route alias"),
+            provider=route.provider,
+            device=route.device,
+            project=route.project,
+            generation=route.generation,
+            session_key=session_key(route.provider, route.session_id),
+            remote=False,
+            session_id=route.session_id,
+            cwd=route.cwd,
+            pid=route.pid,
+        )
+    except ChatError:
+        return None
+
+
+def local_targets(root: Path) -> list[Target]:
+    routes = [route for route in Registry(root).routes() if route.process_is_live()]
+    if not routes:
+        return []
+    with ThreadPoolExecutor(max_workers=len(routes)) as workers:
+        targets = workers.map(lambda route: _local_target(root, route), routes)
+        return [target for target in targets if target is not None]
 
 
 def _targets_from_tailnet(address: str, raw: object) -> list[Target]:
@@ -618,7 +657,8 @@ def _remote_node_targets(address: str) -> list[Target]:
         raw = request_tailnet(
             address,
             {"schema_version": SCHEMA_VERSION, "operation": "peers"},
-            timeout=5.0,
+            # The remote broker may spend HEALTH_TIMEOUT_SECONDS validating local routes.
+            timeout=REMOTE_DISCOVERY_TIMEOUT_SECONDS,
         )
         return _targets_from_tailnet(address, raw)
     except (ChatError, UnknownDeliveryError):
@@ -638,9 +678,13 @@ def remote_targets(_root: Path) -> list[Target]:
 
 
 def all_targets(root: Path, *, include_remote: bool = True) -> list[Target]:
-    targets = local_targets(root)
     if include_remote:
-        targets.extend(remote_targets(root))
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            local = workers.submit(local_targets, root)
+            remote = workers.submit(remote_targets, root)
+            targets = [*local.result(), *remote.result()]
+    else:
+        targets = local_targets(root)
     aliases = [target.alias.casefold() for target in targets]
     if len(set(aliases)) != len(aliases):
         raise ChatError("peer discovery returned duplicate aliases")
@@ -650,8 +694,6 @@ def all_targets(root: Path, *, include_remote: bool = True) -> list[Target]:
 def _target_matches(target: Target, query: str) -> bool:
     if target.alias.casefold() == query.casefold():
         return True
-    import re
-
     wanted = [token for token in re.split(r"[^A-Za-z0-9]+", query.casefold()) if token]
     available = {token for token in re.split(r"[^A-Za-z0-9]+", target.alias.casefold()) if token}
     return bool(wanted) and all(token in available for token in wanted)
@@ -725,6 +767,7 @@ def send_local(root: Path, source: Route, target_query: str, message: str) -> di
                 "event_id": event_id,
                 "message": body,
             },
+            timeout=ACCEPT_TIMEOUT_SECONDS,
         )
     except UnknownDeliveryError:
         store.mark(event_id, "UNKNOWN_DELIVERY")
@@ -876,7 +919,7 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
     authorization = request_tailnet(
         source_address,
         authorization_request,
-        timeout=20.0,
+        timeout=AUTHORIZE_TIMEOUT_SECONDS,
     )
     expected_authorization = {
         key: value for key, value in authorization_request.items() if key != "operation"
@@ -903,6 +946,7 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
             "event_id": event_id,
             "message": message,
         },
+        timeout=ACCEPT_TIMEOUT_SECONDS,
     )
     expected: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,

@@ -15,7 +15,7 @@ from typing import cast
 from cross_agent_chat.core import SCHEMA_VERSION, ChatError
 from cross_agent_chat.runtime import (
     authorize_remote,
-    emit_frame,
+    emit_frame_safely,
     peers,
     read_frame,
     receive_remote,
@@ -137,7 +137,7 @@ def serve_broker_connection(root: Path, connection: socket.socket, peer_address:
         raw: object = json.loads(read_frame(connection))
     except json.JSONDecodeError as error:
         raise ChatError("Tailnet broker request is invalid") from error
-    emit_frame(connection, handle_broker_request(root, raw, peer_address))
+    emit_frame_safely(connection, handle_broker_request(root, raw, peer_address))
 
 
 def _serve_and_close(

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Final, cast
 from uuid import uuid4
 
-from cross_agent_chat.core import atomic_json, ensure_private_dir, valid_device
+from cross_agent_chat.core import ChatError, atomic_json, ensure_private_dir, valid_device
 from cross_agent_chat.tailnet import LOCAL_BROKER_HOST, LOCAL_BROKER_PORT, valid_tailnet_address
 
 SERVER_NAME: Final = "cross-agent-chat"
@@ -461,7 +461,7 @@ class Installer:
                     time.sleep(0.25)
             else:
                 raise SettingsError("background broker did not become healthy")
-        except (OSError, subprocess.SubprocessError, SettingsError):
+        except (OSError, subprocess.SubprocessError, ChatError, SettingsError):
             self._bootout()
             self._restore(report.backup)
             raise
