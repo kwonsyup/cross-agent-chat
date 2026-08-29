@@ -17,7 +17,14 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Final, TypedDict, cast
 
-from cross_agent_chat.core import ChatError, bounded_message, canonical_cwd, valid_name, valid_uuid
+from cross_agent_chat.core import (
+    ChatError,
+    UnknownDeliveryError,
+    bounded_message,
+    canonical_cwd,
+    valid_name,
+    valid_uuid,
+)
 
 AGENTS_TIMEOUT_SECONDS: Final = 15.0
 DISCOVERY_TIMEOUT_SECONDS: Final = 30.0
@@ -343,6 +350,19 @@ def parse_sendmessage_receipt(text: str, target_ref: str, message: str) -> str:
     return valid_uuid(cast(str, result["msg_id"]), "courier message id")
 
 
+def gate_consumed(gate: Path) -> bool:
+    """Return whether the exact native-send gate marker is present and valid."""
+    try:
+        marker = (gate / "consumed").read_bytes()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise UnknownDeliveryError("Claude SendMessage outcome is unknown") from error
+    if marker != b"consumed\n":
+        raise UnknownDeliveryError("Claude SendMessage outcome is unknown")
+    return True
+
+
 def sendmessage(target_ref: str, message: str, executable: Path) -> None:
     bounded_message(message)
     if TARGET_REF_RE.fullmatch(target_ref) is None:
@@ -358,7 +378,13 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
         "'Cross Agent Chat'. Do not use any other tool. Stop immediately after it returns."
     )
     try:
-        with tempfile.TemporaryDirectory(prefix="cross-agent-chat-gate.", dir="/tmp") as temporary:
+        temporary_context = tempfile.TemporaryDirectory(
+            prefix="cross-agent-chat-gate.", dir="/tmp", ignore_cleanup_errors=True
+        )
+    except OSError as error:
+        raise ChatError("Claude SendMessage courier setup failed") from error
+    with temporary_context as temporary:
+        try:
             gate = Path(temporary)
             gate.chmod(0o700)
             expected_path = gate / "expected.json"
@@ -413,6 +439,9 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
                 "--include-hook-events",
                 "--verbose",
             ]
+        except OSError as error:
+            raise ChatError("Claude SendMessage courier setup failed") from error
+        try:
             completed = subprocess.run(
                 command,
                 cwd="/var/empty",
@@ -423,11 +452,15 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
                 timeout=SEND_TIMEOUT_SECONDS,
                 check=False,
             )
-            if (gate / "consumed").read_bytes() != b"consumed\n":
-                raise ChatError("Claude one-shot gate was not consumed")
-        message_id = parse_sendmessage_receipt(completed.stdout, target_ref, message)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
-        raise ChatError("Claude SendMessage courier failed") from error
+        except subprocess.TimeoutExpired as error:
+            raise UnknownDeliveryError("Claude SendMessage outcome is unknown") from error
+        except (OSError, subprocess.SubprocessError) as error:
+            raise UnknownDeliveryError("Claude SendMessage outcome is unknown") from error
+        if not gate_consumed(gate):
+            raise UnknownDeliveryError("Claude SendMessage outcome is unknown")
+        try:
+            parse_sendmessage_receipt(completed.stdout, target_ref, message)
+        except ChatError as error:
+            raise UnknownDeliveryError("Claude SendMessage outcome is unknown") from error
     if completed.returncode != 0:
-        raise ChatError("Claude SendMessage courier failed")
-    valid_uuid(message_id, "courier message id")
+        raise UnknownDeliveryError("Claude SendMessage outcome is unknown")

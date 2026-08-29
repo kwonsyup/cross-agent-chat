@@ -310,6 +310,72 @@ def _route_current(root: Path, expected: Route) -> bool:
     return Registry(root).current(expected) and expected.process_is_live()
 
 
+def courier_accept(
+    route: Route,
+    courier: CodexCourier | None,
+    event_id: str,
+    message: str,
+) -> dict[str, object]:
+    """Attempt one provider delivery and report its exact effect boundary."""
+    try:
+        identifier = valid_uuid(event_id, "event id")
+        body = bounded_message(message)
+        if route.provider == "codex":
+            if courier is None:
+                raise ChatError("Codex courier is unavailable")
+            return courier.accept(identifier, body)
+        agent = exact_agent(route.session_id, route.cwd)
+        target_ref = discover_target_ref(agent["name"])
+        if exact_agent(route.session_id, route.cwd) != agent:
+            raise ChatError("Claude target changed during discovery")
+        target_alias = claude_alias(route.device, route.project, agent)
+        sendmessage(target_ref, body, executable())
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "event_id": identifier,
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target_alias,
+            "provider": "claude",
+        }
+    except UnknownDeliveryError:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "event_id": event_id,
+            "status": "UNKNOWN_DELIVERY",
+            "provider": route.provider,
+        }
+    except ChatError as error:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "event_id": event_id,
+            "status": "PRE_EFFECT_REJECTED",
+            "provider": route.provider,
+            "error": str(error),
+        }
+
+
+def pre_effect_error(response: dict[str, object], event_id: str, provider: Provider) -> str | None:
+    if set(response) != {"schema_version", "event_id", "status", "provider", "error"}:
+        return None
+    error = response.get("error")
+    if (
+        response.get("schema_version") != SCHEMA_VERSION
+        or response.get("event_id") != event_id
+        or response.get("status") != "PRE_EFFECT_REJECTED"
+        or response.get("provider") != provider
+        or not isinstance(error, str)
+        or not error
+        or any(character in error for character in "\r\n\0")
+    ):
+        return None
+    try:
+        if len(error.encode()) > 256:
+            return None
+    except UnicodeEncodeError:
+        return None
+    return error
+
+
 def courier_server(
     *,
     provider: str,
@@ -393,37 +459,7 @@ def courier_server(
                     message = request.get("message")
                     if not isinstance(event_id, str) or not isinstance(message, str):
                         continue
-                    try:
-                        if provider == "codex":
-                            if courier is None:
-                                raise ChatError("Codex courier is unavailable")
-                            emit_frame(connection, courier.accept(event_id, message))
-                        else:
-                            agent = exact_agent(route.session_id, route.cwd)
-                            target_ref = discover_target_ref(agent["name"])
-                            if exact_agent(route.session_id, route.cwd) != agent:
-                                raise ChatError("Claude target changed during discovery")
-                            sendmessage(target_ref, bounded_message(message), executable())
-                            emit_frame(
-                                connection,
-                                {
-                                    "schema_version": SCHEMA_VERSION,
-                                    "event_id": valid_uuid(event_id, "event id"),
-                                    "status": "TRANSPORT_ACCEPTED",
-                                    "to": claude_alias(route.device, route.project, agent),
-                                    "provider": "claude",
-                                },
-                            )
-                    except ChatError:
-                        emit_frame(
-                            connection,
-                            {
-                                "schema_version": 1,
-                                "event_id": event_id,
-                                "status": "UNKNOWN_DELIVERY",
-                                "provider": "codex",
-                            },
-                        )
+                    emit_frame(connection, courier_accept(route, courier, event_id, message))
                 elif operation == "peek":
                     if courier is None:
                         continue
@@ -702,6 +738,11 @@ def send_local(root: Path, source: Route, target_query: str, message: str) -> di
         "to": target.alias,
         "provider": target.provider,
     }
+    rejection = pre_effect_error(response, event_id, target.provider)
+    if rejection is not None:
+        store.mark(event_id, "PRE_EFFECT_REJECTED")
+        # Local courier errors originate in a same-uid process, not a remote peer.
+        raise ChatError(rejection)
     if response != expected:
         store.mark(event_id, "UNKNOWN_DELIVERY")
         raise UnknownDeliveryError("delivery state is unknown")
@@ -758,6 +799,10 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
         raise UnknownDeliveryError(
             f"remote delivery state is unknown for event {event_id}; do not retry automatically"
         ) from error
+    rejection = pre_effect_error(response, event_id, target.provider)
+    if rejection is not None:
+        store.mark(event_id, "PRE_EFFECT_REJECTED")
+        raise ChatError("remote target rejected the message before provider effect")
     if response != expected:
         store.mark(event_id, "UNKNOWN_DELIVERY")
         raise UnknownDeliveryError("remote delivery state is unknown")
@@ -866,6 +911,14 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         "to": target.alias,
         "provider": target.provider,
     }
+    if pre_effect_error(response, event_id, target.provider) is not None:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "event_id": event_id,
+            "status": "PRE_EFFECT_REJECTED",
+            "provider": target.provider,
+            "error": "remote destination rejected before provider effect",
+        }
     if response != expected:
         raise UnknownDeliveryError("remote delivery state is unknown")
     return expected
@@ -921,10 +974,7 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
             raise ChatError("Codex courier response is invalid")
         messages.append({"event_id": valid_uuid(event_id, "event id"), "message": message})
 
-    class SnapshotCourier(CodexCourier):
-        pass
-
-    snapshot = SnapshotCourier(alias=route.alias, generation=route.generation)
+    snapshot = CodexCourier(alias=route.alias, generation=route.generation)
     for item in messages:
         snapshot.accept(item["event_id"], item["message"])
 

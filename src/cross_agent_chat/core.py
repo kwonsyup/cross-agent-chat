@@ -21,6 +21,7 @@ Provider = Literal["claude", "codex"]
 IntentStatus = Literal[
     "PENDING",
     "REMOTE_AUTHORIZED",
+    "PRE_EFFECT_REJECTED",
     "TRANSPORT_ACCEPTED",
     "UNKNOWN_DELIVERY",
     "RESOLVED_BY_OWNER",
@@ -28,7 +29,6 @@ IntentStatus = Literal[
 
 SCHEMA_VERSION: Final = 1
 MAX_MESSAGE_BYTES: Final = 16 * 1024
-ROUTE_TTL_SECONDS: Final = 15 * 60
 CODEX_ALIAS_DIGEST_LENGTH: Final = 12
 SAFE_DEVICE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}\Z")
 SAFE_NAME_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._@:-]{0,127}\Z")
@@ -250,12 +250,6 @@ class Route:
             "last_seen": self.last_seen,
         }
 
-    def is_recent(self, ttl_seconds: int = ROUTE_TTL_SECONDS) -> bool:
-        if ttl_seconds < 0:
-            fail("route TTL must not be negative")
-        age = (datetime.now(UTC) - _parse_timestamp(self.last_seen)).total_seconds()
-        return age <= ttl_seconds
-
     def process_is_live(self) -> bool:
         try:
             os.kill(self.pid, 0)
@@ -398,6 +392,7 @@ class Intent:
         allowed = {
             "PENDING",
             "REMOTE_AUTHORIZED",
+            "PRE_EFFECT_REJECTED",
             "TRANSPORT_ACCEPTED",
             "UNKNOWN_DELIVERY",
             "RESOLVED_BY_OWNER",
@@ -606,6 +601,7 @@ class IntentStore:
         if status not in {
             "PENDING",
             "REMOTE_AUTHORIZED",
+            "PRE_EFFECT_REJECTED",
             "TRANSPORT_ACCEPTED",
             "UNKNOWN_DELIVERY",
             "RESOLVED_BY_OWNER",

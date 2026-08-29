@@ -1,0 +1,20 @@
+# Changelog
+
+## 0.1.1 - 2026-08-29
+
+- Report exact-agent lookup, ListAgents discovery, and route revalidation failures before
+  launching the native `SendMessage` courier as deterministic.
+- Report the destination's actual provider when delivery is unknown.
+- State the Tailnet and Tailscale ACL trust boundary accurately.
+- Add distributable build, clean-wheel smoke, and package-content checks to CI.
+- Remove private release-process residue and tighten owned-hook recognition.
+- Document supported surfaces, security behavior, and the install lifecycle.
+
+Downgrade note: run `cross-agent-chat uninstall` before reinstalling 0.1.0 because 0.1.1
+intent state includes a status that 0.1.0 does not read.
+
+## 0.1.0 - 2026-08-28
+
+- Initial public release with automatic local and Tailnet discovery.
+- Native Claude delivery and process-scoped Codex delivery at natural Stop.
+- One-command setup, repair, upgrade, and owned uninstall on macOS.

@@ -6,7 +6,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from typing import Final
 
-from cross_agent_chat.core import ChatError, bounded_message, valid_uuid
+from cross_agent_chat.core import ChatError, UnknownDeliveryError, bounded_message, valid_uuid
 
 DEFAULT_CAPACITY: Final = 32
 
@@ -26,7 +26,15 @@ class CodexCourier:
         identifier = valid_uuid(event_id, "event id")
         body = bounded_message(message)
         if identifier in self._pending:
-            raise ChatError("Codex courier event is already pending")
+            if self._pending[identifier] == body:
+                return {
+                    "schema_version": 1,
+                    "event_id": identifier,
+                    "status": "TRANSPORT_ACCEPTED",
+                    "to": self.alias,
+                    "provider": "codex",
+                }
+            raise UnknownDeliveryError("Codex courier event conflicts with a pending message")
         if len(self._pending) >= self.capacity:
             raise ChatError("Codex courier queue is full")
         self._pending[identifier] = body

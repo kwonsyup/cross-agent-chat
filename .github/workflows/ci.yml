@@ -18,3 +18,43 @@ jobs:
       - run: ruff format --check .
       - run: mypy --strict src tests
       - run: pytest -q
+      - run: sh -n install.sh
+      - run: python -m build
+      - name: Smoke built wheel in a fresh environment
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-smoke"
+          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install dist/*.whl
+          test "$("$RUNNER_TEMP/wheel-smoke/bin/cross-agent-chat" --version)" = "cross-agent-chat 0.1.1"
+          mkdir -p "$RUNNER_TEMP/doctor-home"
+          set +e
+          HOME="$RUNNER_TEMP/doctor-home" "$RUNNER_TEMP/wheel-smoke/bin/cross-agent-chat" doctor --json > "$RUNNER_TEMP/doctor.json"
+          status=$?
+          set -e
+          test "$status" -eq 1
+          python -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value == {"integration":"needs setup","local_broker":"unavailable","next":"cross-agent-chat setup","remote_trust":"tailscale_acl","version":"0.1.1"}' "$RUNNER_TEMP/doctor.json"
+      - name: Inspect wheel and sdist contents
+        run: |
+          python - <<'PY'
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          wheel, = Path("dist").glob("*.whl")
+          sdist, = Path("dist").glob("*.tar.gz")
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_names = archive.namelist()
+          with tarfile.open(sdist) as archive:
+              sdist_names = archive.getnames()
+          names = wheel_names + sdist_names
+          prohibited = (
+              ".product-proof.json",
+              "current-phase.json",
+              "evidence/current-slice.md",
+              "AGENTS.md",
+              "Kwon-AI-Workflows",
+          )
+          assert not any(marker in name for marker in prohibited for name in names)
+          assert any(name.endswith("/SECURITY.md") for name in sdist_names)
+          assert any(name.endswith("/CHANGELOG.md") for name in sdist_names)
+          PY
