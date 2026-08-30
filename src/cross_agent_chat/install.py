@@ -529,11 +529,15 @@ class Installer:
                 ).returncode
                 == 0
             )
-        except (OSError, subprocess.SubprocessError):
-            return False
+        except (OSError, subprocess.SubprocessError) as error:
+            raise SettingsError("could not determine previous broker state") from error
 
     def broker_is_healthy(self) -> bool:
-        if not self.broker_is_loaded():
+        try:
+            loaded = self.broker_is_loaded()
+        except SettingsError:
+            return False
+        if not loaded:
             return False
         try:
             from cross_agent_chat.runtime import request_tailnet

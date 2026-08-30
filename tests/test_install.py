@@ -290,6 +290,31 @@ def test_install_preserves_healthy_broker_when_courier_shutdown_fails(
     assert health_checks == 2
 
 
+def test_install_aborts_before_setup_when_previous_broker_state_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    setup_called = False
+
+    def unknown() -> bool:
+        raise SettingsError("could not determine previous broker state")
+
+    def setup() -> InstallReport:
+        nonlocal setup_called
+        setup_called = True
+        return InstallReport(changed_paths=(), backup=tmp_path / "backup")
+
+    monkeypatch.setattr(installer, "broker_is_loaded", unknown)
+    monkeypatch.setattr(installer, "setup", setup)
+
+    with pytest.raises(SettingsError, match="could not determine previous broker state"):
+        installer.install()
+
+    assert not setup_called
+    assert not home.exists()
+
+
 def test_install_restores_and_restarts_healthy_broker_after_activation_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
