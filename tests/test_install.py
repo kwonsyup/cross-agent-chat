@@ -107,6 +107,26 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
 ) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.codex_hooks.parent.mkdir(parents=True)
+    installer.codex_hooks.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "/opt/unrelated-hook",
+                                    "timeout": 3,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+    )
     installer.setup()
     config = home / ".codex" / "config.toml"
     parsed = tomllib.loads(config.read_text())
@@ -126,7 +146,7 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
         f"[hooks.state.{json.dumps(key)}]\ntrusted_hash = {json.dumps(trusted_hash)}\n\n"
         for key, trusted_hash in owned.items()
     )
-    unrelated_key = "unrelated-hooks.json:stop:0:0"
+    unrelated_key = f"{installer.codex_hooks}:stop:0:0"
     unrelated_hash = "sha256:" + "0" * 64
     unrelated = (
         f"[hooks.state.{json.dumps(unrelated_key)}]\n"
@@ -147,7 +167,7 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     repaired_owned = [
         key for key in repaired_trust if str(key).startswith(f"{installer.codex_hooks}:")
     ]
-    assert len(repaired_owned) == 3
+    assert set(repaired_owned) == {*owned, unrelated_key}
     assert repaired_trust[unrelated_key] == {"trusted_hash": unrelated_hash}
 
     installer.uninstall()
@@ -155,7 +175,7 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     uninstalled = tomllib.loads(config.read_text())
     uninstalled_trust = uninstalled["hooks"]["state"]
     assert isinstance(uninstalled_trust, dict)
-    assert not any(str(key).startswith(f"{installer.codex_hooks}:") for key in uninstalled_trust)
+    assert not set(owned).intersection(uninstalled_trust)
     assert uninstalled_trust[unrelated_key] == {"trusted_hash": unrelated_hash}
 
 

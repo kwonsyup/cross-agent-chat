@@ -258,18 +258,23 @@ def _codex_owned_toml(
     return text + f"{OWNED_TOML_END}\n"
 
 
-def _remove_owned_hook_trust(
-    text: str,
-    executable: Path,
-    device: str,
-    hooks_path: Path,
-) -> str:
-    expected = {
-        _hook_event_name(event): _hook_trust_hash(
-            _hook_command(executable, "codex", device, event), event, timeout
-        )
-        for event, timeout in (("SessionStart", 5), ("SessionEnd", 3), ("Stop", 3))
-    }
+def _owned_hook_trust_keys(config: dict[str, object], hooks_path: Path) -> set[str]:
+    raw_hooks = config.get("hooks")
+    if not isinstance(raw_hooks, dict):
+        return set()
+    hook_map = cast(dict[str, object], raw_hooks)
+    keys: set[str] = set()
+    for event in ("SessionStart", "SessionEnd", "Stop"):
+        groups = hook_map.get(event)
+        if not isinstance(groups, list):
+            continue
+        for index, item in enumerate(groups):
+            if _owned_hook(item):
+                keys.add(f"{hooks_path}:{_hook_event_name(event)}:{index}:0")
+    return keys
+
+
+def _remove_owned_hook_trust(text: str, owned_keys: set[str]) -> str:
 
     def remove_owned(match: re.Match[str]) -> str:
         try:
@@ -279,13 +284,8 @@ def _remove_owned_hook_trust(
             return match.group(0)
         if not isinstance(raw_key, str) or not isinstance(raw_hash, str):
             return match.group(0)
-        for event_name, trusted_hash in expected.items():
-            prefix = f"{hooks_path}:{event_name}:"
-            if not raw_key.startswith(prefix) or not raw_key.endswith(":0"):
-                continue
-            index = raw_key[len(prefix) : -2]
-            if index.isdecimal() and raw_hash == trusted_hash:
-                return ""
+        if raw_key in owned_keys:
+            return ""
         return match.group(0)
 
     return HOOK_TRUST_TABLE_RE.sub(remove_owned, text)
@@ -413,9 +413,7 @@ class Installer:
         codex_text = OWNED_TOML_RE.sub("\n", codex_text)
         codex_text = _remove_owned_hook_trust(
             codex_text,
-            self.executable,
-            self.device,
-            self.codex_hooks,
+            _owned_hook_trust_keys(codex_hooks, self.codex_hooks),
         ).rstrip()
         codex_text = _enable_hooks_feature(codex_text).rstrip() + "\n\n"
         codex_text += _codex_owned_toml(
@@ -725,17 +723,13 @@ class Installer:
             cast(dict[str, object], servers).pop(SERVER_NAME, None)
         _atomic_write(self.claude_config, _json_bytes(claude))
 
+        codex_hooks = _json_object(self.codex_hooks)
+        owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
         if self.codex_config.exists():
             cleaned = OWNED_TOML_RE.sub("\n", self.codex_config.read_text())
-            cleaned = _remove_owned_hook_trust(
-                cleaned,
-                self.executable,
-                self.device,
-                self.codex_hooks,
-            ).lstrip("\n")
+            cleaned = _remove_owned_hook_trust(cleaned, owned_trust_keys).lstrip("\n")
             _atomic_write(self.codex_config, cleaned.encode())
 
-        codex_hooks = _json_object(self.codex_hooks)
         _remove_hooks(codex_hooks)
         _atomic_write(self.codex_hooks, _json_bytes(codex_hooks))
         self.launch_agent.unlink(missing_ok=True)
