@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import tomllib
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -30,6 +31,11 @@ OWNED_TOML_START: Final = "# cross-agent-chat:start"
 OWNED_TOML_END: Final = "# cross-agent-chat:end"
 OWNED_TOML_RE: Final = re.compile(
     rf"\n?{re.escape(OWNED_TOML_START)}.*?{re.escape(OWNED_TOML_END)}\n?", re.DOTALL
+)
+HOOK_TRUST_TABLE_RE: Final = re.compile(
+    r"^\[hooks\.state\.(?P<key>\"(?:[^\"\\]|\\.)*\")\]\n"
+    r"trusted_hash = (?P<trusted_hash>\"(?:[^\"\\]|\\.)*\")\n(?:\n|$)",
+    re.MULTILINE,
 )
 
 
@@ -250,6 +256,39 @@ def _codex_owned_toml(
     return text + f"{OWNED_TOML_END}\n"
 
 
+def _remove_owned_hook_trust(
+    text: str,
+    executable: Path,
+    device: str,
+    hooks_path: Path,
+) -> str:
+    expected = {
+        _hook_event_name(event): _hook_trust_hash(
+            _hook_command(executable, "codex", device, event), event, timeout
+        )
+        for event, timeout in (("SessionStart", 5), ("SessionEnd", 3), ("Stop", 3))
+    }
+
+    def remove_owned(match: re.Match[str]) -> str:
+        try:
+            raw_key: object = json.loads(match.group("key"))
+            raw_hash: object = json.loads(match.group("trusted_hash"))
+        except json.JSONDecodeError:
+            return match.group(0)
+        if not isinstance(raw_key, str) or not isinstance(raw_hash, str):
+            return match.group(0)
+        for event_name, trusted_hash in expected.items():
+            prefix = f"{hooks_path}:{event_name}:"
+            if not raw_key.startswith(prefix) or not raw_key.endswith(":0"):
+                continue
+            index = raw_key[len(prefix) : -2]
+            if index.isdecimal() and raw_hash == trusted_hash:
+                return ""
+        return match.group(0)
+
+    return HOOK_TRUST_TABLE_RE.sub(remove_owned, text)
+
+
 class Installer:
     """Transactional owner of the Cross Agent Chat config surface."""
 
@@ -369,7 +408,13 @@ class Installer:
             hook_indices[event] = indices[0]
 
         codex_text = self.codex_config.read_text() if self.codex_config.exists() else ""
-        codex_text = OWNED_TOML_RE.sub("\n", codex_text).rstrip()
+        codex_text = OWNED_TOML_RE.sub("\n", codex_text)
+        codex_text = _remove_owned_hook_trust(
+            codex_text,
+            self.executable,
+            self.device,
+            self.codex_hooks,
+        ).rstrip()
         codex_text = _enable_hooks_feature(codex_text).rstrip() + "\n\n"
         codex_text += _codex_owned_toml(
             self.executable,
@@ -488,6 +533,9 @@ class Installer:
             settings = _json_object(self.claude_settings)
             codex_hooks = _json_object(self.codex_hooks)
             codex_text = self.codex_config.read_text()
+            parsed_codex: object = tomllib.loads(codex_text)
+            if not isinstance(parsed_codex, dict):
+                return False
             if not isinstance(servers, dict) or SERVER_NAME not in servers:
                 return False
             if settings.get("crossSessionInbound") != "accept":
@@ -512,7 +560,13 @@ class Installer:
                     if len([item for item in groups if _owned_hook(item)]) != 1:
                         return False
             return True
-        except (OSError, plistlib.InvalidFileException, SettingsError, RuntimeError):
+        except (
+            OSError,
+            plistlib.InvalidFileException,
+            SettingsError,
+            RuntimeError,
+            tomllib.TOMLDecodeError,
+        ):
             return False
 
     def broker_is_loaded(self) -> bool:
@@ -670,7 +724,13 @@ class Installer:
         _atomic_write(self.claude_config, _json_bytes(claude))
 
         if self.codex_config.exists():
-            cleaned = OWNED_TOML_RE.sub("\n", self.codex_config.read_text()).lstrip("\n")
+            cleaned = OWNED_TOML_RE.sub("\n", self.codex_config.read_text())
+            cleaned = _remove_owned_hook_trust(
+                cleaned,
+                self.executable,
+                self.device,
+                self.codex_hooks,
+            ).lstrip("\n")
             _atomic_write(self.codex_config, cleaned.encode())
 
         codex_hooks = _json_object(self.codex_hooks)
