@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2 - 2026-08-30
+
+- Preserve a previously healthy broker when upgrade preparation fails before service
+  transition.
+- Restore, restart, and health-check the previous broker when candidate activation or
+  health verification fails.
+- Retain the rollback backup and report both failures if predecessor recovery fails.
+
 ## 0.1.1 - 2026-08-29
 
 - Report exact-agent lookup, ListAgents discovery, and route revalidation failures before

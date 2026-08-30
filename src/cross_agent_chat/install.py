@@ -449,10 +449,14 @@ class Installer:
                 raise SettingsError("backup manifest is invalid")
 
     def install(self) -> InstallReport:
+        previous_broker_loaded = self.broker_is_loaded()
+        previous_broker_healthy = previous_broker_loaded and self.broker_is_healthy()
         report = self.setup()
+        service_transition_started = False
         try:
             self._stop_couriers()
             self._remove_runtime_state()
+            service_transition_started = True
             self.activate()
             for attempt in range(60):
                 if self.verify():
@@ -461,9 +465,19 @@ class Installer:
                     time.sleep(0.25)
             else:
                 raise SettingsError("background broker did not become healthy")
-        except (OSError, subprocess.SubprocessError, ChatError, SettingsError):
-            self._bootout()
-            self._restore(report.backup)
+        except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as failure:
+            try:
+                if service_transition_started:
+                    self._bootout()
+                self._restore(report.backup)
+                if service_transition_started and previous_broker_loaded:
+                    self.activate()
+                if previous_broker_healthy and not self._wait_for_broker_health():
+                    raise SettingsError("previous broker did not become healthy")
+            except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as rollback:
+                raise SettingsError(
+                    f"installation failed: {failure}; rollback failed: {rollback}"
+                ) from failure
             raise
         return report
 
@@ -501,20 +515,25 @@ class Installer:
         except (OSError, plistlib.InvalidFileException, SettingsError, RuntimeError):
             return False
 
-    def broker_is_healthy(self) -> bool:
+    def broker_is_loaded(self) -> bool:
         service = f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"
         try:
-            loaded = subprocess.run(
-                ["launchctl", "print", service],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=5.0,
-                check=False,
+            return (
+                subprocess.run(
+                    ["launchctl", "print", service],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                    check=False,
+                ).returncode
+                == 0
             )
         except (OSError, subprocess.SubprocessError):
             return False
-        if loaded.returncode != 0:
+
+    def broker_is_healthy(self) -> bool:
+        if not self.broker_is_loaded():
             return False
         try:
             from cross_agent_chat.runtime import request_tailnet
@@ -528,6 +547,14 @@ class Installer:
         except RuntimeError:
             return False
         return response == {"schema_version": 1, "status": "READY"}
+
+    def _wait_for_broker_health(self) -> bool:
+        for attempt in range(60):
+            if self.broker_is_healthy():
+                return True
+            if attempt < 59:
+                time.sleep(0.25)
+        return False
 
     def verify(self) -> bool:
         return self.verify_configuration() and self.broker_is_healthy()

@@ -243,6 +243,7 @@ def test_install_restores_provider_files_if_activation_fails(
     def fail() -> None:
         raise SettingsError("activation failed")
 
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
     monkeypatch.setattr(installer, "activate", fail)
 
     with pytest.raises(SettingsError, match="activation failed"):
@@ -250,6 +251,134 @@ def test_install_restores_provider_files_if_activation_fails(
 
     assert settings.read_bytes() == original
     assert not installer.launch_agent.exists()
+
+
+def test_install_preserves_healthy_broker_when_courier_shutdown_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"theme": "light"}))
+    original = settings.read_bytes()
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    health_checks = 0
+    bootouts = 0
+
+    def healthy() -> bool:
+        nonlocal health_checks
+        health_checks += 1
+        return True
+
+    def fail_shutdown() -> None:
+        raise SettingsError("courier shutdown failed")
+
+    def bootout() -> None:
+        nonlocal bootouts
+        bootouts += 1
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
+    monkeypatch.setattr(installer, "broker_is_healthy", healthy)
+    monkeypatch.setattr(installer, "_stop_couriers", fail_shutdown)
+    monkeypatch.setattr(installer, "_bootout", bootout)
+
+    with pytest.raises(SettingsError, match="courier shutdown failed"):
+        installer.install()
+
+    assert settings.read_bytes() == original
+    assert bootouts == 0
+    assert health_checks == 2
+
+
+def test_install_restores_and_restarts_healthy_broker_after_activation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"theme": "light"}))
+    original = settings.read_bytes()
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    activations = 0
+
+    def activate() -> None:
+        nonlocal activations
+        activations += 1
+        if activations == 1:
+            raise SettingsError("activation failed")
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
+    monkeypatch.setattr(installer, "broker_is_healthy", lambda: True)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+    monkeypatch.setattr(installer, "activate", activate)
+
+    with pytest.raises(SettingsError, match="activation failed"):
+        installer.install()
+
+    assert settings.read_bytes() == original
+    assert activations == 2
+
+
+def test_install_restores_and_restarts_healthy_broker_after_candidate_health_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"theme": "light"}))
+    original = settings.read_bytes()
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    activations = 0
+
+    def activate() -> None:
+        nonlocal activations
+        activations += 1
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
+    monkeypatch.setattr(installer, "broker_is_healthy", lambda: True)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+    monkeypatch.setattr(installer, "activate", activate)
+    monkeypatch.setattr(installer, "verify", lambda: False)
+    monkeypatch.setattr("cross_agent_chat.install.time.sleep", lambda _: None)
+
+    with pytest.raises(SettingsError, match="background broker did not become healthy"):
+        installer.install()
+
+    assert settings.read_bytes() == original
+    assert activations == 2
+
+
+def test_install_reports_primary_and_rollback_restart_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    activations = 0
+
+    def activate() -> None:
+        nonlocal activations
+        activations += 1
+        if activations == 1:
+            raise SettingsError("candidate activation failed")
+        raise SettingsError("predecessor restart failed")
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
+    monkeypatch.setattr(installer, "broker_is_healthy", lambda: True)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+    monkeypatch.setattr(installer, "activate", activate)
+
+    with pytest.raises(SettingsError) as captured:
+        installer.install()
+
+    message = str(captured.value)
+    assert "candidate activation failed" in message
+    assert "predecessor restart failed" in message
+    backups = list((home / ".cache" / "cross-agent-chat" / "backups").iterdir())
+    assert len(backups) == 1
+    assert (backups[0] / "manifest.json").exists()
 
 
 def test_install_allows_bounded_launchd_throttle_recovery(
@@ -264,6 +393,7 @@ def test_install_allows_bounded_launchd_throttle_recovery(
         checks += 1
         return checks > 21
 
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", lambda: None)
@@ -284,6 +414,7 @@ def test_upgrade_install_stops_old_couriers_before_reloading(
     calls: list[str] = []
     report = InstallReport(changed_paths=(), backup=tmp_path / "backup")
     monkeypatch.setattr(installer, "setup", lambda: report)
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: calls.append("stop"))
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: calls.append("remove"))
     monkeypatch.setattr(installer, "activate", lambda: calls.append("activate"))
