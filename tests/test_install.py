@@ -11,6 +11,14 @@ import pytest
 from cross_agent_chat.install import Installer, InstallReport, SettingsError, _owned_hook
 
 
+def test_install_script_snapshots_runtime_before_package_replacement() -> None:
+    script = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
+
+    assert script.index("backup_previous_runtime\n") < script.index("uv tool install --force")
+    assert "CROSS_AGENT_CHAT_PREVIOUS_RUNTIME" in script
+    assert "CROSS_AGENT_CHAT_RUNTIME_ROOT" in script
+
+
 def test_setup_preserves_unrelated_provider_configuration(tmp_path: Path) -> None:
     home = tmp_path / "home"
     claude_settings = home / ".claude" / "settings.json"
@@ -177,6 +185,36 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     assert isinstance(uninstalled_trust, dict)
     assert not set(owned).intersection(uninstalled_trust)
     assert uninstalled_trust[unrelated_key] == {"trusted_hash": unrelated_hash}
+
+
+def test_setup_preserves_owned_hook_position_when_unrelated_hook_follows(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    hooks = json.loads(installer.codex_hooks.read_text())
+    stop_hooks = hooks["hooks"]["Stop"]
+    stop_hooks.append(
+        {"hooks": [{"type": "command", "command": "/opt/unrelated-hook", "timeout": 3}]}
+    )
+    installer.codex_hooks.write_text(json.dumps(hooks))
+    unrelated_key = f"{installer.codex_hooks}:stop:1:0"
+    unrelated_hash = "sha256:" + "0" * 64
+    config = installer.codex_config
+    config.write_text(
+        config.read_text()
+        + f"\n[hooks.state.{json.dumps(unrelated_key)}]\n"
+        + f"trusted_hash = {json.dumps(unrelated_hash)}\n"
+    )
+
+    installer.setup()
+
+    repaired_hooks = json.loads(installer.codex_hooks.read_text())["hooks"]["Stop"]
+    assert _owned_hook(repaired_hooks[0])
+    assert repaired_hooks[1]["hooks"][0]["command"] == "/opt/unrelated-hook"
+    repaired_trust = tomllib.loads(config.read_text())["hooks"]["state"]
+    assert repaired_trust[unrelated_key] == {"trusted_hash": unrelated_hash}
 
 
 def test_setup_rolls_back_when_verification_fails(tmp_path: Path) -> None:
@@ -481,6 +519,73 @@ def test_install_reports_primary_and_rollback_restart_failures(
     backups = list((home / ".cache" / "cross-agent-chat" / "backups").iterdir())
     assert len(backups) == 1
     assert (backups[0] / "manifest.json").exists()
+
+
+def test_install_restores_predecessor_runtime_before_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    runtime = home / ".local" / "share" / "cross-agent-chat"
+    previous = home / ".cache" / "cross-agent-chat" / "runtime-backups" / "previous"
+    for root, marker in ((runtime, "candidate"), (previous, "predecessor")):
+        executable = root / "bin" / "cross-agent-chat"
+        executable.parent.mkdir(parents=True)
+        executable.write_text(marker)
+    monkeypatch.setenv("CROSS_AGENT_CHAT_RUNTIME_ROOT", str(runtime))
+    monkeypatch.setenv("CROSS_AGENT_CHAT_PREVIOUS_RUNTIME", str(previous))
+    installer = Installer(
+        home=home,
+        executable=runtime / "bin" / "cross-agent-chat",
+        device="studio",
+    )
+    activations = 0
+
+    def activate() -> None:
+        nonlocal activations
+        activations += 1
+        if activations == 1:
+            raise SettingsError("candidate activation failed")
+        assert installer.executable.read_text() == "predecessor"
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
+    monkeypatch.setattr(installer, "broker_is_healthy", lambda: True)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+    monkeypatch.setattr(installer, "activate", activate)
+
+    with pytest.raises(SettingsError, match="candidate activation failed"):
+        installer.install()
+
+    assert activations == 2
+    assert installer.executable.read_text() == "predecessor"
+    backups = list((home / ".cache" / "cross-agent-chat" / "backups").iterdir())
+    assert (backups[0] / "failed-runtime" / "bin" / "cross-agent-chat").read_text() == ("candidate")
+
+
+def test_loaded_predecessor_health_snapshot_retries_transient_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    health_checks = 0
+
+    def health() -> bool:
+        nonlocal health_checks
+        health_checks += 1
+        return health_checks > 1
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
+    monkeypatch.setattr(installer, "broker_is_healthy", health)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+    monkeypatch.setattr(installer, "activate", lambda: None)
+    monkeypatch.setattr(installer, "verify", lambda: True)
+    monkeypatch.setattr("cross_agent_chat.install.time.sleep", lambda _: None)
+
+    installer.install()
+
+    assert health_checks == 2
 
 
 def test_install_allows_bounded_launchd_throttle_recovery(

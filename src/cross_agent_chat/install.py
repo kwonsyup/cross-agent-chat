@@ -158,7 +158,17 @@ def _merge_hook(config: dict[str, object], event: str, owned: dict[str, object])
     existing = hook_map.get(event, [])
     if not isinstance(existing, list):
         raise SettingsError(f"provider hook {event} must be a list")
-    hook_map[event] = [item for item in existing if not _owned_hook(item)] + [owned]
+    merged: list[object] = []
+    replaced = False
+    for item in existing:
+        if not _owned_hook(item):
+            merged.append(item)
+        elif not replaced:
+            merged.append(owned)
+            replaced = True
+    if not replaced:
+        merged.append(owned)
+    hook_map[event] = merged
 
 
 def _remove_hooks(config: dict[str, object]) -> None:
@@ -317,6 +327,10 @@ class Installer:
         self.codex_config = self.home / ".codex" / "config.toml"
         self.codex_hooks = self.home / ".codex" / "hooks.json"
         self.launch_agent = self.home / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+        previous_runtime = os.environ.get("CROSS_AGENT_CHAT_PREVIOUS_RUNTIME")
+        runtime_root = os.environ.get("CROSS_AGENT_CHAT_RUNTIME_ROOT")
+        self.previous_runtime = Path(previous_runtime) if previous_runtime else None
+        self.runtime_root = Path(runtime_root) if runtime_root else None
 
     @property
     def config_paths(self) -> tuple[Path, ...]:
@@ -493,9 +507,42 @@ class Installer:
             else:
                 raise SettingsError("backup manifest is invalid")
 
+    def _restore_predecessor_runtime(self, backup: Path) -> None:
+        if self.previous_runtime is None and self.runtime_root is None:
+            return
+        if self.previous_runtime is None or self.runtime_root is None:
+            raise SettingsError("previous runtime metadata is incomplete")
+        previous = self.previous_runtime.resolve()
+        runtime = self.runtime_root.resolve()
+        allowed = (
+            self.home / ".local" / "share" / "uv" / "tools" / SERVER_NAME,
+            self.home / ".local" / "share" / "pipx" / "venvs" / SERVER_NAME,
+            self.home / ".local" / "pipx" / "venvs" / SERVER_NAME,
+            self.home / ".local" / "share" / SERVER_NAME,
+        )
+        if runtime not in allowed or not previous.is_dir() or not runtime.is_dir():
+            raise SettingsError("previous runtime metadata is invalid")
+        previous_executable = previous / "bin" / SERVER_NAME
+        if not previous_executable.is_file():
+            raise SettingsError("previous runtime is incomplete")
+        failed_runtime = backup / "failed-runtime"
+        if failed_runtime.exists():
+            raise SettingsError("failed runtime backup already exists")
+        os.replace(runtime, failed_runtime)
+        try:
+            shutil.copytree(previous, runtime, symlinks=True)
+        except OSError:
+            if runtime.exists():
+                shutil.rmtree(runtime)
+            os.replace(failed_runtime, runtime)
+            raise
+        restored_executable = runtime / "bin" / SERVER_NAME
+        if not restored_executable.is_file():
+            raise SettingsError("restored previous runtime is incomplete")
+
     def install(self) -> InstallReport:
         previous_broker_loaded = self.broker_is_loaded()
-        previous_broker_healthy = previous_broker_loaded and self.broker_is_healthy()
+        previous_broker_healthy = previous_broker_loaded and self._wait_for_broker_health()
         report = self.setup()
         service_transition_started = False
         try:
@@ -514,6 +561,7 @@ class Installer:
             try:
                 if service_transition_started:
                     self._bootout()
+                self._restore_predecessor_runtime(report.backup)
                 self._restore(report.backup)
                 if service_transition_started and previous_broker_loaded:
                     self.activate()
