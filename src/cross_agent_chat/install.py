@@ -27,6 +27,8 @@ from cross_agent_chat.tailnet import LOCAL_BROKER_HOST, LOCAL_BROKER_PORT, valid
 
 SERVER_NAME: Final = "cross-agent-chat"
 LAUNCH_AGENT_LABEL: Final = "io.github.kwonsyup.cross-agent-chat"
+BROKER_HEALTH_ATTEMPTS: Final = 300
+BROKER_HEALTH_INTERVAL_SECONDS: Final = 0.25
 OWNED_TOML_START: Final = "# cross-agent-chat:start"
 OWNED_TOML_END: Final = "# cross-agent-chat:end"
 OWNED_TOML_RE: Final = re.compile(
@@ -503,11 +505,11 @@ class Installer:
             self._remove_runtime_state()
             service_transition_started = True
             self.activate()
-            for attempt in range(60):
+            for attempt in range(BROKER_HEALTH_ATTEMPTS):
                 if self.verify():
                     break
-                if attempt < 59:
-                    time.sleep(0.25)
+                if attempt < BROKER_HEALTH_ATTEMPTS - 1:
+                    time.sleep(BROKER_HEALTH_INTERVAL_SECONDS)
             else:
                 raise SettingsError("background broker did not become healthy")
         except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as failure:
@@ -607,11 +609,11 @@ class Installer:
         return response == {"schema_version": 1, "status": "READY"}
 
     def _wait_for_broker_health(self) -> bool:
-        for attempt in range(60):
+        for attempt in range(BROKER_HEALTH_ATTEMPTS):
             if self.broker_is_healthy():
                 return True
-            if attempt < 59:
-                time.sleep(0.25)
+            if attempt < BROKER_HEALTH_ATTEMPTS - 1:
+                time.sleep(BROKER_HEALTH_INTERVAL_SECONDS)
         return False
 
     def verify(self) -> bool:

@@ -487,6 +487,30 @@ def test_install_allows_bounded_launchd_throttle_recovery(
     assert checks == 22
 
 
+def test_install_allows_broker_readiness_after_sixty_seconds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    checks = 0
+
+    def verify() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks == 241
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+    monkeypatch.setattr(installer, "activate", lambda: None)
+    monkeypatch.setattr(installer, "verify", verify)
+    monkeypatch.setattr("cross_agent_chat.install.time.sleep", lambda _: None)
+
+    installer.install()
+
+    assert checks == 241
+
+
 def test_upgrade_install_stops_old_couriers_before_reloading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
