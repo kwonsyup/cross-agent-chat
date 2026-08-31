@@ -1481,6 +1481,12 @@ class Installer:
         raise SettingsError(message)
 
     def _stop_owned_orphan_broker(self) -> None:
+        try:
+            self._stop_owned_orphan_broker_checked()
+        except (OSError, subprocess.SubprocessError):
+            self._require_broker_released("local broker port is occupied by an unverified process")
+
+    def _stop_owned_orphan_broker_checked(self) -> None:
         if self._broker_port_is_available():
             return
         listener = subprocess.run(
@@ -1560,7 +1566,11 @@ class Installer:
         ):
             self._require_broker_released("local broker process changed before termination")
             return
-        os.kill(pid, signal.SIGTERM)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            self._require_broker_released("local broker process changed before termination")
+            return
         if not self._wait_for_broker_port_release():
             raise SettingsError("owned predecessor broker did not stop")
 
