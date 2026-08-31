@@ -34,6 +34,7 @@ SERVER_NAME: Final = "cross-agent-chat"
 LAUNCH_AGENT_LABEL: Final = "io.github.kwonsyup.cross-agent-chat"
 BROKER_HEALTH_ATTEMPTS: Final = 300
 BROKER_HEALTH_INTERVAL_SECONDS: Final = 0.25
+BROKER_HEALTH_WAIT_SECONDS: Final = 75.0
 BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS: Final = 3.0
 OWNED_TOML_START: Final = "# cross-agent-chat:start"
 OWNED_TOML_END: Final = "# cross-agent-chat:end"
@@ -789,12 +790,7 @@ class Installer:
             self._remove_runtime_state()
             service_transition_started = True
             self.activate()
-            for attempt in range(BROKER_HEALTH_ATTEMPTS):
-                if self.verify():
-                    break
-                if attempt < BROKER_HEALTH_ATTEMPTS - 1:
-                    time.sleep(BROKER_HEALTH_INTERVAL_SECONDS)
-            else:
+            if not self._wait_for_broker_health(lambda timeout: self.verify(timeout=timeout)):
                 raise SettingsError("background broker did not become healthy")
         except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as failure:
             rollback_failures: list[str] = []
@@ -1247,12 +1243,12 @@ class Installer:
             service_transition_started = True
             self.activate()
             record("service_started")
-            for attempt in range(BROKER_HEALTH_ATTEMPTS):
-                if self.verify() and _package_tree_digest(final_runtime) == package_digest:
-                    break
-                if attempt < BROKER_HEALTH_ATTEMPTS - 1:
-                    time.sleep(BROKER_HEALTH_INTERVAL_SECONDS)
-            else:
+            if not self._wait_for_broker_health(
+                lambda timeout: (
+                    self.verify(timeout=timeout)
+                    and _package_tree_digest(final_runtime) == package_digest
+                )
+            ):
                 raise SettingsError("background broker did not become healthy")
             _atomic_write(final_runtime / RELEASE_MARKER, COMMITTED_RELEASE_MARKER.encode())
         except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as failure:
@@ -1328,7 +1324,7 @@ class Installer:
         ):
             return False
 
-    def _broker_service(self) -> BrokerService | None:
+    def _broker_service(self, *, timeout: float = 5.0) -> BrokerService | None:
         service = f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"
         try:
             result = subprocess.run(
@@ -1336,7 +1332,7 @@ class Installer:
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
-                timeout=5.0,
+                timeout=timeout,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as error:
@@ -1367,9 +1363,10 @@ class Installer:
         except (OSError, subprocess.SubprocessError) as error:
             raise SettingsError("could not determine previous broker state") from error
 
-    def broker_is_healthy(self) -> bool:
+    def broker_is_healthy(self, *, timeout: float = BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS) -> bool:
+        deadline = time.monotonic() + timeout
         try:
-            service = self._broker_service()
+            service = self._broker_service(timeout=min(5.0, timeout))
         except SettingsError:
             return False
         if service is None or service.program != self.executable:
@@ -1377,11 +1374,14 @@ class Installer:
         try:
             from cross_agent_chat.runtime import request_tailnet
 
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
             response = request_tailnet(
                 LOCAL_BROKER_HOST,
                 {"schema_version": 1, "operation": "health"},
                 port=LOCAL_BROKER_PORT,
-                timeout=BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
+                timeout=min(BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS, remaining),
             )
         except RuntimeError:
             return False
@@ -1405,13 +1405,13 @@ class Installer:
             return False
         return module.is_relative_to(runtime)
 
-    def _local_broker_listener_pid(self) -> int | None:
+    def _local_broker_listener_pid(self, *, timeout: float = 5.0) -> int | None:
         result = subprocess.run(
             ["/usr/sbin/lsof", "-nP", "-t", f"-iTCP:{LOCAL_BROKER_PORT}", "-sTCP:LISTEN"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=5.0,
+            timeout=timeout,
             check=False,
         )
         raw_pids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
@@ -1419,43 +1419,87 @@ class Installer:
             return None
         return int(raw_pids[0])
 
-    def _previous_broker_is_healthy(self) -> bool:
-        if self.broker_is_healthy():
-            return True
+    def _previous_broker_is_healthy(self, *, deadline: float | None = None) -> bool:
+        health_deadline = (
+            deadline if deadline is not None else time.monotonic() + BROKER_HEALTH_WAIT_SECONDS
+        )
         try:
-            service = self._broker_service()
-            if service is None or self._local_broker_listener_pid() != service.pid:
+            remaining = health_deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            service = self._broker_service(timeout=min(5.0, remaining))
+            remaining = health_deadline - time.monotonic()
+            if (
+                service is None
+                or remaining <= 0
+                or self._local_broker_listener_pid(timeout=min(5.0, remaining)) != service.pid
+            ):
                 return False
             from cross_agent_chat.runtime import request_tailnet
 
+            remaining = health_deadline - time.monotonic()
+            if remaining <= 0:
+                return False
             response = request_tailnet(
                 LOCAL_BROKER_HOST,
                 {"schema_version": 1, "operation": "health"},
                 port=LOCAL_BROKER_PORT,
-                timeout=BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
+                timeout=min(BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS, remaining),
             )
         except (OSError, RuntimeError, SettingsError, subprocess.SubprocessError):
             return False
-        return response.get("schema_version") == 1 and response.get("status") == "READY"
+        if service.program != self.executable:
+            return response.get("schema_version") == 1 and response.get("status") == "READY"
+        pid = response.get("pid")
+        version = response.get("version")
+        module_path = response.get("module_path")
+        if (
+            response.get("schema_version") != 1
+            or response.get("status") != "READY"
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid != service.pid
+            or version != __version__
+            or not isinstance(module_path, str)
+        ):
+            return False
+        try:
+            runtime = self.executable.resolve(strict=True).parent.parent
+            module = Path(module_path).resolve(strict=True)
+        except OSError:
+            return False
+        return module.is_relative_to(runtime)
 
     def _wait_for_previous_broker_health(self) -> bool:
+        deadline = time.monotonic() + BROKER_HEALTH_WAIT_SECONDS
         for attempt in range(BROKER_HEALTH_ATTEMPTS):
-            if self._previous_broker_is_healthy():
+            if self._previous_broker_is_healthy(deadline=deadline):
                 return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
             if attempt < BROKER_HEALTH_ATTEMPTS - 1:
-                time.sleep(BROKER_HEALTH_INTERVAL_SECONDS)
+                time.sleep(min(BROKER_HEALTH_INTERVAL_SECONDS, remaining))
         return False
 
-    def _wait_for_broker_health(self) -> bool:
+    def _wait_for_broker_health(self, check: Callable[[float], bool] | None = None) -> bool:
+        health_check = check or (lambda timeout: self.broker_is_healthy(timeout=timeout))
+        deadline = time.monotonic() + BROKER_HEALTH_WAIT_SECONDS
         for attempt in range(BROKER_HEALTH_ATTEMPTS):
-            if self.broker_is_healthy():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if health_check(min(BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS, remaining)):
                 return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
             if attempt < BROKER_HEALTH_ATTEMPTS - 1:
-                time.sleep(BROKER_HEALTH_INTERVAL_SECONDS)
+                time.sleep(min(BROKER_HEALTH_INTERVAL_SECONDS, remaining))
         return False
 
-    def verify(self) -> bool:
-        return self.verify_configuration() and self.broker_is_healthy()
+    def verify(self, *, timeout: float = BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS) -> bool:
+        return self.verify_configuration() and self.broker_is_healthy(timeout=timeout)
 
     def _broker_port_is_available(self) -> bool:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -18,6 +18,7 @@ import pytest
 
 from cross_agent_chat.install import (
     BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
+    BROKER_HEALTH_WAIT_SECONDS,
     BrokerService,
     Installer,
     InstallReport,
@@ -929,7 +930,7 @@ def test_install_preserves_healthy_broker_when_courier_shutdown_fails(
         bootouts += 1
 
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
-    monkeypatch.setattr(installer, "broker_is_healthy", healthy)
+    monkeypatch.setattr(installer, "_wait_for_previous_broker_health", healthy)
     monkeypatch.setattr(installer, "_stop_couriers", fail_shutdown)
     monkeypatch.setattr(installer, "_bootout", bootout)
 
@@ -985,7 +986,7 @@ def test_install_restores_and_restarts_healthy_broker_after_activation_failure(
             raise SettingsError("activation failed")
 
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
-    monkeypatch.setattr(installer, "broker_is_healthy", lambda: True)
+    monkeypatch.setattr(installer, "_wait_for_previous_broker_health", lambda: True)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
@@ -1013,11 +1014,11 @@ def test_install_restores_and_restarts_healthy_broker_after_candidate_health_fai
         activations += 1
 
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
-    monkeypatch.setattr(installer, "broker_is_healthy", lambda: True)
+    monkeypatch.setattr(installer, "_wait_for_previous_broker_health", lambda: True)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
-    monkeypatch.setattr(installer, "verify", lambda: False)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: False)
     monkeypatch.setattr("cross_agent_chat.install.time.sleep", lambda _: None)
 
     with pytest.raises(SettingsError, match="background broker did not become healthy"):
@@ -1042,7 +1043,7 @@ def test_install_reports_primary_and_rollback_restart_failures(
         raise SettingsError("predecessor restart failed")
 
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
-    monkeypatch.setattr(installer, "broker_is_healthy", lambda: True)
+    monkeypatch.setattr(installer, "_wait_for_previous_broker_health", lambda: True)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
@@ -1085,7 +1086,7 @@ def test_staged_install_commits_stable_runtime_and_provider_paths(
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", lambda: None)
-    monkeypatch.setattr(installer, "verify", lambda: True)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: True)
 
     installer.install_staged(stage, stable)
 
@@ -1133,7 +1134,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", lambda: None)
-    monkeypatch.setattr(installer, "verify", lambda: True)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: True)
 
     installer.install_staged(stage, stable)
 
@@ -1248,7 +1249,7 @@ def test_staged_install_activation_failure_restores_custom_symlink_and_broker(
 
     monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
-    monkeypatch.setattr(installer, "broker_is_healthy", lambda: True)
+    monkeypatch.setattr(installer, "_wait_for_previous_broker_health", lambda: True)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
@@ -1696,7 +1697,7 @@ def test_staged_install_courier_failure_preserves_healthy_predecessor(
 
     monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
-    monkeypatch.setattr(installer, "broker_is_healthy", lambda: True)
+    monkeypatch.setattr(installer, "_wait_for_previous_broker_health", lambda: True)
     monkeypatch.setattr(installer, "_stop_couriers", fail_shutdown)
     monkeypatch.setattr(installer, "activate", activate)
 
@@ -1760,11 +1761,11 @@ def test_staged_install_health_failure_restores_predecessor(
 
     monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
-    monkeypatch.setattr(installer, "broker_is_healthy", lambda: True)
+    monkeypatch.setattr(installer, "_wait_for_previous_broker_health", lambda: True)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
-    monkeypatch.setattr(installer, "verify", lambda: False)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: False)
     monkeypatch.setattr("cross_agent_chat.install.time.sleep", lambda _: None)
 
     with pytest.raises(SettingsError, match="background broker did not become healthy"):
@@ -1798,7 +1799,7 @@ def test_staged_install_retains_evidence_when_predecessor_restart_fails(
 
     monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
-    monkeypatch.setattr(installer, "broker_is_healthy", lambda: True)
+    monkeypatch.setattr(installer, "_wait_for_previous_broker_health", lambda: True)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
@@ -1822,17 +1823,18 @@ def test_loaded_predecessor_health_snapshot_retries_transient_failure(
     )
     health_checks = 0
 
-    def health() -> bool:
+    def health(*, deadline: float) -> bool:
+        del deadline
         nonlocal health_checks
         health_checks += 1
         return health_checks > 1
 
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
-    monkeypatch.setattr(installer, "broker_is_healthy", health)
+    monkeypatch.setattr(installer, "_previous_broker_is_healthy", health)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", lambda: None)
-    monkeypatch.setattr(installer, "verify", lambda: True)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: True)
     monkeypatch.setattr("cross_agent_chat.install.time.sleep", lambda _: None)
 
     installer.install()
@@ -1847,7 +1849,7 @@ def test_install_allows_bounded_launchd_throttle_recovery(
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
     checks = 0
 
-    def verify() -> bool:
+    def verify(**_kwargs: float) -> bool:
         nonlocal checks
         checks += 1
         return checks > 21
@@ -1871,7 +1873,7 @@ def test_install_allows_broker_readiness_after_sixty_seconds(
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
     checks = 0
 
-    def verify() -> bool:
+    def verify(**_kwargs: float) -> bool:
         nonlocal checks
         checks += 1
         return checks == 241
@@ -1901,7 +1903,7 @@ def test_upgrade_install_stops_old_couriers_before_reloading(
     monkeypatch.setattr(installer, "_stop_couriers", lambda: calls.append("stop"))
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: calls.append("remove"))
     monkeypatch.setattr(installer, "activate", lambda: calls.append("activate"))
-    monkeypatch.setattr(installer, "verify", lambda: True)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: True)
 
     assert installer.install() == report
     assert calls == ["stop", "remove", "activate"]
@@ -2109,7 +2111,7 @@ def test_broker_health_uses_bounded_three_second_local_request(
     monkeypatch.setattr(
         installer,
         "_broker_service",
-        lambda: BrokerService(pid=4242, program=executable),
+        lambda **_kwargs: BrokerService(pid=4242, program=executable),
     )
 
     def request(*_args: object, **kwargs: object) -> dict[str, object]:
@@ -2127,8 +2129,80 @@ def test_broker_health_uses_bounded_three_second_local_request(
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
 
     assert installer.broker_is_healthy()
-    assert timeouts == [BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS]
-    assert timeouts == [3.0]
+    assert len(timeouts) == 1
+    assert 2.9 < timeouts[0] <= BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS
+
+
+def test_candidate_health_wait_has_one_monotonic_total_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    now = 0.0
+    timeouts: list[float] = []
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(duration: float) -> None:
+        nonlocal now
+        now += duration
+
+    def unavailable(timeout: float) -> bool:
+        nonlocal now
+        timeouts.append(timeout)
+        now += timeout
+        return False
+
+    monkeypatch.setattr("cross_agent_chat.install.time.monotonic", monotonic)
+    monkeypatch.setattr("cross_agent_chat.install.time.sleep", sleep)
+
+    assert not installer._wait_for_broker_health(unavailable)
+    assert now == pytest.approx(BROKER_HEALTH_WAIT_SECONDS)
+    assert timeouts
+    assert all(0 < timeout <= BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS for timeout in timeouts)
+
+
+def test_predecessor_health_wait_uses_one_request_per_iteration_and_total_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "legacy/bin/cross-agent-chat"
+    installer = Installer(home=tmp_path / "home", executable=executable, device="studio")
+    now = 0.0
+    timeouts: list[float] = []
+    sleeps: list[float] = []
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(duration: float) -> None:
+        nonlocal now
+        sleeps.append(duration)
+        now += duration
+
+    def request(*_args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal now
+        timeout = kwargs.get("timeout")
+        assert isinstance(timeout, float)
+        timeouts.append(timeout)
+        now += timeout
+        return {"schema_version": 1, "status": "UNAVAILABLE"}
+
+    monkeypatch.setattr("cross_agent_chat.install.time.monotonic", monotonic)
+    monkeypatch.setattr("cross_agent_chat.install.time.sleep", sleep)
+    monkeypatch.setattr(
+        installer,
+        "_broker_service",
+        lambda **_kwargs: BrokerService(pid=4242, program=tmp_path / "previous/bin/chat"),
+    )
+    monkeypatch.setattr(installer, "_local_broker_listener_pid", lambda **_kwargs: 4242)
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
+
+    assert not installer._wait_for_previous_broker_health()
+    assert now == pytest.approx(BROKER_HEALTH_WAIT_SECONDS)
+    assert len(timeouts) == len(sleeps) + 1
+    assert all(0 < timeout <= BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS for timeout in timeouts)
 
 
 def test_uninstall_removes_owned_runtime_state_and_backups(tmp_path: Path) -> None:
