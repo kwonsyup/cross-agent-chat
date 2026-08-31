@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -10,13 +11,15 @@ import plistlib
 import re
 import shlex
 import shutil
+import signal
+import socket
 import stat
 import subprocess
 import tempfile
 import time
 import tomllib
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +36,9 @@ BROKER_HEALTH_ATTEMPTS: Final = 300
 BROKER_HEALTH_INTERVAL_SECONDS: Final = 0.25
 OWNED_TOML_START: Final = "# cross-agent-chat:start"
 OWNED_TOML_END: Final = "# cross-agent-chat:end"
+RELEASE_MARKER: Final = ".cross-agent-chat-release"
+STAGED_RELEASE_MARKER: Final = "cross-agent-chat-runtime-v1:staged\n"
+COMMITTED_RELEASE_MARKER: Final = "cross-agent-chat-runtime-v1:committed\n"
 OWNED_TOML_RE: Final = re.compile(
     rf"\n?{re.escape(OWNED_TOML_START)}.*?{re.escape(OWNED_TOML_END)}\n?", re.DOTALL
 )
@@ -47,9 +53,26 @@ class SettingsError(RuntimeError):
     """A safe setup or configuration failure."""
 
 
+class SetupRollbackError(SettingsError):
+    """Setup failed and its provider-file rollback also failed."""
+
+    def __init__(self, failure: Exception, rollback: Exception, backup: Path) -> None:
+        super().__init__(f"setup failed: {failure}; setup rollback failed: {rollback}")
+        self.failure = failure
+        self.rollback = rollback
+        self.backup = backup
+
+
 @dataclass(frozen=True, slots=True)
 class InstallReport:
     changed_paths: tuple[Path, ...]
+    backup: Path
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSetup:
+    payloads: dict[Path, bytes]
+    originals: dict[Path, bytes | None]
     backup: Path
 
 
@@ -60,6 +83,25 @@ class PathSnapshot:
     payload: bytes | None = None
     mode: int | None = None
     target: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerService:
+    pid: int
+    program: Path
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryTransaction:
+    phase: str
+    candidate: Path
+    stable_entrypoint: Path
+    current_snapshot: PathSnapshot
+    entrypoint_snapshot: PathSnapshot
+    config_backup: Path
+    previous_broker_loaded: bool
+    previous_broker_healthy: bool
+    package_tree_sha256: str
 
 
 def default_device() -> str:
@@ -159,9 +201,52 @@ def _restore_path(snapshot: PathSnapshot) -> None:
     _atomic_write(snapshot.path, snapshot.payload, snapshot.mode)
 
 
+def _snapshot_json(snapshot: PathSnapshot) -> dict[str, object]:
+    return {
+        "kind": snapshot.kind,
+        "payload": None
+        if snapshot.payload is None
+        else base64.b64encode(snapshot.payload).decode("ascii"),
+        "mode": snapshot.mode,
+        "target": snapshot.target,
+    }
+
+
+def _snapshot_from_json(path: Path, raw: object) -> PathSnapshot:
+    if not isinstance(raw, dict):
+        raise SettingsError("transaction snapshot is invalid")
+    value = cast(dict[object, object], raw)
+    if set(value) != {"kind", "payload", "mode", "target"}:
+        raise SettingsError("transaction snapshot is invalid")
+    kind = value["kind"]
+    payload = value["payload"]
+    mode = value["mode"]
+    target = value["target"]
+    if kind == "absent" and payload is None and mode is None and target is None:
+        return PathSnapshot(path=path, kind="absent")
+    if kind == "symlink" and payload is None and mode is None and isinstance(target, str):
+        return PathSnapshot(path=path, kind="symlink", target=target)
+    if (
+        kind == "file"
+        and isinstance(payload, str)
+        and isinstance(mode, int)
+        and not isinstance(mode, bool)
+        and 0 <= mode <= 0o777
+        and target is None
+    ):
+        try:
+            decoded = base64.b64decode(payload, validate=True)
+        except ValueError as error:
+            raise SettingsError("transaction snapshot is invalid") from error
+        return PathSnapshot(path=path, kind="file", payload=decoded, mode=mode)
+    raise SettingsError("transaction snapshot is invalid")
+
+
 def _package_tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
     for item in sorted(root.rglob("*"), key=lambda candidate: candidate.as_posix()):
+        if item.name == RELEASE_MARKER:
+            continue
         relative = item.relative_to(root).as_posix().encode()
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
@@ -412,6 +497,8 @@ class Installer:
         self.releases = self.runtime_root / "releases"
         self.current_runtime = self.runtime_root / "current"
         self.transactions = self.runtime_root / "transactions"
+        self.install_lock = self.home / ".local" / "share" / f".{SERVER_NAME}-install.lock"
+        self._lock_depth = 0
 
     @property
     def config_paths(self) -> tuple[Path, ...]:
@@ -423,6 +510,38 @@ class Installer:
             self.launch_agent,
             self.install_state,
         )
+
+    @contextmanager
+    def _exclusive_lock(self) -> Iterator[None]:
+        if self._lock_depth > 0:
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
+        local_root = self.home / ".local"
+        share_root = local_root / "share"
+        if local_root.is_symlink() or share_root.is_symlink():
+            raise SettingsError("install lock ownership is invalid")
+        share_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not share_root.resolve(strict=True).is_relative_to(self.home):
+            raise SettingsError("install lock ownership is invalid")
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(self.install_lock, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            self._lock_depth = 1
+            try:
+                yield
+            finally:
+                self._lock_depth = 0
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
     def _install_metadata(self, settings: dict[str, object]) -> dict[str, object]:
         if self.install_state.exists():
@@ -542,15 +661,33 @@ class Installer:
         atomic_json(destination / "manifest.json", manifest)
         return destination
 
-    def setup(self, verify: Callable[[], bool] | None = None) -> InstallReport:
+    def _prepare_setup(self) -> PreparedSetup:
         payloads = self._payloads()
         originals = {path: path.read_bytes() if path.exists() else None for path in payloads}
         if self.legacy_peers.exists():
             originals[self.legacy_peers] = self.legacy_peers.read_bytes()
         backup = self._backup(originals)
+        return PreparedSetup(payloads=payloads, originals=originals, backup=backup)
+
+    def setup(
+        self,
+        verify: Callable[[], bool] | None = None,
+        *,
+        prepared: PreparedSetup | None = None,
+    ) -> InstallReport:
+        with self._exclusive_lock():
+            return self._setup(verify, prepared=prepared)
+
+    def _setup(
+        self,
+        verify: Callable[[], bool] | None = None,
+        *,
+        prepared: PreparedSetup | None = None,
+    ) -> InstallReport:
+        transaction = self._prepare_setup() if prepared is None else prepared
         written: list[Path] = []
         try:
-            for path, payload in payloads.items():
+            for path, payload in transaction.payloads.items():
                 _atomic_write(path, payload)
                 written.append(path)
             if self.legacy_peers.exists():
@@ -559,15 +696,18 @@ class Installer:
             healthy = self.verify_configuration() if verify is None else verify()
             if not healthy:
                 raise SettingsError("verification failed after setup")
-        except (OSError, SettingsError):
-            for path in reversed(written):
-                original = originals[path]
-                if original is None:
-                    path.unlink(missing_ok=True)
-                else:
-                    _atomic_write(path, original)
+        except (OSError, SettingsError) as failure:
+            try:
+                for path in reversed(written):
+                    original = transaction.originals[path]
+                    if original is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        _atomic_write(path, original)
+            except (OSError, SettingsError) as rollback:
+                raise SetupRollbackError(failure, rollback, transaction.backup) from failure
             raise
-        return InstallReport(tuple(payloads), backup)
+        return InstallReport(tuple(transaction.payloads), transaction.backup)
 
     def _restore(self, backup: Path) -> None:
         manifest = _json_object(backup / "manifest.json")
@@ -589,8 +729,12 @@ class Installer:
                 raise SettingsError("backup manifest is invalid")
 
     def install(self) -> InstallReport:
+        with self._exclusive_lock():
+            return self._install()
+
+    def _install(self) -> InstallReport:
         previous_broker_loaded = self.broker_is_loaded()
-        previous_broker_healthy = previous_broker_loaded and self._wait_for_broker_health()
+        previous_broker_healthy = previous_broker_loaded and self._wait_for_previous_broker_health()
         report = self.setup()
         service_transition_started = False
         try:
@@ -612,8 +756,9 @@ class Installer:
                 self._restore(report.backup)
                 if service_transition_started and previous_broker_loaded:
                     self.activate()
-                if previous_broker_healthy and not self._wait_for_broker_health():
-                    raise SettingsError("previous broker did not become healthy")
+                if previous_broker_loaded and not self._wait_for_previous_broker_health():
+                    qualifier = "previous healthy" if previous_broker_healthy else "previous"
+                    raise SettingsError(f"{qualifier} broker did not become healthy")
             except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as rollback:
                 raise SettingsError(
                     f"installation failed: {failure}; rollback failed: {rollback}"
@@ -622,7 +767,12 @@ class Installer:
         return report
 
     def _validate_staged_runtime(self, staged_runtime: Path) -> Path:
-        if staged_runtime.is_symlink() or not staged_runtime.is_dir():
+        if (
+            self.runtime_root.is_symlink()
+            or self.releases.is_symlink()
+            or staged_runtime.is_symlink()
+            or not staged_runtime.is_dir()
+        ):
             raise SettingsError("candidate staging failed: staged runtime is unavailable")
         try:
             staged = staged_runtime.resolve(strict=True)
@@ -631,7 +781,15 @@ class Installer:
             raise SettingsError(
                 "candidate staging failed: staged runtime is unavailable"
             ) from error
-        if staged.parent != releases or not staged.name.startswith(".staging-"):
+        marker = staged / RELEASE_MARKER
+        if (
+            not releases.is_relative_to(self.home)
+            or staged.parent != releases
+            or not staged.name.startswith("release-")
+            or marker.is_symlink()
+            or not marker.is_file()
+            or marker.read_text(encoding="utf-8") != STAGED_RELEASE_MARKER
+        ):
             raise SettingsError(
                 "candidate staging failed: staged runtime is outside owned releases"
             )
@@ -689,14 +847,22 @@ class Installer:
                 raise SettingsError(
                     "predecessor state is unknown: current runtime is unavailable"
                 ) from error
-            if target.parent != releases or not target.name.startswith("release-"):
+            marker = target / RELEASE_MARKER
+            if (
+                target.parent != releases
+                or not target.name.startswith("release-")
+                or marker.is_symlink()
+                or not marker.is_file()
+                or marker.read_text(encoding="utf-8") != COMMITTED_RELEASE_MARKER
+            ):
                 raise SettingsError("predecessor state is unknown: current runtime is not owned")
         return snapshot
 
     def _validate_stable_entrypoint(self, stable_entrypoint: Path) -> Path:
         if not stable_entrypoint.is_absolute() or stable_entrypoint.name != SERVER_NAME:
             raise SettingsError("stable entrypoint is invalid")
-        if not stable_entrypoint.is_relative_to(self.home):
+        parent = stable_entrypoint.parent.resolve(strict=False)
+        if not parent.is_relative_to(self.home):
             raise SettingsError("stable entrypoint must be owner-local")
         _snapshot_path(stable_entrypoint)
         return stable_entrypoint
@@ -708,86 +874,228 @@ class Installer:
         phase: str,
         staged: Path,
         stable_entrypoint: Path,
+        current_snapshot: PathSnapshot,
+        entrypoint_snapshot: PathSnapshot,
+        config_backup: Path,
         previous_broker_loaded: bool,
         previous_broker_healthy: bool,
+        package_tree_sha256: str,
     ) -> None:
         atomic_json(
             transaction / "metadata.json",
             {
                 "schema_version": 1,
                 "phase": phase,
-                "staged_name": staged.name,
+                "candidate_name": staged.name,
                 "stable_entrypoint": str(stable_entrypoint.relative_to(self.home)),
+                "current_snapshot": _snapshot_json(current_snapshot),
+                "entrypoint_snapshot": _snapshot_json(entrypoint_snapshot),
+                "config_backup": str(config_backup.relative_to(self.home)),
                 "previous_broker_loaded": previous_broker_loaded,
                 "previous_broker_healthy": previous_broker_healthy,
-                "package_tree_sha256": _package_tree_digest(staged),
+                "package_tree_sha256": package_tree_sha256,
             },
         )
 
+    def _read_transaction(self, transaction: Path) -> RecoveryTransaction:
+        metadata = _json_object(transaction / "metadata.json")
+        expected_keys = {
+            "schema_version",
+            "phase",
+            "candidate_name",
+            "stable_entrypoint",
+            "current_snapshot",
+            "entrypoint_snapshot",
+            "config_backup",
+            "previous_broker_loaded",
+            "previous_broker_healthy",
+            "package_tree_sha256",
+        }
+        if set(metadata) != expected_keys or metadata.get("schema_version") != 1:
+            raise SettingsError("transaction metadata is invalid")
+        phase = metadata["phase"]
+        candidate_name = metadata["candidate_name"]
+        stable_relative = metadata["stable_entrypoint"]
+        backup_relative = metadata["config_backup"]
+        previous_loaded = metadata["previous_broker_loaded"]
+        previous_healthy = metadata["previous_broker_healthy"]
+        package_digest = metadata["package_tree_sha256"]
+        if (
+            not isinstance(phase, str)
+            or phase
+            not in {
+                "prepared",
+                "runtime_switched",
+                "config_written",
+                "service_started",
+                "committed",
+            }
+            or not isinstance(candidate_name, str)
+            or not candidate_name.startswith("release-")
+            or Path(candidate_name).name != candidate_name
+            or not isinstance(stable_relative, str)
+            or not isinstance(backup_relative, str)
+            or not isinstance(previous_loaded, bool)
+            or not isinstance(previous_healthy, bool)
+            or not isinstance(package_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", package_digest) is None
+        ):
+            raise SettingsError("transaction metadata is invalid")
+        stable = self.home / stable_relative
+        backup = self.home / backup_relative
+        candidate = self.releases / candidate_name
+        if (
+            not stable.is_absolute()
+            or not stable.is_relative_to(self.home)
+            or backup.resolve(strict=True).parent != (self.cache / "backups").resolve(strict=True)
+        ):
+            raise SettingsError("transaction metadata is invalid")
+        return RecoveryTransaction(
+            phase=phase,
+            candidate=candidate,
+            stable_entrypoint=stable,
+            current_snapshot=_snapshot_from_json(
+                self.current_runtime, metadata["current_snapshot"]
+            ),
+            entrypoint_snapshot=_snapshot_from_json(stable, metadata["entrypoint_snapshot"]),
+            config_backup=backup,
+            previous_broker_loaded=previous_loaded,
+            previous_broker_healthy=previous_healthy,
+            package_tree_sha256=package_digest,
+        )
+
+    def _recover_unfinished_transaction(self) -> None:
+        if not self.transactions.exists():
+            return
+        transactions = [item for item in self.transactions.iterdir() if item.is_dir()]
+        if len(transactions) != 1 or len(list(self.transactions.iterdir())) != 1:
+            raise SettingsError("predecessor state is unknown: transaction state is ambiguous")
+        transaction_path = transactions[0]
+        transaction = self._read_transaction(transaction_path)
+        if transaction.phase == "committed":
+            try:
+                if (
+                    self.current_runtime.resolve(strict=True)
+                    != transaction.candidate.resolve(strict=True)
+                    or transaction.stable_entrypoint.resolve(strict=True)
+                    != transaction.candidate / "bin" / SERVER_NAME
+                    or _package_tree_digest(transaction.candidate)
+                    != transaction.package_tree_sha256
+                ):
+                    raise SettingsError("committed transaction state is invalid")
+            except OSError as error:
+                raise SettingsError("committed transaction state is invalid") from error
+            shutil.rmtree(transaction_path)
+            return
+        try:
+            self._bootout()
+            self._restore(transaction.config_backup)
+            _restore_path(transaction.current_snapshot)
+            _restore_path(transaction.entrypoint_snapshot)
+            if transaction.previous_broker_loaded:
+                self.activate()
+            if transaction.previous_broker_loaded and not self._wait_for_previous_broker_health():
+                raise SettingsError("previous broker did not become healthy")
+            if transaction.candidate.exists():
+                self._remove_release(transaction.candidate)
+            shutil.rmtree(transaction_path)
+        except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as error:
+            raise SettingsError(f"unfinished transaction recovery failed: {error}") from error
+
     def _remove_release(self, release: Path) -> None:
+        if self.runtime_root.is_symlink() or self.releases.is_symlink():
+            raise SettingsError("runtime ownership is invalid")
         releases = self.releases.resolve(strict=True)
         resolved = release.resolve(strict=True)
-        if resolved.parent != releases or not resolved.name.startswith("release-"):
+        marker = resolved / RELEASE_MARKER
+        if (
+            not releases.is_relative_to(self.home)
+            or resolved.parent != releases
+            or not resolved.name.startswith("release-")
+            or marker.is_symlink()
+            or not marker.is_file()
+            or marker.read_text(encoding="utf-8")
+            not in {STAGED_RELEASE_MARKER, COMMITTED_RELEASE_MARKER}
+        ):
             raise SettingsError("refusing to remove an unowned runtime")
         shutil.rmtree(resolved)
 
-    def _prune_releases(self, current: Path, previous: PathSnapshot) -> None:
+    def _prune_committed_releases(self, current: Path, previous: PathSnapshot) -> None:
         retained = {current.resolve()}
         if previous.kind == "symlink" and previous.target is not None:
             retained.add((self.current_runtime.parent / previous.target).resolve())
         for release in self.releases.iterdir():
+            marker = release / RELEASE_MARKER
             if (
                 release.is_dir()
                 and not release.is_symlink()
-                and release.name.startswith("release-")
                 and release.resolve() not in retained
+                and marker.is_file()
+                and not marker.is_symlink()
+                and marker.read_text(encoding="utf-8") == COMMITTED_RELEASE_MARKER
             ):
                 self._remove_release(release)
 
     def install_staged(self, staged_runtime: Path, stable_entrypoint: Path) -> InstallReport:
+        with self._exclusive_lock():
+            return self._install_staged(staged_runtime, stable_entrypoint)
+
+    def _install_staged(self, staged_runtime: Path, stable_entrypoint: Path) -> InstallReport:
         staged = self._validate_staged_runtime(staged_runtime)
+        self._recover_unfinished_transaction()
         stable = self._validate_stable_entrypoint(stable_entrypoint)
-        if self.transactions.exists() and any(self.transactions.iterdir()):
-            raise SettingsError("predecessor state is unknown: unfinished transaction exists")
         current_snapshot = self._validate_runtime_pointer()
         entrypoint_snapshot = _snapshot_path(stable)
         previous_broker_loaded = self.broker_is_loaded()
-        previous_broker_healthy = previous_broker_loaded and self._wait_for_broker_health()
+        previous_broker_healthy = previous_broker_loaded and self._wait_for_previous_broker_health()
+        prepared_setup = self._prepare_setup()
+        package_digest = _package_tree_digest(staged)
 
         ensure_private_dir(self.transactions)
         transaction = self.transactions / uuid4().hex
         ensure_private_dir(transaction)
-        self._record_transaction(
-            transaction,
-            phase="prepared",
-            staged=staged,
-            stable_entrypoint=stable,
-            previous_broker_loaded=previous_broker_loaded,
-            previous_broker_healthy=previous_broker_healthy,
-        )
+        final_runtime = staged
 
-        final_runtime = self.releases / f"release-{uuid4().hex}"
+        def record(phase: str) -> None:
+            self._record_transaction(
+                transaction,
+                phase=phase,
+                staged=final_runtime,
+                stable_entrypoint=stable,
+                current_snapshot=current_snapshot,
+                entrypoint_snapshot=entrypoint_snapshot,
+                config_backup=prepared_setup.backup,
+                previous_broker_loaded=previous_broker_loaded,
+                previous_broker_healthy=previous_broker_healthy,
+                package_tree_sha256=package_digest,
+            )
+
+        record("prepared")
         report: InstallReport | None = None
         service_transition_started = False
         runtime_transition_started = False
         try:
             self._stop_couriers()
-            os.replace(staged, final_runtime)
             runtime_transition_started = True
             _atomic_symlink(f"releases/{final_runtime.name}", self.current_runtime)
             _atomic_symlink(str(self.current_runtime / "bin" / SERVER_NAME), stable)
-            report = self.setup()
+            record("runtime_switched")
+            report = self.setup(prepared=prepared_setup)
+            record("config_written")
             self._remove_runtime_state()
             service_transition_started = True
             self.activate()
+            record("service_started")
             for attempt in range(BROKER_HEALTH_ATTEMPTS):
-                if self.verify():
+                if self.verify() and _package_tree_digest(final_runtime) == package_digest:
                     break
                 if attempt < BROKER_HEALTH_ATTEMPTS - 1:
                     time.sleep(BROKER_HEALTH_INTERVAL_SECONDS)
             else:
                 raise SettingsError("background broker did not become healthy")
+            _atomic_write(final_runtime / RELEASE_MARKER, COMMITTED_RELEASE_MARKER.encode())
         except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as failure:
+            setup_rollback_failed = isinstance(failure, SetupRollbackError)
             try:
                 if service_transition_started:
                     self._bootout()
@@ -798,8 +1106,10 @@ class Installer:
                     _restore_path(entrypoint_snapshot)
                 if service_transition_started and previous_broker_loaded:
                     self.activate()
-                if previous_broker_healthy and not self._wait_for_broker_health():
+                if previous_broker_loaded and not self._wait_for_previous_broker_health():
                     raise SettingsError("previous broker did not become healthy")
+                if setup_rollback_failed:
+                    raise SettingsError(str(failure))
                 if final_runtime.exists():
                     self._remove_release(final_runtime)
                 shutil.rmtree(transaction)
@@ -811,15 +1121,8 @@ class Installer:
 
         if report is None:
             raise SettingsError("installation transaction did not produce a report")
-        self._record_transaction(
-            transaction,
-            phase="committed",
-            staged=final_runtime,
-            stable_entrypoint=stable,
-            previous_broker_loaded=previous_broker_loaded,
-            previous_broker_healthy=previous_broker_healthy,
-        )
-        self._prune_releases(final_runtime, current_snapshot)
+        record("committed")
+        self._prune_committed_releases(final_runtime, current_snapshot)
         shutil.rmtree(transaction)
         return report
 
@@ -866,6 +1169,28 @@ class Installer:
         ):
             return False
 
+    def _broker_service(self) -> BrokerService | None:
+        service = f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", service],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise SettingsError("could not determine previous broker state") from error
+        if result.returncode != 0:
+            return None
+        state = re.search(r"^\s*state = (?P<state>\S+)\s*$", result.stdout, re.MULTILINE)
+        pid = re.search(r"^\s*pid = (?P<pid>[0-9]+)\s*$", result.stdout, re.MULTILINE)
+        program = re.search(r"^\s*program = (?P<program>.+?)\s*$", result.stdout, re.MULTILINE)
+        if state is None or state.group("state") != "running" or pid is None or program is None:
+            return None
+        return BrokerService(pid=int(pid.group("pid")), program=Path(program.group("program")))
+
     def broker_is_loaded(self) -> bool:
         service = f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"
         try:
@@ -885,10 +1210,10 @@ class Installer:
 
     def broker_is_healthy(self) -> bool:
         try:
-            loaded = self.broker_is_loaded()
+            service = self._broker_service()
         except SettingsError:
             return False
-        if not loaded:
+        if service is None or service.program != self.executable:
             return False
         try:
             from cross_agent_chat.runtime import request_tailnet
@@ -901,7 +1226,66 @@ class Installer:
             )
         except RuntimeError:
             return False
-        return response == {"schema_version": 1, "status": "READY"}
+        pid = response.get("pid")
+        version = response.get("version")
+        module_path = response.get("module_path")
+        if (
+            response.get("schema_version") != 1
+            or response.get("status") != "READY"
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid != service.pid
+            or version != __version__
+            or not isinstance(module_path, str)
+        ):
+            return False
+        try:
+            runtime = self.executable.resolve(strict=True).parent.parent
+            module = Path(module_path).resolve(strict=True)
+        except OSError:
+            return False
+        return module.is_relative_to(runtime)
+
+    def _local_broker_listener_pid(self) -> int | None:
+        result = subprocess.run(
+            ["/usr/sbin/lsof", "-nP", "-t", f"-iTCP:{LOCAL_BROKER_PORT}", "-sTCP:LISTEN"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        raw_pids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if result.returncode != 0 or len(raw_pids) != 1 or not raw_pids[0].isdigit():
+            return None
+        return int(raw_pids[0])
+
+    def _previous_broker_is_healthy(self) -> bool:
+        if self.broker_is_healthy():
+            return True
+        try:
+            service = self._broker_service()
+            if service is None or self._local_broker_listener_pid() != service.pid:
+                return False
+            from cross_agent_chat.runtime import request_tailnet
+
+            response = request_tailnet(
+                LOCAL_BROKER_HOST,
+                {"schema_version": 1, "operation": "health"},
+                port=LOCAL_BROKER_PORT,
+                timeout=1.0,
+            )
+        except (OSError, RuntimeError, SettingsError, subprocess.SubprocessError):
+            return False
+        return response.get("schema_version") == 1 and response.get("status") == "READY"
+
+    def _wait_for_previous_broker_health(self) -> bool:
+        for attempt in range(BROKER_HEALTH_ATTEMPTS):
+            if self._previous_broker_is_healthy():
+                return True
+            if attempt < BROKER_HEALTH_ATTEMPTS - 1:
+                time.sleep(BROKER_HEALTH_INTERVAL_SECONDS)
+        return False
 
     def _wait_for_broker_health(self) -> bool:
         for attempt in range(BROKER_HEALTH_ATTEMPTS):
@@ -913,6 +1297,88 @@ class Installer:
 
     def verify(self) -> bool:
         return self.verify_configuration() and self.broker_is_healthy()
+
+    def _broker_port_is_available(self) -> bool:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.bind((LOCAL_BROKER_HOST, LOCAL_BROKER_PORT))
+            listener.listen(1)
+            return True
+        except OSError:
+            return False
+        finally:
+            listener.close()
+
+    def _wait_for_broker_port_release(self) -> bool:
+        for attempt in range(20):
+            if self._broker_port_is_available():
+                return True
+            if attempt < 19:
+                time.sleep(0.1)
+        return False
+
+    def _stop_owned_orphan_broker(self) -> None:
+        listener = subprocess.run(
+            ["/usr/sbin/lsof", "-nP", "-t", f"-iTCP:{LOCAL_BROKER_PORT}", "-sTCP:LISTEN"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        raw_pids = [line.strip() for line in listener.stdout.splitlines() if line.strip()]
+        if listener.returncode != 0 or len(raw_pids) != 1 or not raw_pids[0].isdigit():
+            raise SettingsError("local broker port is occupied by an unverified process")
+        pid = int(raw_pids[0])
+        uid = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "uid="],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        command = subprocess.run(
+            ["/bin/ps", "-ww", "-p", str(pid), "-o", "command="],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        try:
+            tokens = shlex.split(command.stdout.strip())
+            broker_index = tokens.index("_broker")
+            broker_executable = Path(tokens[broker_index - 1])
+        except (ValueError, IndexError):
+            raise SettingsError("local broker port is occupied by an unverified process") from None
+        if (
+            uid.returncode != 0
+            or uid.stdout.strip() != str(os.getuid())
+            or command.returncode != 0
+            or broker_index == 0
+            or broker_executable.name != SERVER_NAME
+            or not broker_executable.is_absolute()
+            or not broker_executable.is_relative_to(self.home)
+        ):
+            raise SettingsError("local broker port is occupied by an unverified process")
+        version = subprocess.run(
+            [str(broker_executable), "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        if (
+            version.returncode != 0
+            or re.fullmatch(rf"{re.escape(SERVER_NAME)} [0-9]+\.[0-9]+\.[0-9]+\s*", version.stdout)
+            is None
+        ):
+            raise SettingsError("local broker port is occupied by an unverified process")
+        os.kill(pid, signal.SIGTERM)
+        if not self._wait_for_broker_port_release():
+            raise SettingsError("owned predecessor broker did not stop")
 
     def activate(self) -> None:
         domain = f"gui/{os.getuid()}"
@@ -929,34 +1395,9 @@ class Installer:
             == 0
         )
         if loaded:
-            stopped = subprocess.run(
-                ["launchctl", "bootout", service],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=10.0,
-                check=False,
-            )
-            if stopped.returncode != 0:
-                raise SettingsError("could not reload the background broker")
-            for attempt in range(20):
-                removed = (
-                    subprocess.run(
-                        ["launchctl", "print", service],
-                        stdin=subprocess.DEVNULL,
-                        capture_output=True,
-                        text=True,
-                        timeout=5.0,
-                        check=False,
-                    ).returncode
-                    != 0
-                )
-                if removed:
-                    break
-                if attempt < 19:
-                    time.sleep(0.1)
-            else:
-                raise SettingsError("could not stop the background broker")
+            self._bootout()
+        if not self._wait_for_broker_port_release():
+            self._stop_owned_orphan_broker()
         started = subprocess.run(
             ["launchctl", "bootstrap", domain, str(self.launch_agent)],
             stdin=subprocess.DEVNULL,
@@ -980,13 +1421,44 @@ class Installer:
 
     def _bootout(self) -> None:
         domain = f"gui/{os.getuid()}"
-        subprocess.run(
+        service = f"{domain}/{LAUNCH_AGENT_LABEL}"
+        existing = subprocess.run(
+            ["launchctl", "print", service],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        if existing.returncode != 0:
+            return
+        stopped = subprocess.run(
             ["launchctl", "bootout", f"{domain}/{LAUNCH_AGENT_LABEL}"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
+            text=True,
             timeout=10.0,
             check=False,
         )
+        if stopped.returncode != 0:
+            raise SettingsError("could not stop the background broker")
+        for attempt in range(20):
+            removed = (
+                subprocess.run(
+                    ["launchctl", "print", service],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                    check=False,
+                ).returncode
+                != 0
+            )
+            if removed:
+                return
+            if attempt < 19:
+                time.sleep(0.1)
+        raise SettingsError("could not stop the background broker")
 
     def _stop_couriers(self) -> None:
         if not self.state.exists():
@@ -1002,6 +1474,8 @@ class Installer:
     def _remove_installed_runtime(self) -> None:
         if not self.current_runtime.is_symlink():
             return
+        if self.runtime_root.is_symlink() or self.releases.is_symlink():
+            raise SettingsError("installed runtime ownership is invalid")
         try:
             current = self.current_runtime.resolve(strict=True)
             releases = self.releases.resolve(strict=True)
@@ -1009,22 +1483,32 @@ class Installer:
         except OSError as error:
             raise SettingsError("installed runtime ownership is invalid") from error
         expected = current / "bin" / SERVER_NAME
+        current_marker = current / RELEASE_MARKER
         if (
             current.parent != releases
+            or not releases.is_relative_to(self.home)
             or not current.name.startswith("release-")
             or executable != expected
+            or current_marker.is_symlink()
+            or not current_marker.is_file()
+            or current_marker.read_text(encoding="utf-8") != COMMITTED_RELEASE_MARKER
         ):
             raise SettingsError("installed runtime ownership is invalid")
+        owned_releases = [
+            release
+            for release in self.releases.iterdir()
+            if release.is_dir()
+            and not release.is_symlink()
+            and release.name.startswith("release-")
+            and (release / RELEASE_MARKER).is_file()
+            and not (release / RELEASE_MARKER).is_symlink()
+            and (release / RELEASE_MARKER).read_text(encoding="utf-8") == COMMITTED_RELEASE_MARKER
+        ]
         if self.executable.is_symlink():
             self.executable.unlink()
         self.current_runtime.unlink()
-        for release in self.releases.iterdir():
-            if release.is_symlink():
-                raise SettingsError("installed runtime ownership is invalid")
-            if release.is_dir() and (
-                release.name.startswith("release-") or release.name.startswith(".staging-")
-            ):
-                shutil.rmtree(release)
+        for release in owned_releases:
+            self._remove_release(release)
         with suppress(OSError):
             self.releases.rmdir()
         if self.transactions.exists():
@@ -1033,6 +1517,10 @@ class Installer:
             self.runtime_root.rmdir()
 
     def uninstall(self) -> None:
+        with self._exclusive_lock():
+            self._uninstall()
+
+    def _uninstall(self) -> None:
         metadata = self._install_metadata(_json_object(self.claude_settings))
         self._bootout()
         self._stop_couriers()

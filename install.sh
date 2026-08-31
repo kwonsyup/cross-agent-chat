@@ -4,10 +4,17 @@ set -eu
 source_ref=${CROSS_AGENT_CHAT_SOURCE:-git+https://github.com/kwonsyup/cross-agent-chat.git@v0.1.2}
 product_root=$HOME/.local/share/cross-agent-chat-runtime
 releases_root=$product_root/releases
+if [ -L "$HOME/.local" ] ||
+    [ -L "$HOME/.local/share" ] ||
+    [ -L "$product_root" ] ||
+    [ -L "$releases_root" ]; then
+    printf '%s\n' 'Cross Agent Chat runtime ownership is invalid.' >&2
+    exit 2
+fi
 mkdir -p "$releases_root"
 chmod 700 "$product_root" "$releases_root"
 
-staged_runtime=$(mktemp -d "$releases_root/.staging-XXXXXX")
+staged_runtime=$(mktemp -d "$releases_root/release-XXXXXX")
 bootstrap_dir=
 cleanup() {
     if [ -n "$staged_runtime" ]; then
@@ -37,9 +44,14 @@ fi
 
 if [ -n "$uv_command" ]; then
     "$uv_command" venv --python 3.11 "$staged_runtime"
-    "$uv_command" pip install --python "$staged_runtime/bin/python" "$source_ref"
 else
     python3 -m venv "$staged_runtime"
+fi
+printf '%s\n' 'cross-agent-chat-runtime-v1:staged' > "$staged_runtime/.cross-agent-chat-release"
+chmod 600 "$staged_runtime/.cross-agent-chat-release"
+if [ -n "$uv_command" ]; then
+    "$uv_command" pip install --python "$staged_runtime/bin/python" "$source_ref"
+else
     "$staged_runtime/bin/python" -m pip install "$source_ref"
 fi
 

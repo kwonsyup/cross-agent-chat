@@ -11,6 +11,8 @@ from uuid import uuid4
 
 import pytest
 
+import cross_agent_chat.tailnet_broker as tailnet_broker_module
+from cross_agent_chat import __version__
 from cross_agent_chat.cli import parser
 from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, session_key
 from cross_agent_chat.runtime import (
@@ -137,11 +139,18 @@ def test_tailnet_client_crosses_real_tcp_boundary(tmp_path: Path) -> None:
     thread = threading.Thread(target=serve)
     thread.start()
     try:
-        assert request_tailnet(
+        response = request_tailnet(
             "127.0.0.1",
             {"schema_version": 1, "operation": "health"},
             port=port,
-        ) == {"schema_version": 1, "status": "READY"}
+        )
+        assert response == {
+            "schema_version": 1,
+            "status": "READY",
+            "pid": os.getpid(),
+            "version": __version__,
+            "module_path": str(Path(tailnet_broker_module.__file__).resolve()),
+        }
     finally:
         thread.join(timeout=5)
         listener.close()

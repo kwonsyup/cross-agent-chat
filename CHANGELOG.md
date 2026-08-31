@@ -9,6 +9,10 @@
 - Restore the exact previous pointer, public entrypoint, configuration, and broker state when
   transition or candidate-health verification fails; retain evidence on compound rollback
   failure.
+- Bind broker readiness to the exact running launchd PID, version, and runtime, and safely
+  retire only a verified owner-local predecessor broker that still owns the port.
+- Serialize setup/install/uninstall, recover interrupted transitions from private transaction
+  state, and delete only marker-owned committed runtimes.
 
 ## 0.1.1 - 2026-08-29
 

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+from cross_agent_chat import __version__
 from cross_agent_chat.core import SCHEMA_VERSION, ChatError
 from cross_agent_chat.runtime import (
     authorize_remote,
@@ -85,7 +86,13 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
     if operation == "health" and set(request) == {"schema_version", "operation"}:
         if request.get("schema_version") != SCHEMA_VERSION or peer_address != LOCAL_BROKER_HOST:
             raise ChatError("Tailnet broker request is invalid")
-        return {"schema_version": SCHEMA_VERSION, "status": "READY"}
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "status": "READY",
+            "pid": os.getpid(),
+            "version": __version__,
+            "module_path": str(Path(__file__).resolve()),
+        }
     if operation == "peers" and set(request) == {"schema_version", "operation"}:
         if request.get("schema_version") != SCHEMA_VERSION:
             raise ChatError("Tailnet broker request is invalid")

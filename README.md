@@ -56,8 +56,8 @@ cross-agent-chat uninstall
 ```
 
 Running the installer again upgrades and repairs the owned configuration. `uninstall`
-removes only Cross Agent Chat-owned hooks, MCP routes, service, and state, and restores the
-prior shared Claude inbound setting.
+removes only Cross Agent Chat-owned runtime, hooks, MCP routes, service, and state, and restores
+the prior shared Claude inbound setting.
 
 ## Architecture
 

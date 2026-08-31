@@ -3,9 +3,14 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import signal
 import stat
 import subprocess
+import sys
+import threading
+import time
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -14,7 +19,10 @@ from cross_agent_chat.install import (
     Installer,
     InstallReport,
     SettingsError,
+    SetupRollbackError,
     _owned_hook,
+    _package_tree_digest,
+    _snapshot_path,
     discover_executable,
 )
 
@@ -74,8 +82,30 @@ def test_install_script_package_failure_leaves_predecessor_untouched(tmp_path: P
     product_root = home / ".local" / "share" / "cross-agent-chat-runtime"
     assert not (product_root / "current").exists()
     releases = product_root / "releases"
-    assert not list(releases.glob(".staging-*"))
+    assert not list(releases.glob("release-*"))
     assert not product_root.exists()
+
+
+def test_install_script_rejects_symlinked_product_parent_before_mutation(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    (home / ".local").symlink_to(outside, target_is_directory=True)
+    script = Path(__file__).resolve().parents[1] / "install.sh"
+
+    completed = subprocess.run(
+        ["sh", str(script)],
+        env={**os.environ, "HOME": str(home), "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "ownership is invalid" in completed.stderr
+    assert not list(outside.iterdir())
 
 
 def test_setup_preserves_unrelated_provider_configuration(tmp_path: Path) -> None:
@@ -404,6 +434,67 @@ def test_activate_retries_transient_launchd_bootstrap_once(
     assert bootstrap_attempts == 2
 
 
+def test_activate_stops_only_verified_owner_local_orphan_broker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    executable = home / "legacy-runtime" / "bin" / "cross-agent-chat"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("legacy")
+    installer = Installer(
+        home=home, executable=home / ".local/bin/cross-agent-chat", device="studio"
+    )
+    killed: list[tuple[int, int]] = []
+    released = iter((False, True))
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if command[0] == "/usr/sbin/lsof":
+            return subprocess.CompletedProcess(command, 0, "4242\n", "")
+        if command[:5] == ["/bin/ps", "-p", "4242", "-o", "uid="]:
+            return subprocess.CompletedProcess(command, 0, f"{os.getuid()}\n", "")
+        if command[:5] == ["/bin/ps", "-ww", "-p", "4242", "-o"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"/usr/bin/python3 {executable} _broker\n",
+                "",
+            )
+        if command == [str(executable), "--version"]:
+            return subprocess.CompletedProcess(command, 0, "cross-agent-chat 0.1.1\n", "")
+        if command[:2] == ["launchctl", "bootstrap"]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(command, 113, "", "not found")
+
+    monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
+    monkeypatch.setattr(installer, "_wait_for_broker_port_release", lambda: next(released))
+    monkeypatch.setattr(
+        "cross_agent_chat.install.os.kill",
+        lambda pid, sent_signal: killed.append((pid, sent_signal)),
+    )
+
+    installer.activate()
+
+    assert killed == [(4242, signal.SIGTERM)]
+
+
+def test_bootout_failure_is_not_reported_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if command[:2] == ["launchctl", "bootout"]:
+            return subprocess.CompletedProcess(command, 5, "", "failed")
+        return subprocess.CompletedProcess(command, 0, "state = running\n", "")
+
+    monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
+
+    with pytest.raises(SettingsError, match="could not stop"):
+        installer._bootout()
+
+
 def test_install_restores_provider_files_if_activation_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -486,7 +577,8 @@ def test_install_aborts_before_setup_when_previous_broker_state_is_unknown(
         installer.install()
 
     assert not setup_called
-    assert not home.exists()
+    assert not installer.claude_settings.exists()
+    assert not installer.launch_agent.exists()
 
 
 def test_install_restores_and_restarts_healthy_broker_after_activation_failure(
@@ -581,11 +673,12 @@ def test_install_reports_primary_and_rollback_restart_failures(
 
 
 def _staged_runtime(installer: Installer, marker: str = "candidate") -> Path:
-    stage = installer.releases / ".staging-test"
+    stage = installer.releases / "release-test"
     executable = stage / "bin" / "cross-agent-chat"
     executable.parent.mkdir(parents=True)
     executable.write_text(marker)
     executable.chmod(0o755)
+    (stage / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:staged\n")
     return stage
 
 
@@ -617,6 +710,49 @@ def test_staged_install_commits_stable_runtime_and_provider_paths(
     assert not list(installer.transactions.iterdir())
 
 
+def test_staged_install_executes_non_relocated_venv_after_cutover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    stable = home / ".local" / "bin" / "cross-agent-chat"
+    installer = Installer(home=home, executable=stable, device="studio")
+    stage = installer.releases / "release-real-venv"
+    subprocess.run([sys.executable, "-m", "venv", str(stage)], check=True, timeout=30.0)
+    (stage / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:staged\n")
+    candidate = stage / "bin" / "cross-agent-chat"
+    candidate.write_text(
+        f"#!{stage / 'bin' / 'python'}\n"
+        "import sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('cross-agent-chat 0.1.2')\n"
+        "elif sys.argv[1:] == ['_broker', '--help']:\n"
+        "    print('broker help')\n"
+        "else:\n"
+        "    raise SystemExit(2)\n"
+    )
+    candidate.chmod(0o755)
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    monkeypatch.setenv("PYTHONPATH", str(source_root))
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+    monkeypatch.setattr(installer, "activate", lambda: None)
+    monkeypatch.setattr(installer, "verify", lambda: True)
+
+    installer.install_staged(stage, stable)
+
+    completed = subprocess.run(
+        [str(stable), "--version"],
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert completed.stdout.strip() == "cross-agent-chat 0.1.2"
+    assert stage.exists()
+
+
 def test_staged_install_setup_failure_restores_public_entrypoint_and_pointer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -628,10 +764,12 @@ def test_staged_install_setup_failure_restores_public_entrypoint_and_pointer(
     installer = Installer(home=home, executable=stable, device="studio")
     previous = installer.releases / "release-previous"
     (previous / "bin").mkdir(parents=True)
+    (previous / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
     installer.current_runtime.symlink_to("releases/release-previous")
     stage = _staged_runtime(installer)
 
-    def fail_setup() -> InstallReport:
+    def fail_setup(*, prepared: object) -> InstallReport:
+        assert prepared is not None
         raise SettingsError("setup failed")
 
     monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
@@ -667,6 +805,7 @@ def test_staged_install_activation_failure_restores_custom_symlink_and_broker(
     installer = Installer(home=home, executable=stable, device="studio")
     previous = installer.releases / "release-previous"
     (previous / "bin").mkdir(parents=True)
+    (previous / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
     installer.current_runtime.symlink_to("releases/release-previous")
     stage = _staged_runtime(installer)
     activations = 0
@@ -721,6 +860,35 @@ def test_staged_install_fails_closed_on_unknown_current_pointer(
     assert installer.current_runtime.read_text() == "unexpected"
 
 
+def test_staged_install_rejects_stable_parent_symlink_outside_home(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = home / "linked-bin"
+    linked_parent.parent.mkdir(parents=True)
+    linked_parent.symlink_to(outside, target_is_directory=True)
+    installer = Installer(home=home, executable=linked_parent / "cross-agent-chat", device="studio")
+
+    with pytest.raises(SettingsError, match="owner-local"):
+        installer._validate_stable_entrypoint(linked_parent / "cross-agent-chat")
+
+
+def test_staged_install_rejects_symlinked_product_runtime_root(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside-runtime"
+    outside.mkdir()
+    installer = Installer(
+        home=home, executable=home / ".local/bin/cross-agent-chat", device="studio"
+    )
+    installer.runtime_root.parent.mkdir(parents=True)
+    installer.runtime_root.symlink_to(outside, target_is_directory=True)
+    stage = outside / "releases" / "release-test"
+    stage.mkdir(parents=True)
+
+    with pytest.raises(SettingsError, match="staged runtime is unavailable"):
+        installer._validate_staged_runtime(stage)
+
+
 def test_staged_install_fails_closed_on_unfinished_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -733,11 +901,92 @@ def test_staged_install_fails_closed_on_unfinished_transaction(
     (unfinished / "metadata.json").write_text("{}")
     monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
 
-    with pytest.raises(SettingsError, match="unfinished transaction"):
+    with pytest.raises(SettingsError, match="transaction metadata is invalid"):
         installer.install_staged(stage, stable)
 
     assert stage.exists()
     assert not stable.exists()
+
+
+def test_interrupted_transaction_restores_pointer_entrypoint_and_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    stable = home / "configured-bin" / "cross-agent-chat"
+    stable.parent.mkdir(parents=True)
+    stable.write_text("predecessor-entrypoint")
+    installer = Installer(home=home, executable=stable, device="studio")
+    previous = installer.releases / "release-previous"
+    (previous / "bin").mkdir(parents=True)
+    (previous / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
+    installer.current_runtime.symlink_to("releases/release-previous")
+    stage = _staged_runtime(installer)
+    current_snapshot = _snapshot_path(installer.current_runtime)
+    entrypoint_snapshot = _snapshot_path(stable)
+    prepared = installer._prepare_setup()
+    digest = _package_tree_digest(stage)
+    transaction = installer.transactions / "interrupted"
+    transaction.mkdir(parents=True, mode=0o700)
+    transaction.chmod(0o700)
+    installer._record_transaction(
+        transaction,
+        phase="config_written",
+        staged=stage,
+        stable_entrypoint=stable,
+        current_snapshot=current_snapshot,
+        entrypoint_snapshot=entrypoint_snapshot,
+        config_backup=prepared.backup,
+        previous_broker_loaded=False,
+        previous_broker_healthy=False,
+        package_tree_sha256=digest,
+    )
+    installer.current_runtime.unlink()
+    installer.current_runtime.symlink_to("releases/release-test")
+    stable.unlink()
+    stable.symlink_to(installer.current_runtime / "bin" / "cross-agent-chat")
+    installer.setup(prepared=prepared)
+    assert str(stable) in installer.claude_config.read_text()
+    monkeypatch.setattr(installer, "_bootout", lambda: None)
+
+    installer._recover_unfinished_transaction()
+
+    assert os.readlink(installer.current_runtime) == "releases/release-previous"
+    assert stable.read_text() == "predecessor-entrypoint"
+    assert not installer.claude_config.exists()
+    assert not stage.exists()
+    assert not transaction.exists()
+
+
+def test_setup_retains_backup_and_reports_compound_rollback_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"theme": "light"}))
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    prepared = installer._prepare_setup()
+    writes = 0
+
+    def fail_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            path.write_bytes(payload)
+            return
+        if writes == 2:
+            raise OSError("candidate config write failed")
+        raise OSError("provider rollback write failed")
+
+    monkeypatch.setattr("cross_agent_chat.install._atomic_write", fail_write)
+
+    with pytest.raises(SetupRollbackError) as captured:
+        installer.setup(prepared=prepared)
+
+    assert "candidate config write failed" in str(captured.value)
+    assert "provider rollback write failed" in str(captured.value)
+    assert captured.value.backup == prepared.backup
+    assert prepared.backup.exists()
 
 
 def test_staged_install_courier_failure_preserves_healthy_predecessor(
@@ -775,7 +1024,7 @@ def test_staged_install_courier_failure_preserves_healthy_predecessor(
 
     assert stable.resolve() == predecessor
     assert predecessor.read_text() == "predecessor"
-    assert stage.exists()
+    assert not stage.exists()
     assert activations == 0
 
 
@@ -953,9 +1202,15 @@ def test_uninstall_removes_only_owned_background_surfaces(
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
     installer.setup()
     calls: list[list[str]] = []
+    stopped = False
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        nonlocal stopped
         calls.append(command)
+        if command[:2] == ["launchctl", "bootout"]:
+            stopped = True
+        if command[:2] == ["launchctl", "print"] and stopped:
+            return subprocess.CompletedProcess(command, 113, "", "not found")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
@@ -1012,7 +1267,14 @@ def test_verify_requires_loaded_responsive_background_broker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
-    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    runtime = home / "runtime"
+    executable = runtime / "bin" / "cross-agent-chat"
+    module = runtime / "lib" / "cross_agent_chat" / "tailnet_broker.py"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("candidate")
+    module.parent.mkdir(parents=True)
+    module.write_text("candidate")
+    installer = Installer(home=home, executable=executable, device="studio")
     installer.setup()
 
     monkeypatch.setattr(
@@ -1023,13 +1285,84 @@ def test_verify_requires_loaded_responsive_background_broker(
 
     monkeypatch.setattr(
         "cross_agent_chat.install.subprocess.run",
-        lambda command, **_: subprocess.CompletedProcess(command, 0, "", ""),
+        lambda command, **_: subprocess.CompletedProcess(
+            command,
+            0,
+            f"state = running\nprogram = {executable}\npid = 4242\n",
+            "",
+        ),
     )
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_tailnet",
+        lambda *_args, **_kwargs: {
+            "schema_version": 1,
+            "status": "READY",
+            "pid": 4242,
+            "version": "0.1.2",
+            "module_path": str(module),
+        },
+    )
+    assert installer.verify()
+
+
+def test_broker_health_rejects_spawn_scheduled_job_with_orphan_ready_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    executable = home / "runtime" / "bin" / "cross-agent-chat"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("candidate")
+    installer = Installer(home=home, executable=executable, device="studio")
+    monkeypatch.setattr(
+        "cross_agent_chat.install.subprocess.run",
+        lambda command, **_: subprocess.CompletedProcess(
+            command,
+            0,
+            f"state = spawn scheduled\nprogram = {executable}\nlast exit code = 2\n",
+            "",
+        ),
+    )
+    requested = False
+
+    def ready(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal requested
+        requested = True
+        return {"schema_version": 1, "status": "READY"}
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", ready)
+
+    assert not installer.broker_is_healthy()
+    assert not requested
+
+
+def test_previous_broker_health_accepts_legacy_response_only_from_launchd_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    stable = home / ".local" / "bin" / "cross-agent-chat"
+    legacy = home / "legacy-runtime" / "bin" / "cross-agent-chat"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("legacy")
+    installer = Installer(home=home, executable=stable, device="studio")
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if command[0] == "/usr/sbin/lsof":
+            return subprocess.CompletedProcess(command, 0, "4242\n", "")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            f"state = running\nprogram = {legacy}\npid = 4242\n",
+            "",
+        )
+
+    monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_tailnet",
         lambda *_args, **_kwargs: {"schema_version": 1, "status": "READY"},
     )
-    assert installer.verify()
+
+    assert not installer.broker_is_healthy()
+    assert installer._previous_broker_is_healthy()
 
 
 def test_broker_health_reports_timeout_as_unavailable(
@@ -1076,20 +1409,38 @@ def test_uninstall_removes_stable_runtime_but_not_legacy_predecessor(
     candidate = release / "bin" / "cross-agent-chat"
     candidate.parent.mkdir(parents=True)
     candidate.write_text("candidate")
+    (release / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
+    unrelated = installer.releases / "release-unrelated"
+    unrelated.mkdir()
+    (unrelated / "keep").write_text("unrelated")
+    staging = installer.releases / "release-in-progress"
+    staging.mkdir()
+    (staging / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:staged\n")
     installer.current_runtime.symlink_to("releases/release-current")
     stable.parent.mkdir(parents=True)
     stable.symlink_to(installer.current_runtime / "bin" / "cross-agent-chat")
     installer.setup()
-    monkeypatch.setattr(
-        "cross_agent_chat.install.subprocess.run",
-        lambda command, **_: subprocess.CompletedProcess(command, 0, "", ""),
-    )
+    stopped = False
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        nonlocal stopped
+        if command[:2] == ["launchctl", "bootout"]:
+            stopped = True
+        if command[:2] == ["launchctl", "print"] and stopped:
+            return subprocess.CompletedProcess(command, 113, "", "not found")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
 
     installer.uninstall()
 
     assert not stable.exists()
     assert not installer.current_runtime.exists()
     assert not release.exists()
+    assert (unrelated / "keep").read_text() == "unrelated"
+    assert (staging / ".cross-agent-chat-release").read_text() == (
+        "cross-agent-chat-runtime-v1:staged\n"
+    )
     assert legacy.read_text() == "legacy"
 
 
@@ -1102,3 +1453,56 @@ def test_discover_executable_preserves_stable_symlink_identity(tmp_path: Path) -
     stable.symlink_to(runtime)
 
     assert discover_executable(stable) == stable.absolute()
+
+
+def test_install_lock_serializes_concurrent_transactions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = Installer(home=home, executable=home / "bin/cross-agent-chat", device="studio")
+    second = Installer(home=home, executable=home / "bin/cross-agent-chat", device="studio")
+    active = 0
+    maximum_active = 0
+    guard = threading.Lock()
+
+    def transaction(_stage: Path, _stable: Path) -> InstallReport:
+        nonlocal active, maximum_active
+        with guard:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.05)
+        with guard:
+            active -= 1
+        return InstallReport(changed_paths=(), backup=tmp_path / "backup")
+
+    monkeypatch.setattr(first, "_install_staged", transaction)
+    monkeypatch.setattr(second, "_install_staged", transaction)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = list(
+            workers.map(
+                lambda installer: installer.install_staged(
+                    tmp_path / "stage", home / "bin/cross-agent-chat"
+                ),
+                (first, second),
+            )
+        )
+
+    assert len(results) == 2
+    assert maximum_active == 1
+
+
+def test_install_lock_rejects_symlinked_share_root(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (home / ".local").mkdir(parents=True)
+    (home / ".local" / "share").symlink_to(outside, target_is_directory=True)
+    installer = Installer(home=home, executable=home / "bin/cross-agent-chat", device="studio")
+
+    with (
+        pytest.raises(SettingsError, match="lock ownership is invalid"),
+        installer._exclusive_lock(),
+    ):
+        pytest.fail("unsafe lock acquired")
+
+    assert not list(outside.iterdir())
