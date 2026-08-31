@@ -536,6 +536,22 @@ def test_bootout_failure_is_not_reported_as_success(
         installer._bootout()
 
 
+def test_stop_broker_requires_port_release_after_label_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(installer, "_bootout", lambda: calls.append("bootout"))
+    monkeypatch.setattr(installer, "_wait_for_broker_port_release", lambda: False)
+    monkeypatch.setattr(installer, "_stop_owned_orphan_broker", lambda: calls.append("orphan"))
+
+    installer._stop_broker()
+
+    assert calls == ["bootout", "orphan"]
+
+
 def test_install_restores_provider_files_if_activation_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -839,6 +855,38 @@ def test_staged_install_setup_failure_restores_public_entrypoint_and_pointer(
         for item in installer.releases.iterdir()
         if item.name.startswith("release-") and item != previous
     ]
+
+
+def test_staged_install_rolls_back_under_in_home_symlinked_data_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    storage = home / "storage"
+    (home / ".local").mkdir(parents=True)
+    storage.mkdir()
+    (home / ".local/share").symlink_to(storage, target_is_directory=True)
+    stable = home / "bin/cross-agent-chat"
+    stable.parent.mkdir()
+    stable.write_text("predecessor")
+    installer = Installer(home=home, executable=stable, device="studio")
+    stage = _staged_runtime(installer)
+
+    def fail_setup(*, prepared: object) -> InstallReport:
+        assert prepared is not None
+        raise SettingsError("setup failed")
+
+    monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "setup", fail_setup)
+
+    with pytest.raises(SettingsError, match="transition failed but rollback succeeded"):
+        installer.install_staged(stage, stable)
+
+    assert stable.read_text() == "predecessor"
+    assert not stage.exists()
+    assert not list(installer.transactions.iterdir())
 
 
 def test_staged_install_activation_failure_restores_custom_symlink_and_broker(
@@ -1727,6 +1775,35 @@ def test_uninstall_removes_stable_runtime_but_not_legacy_predecessor(
     assert not abandoned.exists()
     assert not reused.exists()
     assert legacy.read_text() == "legacy"
+
+
+def test_uninstall_retains_runtime_when_broker_port_cannot_be_released(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    stable = home / "bin/cross-agent-chat"
+    installer = Installer(home=home, executable=stable, device="studio")
+    release = installer.releases / "release-current"
+    candidate = release / "bin/cross-agent-chat"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("candidate")
+    (release / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
+    installer.current_runtime.symlink_to("releases/release-current")
+    stable.parent.mkdir(parents=True)
+    stable.symlink_to(installer.current_runtime / "bin/cross-agent-chat")
+    installer.setup()
+    monkeypatch.setattr(
+        installer,
+        "_stop_broker",
+        lambda: (_ for _ in ()).throw(SettingsError("broker port remained occupied")),
+    )
+
+    with pytest.raises(SettingsError, match="broker port remained occupied"):
+        installer.uninstall()
+
+    assert stable.is_symlink()
+    assert installer.current_runtime.is_symlink()
+    assert release.exists()
 
 
 def test_discover_executable_preserves_stable_symlink_identity(tmp_path: Path) -> None:

@@ -781,7 +781,7 @@ class Installer:
             service_stopped = not service_transition_started
             if service_transition_started:
                 try:
-                    self._bootout()
+                    self._stop_broker()
                     service_stopped = True
                 except (OSError, subprocess.SubprocessError, SettingsError) as error:
                     rollback_failures.append(f"broker stop failed: {error}")
@@ -1017,7 +1017,7 @@ class Installer:
         service_stopped = not service_transition_started
         if service_transition_started:
             try:
-                self._bootout()
+                self._stop_broker()
                 service_stopped = True
             except (OSError, subprocess.SubprocessError, SettingsError) as error:
                 failures.append(f"broker stop failed: {error}")
@@ -1094,12 +1094,7 @@ class Installer:
 
     def _remove_release(self, release: Path) -> None:
         self._validate_runtime_roots()
-        if (
-            release.is_symlink()
-            or not release.is_dir()
-            or release.parent != self.releases
-            or not release.name.startswith("release-")
-        ):
+        if release.is_symlink() or not release.is_dir() or not release.name.startswith("release-"):
             raise SettingsError("refusing to remove an unowned runtime")
         releases = self.releases.resolve(strict=True)
         resolved = release.resolve(strict=True)
@@ -1107,6 +1102,7 @@ class Installer:
         marker_text = marker.read_text(encoding="utf-8") if marker.is_file() else ""
         if (
             not releases.is_relative_to(self.home)
+            or release.parent.resolve(strict=True) != releases
             or resolved.parent != releases
             or marker.is_symlink()
             or not marker.is_file()
@@ -1506,6 +1502,11 @@ class Installer:
         if not self._wait_for_broker_port_release():
             raise SettingsError("owned predecessor broker did not stop")
 
+    def _stop_broker(self) -> None:
+        self._bootout()
+        if not self._wait_for_broker_port_release():
+            self._stop_owned_orphan_broker()
+
     def activate(self) -> None:
         domain = f"gui/{os.getuid()}"
         service = f"{domain}/{LAUNCH_AGENT_LABEL}"
@@ -1521,8 +1522,8 @@ class Installer:
             == 0
         )
         if loaded:
-            self._bootout()
-        if not self._wait_for_broker_port_release():
+            self._stop_broker()
+        elif not self._wait_for_broker_port_release():
             self._stop_owned_orphan_broker()
         started = subprocess.run(
             ["launchctl", "bootstrap", domain, str(self.launch_agent)],
@@ -1648,7 +1649,7 @@ class Installer:
 
     def _uninstall(self) -> None:
         metadata = self._install_metadata(_json_object(self.claude_settings))
-        self._bootout()
+        self._stop_broker()
         self._stop_couriers()
         self._remove_runtime_state()
         claude_settings = _json_object(self.claude_settings)
