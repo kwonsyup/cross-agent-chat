@@ -27,12 +27,9 @@ if [ -L "$product_root" ] || [ -L "$releases_root" ]; then
     printf '%s\n' 'Cross Agent Chat runtime ownership is invalid.' >&2
     exit 2
 fi
-mkdir -p "$releases_root"
-chmod 700 "$product_root" "$releases_root"
-
-staged_runtime=$(mktemp -d "$releases_root/release-XXXXXX")
+staged_runtime=
 bootstrap_dir=
-owner_identity=$(/bin/ps -ww -p "$$" -o lstart= -o command= | shasum -a 256 | awk '{print $1}')
+owner_identity=
 cleanup() {
     if [ -n "$staged_runtime" ]; then
         marker=$staged_runtime/.cross-agent-chat-release
@@ -51,6 +48,11 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+mkdir -p "$releases_root"
+chmod 700 "$product_root" "$releases_root"
+staged_runtime=$(mktemp -d "$releases_root/release-XXXXXX")
+owner_identity=$(/bin/ps -ww -p "$$" -o lstart= -o command= | shasum -a 256 | awk '{print $1}')
 
 python_is_compatible() {
     command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'

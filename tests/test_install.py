@@ -318,6 +318,8 @@ def test_install_script_falls_back_from_runtime_internal_entrypoint(tmp_path: Pa
 def test_install_script_signal_handlers_terminate_after_cleanup() -> None:
     script = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
 
+    assert script.index("trap cleanup EXIT") < script.index('mkdir -p "$releases_root"')
+    assert script.index("trap cleanup EXIT") < script.index("staged_runtime=$(mktemp")
     assert "trap cleanup EXIT" in script
     assert "trap 'exit 129' HUP" in script
     assert "trap 'exit 130' INT" in script
@@ -577,6 +579,20 @@ def test_setup_rollback_preserves_in_home_symlink_and_target_mode(tmp_path: Path
     assert settings.resolve() == target
     assert json.loads(target.read_text()) == {"theme": "light"}
     assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+def test_setup_rejects_configuration_parent_symlink_outside_home(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    (home / ".claude").symlink_to(outside, target_is_directory=True)
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    with pytest.raises(SettingsError, match="configuration path escapes home"):
+        installer.setup()
+
+    assert not (outside / "settings.json").exists()
 
 
 def test_activate_starts_only_owned_launch_agent(
@@ -2616,6 +2632,11 @@ def test_uninstall_preserves_in_home_provider_configuration_symlinks(
     assert json.loads(targets[installer.claude_config].read_text()).get("mcpServers", {}) == {}
     hooks = json.loads(targets[installer.codex_hooks].read_text()).get("hooks", {})
     assert all(not _owned_hook(group) for groups in hooks.values() for group in groups)
+
+    installer.setup()
+
+    assert all(path.is_symlink() for path in provider_paths)
+    assert all(target.exists() for target in targets.values())
 
 
 def test_uninstall_restores_absent_claude_cross_session_setting(tmp_path: Path) -> None:

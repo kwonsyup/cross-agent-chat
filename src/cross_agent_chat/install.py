@@ -793,25 +793,21 @@ class Installer:
     def _configuration_destinations(self) -> dict[Path, Path]:
         destinations: dict[Path, Path] = {}
         for path in self.config_paths:
-            destination = path
-            if path.is_symlink():
-                try:
-                    destination = path.resolve(strict=True)
-                except OSError as error:
-                    raise SettingsError(
-                        f"managed configuration symlink is unavailable: {path}"
-                    ) from error
-                if not destination.is_relative_to(self.home):
-                    raise SettingsError(f"managed configuration symlink escapes home: {path}")
+            try:
+                destination = path.resolve(strict=False)
+            except (OSError, RuntimeError) as error:
+                raise SettingsError(f"managed configuration path is invalid: {path}") from error
+            if not destination.is_relative_to(self.home):
+                raise SettingsError(f"managed configuration path escapes home: {path}")
             destinations[path] = destination
         return destinations
 
     def _prepare_setup(self, stable_entrypoint: Path | None = None) -> PreparedSetup:
-        payloads = self._payloads(stable_entrypoint)
         destinations = self._configuration_destinations()
+        payloads = self._payloads(stable_entrypoint)
         originals: dict[Path, PathSnapshot] = {}
         for path, destination in destinations.items():
-            if destination != path:
+            if path.is_symlink():
                 originals[path] = _snapshot_path(path)
             originals[destination] = _snapshot_path(destination)
         if self.legacy_peers.exists():
@@ -992,6 +988,7 @@ class Installer:
         )
         if broker_smoke.returncode != 0:
             raise SettingsError("candidate staging failed: broker executable verification failed")
+        self._configuration_destinations()
         self._payloads()
         _package_tree_digest(staged)
         return staged
