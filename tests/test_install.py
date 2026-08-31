@@ -452,6 +452,7 @@ def test_activate_starts_only_owned_launch_agent(
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
 
     installer.activate()
 
@@ -482,6 +483,7 @@ def test_activate_reloads_existing_owned_launch_agent(
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
 
     installer.activate()
 
@@ -518,6 +520,7 @@ def test_activate_waits_for_existing_broker_to_stop_before_bootstrap(
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
     monkeypatch.setattr("cross_agent_chat.install.time.sleep", lambda _: None)
 
     installer.activate()
@@ -544,6 +547,7 @@ def test_activate_retries_transient_launchd_bootstrap_once(
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
     monkeypatch.setattr("cross_agent_chat.install.time.sleep", lambda _: None)
 
     installer.activate()
@@ -726,9 +730,56 @@ def test_broker_port_probe_uses_broker_reuse_semantics(
 
     probe = ProbeSocket()
     monkeypatch.setattr("cross_agent_chat.install.socket.socket", lambda *_args: probe)
+    monkeypatch.setattr(
+        "cross_agent_chat.install.subprocess.run",
+        lambda command, **_: subprocess.CompletedProcess(
+            command,
+            0,
+            "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+            f"python {os.getpid()} user 1u IPv4 0 0t0 "
+            "TCP 127.0.0.1:47072 (LISTEN)\n",
+            "",
+        ),
+    )
 
     assert installer._broker_port_is_available()
     assert calls == ["reuse", "bind", "listen", "close"]
+
+
+def test_broker_port_probe_rejects_second_wildcard_listener_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+
+    class ProbeSocket:
+        def setsockopt(self, _level: int, _option: int, _value: int) -> None:
+            return
+
+        def bind(self, _address: tuple[str, int]) -> None:
+            return
+
+        def listen(self, _backlog: int) -> None:
+            return
+
+        def close(self) -> None:
+            return
+
+    monkeypatch.setattr("cross_agent_chat.install.socket.socket", lambda *_args: ProbeSocket())
+    monkeypatch.setattr(
+        "cross_agent_chat.install.subprocess.run",
+        lambda command, **_: subprocess.CompletedProcess(
+            command,
+            0,
+            "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+            f"python {os.getpid()} user 1u IPv4 0 0t0 TCP 127.0.0.1:47072 (LISTEN)\n"
+            "python 4242 user 2u IPv4 0 0t0 TCP *:47072 (LISTEN)\n",
+            "",
+        ),
+    )
+
+    assert not installer._broker_port_is_available()
 
 
 def test_orphan_probe_accepts_port_released_before_listener_readback(
@@ -1838,6 +1889,7 @@ def test_uninstall_removes_only_owned_background_surfaces(
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
 
     installer.uninstall()
 
@@ -2069,6 +2121,7 @@ def test_uninstall_removes_stable_runtime_but_not_legacy_predecessor(
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
     monkeypatch.setattr(
         "cross_agent_chat.install._process_identity_digest",
         lambda pid: identity if pid == os.getpid() else None,

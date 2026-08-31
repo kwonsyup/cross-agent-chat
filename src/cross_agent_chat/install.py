@@ -1462,7 +1462,26 @@ class Installer:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((LOCAL_BROKER_HOST, LOCAL_BROKER_PORT))
             listener.listen(1)
-            return True
+            readback = subprocess.run(
+                [
+                    "/usr/sbin/lsof",
+                    "-nP",
+                    f"-iTCP:{LOCAL_BROKER_PORT}",
+                    "-sTCP:LISTEN",
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+            rows = [line.split() for line in readback.stdout.splitlines()[1:] if line.split()]
+            return (
+                readback.returncode == 0
+                and len(rows) == 1
+                and len(rows[0]) > 1
+                and rows[0][1] == str(os.getpid())
+            )
         except OSError:
             return False
         finally:
