@@ -681,6 +681,23 @@ def test_orphan_probe_accepts_port_released_before_listener_readback(
     installer._stop_owned_orphan_broker()
 
 
+def test_orphan_probe_accepts_port_released_after_listener_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    port_checks = iter((False, True))
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: next(port_checks))
+    monkeypatch.setattr(
+        "cross_agent_chat.install.subprocess.run",
+        lambda command, **_: subprocess.CompletedProcess(command, 0, "4242\n", ""),
+    )
+    monkeypatch.setattr("cross_agent_chat.install._process_identity_digest", lambda _pid: None)
+
+    installer._stop_owned_orphan_broker()
+
+
 def test_install_restores_provider_files_if_activation_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

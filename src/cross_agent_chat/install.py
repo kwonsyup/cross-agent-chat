@@ -1475,6 +1475,11 @@ class Installer:
                 time.sleep(0.1)
         return False
 
+    def _require_broker_released(self, message: str) -> None:
+        if self._broker_port_is_available():
+            return
+        raise SettingsError(message)
+
     def _stop_owned_orphan_broker(self) -> None:
         if self._broker_port_is_available():
             return
@@ -1488,13 +1493,13 @@ class Installer:
         )
         raw_pids = [line.strip() for line in listener.stdout.splitlines() if line.strip()]
         if listener.returncode != 0 or len(raw_pids) != 1 or not raw_pids[0].isdigit():
-            if self._broker_port_is_available():
-                return
-            raise SettingsError("local broker port is occupied by an unverified process")
+            self._require_broker_released("local broker port is occupied by an unverified process")
+            return
         pid = int(raw_pids[0])
         process_identity = _process_identity_digest(pid)
         if process_identity is None:
-            raise SettingsError("local broker port is occupied by an unverified process")
+            self._require_broker_released("local broker port is occupied by an unverified process")
+            return
         uid = subprocess.run(
             ["/bin/ps", "-p", str(pid), "-o", "uid="],
             stdin=subprocess.DEVNULL,
@@ -1516,11 +1521,13 @@ class Installer:
             broker_index = tokens.index("_broker")
             broker_executable = Path(tokens[broker_index - 1])
         except (ValueError, IndexError):
-            raise SettingsError("local broker port is occupied by an unverified process") from None
+            self._require_broker_released("local broker port is occupied by an unverified process")
+            return
         try:
             resolved_executable = broker_executable.resolve(strict=True)
         except OSError:
-            raise SettingsError("local broker port is occupied by an unverified process") from None
+            self._require_broker_released("local broker port is occupied by an unverified process")
+            return
         if (
             uid.returncode != 0
             or uid.stdout.strip() != str(os.getuid())
@@ -1530,7 +1537,8 @@ class Installer:
             or not broker_executable.is_absolute()
             or not resolved_executable.is_relative_to(self.home)
         ):
-            raise SettingsError("local broker port is occupied by an unverified process")
+            self._require_broker_released("local broker port is occupied by an unverified process")
+            return
         version = subprocess.run(
             [str(resolved_executable), "--version"],
             stdin=subprocess.DEVNULL,
@@ -1544,12 +1552,14 @@ class Installer:
             or re.fullmatch(rf"{re.escape(SERVER_NAME)} [0-9]+\.[0-9]+\.[0-9]+\s*", version.stdout)
             is None
         ):
-            raise SettingsError("local broker port is occupied by an unverified process")
+            self._require_broker_released("local broker port is occupied by an unverified process")
+            return
         if (
             self._local_broker_listener_pid() != pid
             or _process_identity_digest(pid) != process_identity
         ):
-            raise SettingsError("local broker process changed before termination")
+            self._require_broker_released("local broker process changed before termination")
+            return
         os.kill(pid, signal.SIGTERM)
         if not self._wait_for_broker_port_release():
             raise SettingsError("owned predecessor broker did not stop")
