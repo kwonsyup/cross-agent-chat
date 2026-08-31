@@ -188,7 +188,7 @@ def dispatch_ready_brokers(
     for server in readable:
         try:
             connection, peer = server.accept()
-        except BlockingIOError:
+        except (BlockingIOError, ConnectionAbortedError, InterruptedError):
             continue
         if dispatch_broker_connection(
             workers,
