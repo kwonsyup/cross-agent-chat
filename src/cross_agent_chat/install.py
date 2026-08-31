@@ -1482,7 +1482,7 @@ class Installer:
                 and len(rows[0]) > 1
                 and rows[0][1] == str(os.getpid())
             )
-        except OSError:
+        except (OSError, subprocess.SubprocessError):
             return False
         finally:
             listener.close()

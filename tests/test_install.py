@@ -782,6 +782,38 @@ def test_broker_port_probe_rejects_second_wildcard_listener_readback(
     assert not installer._broker_port_is_available()
 
 
+def test_broker_port_probe_timeout_returns_false_and_closes_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    closed = False
+
+    class ProbeSocket:
+        def setsockopt(self, _level: int, _option: int, _value: int) -> None:
+            return
+
+        def bind(self, _address: tuple[str, int]) -> None:
+            return
+
+        def listen(self, _backlog: int) -> None:
+            return
+
+        def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    monkeypatch.setattr("cross_agent_chat.install.socket.socket", lambda *_args: ProbeSocket())
+    monkeypatch.setattr(
+        "cross_agent_chat.install.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(["lsof"], 5)),
+    )
+
+    assert not installer._broker_port_is_available()
+    assert closed
+
+
 def test_orphan_probe_accepts_port_released_before_listener_readback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
