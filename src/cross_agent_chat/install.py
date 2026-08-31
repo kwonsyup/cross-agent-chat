@@ -10,6 +10,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -19,9 +20,10 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final, cast
+from typing import Final, Literal, cast
 from uuid import uuid4
 
+from cross_agent_chat import __version__
 from cross_agent_chat.core import ChatError, atomic_json, ensure_private_dir, valid_device
 from cross_agent_chat.tailnet import LOCAL_BROKER_HOST, LOCAL_BROKER_PORT, valid_tailnet_address
 
@@ -49,6 +51,15 @@ class SettingsError(RuntimeError):
 class InstallReport:
     changed_paths: tuple[Path, ...]
     backup: Path
+
+
+@dataclass(frozen=True, slots=True)
+class PathSnapshot:
+    path: Path
+    kind: Literal["absent", "file", "symlink"]
+    payload: bytes | None = None
+    mode: int | None = None
+    target: str | None = None
 
 
 def default_device() -> str:
@@ -95,6 +106,76 @@ def _atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _snapshot_path(path: Path) -> PathSnapshot:
+    if path.is_symlink():
+        return PathSnapshot(path=path, kind="symlink", target=os.readlink(path))
+    if not path.exists():
+        return PathSnapshot(path=path, kind="absent")
+    if not path.is_file():
+        raise SettingsError(f"expected a file or symlink: {path}")
+    return PathSnapshot(
+        path=path,
+        kind="file",
+        payload=path.read_bytes(),
+        mode=stat.S_IMODE(path.stat().st_mode),
+    )
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        raise SettingsError(f"refusing to replace a directory: {path}")
+
+
+def _atomic_symlink(target: str, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.parent / f".{path.name}.{uuid4().hex}.tmp"
+    try:
+        os.symlink(target, temporary)
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _restore_path(snapshot: PathSnapshot) -> None:
+    _remove_path(snapshot.path)
+    if snapshot.kind == "absent":
+        return
+    if snapshot.kind == "symlink":
+        if snapshot.target is None:
+            raise SettingsError("symlink snapshot is incomplete")
+        _atomic_symlink(snapshot.target, snapshot.path)
+        return
+    if snapshot.payload is None or snapshot.mode is None:
+        raise SettingsError("file snapshot is incomplete")
+    _atomic_write(snapshot.path, snapshot.payload, snapshot.mode)
+
+
+def _package_tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for item in sorted(root.rglob("*"), key=lambda candidate: candidate.as_posix()):
+        relative = item.relative_to(root).as_posix().encode()
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        if item.is_symlink():
+            target = os.readlink(item).encode()
+            digest.update(b"L")
+            digest.update(len(target).to_bytes(4, "big"))
+            digest.update(target)
+        elif item.is_file():
+            digest.update(b"F")
+            digest.update(item.read_bytes())
+        elif item.is_dir():
+            digest.update(b"D")
+    return digest.hexdigest()
 
 
 def _hook_command(executable: Path, provider: str, device: str, event: str) -> str:
@@ -327,10 +408,10 @@ class Installer:
         self.codex_config = self.home / ".codex" / "config.toml"
         self.codex_hooks = self.home / ".codex" / "hooks.json"
         self.launch_agent = self.home / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
-        previous_runtime = os.environ.get("CROSS_AGENT_CHAT_PREVIOUS_RUNTIME")
-        runtime_root = os.environ.get("CROSS_AGENT_CHAT_RUNTIME_ROOT")
-        self.previous_runtime = Path(previous_runtime) if previous_runtime else None
-        self.runtime_root = Path(runtime_root) if runtime_root else None
+        self.runtime_root = self.home / ".local" / "share" / f"{SERVER_NAME}-runtime"
+        self.releases = self.runtime_root / "releases"
+        self.current_runtime = self.runtime_root / "current"
+        self.transactions = self.runtime_root / "transactions"
 
     @property
     def config_paths(self) -> tuple[Path, ...]:
@@ -507,39 +588,6 @@ class Installer:
             else:
                 raise SettingsError("backup manifest is invalid")
 
-    def _restore_predecessor_runtime(self, backup: Path) -> None:
-        if self.previous_runtime is None and self.runtime_root is None:
-            return
-        if self.previous_runtime is None or self.runtime_root is None:
-            raise SettingsError("previous runtime metadata is incomplete")
-        previous = self.previous_runtime.resolve()
-        runtime = self.runtime_root.resolve()
-        allowed = (
-            self.home / ".local" / "share" / "uv" / "tools" / SERVER_NAME,
-            self.home / ".local" / "share" / "pipx" / "venvs" / SERVER_NAME,
-            self.home / ".local" / "pipx" / "venvs" / SERVER_NAME,
-            self.home / ".local" / "share" / SERVER_NAME,
-        )
-        if runtime not in allowed or not previous.is_dir() or not runtime.is_dir():
-            raise SettingsError("previous runtime metadata is invalid")
-        previous_executable = previous / "bin" / SERVER_NAME
-        if not previous_executable.is_file():
-            raise SettingsError("previous runtime is incomplete")
-        failed_runtime = backup / "failed-runtime"
-        if failed_runtime.exists():
-            raise SettingsError("failed runtime backup already exists")
-        os.replace(runtime, failed_runtime)
-        try:
-            shutil.copytree(previous, runtime, symlinks=True)
-        except OSError:
-            if runtime.exists():
-                shutil.rmtree(runtime)
-            os.replace(failed_runtime, runtime)
-            raise
-        restored_executable = runtime / "bin" / SERVER_NAME
-        if not restored_executable.is_file():
-            raise SettingsError("restored previous runtime is incomplete")
-
     def install(self) -> InstallReport:
         previous_broker_loaded = self.broker_is_loaded()
         previous_broker_healthy = previous_broker_loaded and self._wait_for_broker_health()
@@ -561,7 +609,6 @@ class Installer:
             try:
                 if service_transition_started:
                     self._bootout()
-                self._restore_predecessor_runtime(report.backup)
                 self._restore(report.backup)
                 if service_transition_started and previous_broker_loaded:
                     self.activate()
@@ -572,6 +619,208 @@ class Installer:
                     f"installation failed: {failure}; rollback failed: {rollback}"
                 ) from failure
             raise
+        return report
+
+    def _validate_staged_runtime(self, staged_runtime: Path) -> Path:
+        if staged_runtime.is_symlink() or not staged_runtime.is_dir():
+            raise SettingsError("candidate staging failed: staged runtime is unavailable")
+        try:
+            staged = staged_runtime.resolve(strict=True)
+            releases = self.releases.resolve(strict=True)
+        except OSError as error:
+            raise SettingsError(
+                "candidate staging failed: staged runtime is unavailable"
+            ) from error
+        if staged.parent != releases or not staged.name.startswith(".staging-"):
+            raise SettingsError(
+                "candidate staging failed: staged runtime is outside owned releases"
+            )
+        candidate = staged / "bin" / SERVER_NAME
+        candidate_python = staged / "bin" / "python"
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            raise SettingsError("candidate staging failed: executable is unavailable")
+        if not candidate_python.is_file() or not os.access(candidate_python, os.X_OK):
+            raise SettingsError("candidate staging failed: Python runtime is unavailable")
+        version = subprocess.run(
+            [str(candidate), "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+        if version.returncode != 0 or version.stdout.strip() != f"{SERVER_NAME} {__version__}":
+            raise SettingsError("candidate staging failed: version verification failed")
+        imported = subprocess.run(
+            [str(candidate_python), "-c", "import cross_agent_chat"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+        if imported.returncode != 0:
+            raise SettingsError("candidate staging failed: import verification failed")
+        broker_smoke = subprocess.run(
+            [str(candidate), "_broker", "--help"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+        if broker_smoke.returncode != 0:
+            raise SettingsError("candidate staging failed: broker executable verification failed")
+        self._payloads()
+        _package_tree_digest(staged)
+        return staged
+
+    def _validate_runtime_pointer(self) -> PathSnapshot:
+        snapshot = _snapshot_path(self.current_runtime)
+        if snapshot.kind == "file":
+            raise SettingsError("predecessor state is unknown: current runtime is not a symlink")
+        if snapshot.kind == "symlink":
+            if snapshot.target is None:
+                raise SettingsError("predecessor state is unknown: current runtime is invalid")
+            try:
+                target = (self.current_runtime.parent / snapshot.target).resolve(strict=True)
+                releases = self.releases.resolve(strict=True)
+            except OSError as error:
+                raise SettingsError(
+                    "predecessor state is unknown: current runtime is unavailable"
+                ) from error
+            if target.parent != releases or not target.name.startswith("release-"):
+                raise SettingsError("predecessor state is unknown: current runtime is not owned")
+        return snapshot
+
+    def _validate_stable_entrypoint(self, stable_entrypoint: Path) -> Path:
+        if not stable_entrypoint.is_absolute() or stable_entrypoint.name != SERVER_NAME:
+            raise SettingsError("stable entrypoint is invalid")
+        if not stable_entrypoint.is_relative_to(self.home):
+            raise SettingsError("stable entrypoint must be owner-local")
+        _snapshot_path(stable_entrypoint)
+        return stable_entrypoint
+
+    def _record_transaction(
+        self,
+        transaction: Path,
+        *,
+        phase: str,
+        staged: Path,
+        stable_entrypoint: Path,
+        previous_broker_loaded: bool,
+        previous_broker_healthy: bool,
+    ) -> None:
+        atomic_json(
+            transaction / "metadata.json",
+            {
+                "schema_version": 1,
+                "phase": phase,
+                "staged_name": staged.name,
+                "stable_entrypoint": str(stable_entrypoint.relative_to(self.home)),
+                "previous_broker_loaded": previous_broker_loaded,
+                "previous_broker_healthy": previous_broker_healthy,
+                "package_tree_sha256": _package_tree_digest(staged),
+            },
+        )
+
+    def _remove_release(self, release: Path) -> None:
+        releases = self.releases.resolve(strict=True)
+        resolved = release.resolve(strict=True)
+        if resolved.parent != releases or not resolved.name.startswith("release-"):
+            raise SettingsError("refusing to remove an unowned runtime")
+        shutil.rmtree(resolved)
+
+    def _prune_releases(self, current: Path, previous: PathSnapshot) -> None:
+        retained = {current.resolve()}
+        if previous.kind == "symlink" and previous.target is not None:
+            retained.add((self.current_runtime.parent / previous.target).resolve())
+        for release in self.releases.iterdir():
+            if (
+                release.is_dir()
+                and not release.is_symlink()
+                and release.name.startswith("release-")
+                and release.resolve() not in retained
+            ):
+                self._remove_release(release)
+
+    def install_staged(self, staged_runtime: Path, stable_entrypoint: Path) -> InstallReport:
+        staged = self._validate_staged_runtime(staged_runtime)
+        stable = self._validate_stable_entrypoint(stable_entrypoint)
+        if self.transactions.exists() and any(self.transactions.iterdir()):
+            raise SettingsError("predecessor state is unknown: unfinished transaction exists")
+        current_snapshot = self._validate_runtime_pointer()
+        entrypoint_snapshot = _snapshot_path(stable)
+        previous_broker_loaded = self.broker_is_loaded()
+        previous_broker_healthy = previous_broker_loaded and self._wait_for_broker_health()
+
+        ensure_private_dir(self.transactions)
+        transaction = self.transactions / uuid4().hex
+        ensure_private_dir(transaction)
+        self._record_transaction(
+            transaction,
+            phase="prepared",
+            staged=staged,
+            stable_entrypoint=stable,
+            previous_broker_loaded=previous_broker_loaded,
+            previous_broker_healthy=previous_broker_healthy,
+        )
+
+        final_runtime = self.releases / f"release-{uuid4().hex}"
+        report: InstallReport | None = None
+        service_transition_started = False
+        runtime_transition_started = False
+        try:
+            self._stop_couriers()
+            os.replace(staged, final_runtime)
+            runtime_transition_started = True
+            _atomic_symlink(f"releases/{final_runtime.name}", self.current_runtime)
+            _atomic_symlink(str(self.current_runtime / "bin" / SERVER_NAME), stable)
+            report = self.setup()
+            self._remove_runtime_state()
+            service_transition_started = True
+            self.activate()
+            for attempt in range(BROKER_HEALTH_ATTEMPTS):
+                if self.verify():
+                    break
+                if attempt < BROKER_HEALTH_ATTEMPTS - 1:
+                    time.sleep(BROKER_HEALTH_INTERVAL_SECONDS)
+            else:
+                raise SettingsError("background broker did not become healthy")
+        except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as failure:
+            try:
+                if service_transition_started:
+                    self._bootout()
+                if report is not None:
+                    self._restore(report.backup)
+                if runtime_transition_started:
+                    _restore_path(current_snapshot)
+                    _restore_path(entrypoint_snapshot)
+                if service_transition_started and previous_broker_loaded:
+                    self.activate()
+                if previous_broker_healthy and not self._wait_for_broker_health():
+                    raise SettingsError("previous broker did not become healthy")
+                if final_runtime.exists():
+                    self._remove_release(final_runtime)
+                shutil.rmtree(transaction)
+            except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as rollback:
+                raise SettingsError(
+                    f"transition and rollback failed: {failure}; rollback failure: {rollback}"
+                ) from failure
+            raise SettingsError(f"transition failed but rollback succeeded: {failure}") from failure
+
+        if report is None:
+            raise SettingsError("installation transaction did not produce a report")
+        self._record_transaction(
+            transaction,
+            phase="committed",
+            staged=final_runtime,
+            stable_entrypoint=stable,
+            previous_broker_loaded=previous_broker_loaded,
+            previous_broker_healthy=previous_broker_healthy,
+        )
+        self._prune_releases(final_runtime, current_snapshot)
+        shutil.rmtree(transaction)
         return report
 
     def verify_configuration(self) -> bool:
@@ -750,6 +999,39 @@ class Installer:
         if self.state.exists():
             shutil.rmtree(self.state)
 
+    def _remove_installed_runtime(self) -> None:
+        if not self.current_runtime.is_symlink():
+            return
+        try:
+            current = self.current_runtime.resolve(strict=True)
+            releases = self.releases.resolve(strict=True)
+            executable = self.executable.resolve(strict=True)
+        except OSError as error:
+            raise SettingsError("installed runtime ownership is invalid") from error
+        expected = current / "bin" / SERVER_NAME
+        if (
+            current.parent != releases
+            or not current.name.startswith("release-")
+            or executable != expected
+        ):
+            raise SettingsError("installed runtime ownership is invalid")
+        if self.executable.is_symlink():
+            self.executable.unlink()
+        self.current_runtime.unlink()
+        for release in self.releases.iterdir():
+            if release.is_symlink():
+                raise SettingsError("installed runtime ownership is invalid")
+            if release.is_dir() and (
+                release.name.startswith("release-") or release.name.startswith(".staging-")
+            ):
+                shutil.rmtree(release)
+        with suppress(OSError):
+            self.releases.rmdir()
+        if self.transactions.exists():
+            shutil.rmtree(self.transactions)
+        with suppress(OSError):
+            self.runtime_root.rmdir()
+
     def uninstall(self) -> None:
         metadata = self._install_metadata(_json_object(self.claude_settings))
         self._bootout()
@@ -787,16 +1069,24 @@ class Installer:
             self.install_state.parent.rmdir()
         if self.cache.exists():
             shutil.rmtree(self.cache)
+        self._remove_installed_runtime()
 
 
 def discover_executable(invoked_as: Path | None = None) -> Path:
     candidate = invoked_as if invoked_as is not None else None
     if candidate is not None and (candidate.is_absolute() or candidate.parent != Path(".")):
         try:
-            return candidate.expanduser().resolve(strict=True)
+            expanded = candidate.expanduser().absolute()
+            expanded.resolve(strict=True)
+            return expanded
         except OSError as error:
             raise SettingsError("cross-agent-chat executable is unavailable") from error
     discovered = shutil.which(SERVER_NAME)
     if discovered is None:
         raise SettingsError("cross-agent-chat executable is not on PATH")
-    return Path(discovered).resolve(strict=True)
+    path = Path(discovered).absolute()
+    try:
+        path.resolve(strict=True)
+    except OSError as error:
+        raise SettingsError("cross-agent-chat executable is unavailable") from error
+    return path

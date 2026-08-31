@@ -2,70 +2,57 @@
 set -eu
 
 source_ref=${CROSS_AGENT_CHAT_SOURCE:-git+https://github.com/kwonsyup/cross-agent-chat.git@v0.1.2}
+product_root=$HOME/.local/share/cross-agent-chat-runtime
+releases_root=$product_root/releases
+mkdir -p "$releases_root"
+chmod 700 "$product_root" "$releases_root"
 
-backup_previous_runtime() {
-    previous_executable=$(command -v cross-agent-chat 2>/dev/null || true)
-    if [ -z "$previous_executable" ] && [ -x "$HOME/.local/bin/cross-agent-chat" ]; then
-        previous_executable=$HOME/.local/bin/cross-agent-chat
+staged_runtime=$(mktemp -d "$releases_root/.staging-XXXXXX")
+bootstrap_dir=
+cleanup() {
+    if [ -n "$staged_runtime" ]; then
+        rm -rf "$staged_runtime"
     fi
-    [ -n "$previous_executable" ] || return 0
-    runtime_root=$(/usr/bin/python3 - "$previous_executable" "$HOME" <<'PY'
-import sys
-from pathlib import Path
-
-executable = Path(sys.argv[1]).resolve()
-home = Path(sys.argv[2]).resolve()
-root = executable.parent.parent
-allowed = {
-    home / ".local/share/uv/tools/cross-agent-chat",
-    home / ".local/share/pipx/venvs/cross-agent-chat",
-    home / ".local/pipx/venvs/cross-agent-chat",
-    home / ".local/share/cross-agent-chat",
+    rmdir "$releases_root" "$product_root" 2>/dev/null || true
+    if [ -n "$bootstrap_dir" ]; then
+        rm -rf "$bootstrap_dir"
+    fi
 }
-if root in allowed and root.is_dir():
-    print(root)
-PY
-)
-    [ -n "$runtime_root" ] || return 0
-    backup_parent=$HOME/.cache/cross-agent-chat/runtime-backups
-    mkdir -p "$backup_parent"
-    chmod 700 "$backup_parent"
-    previous_runtime=$(mktemp -d "$backup_parent/runtime.XXXXXX")
-    chmod 700 "$previous_runtime"
-    cp -R "$runtime_root/." "$previous_runtime/"
-    export CROSS_AGENT_CHAT_PREVIOUS_RUNTIME=$previous_runtime
-    export CROSS_AGENT_CHAT_RUNTIME_ROOT=$runtime_root
-}
+trap cleanup EXIT HUP INT TERM
 
 python_is_compatible() {
     command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'
 }
 
-backup_previous_runtime
-
 if command -v uv >/dev/null 2>&1; then
-    uv tool install --force --python 3.11 "$source_ref"
-elif command -v pipx >/dev/null 2>&1 && python_is_compatible; then
-    pipx install --force "$source_ref"
+    uv_command=$(command -v uv)
 elif python_is_compatible; then
-    runtime="$HOME/.local/share/cross-agent-chat"
-    python3 -m venv "$runtime"
-    "$runtime/bin/python" -m pip install --force-reinstall "$source_ref"
-    mkdir -p "$HOME/.local/bin"
-    ln -sfn "$runtime/bin/cross-agent-chat" "$HOME/.local/bin/cross-agent-chat"
+    uv_command=
 else
     bootstrap_dir=$(mktemp -d /tmp/cross-agent-chat-uv.XXXXXX)
-    trap 'rm -rf "$bootstrap_dir"' EXIT HUP INT TERM
     curl -fsSL https://astral.sh/uv/install.sh -o "$bootstrap_dir/install-uv.sh"
-    UV_UNMANAGED_INSTALL="$HOME/.local/bin" sh "$bootstrap_dir/install-uv.sh"
-    "$HOME/.local/bin/uv" tool install --force --python 3.11 "$source_ref"
+    UV_UNMANAGED_INSTALL="$bootstrap_dir/bin" sh "$bootstrap_dir/install-uv.sh"
+    uv_command=$bootstrap_dir/bin/uv
 fi
 
-if command -v cross-agent-chat >/dev/null 2>&1; then
-    cross-agent-chat setup
-elif [ -x "$HOME/.local/bin/cross-agent-chat" ]; then
-    "$HOME/.local/bin/cross-agent-chat" setup
+if [ -n "$uv_command" ]; then
+    "$uv_command" venv --python 3.11 "$staged_runtime"
+    "$uv_command" pip install --python "$staged_runtime/bin/python" "$source_ref"
 else
-    printf '%s\n' 'Cross Agent Chat installed, but its executable is not available.' >&2
-    exit 2
+    python3 -m venv "$staged_runtime"
+    "$staged_runtime/bin/python" -m pip install "$source_ref"
 fi
+
+previous_executable=$(command -v cross-agent-chat 2>/dev/null || true)
+case "$previous_executable" in
+    "$HOME"/*) stable_entrypoint=$previous_executable ;;
+    *) stable_entrypoint=$HOME/.local/bin/cross-agent-chat ;;
+esac
+
+"$staged_runtime/bin/python" -c 'import cross_agent_chat'
+"$staged_runtime/bin/cross-agent-chat" --version
+"$staged_runtime/bin/cross-agent-chat" _install-staged \
+    --staged-runtime "$staged_runtime" \
+    --stable-entrypoint "$stable_entrypoint"
+
+staged_runtime=

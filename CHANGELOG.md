@@ -2,11 +2,13 @@
 
 ## 0.1.2 - 2026-08-30
 
-- Preserve a previously healthy broker when upgrade preparation fails before service
-  transition.
-- Restore, restart, and health-check the previous broker when candidate activation or
-  health verification fails.
-- Retain the rollback backup and report both failures if predecessor recovery fails.
+- Stage and verify a product-owned runtime before changing the public command, provider
+  configuration, or broker.
+- Switch one stable executable identity atomically across uv, pipx, local-venv, custom-root,
+  and symlinked predecessor layouts without guessing package-manager internals.
+- Restore the exact previous pointer, public entrypoint, configuration, and broker state when
+  transition or candidate-health verification fails; retain evidence on compound rollback
+  failure.
 
 ## 0.1.1 - 2026-08-29
 

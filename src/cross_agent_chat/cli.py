@@ -214,6 +214,9 @@ def parser() -> argparse.ArgumentParser:
     pretool = commands.add_parser("_pretool")
     pretool.add_argument("--expected", required=True)
     pretool.add_argument("--content-hmac-key", required=True)
+    staged_install = commands.add_parser("_install-staged")
+    staged_install.add_argument("--staged-runtime", type=Path, required=True)
+    staged_install.add_argument("--stable-entrypoint", type=Path, required=True)
     return root
 
 
@@ -279,6 +282,16 @@ def run(arguments: argparse.Namespace) -> int:
         from cross_agent_chat.claude_runtime import run_pretool_gate
 
         return 0 if run_pretool_gate(arguments.expected, arguments.content_hmac_key) else 2
+    elif command == "_install-staged":
+        device = default_device()
+        installer = Installer(
+            home=Path.home(),
+            executable=arguments.stable_entrypoint,
+            device=device,
+            tailnet_address=local_tailnet_address(),
+        )
+        installer.install_staged(arguments.staged_runtime, arguments.stable_entrypoint)
+        print(f"Cross Agent Chat is ready on {device}. Start fresh Claude/Codex sessions.")
     else:
         _fail("unsupported command")
     return 0
