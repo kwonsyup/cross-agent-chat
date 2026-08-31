@@ -32,9 +32,15 @@ chmod 700 "$product_root" "$releases_root"
 
 staged_runtime=$(mktemp -d "$releases_root/release-XXXXXX")
 bootstrap_dir=
+owner_identity=$(/bin/ps -ww -p "$$" -o lstart= -o command= | shasum -a 256 | awk '{print $1}')
 cleanup() {
     if [ -n "$staged_runtime" ]; then
-        rm -rf "$staged_runtime"
+        marker=$staged_runtime/.cross-agent-chat-release
+        expected="cross-agent-chat-runtime-v1:staged:$$:$owner_identity"
+        if [ ! -e "$marker" ] ||
+            { [ -f "$marker" ] && [ "$(sed -n '1p' "$marker")" = "$expected" ]; }; then
+            rm -rf "$staged_runtime"
+        fi
     fi
     rmdir "$releases_root" "$product_root" 2>/dev/null || true
     if [ -n "$bootstrap_dir" ]; then
@@ -63,7 +69,6 @@ if [ -n "$uv_command" ]; then
 else
     python3 -m venv "$staged_runtime"
 fi
-owner_identity=$(/bin/ps -ww -p "$$" -o lstart= -o command= | shasum -a 256 | awk '{print $1}')
 printf '%s:%s:%s\n' 'cross-agent-chat-runtime-v1:staged' "$$" "$owner_identity" > "$staged_runtime/.cross-agent-chat-release"
 chmod 600 "$staged_runtime/.cross-agent-chat-release"
 if [ -n "$uv_command" ]; then

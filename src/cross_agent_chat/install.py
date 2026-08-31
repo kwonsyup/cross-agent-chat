@@ -74,7 +74,8 @@ class InstallReport:
 @dataclass(frozen=True, slots=True)
 class PreparedSetup:
     payloads: dict[Path, bytes]
-    originals: dict[Path, bytes | None]
+    destinations: dict[Path, Path]
+    originals: dict[Path, PathSnapshot]
     backup: Path
 
 
@@ -282,7 +283,8 @@ def _process_identity_digest(pid: int) -> str | None:
     )
     if result.returncode != 0 or not result.stdout:
         return None
-    return hashlib.sha256(result.stdout).hexdigest()
+    payload = result.stdout.encode() if isinstance(result.stdout, str) else result.stdout
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _hook_command(executable: Path, provider: str, device: str, event: str) -> str:
@@ -673,28 +675,41 @@ class Installer:
             self.install_state: _json_bytes(install_metadata),
         }
 
-    def _backup(self, originals: dict[Path, bytes | None]) -> Path:
+    def _backup(self, originals: dict[Path, PathSnapshot]) -> Path:
         root = self.home / ".cache" / SERVER_NAME / "backups"
         ensure_private_dir(root)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         destination = root / f"{stamp}-{uuid4().hex[:8]}"
         ensure_private_dir(destination)
         manifest = {
-            str(path.relative_to(self.home)): None
-            if payload is None
-            else base64.b64encode(payload).decode("ascii")
-            for path, payload in originals.items()
+            str(path.relative_to(self.home)): _snapshot_json(snapshot)
+            for path, snapshot in originals.items()
         }
         atomic_json(destination / "manifest.json", manifest)
         return destination
 
     def _prepare_setup(self) -> PreparedSetup:
         payloads = self._payloads()
-        originals = {path: path.read_bytes() if path.exists() else None for path in payloads}
+        destinations: dict[Path, Path] = {}
+        originals: dict[Path, PathSnapshot] = {}
+        for path in payloads:
+            destination = path
+            if path.is_symlink():
+                destination = path.resolve(strict=True)
+                if not destination.is_relative_to(self.home):
+                    raise SettingsError(f"managed configuration symlink escapes home: {path}")
+                originals[path] = _snapshot_path(path)
+            destinations[path] = destination
+            originals[destination] = _snapshot_path(destination)
         if self.legacy_peers.exists():
-            originals[self.legacy_peers] = self.legacy_peers.read_bytes()
+            originals[self.legacy_peers] = _snapshot_path(self.legacy_peers)
         backup = self._backup(originals)
-        return PreparedSetup(payloads=payloads, originals=originals, backup=backup)
+        return PreparedSetup(
+            payloads=payloads,
+            destinations=destinations,
+            originals=originals,
+            backup=backup,
+        )
 
     def setup(
         self,
@@ -715,8 +730,9 @@ class Installer:
         written: list[Path] = []
         try:
             for path, payload in transaction.payloads.items():
-                _atomic_write(path, payload)
-                written.append(path)
+                destination = transaction.destinations[path]
+                _atomic_write(destination, payload)
+                written.append(destination)
             if self.legacy_peers.exists():
                 self.legacy_peers.unlink()
                 written.append(self.legacy_peers)
@@ -726,11 +742,7 @@ class Installer:
         except (OSError, SettingsError) as failure:
             try:
                 for path in reversed(written):
-                    original = transaction.originals[path]
-                    if original is None:
-                        path.unlink(missing_ok=True)
-                    else:
-                        _atomic_write(path, original)
+                    _restore_path(transaction.originals[path])
             except (OSError, SettingsError) as rollback:
                 raise SetupRollbackError(failure, rollback, transaction.backup) from failure
             raise
@@ -741,10 +753,17 @@ class Installer:
         for relative, encoded in manifest.items():
             if not isinstance(relative, str):
                 raise SettingsError("backup manifest is invalid")
-            destination = (self.home / relative).resolve()
-            if not destination.is_relative_to(self.home):
+            relative_path = Path(relative)
+            destination = self.home / relative_path
+            if (
+                relative_path.is_absolute()
+                or ".." in relative_path.parts
+                or not destination.parent.resolve(strict=False).is_relative_to(self.home)
+            ):
                 raise SettingsError("backup manifest is invalid")
-            if encoded is None:
+            if isinstance(encoded, dict):
+                _restore_path(_snapshot_from_json(destination, encoded))
+            elif encoded is None:
                 destination.unlink(missing_ok=True)
             elif isinstance(encoded, str):
                 try:
@@ -961,6 +980,7 @@ class Installer:
                 "prepared",
                 "runtime_switching",
                 "runtime_switched",
+                "config_writing",
                 "config_written",
                 "service_starting",
                 "service_started",
@@ -977,14 +997,22 @@ class Installer:
             or re.fullmatch(r"[0-9a-f]{64}", package_digest) is None
         ):
             raise SettingsError("transaction metadata is invalid")
-        stable = self.home / stable_relative
-        backup = self.home / backup_relative
-        candidate = self.releases / candidate_name
+        stable_path = Path(stable_relative)
+        backup_path = Path(backup_relative)
         if (
-            not stable.is_absolute()
-            or not stable.is_relative_to(self.home)
-            or backup.resolve(strict=True).parent != (self.cache / "backups").resolve(strict=True)
+            stable_path.is_absolute()
+            or backup_path.is_absolute()
+            or ".." in stable_path.parts
+            or ".." in backup_path.parts
+            or stable_path.name != SERVER_NAME
         ):
+            raise SettingsError("transaction metadata is invalid")
+        stable = self.home / stable_path
+        backup = self.home / backup_path
+        candidate = self.releases / candidate_name
+        if not stable.parent.resolve(strict=True).is_relative_to(self.home) or backup.resolve(
+            strict=True
+        ).parent != (self.cache / "backups").resolve(strict=True):
             raise SettingsError("transaction metadata is invalid")
         return RecoveryTransaction(
             phase=phase,
@@ -1009,6 +1037,7 @@ class Installer:
         entrypoint_snapshot: PathSnapshot,
         candidate: Path,
         runtime_transition_started: bool,
+        config_transition_started: bool,
         service_transition_started: bool,
         previous_broker_loaded: bool,
         cleanup_on_success: bool = True,
@@ -1021,10 +1050,11 @@ class Installer:
                 service_stopped = True
             except (OSError, subprocess.SubprocessError, SettingsError) as error:
                 failures.append(f"broker stop failed: {error}")
-        try:
-            self._restore(config_backup)
-        except (OSError, SettingsError) as error:
-            failures.append(f"configuration restore failed: {error}")
+        if config_transition_started:
+            try:
+                self._restore(config_backup)
+            except (OSError, SettingsError) as error:
+                failures.append(f"configuration restore failed: {error}")
         if runtime_transition_started:
             for label, snapshot in (
                 ("runtime pointer", current_snapshot),
@@ -1085,6 +1115,8 @@ class Installer:
                 entrypoint_snapshot=transaction.entrypoint_snapshot,
                 candidate=transaction.candidate,
                 runtime_transition_started=True,
+                config_transition_started=transaction.phase
+                in {"config_writing", "config_written", "service_starting", "service_started"},
                 service_transition_started=transaction.phase
                 in {"service_starting", "service_started"},
                 previous_broker_loaded=transaction.previous_broker_loaded,
@@ -1197,6 +1229,7 @@ class Installer:
         report: InstallReport | None = None
         service_transition_started = False
         runtime_transition_started = False
+        config_transition_started = False
         try:
             self._stop_couriers()
             record("runtime_switching")
@@ -1204,6 +1237,8 @@ class Installer:
             _atomic_symlink(f"releases/{final_runtime.name}", self.current_runtime)
             _atomic_symlink(str(self.current_runtime / "bin" / SERVER_NAME), stable)
             record("runtime_switched")
+            record("config_writing")
+            config_transition_started = True
             report = self.setup(prepared=prepared_setup)
             record("config_written")
             self._remove_runtime_state()
@@ -1229,6 +1264,7 @@ class Installer:
                     entrypoint_snapshot=entrypoint_snapshot,
                     candidate=final_runtime,
                     runtime_transition_started=runtime_transition_started,
+                    config_transition_started=config_transition_started,
                     service_transition_started=service_transition_started,
                     previous_broker_loaded=previous_broker_loaded,
                     cleanup_on_success=not setup_rollback_failed,
@@ -1452,6 +1488,9 @@ class Installer:
         if listener.returncode != 0 or len(raw_pids) != 1 or not raw_pids[0].isdigit():
             raise SettingsError("local broker port is occupied by an unverified process")
         pid = int(raw_pids[0])
+        process_identity = _process_identity_digest(pid)
+        if process_identity is None:
+            raise SettingsError("local broker port is occupied by an unverified process")
         uid = subprocess.run(
             ["/bin/ps", "-p", str(pid), "-o", "uid="],
             stdin=subprocess.DEVNULL,
@@ -1474,6 +1513,10 @@ class Installer:
             broker_executable = Path(tokens[broker_index - 1])
         except (ValueError, IndexError):
             raise SettingsError("local broker port is occupied by an unverified process") from None
+        try:
+            resolved_executable = broker_executable.resolve(strict=True)
+        except OSError:
+            raise SettingsError("local broker port is occupied by an unverified process") from None
         if (
             uid.returncode != 0
             or uid.stdout.strip() != str(os.getuid())
@@ -1481,11 +1524,11 @@ class Installer:
             or broker_index == 0
             or broker_executable.name != SERVER_NAME
             or not broker_executable.is_absolute()
-            or not broker_executable.is_relative_to(self.home)
+            or not resolved_executable.is_relative_to(self.home)
         ):
             raise SettingsError("local broker port is occupied by an unverified process")
         version = subprocess.run(
-            [str(broker_executable), "--version"],
+            [str(resolved_executable), "--version"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -1498,6 +1541,11 @@ class Installer:
             is None
         ):
             raise SettingsError("local broker port is occupied by an unverified process")
+        if (
+            self._local_broker_listener_pid() != pid
+            or _process_identity_digest(pid) != process_identity
+        ):
+            raise SettingsError("local broker process changed before termination")
         os.kill(pid, signal.SIGTERM)
         if not self._wait_for_broker_port_release():
             raise SettingsError("owned predecessor broker did not stop")
