@@ -1459,6 +1459,7 @@ class Installer:
     def _broker_port_is_available(self) -> bool:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((LOCAL_BROKER_HOST, LOCAL_BROKER_PORT))
             listener.listen(1)
             return True

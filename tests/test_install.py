@@ -4,6 +4,7 @@ import json
 import os
 import plistlib
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -697,6 +698,37 @@ def test_stop_broker_requires_port_release_after_label_disappears(
     installer._stop_broker()
 
     assert calls == ["bootout", "orphan"]
+
+
+def test_broker_port_probe_uses_broker_reuse_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    calls: list[str] = []
+
+    class ProbeSocket:
+        def setsockopt(self, level: int, option: int, value: int) -> None:
+            assert (level, option, value) == (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            calls.append("reuse")
+
+        def bind(self, address: tuple[str, int]) -> None:
+            assert address[0] == "127.0.0.1"
+            calls.append("bind")
+
+        def listen(self, backlog: int) -> None:
+            assert backlog == 1
+            calls.append("listen")
+
+        def close(self) -> None:
+            calls.append("close")
+
+    probe = ProbeSocket()
+    monkeypatch.setattr("cross_agent_chat.install.socket.socket", lambda *_args: probe)
+
+    assert installer._broker_port_is_available()
+    assert calls == ["reuse", "bind", "listen", "close"]
 
 
 def test_orphan_probe_accepts_port_released_before_listener_readback(
