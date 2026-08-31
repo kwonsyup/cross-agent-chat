@@ -177,6 +177,30 @@ def dispatch_broker_connection(
     return True
 
 
+def dispatch_ready_brokers(
+    workers: Executor,
+    root: Path,
+    readable: list[socket.socket],
+    admission: BrokerAdmission,
+) -> int:
+    """Accept each ready listener without letting one vanished connection stall the broker."""
+    dispatched = 0
+    for server in readable:
+        try:
+            connection, peer = server.accept()
+        except BlockingIOError:
+            continue
+        if dispatch_broker_connection(
+            workers,
+            root,
+            connection,
+            cast(tuple[str, int], peer)[0],
+            admission,
+        ):
+            dispatched += 1
+    return dispatched
+
+
 def broker_server(state_root_value: str | None) -> None:
     """Serve localhost and, when available, this Mac's private Tailnet address."""
     root = state_root(state_root_value)
@@ -187,6 +211,7 @@ def broker_server(state_root_value: str | None) -> None:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind((host, port))
             server.listen(16)
+            server.setblocking(False)
             servers.append(server)
         admission = BrokerAdmission()
         with ThreadPoolExecutor(
@@ -195,14 +220,7 @@ def broker_server(state_root_value: str | None) -> None:
         ) as workers:
             while True:
                 readable, _, _ = select.select(servers, [], [])
-                connection, peer = readable[0].accept()
-                dispatch_broker_connection(
-                    workers,
-                    root,
-                    connection,
-                    cast(tuple[str, int], peer)[0],
-                    admission,
-                )
+                dispatch_ready_brokers(workers, root, readable, admission)
     finally:
         for server in servers:
             server.close()

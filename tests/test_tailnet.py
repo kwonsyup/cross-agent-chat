@@ -29,6 +29,7 @@ from cross_agent_chat.tailnet_broker import (
     BrokerAdmission,
     broker_bindings,
     dispatch_broker_connection,
+    dispatch_ready_brokers,
     handle_broker_request,
     serve_broker_connection,
 )
@@ -174,6 +175,26 @@ def test_silent_connection_does_not_block_another_broker_request(tmp_path: Path)
 
         silent_client.close()
         active_client.close()
+
+
+def test_vanished_ready_connection_does_not_block_broker_loop(tmp_path: Path) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.setblocking(False)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            assert (
+                dispatch_ready_brokers(
+                    workers,
+                    tmp_path,
+                    [listener],
+                    BrokerAdmission(),
+                )
+                == 0
+            )
+    finally:
+        listener.close()
 
 
 def test_broker_admission_rejects_third_connection_from_one_peer() -> None:
