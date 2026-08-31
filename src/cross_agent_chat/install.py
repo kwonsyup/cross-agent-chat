@@ -34,6 +34,7 @@ SERVER_NAME: Final = "cross-agent-chat"
 LAUNCH_AGENT_LABEL: Final = "io.github.kwonsyup.cross-agent-chat"
 BROKER_HEALTH_ATTEMPTS: Final = 300
 BROKER_HEALTH_INTERVAL_SECONDS: Final = 0.25
+BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS: Final = 3.0
 OWNED_TOML_START: Final = "# cross-agent-chat:start"
 OWNED_TOML_END: Final = "# cross-agent-chat:end"
 RELEASE_MARKER: Final = ".cross-agent-chat-release"
@@ -1380,7 +1381,7 @@ class Installer:
                 LOCAL_BROKER_HOST,
                 {"schema_version": 1, "operation": "health"},
                 port=LOCAL_BROKER_PORT,
-                timeout=1.0,
+                timeout=BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
             )
         except RuntimeError:
             return False
@@ -1431,7 +1432,7 @@ class Installer:
                 LOCAL_BROKER_HOST,
                 {"schema_version": 1, "operation": "health"},
                 port=LOCAL_BROKER_PORT,
-                timeout=1.0,
+                timeout=BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
             )
         except (OSError, RuntimeError, SettingsError, subprocess.SubprocessError):
             return False

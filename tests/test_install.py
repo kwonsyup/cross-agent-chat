@@ -17,6 +17,8 @@ from pathlib import Path
 import pytest
 
 from cross_agent_chat.install import (
+    BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
+    BrokerService,
     Installer,
     InstallReport,
     SettingsError,
@@ -2090,6 +2092,43 @@ def test_broker_health_reports_timeout_as_unavailable(
     )
 
     assert not installer.broker_is_healthy()
+
+
+def test_broker_health_uses_bounded_three_second_local_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    executable = home / "runtime/bin/cross-agent-chat"
+    module = home / "runtime/lib/cross_agent_chat/tailnet_broker.py"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("candidate")
+    module.parent.mkdir(parents=True)
+    module.write_text("candidate")
+    installer = Installer(home=home, executable=executable, device="studio")
+    timeouts: list[float] = []
+    monkeypatch.setattr(
+        installer,
+        "_broker_service",
+        lambda: BrokerService(pid=4242, program=executable),
+    )
+
+    def request(*_args: object, **kwargs: object) -> dict[str, object]:
+        timeout = kwargs.get("timeout")
+        assert isinstance(timeout, float)
+        timeouts.append(timeout)
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "pid": 4242,
+            "version": "0.1.2",
+            "module_path": str(module),
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
+
+    assert installer.broker_is_healthy()
+    assert timeouts == [BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS]
+    assert timeouts == [3.0]
 
 
 def test_uninstall_removes_owned_runtime_state_and_backups(tmp_path: Path) -> None:
