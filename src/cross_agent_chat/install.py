@@ -112,6 +112,13 @@ class RecoveryTransaction:
     package_tree_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeRemovalPlan:
+    current: Path
+    owned_releases: tuple[Path, ...]
+    entrypoints: tuple[Path, ...]
+
+
 def default_device() -> str:
     candidate = os.uname().nodename.split(".", maxsplit=1)[0].lower()
     try:
@@ -193,6 +200,21 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _fsync_tree(root: Path) -> None:
+    for item in sorted(root.rglob("*"), key=lambda path: len(path.parts), reverse=True):
+        if item.is_symlink():
+            continue
+        if item.is_dir():
+            _fsync_directory(item)
+            continue
+        descriptor = os.open(item, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    _fsync_directory(root)
 
 
 def _restore_path(snapshot: PathSnapshot) -> None:
@@ -729,6 +751,7 @@ class Installer:
         _fsync_directory(root)
         _fsync_directory(root.parent)
         _fsync_directory(root.parent.parent)
+        _fsync_directory(self.home)
         return destination
 
     def _prepare_setup(self) -> PreparedSetup:
@@ -850,8 +873,11 @@ class Installer:
                 try:
                     if service_transition_started:
                         self.activate()
-                    if previous_broker_healthy and not self._wait_for_previous_broker_health():
-                        raise SettingsError("previous healthy broker did not become healthy")
+                    if previous_broker_healthy:
+                        if not self._wait_for_previous_broker_health():
+                            raise SettingsError("previous healthy broker did not become healthy")
+                    elif not self.broker_is_loaded():
+                        raise SettingsError("previous broker did not become loaded")
                 except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as error:
                     rollback_failures.append(f"predecessor broker restore failed: {error}")
             if rollback_failures:
@@ -1046,12 +1072,24 @@ class Installer:
             or stable_path.name != SERVER_NAME
         ):
             raise SettingsError("transaction metadata is invalid")
-        stable = self.home / stable_path
+        stable = self._validate_stable_entrypoint(self.home / stable_path)
         backup = self.home / backup_path
         candidate = self.releases / candidate_name
-        if not stable.parent.resolve(strict=False).is_relative_to(self.home) or backup.resolve(
-            strict=True
-        ).parent != (self.cache / "backups").resolve(strict=True):
+        if backup.resolve(strict=True).parent != (self.cache / "backups").resolve(strict=True):
+            raise SettingsError("transaction metadata is invalid")
+        marker = candidate / RELEASE_MARKER
+        marker_text = (
+            marker.read_text(encoding="utf-8")
+            if marker.is_file() and not marker.is_symlink()
+            else ""
+        )
+        if phase == "committed":
+            marker_matches = marker_text == COMMITTED_RELEASE_MARKER
+        else:
+            marker_matches = marker_text == (
+                f"cross-agent-chat-runtime-v1:transaction:{transaction.name}\n"
+            )
+        if re.fullmatch(r"[0-9a-f]{32}", transaction.name) is None or not marker_matches:
             raise SettingsError("transaction metadata is invalid")
         return RecoveryTransaction(
             phase=phase,
@@ -1107,8 +1145,11 @@ class Installer:
         if service_transition_started and previous_broker_loaded and service_stopped:
             try:
                 self.activate()
-                if previous_broker_healthy and not self._wait_for_previous_broker_health():
-                    raise SettingsError("previous broker did not become healthy")
+                if previous_broker_healthy:
+                    if not self._wait_for_previous_broker_health():
+                        raise SettingsError("previous broker did not become healthy")
+                elif not self.broker_is_loaded():
+                    raise SettingsError("previous broker did not become loaded")
             except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as error:
                 failures.append(f"predecessor broker restore failed: {error}")
         if failures:
@@ -1240,6 +1281,7 @@ class Installer:
         self._recover_unfinished_transaction()
         self._prune_abandoned_staged_releases({staged})
         stable = self._validate_stable_entrypoint(stable_entrypoint)
+        self.executable = stable
         current_snapshot = self._validate_runtime_pointer()
         entrypoint_snapshot = _snapshot_path(stable)
         previous_broker_loaded = self.broker_is_loaded()
@@ -1247,11 +1289,14 @@ class Installer:
             raise SettingsError("predecessor broker state is unmanaged; no changes were made")
         previous_broker_healthy = previous_broker_loaded and self._wait_for_previous_broker_health()
         prepared_setup = self._prepare_setup()
+        _fsync_tree(staged)
         package_digest = _package_tree_digest(staged)
 
         ensure_private_dir(self.transactions)
         _fsync_directory(self.runtime_root)
         _fsync_directory(self.runtime_root.parent)
+        _fsync_directory(self.runtime_root.parent.parent)
+        _fsync_directory(self.home)
         transaction_id = uuid4().hex
         preparing_transaction = self.transactions / f".preparing-{transaction_id}"
         transaction = self.transactions / transaction_id
@@ -1463,8 +1508,7 @@ class Installer:
             or not isinstance(pid, int)
             or isinstance(pid, bool)
             or pid != service.pid
-            or not isinstance(version, str)
-            or not version
+            or version != __version__
             or not isinstance(module_path, str)
         ):
             return False
@@ -1822,10 +1866,9 @@ class Installer:
         if self.state.exists():
             shutil.rmtree(self.state)
 
-    def _remove_installed_runtime(self, stable_entrypoint: Path | None = None) -> None:
-        self._prune_abandoned_staged_releases()
+    def _prepare_runtime_removal(self, stable_entrypoint: Path | None) -> RuntimeRemovalPlan | None:
         if not self.current_runtime.is_symlink():
-            return
+            return None
         self._validate_runtime_roots()
         try:
             current = self.current_runtime.resolve(strict=True)
@@ -1845,7 +1888,7 @@ class Installer:
             or current_marker.read_text(encoding="utf-8") != COMMITTED_RELEASE_MARKER
         ):
             raise SettingsError("installed runtime ownership is invalid")
-        owned_releases = [
+        owned_releases = tuple(
             release
             for release in self.releases.iterdir()
             if release.is_dir()
@@ -1854,18 +1897,34 @@ class Installer:
             and (release / RELEASE_MARKER).is_file()
             and not (release / RELEASE_MARKER).is_symlink()
             and (release / RELEASE_MARKER).read_text(encoding="utf-8") == COMMITTED_RELEASE_MARKER
-        ]
-        public_entrypoints = {self.executable, self.home / ".local" / "bin" / SERVER_NAME}
-        if stable_entrypoint is not None:
-            public_entrypoints.add(stable_entrypoint)
-        for public_entrypoint in public_entrypoints:
-            if (
-                public_entrypoint.is_symlink()
-                and public_entrypoint.resolve(strict=True) == expected
-            ):
-                public_entrypoint.unlink()
+        )
+        entrypoints: list[Path] = []
+        if stable_entrypoint is not None and stable_entrypoint.is_symlink():
+            try:
+                if stable_entrypoint.resolve(strict=True) == expected:
+                    entrypoints.append(stable_entrypoint)
+            except OSError as error:
+                raise SettingsError("installed runtime ownership is invalid") from error
+        if self.executable.is_symlink() and self.executable not in entrypoints:
+            try:
+                if self.executable.resolve(strict=True) == expected:
+                    entrypoints.append(self.executable)
+            except OSError as error:
+                raise SettingsError("installed runtime ownership is invalid") from error
+        return RuntimeRemovalPlan(
+            current=current,
+            owned_releases=owned_releases,
+            entrypoints=tuple(entrypoints),
+        )
+
+    def _remove_installed_runtime(self, plan: RuntimeRemovalPlan | None) -> None:
+        self._prune_abandoned_staged_releases()
+        if plan is None:
+            return
+        for public_entrypoint in plan.entrypoints:
+            public_entrypoint.unlink()
         self.current_runtime.unlink()
-        for release in owned_releases:
+        for release in plan.owned_releases:
             self._remove_release(release)
         with suppress(OSError):
             self.releases.rmdir()
@@ -1882,6 +1941,7 @@ class Installer:
         self._recover_unfinished_transaction()
         metadata = self._install_metadata(_json_object(self.claude_settings))
         stable_entrypoint = self.home / cast(str, metadata["stable_entrypoint"])
+        runtime_removal = self._prepare_runtime_removal(stable_entrypoint)
         self._stop_broker()
         self._stop_couriers()
         self._remove_runtime_state()
@@ -1917,7 +1977,7 @@ class Installer:
             self.install_state.parent.rmdir()
         if self.cache.exists():
             shutil.rmtree(self.cache)
-        self._remove_installed_runtime(stable_entrypoint)
+        self._remove_installed_runtime(runtime_removal)
 
 
 def discover_executable(invoked_as: Path | None = None) -> Path:

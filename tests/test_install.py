@@ -1210,6 +1210,12 @@ def _staged_runtime(installer: Installer, marker: str = "candidate") -> Path:
     return stage
 
 
+def _bind_transaction_marker(stage: Path, transaction: Path) -> None:
+    (stage / ".cross-agent-chat-release").write_text(
+        f"cross-agent-chat-runtime-v1:transaction:{transaction.name}\n"
+    )
+
+
 def test_staged_install_commits_stable_runtime_and_provider_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1263,8 +1269,15 @@ def test_staged_install_fsyncs_backup_and_journal_parents_before_first_effect(
 
     before_effect = events[: events.index("first-effect")]
     assert f"fsync:{installer.cache / 'backups'}" in before_effect
+    assert f"fsync:{installer.cache}" in before_effect
+    assert f"fsync:{home / '.cache'}" in before_effect
     assert f"fsync:{installer.runtime_root}" in before_effect
+    assert f"fsync:{home / '.local/share'}" in before_effect
+    assert f"fsync:{home / '.local'}" in before_effect
     assert f"fsync:{installer.transactions}" in before_effect
+    assert f"fsync:{stage}" in before_effect
+    assert f"fsync:{installer.releases}" in before_effect
+    assert f"fsync:{home}" in before_effect
 
 
 def test_staged_install_executes_non_relocated_venv_after_cutover(
@@ -1631,7 +1644,7 @@ def test_prepared_recovery_preserves_newer_runtime_and_entrypoint_state(tmp_path
     installer.current_runtime.symlink_to("releases/release-previous")
     stage = _staged_runtime(installer)
     prepared = installer._prepare_setup()
-    transaction = installer.transactions / "interrupted"
+    transaction = installer.transactions / ("a" * 32)
     transaction.mkdir(parents=True, mode=0o700)
     transaction.chmod(0o700)
     installer._record_transaction(
@@ -1646,6 +1659,7 @@ def test_prepared_recovery_preserves_newer_runtime_and_entrypoint_state(tmp_path
         previous_broker_healthy=False,
         package_tree_sha256=_package_tree_digest(stage),
     )
+    _bind_transaction_marker(stage, transaction)
     newer = installer.releases / "release-newer"
     (newer / "bin").mkdir(parents=True)
     (newer / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
@@ -1667,7 +1681,7 @@ def test_prepared_recovery_accepts_absent_entrypoint_parent(tmp_path: Path) -> N
     installer = Installer(home=home, executable=stable, device="studio")
     stage = _staged_runtime(installer)
     prepared = installer._prepare_setup()
-    transaction = installer.transactions / "interrupted"
+    transaction = installer.transactions / ("a" * 32)
     transaction.mkdir(parents=True, mode=0o700)
     installer._record_transaction(
         transaction,
@@ -1681,12 +1695,85 @@ def test_prepared_recovery_accepts_absent_entrypoint_parent(tmp_path: Path) -> N
         previous_broker_healthy=False,
         package_tree_sha256=_package_tree_digest(stage),
     )
+    _bind_transaction_marker(stage, transaction)
 
     installer._recover_unfinished_transaction()
 
     assert not stable.parent.exists()
     assert not stage.exists()
     assert not transaction.exists()
+
+
+def test_recovery_rejects_transaction_that_names_active_committed_release(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    stable = home / "bin/cross-agent-chat"
+    stable.parent.mkdir(parents=True)
+    installer = Installer(home=home, executable=stable, device="studio")
+    active = installer.releases / "release-active"
+    (active / "bin").mkdir(parents=True)
+    (active / "bin/cross-agent-chat").write_text("active")
+    (active / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
+    installer.current_runtime.symlink_to("releases/release-active")
+    stable.symlink_to(installer.current_runtime / "bin/cross-agent-chat")
+    prepared = installer._prepare_setup()
+    transaction = installer.transactions / ("a" * 32)
+    transaction.mkdir(parents=True, mode=0o700)
+    installer._record_transaction(
+        transaction,
+        phase="prepared",
+        staged=active,
+        stable_entrypoint=stable,
+        current_snapshot=_snapshot_path(installer.current_runtime),
+        entrypoint_snapshot=_snapshot_path(stable),
+        config_backup=prepared.backup,
+        previous_broker_loaded=False,
+        previous_broker_healthy=False,
+        package_tree_sha256=_package_tree_digest(active),
+    )
+
+    with pytest.raises(SettingsError, match="transaction metadata is invalid"):
+        installer._recover_unfinished_transaction()
+
+    assert active.exists()
+    assert installer.current_runtime.resolve() == active.resolve()
+    assert stable.resolve() == active / "bin/cross-agent-chat"
+
+
+def test_recovery_rejects_runtime_internal_stable_entrypoint(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    stable = home / "bin/cross-agent-chat"
+    stable.parent.mkdir(parents=True)
+    installer = Installer(home=home, executable=stable, device="studio")
+    stage = _staged_runtime(installer)
+    prepared = installer._prepare_setup()
+    transaction = installer.transactions / ("a" * 32)
+    transaction.mkdir(parents=True, mode=0o700)
+    installer._record_transaction(
+        transaction,
+        phase="prepared",
+        staged=stage,
+        stable_entrypoint=stable,
+        current_snapshot=_snapshot_path(installer.current_runtime),
+        entrypoint_snapshot=_snapshot_path(stable),
+        config_backup=prepared.backup,
+        previous_broker_loaded=False,
+        previous_broker_healthy=False,
+        package_tree_sha256=_package_tree_digest(stage),
+    )
+    _bind_transaction_marker(stage, transaction)
+    metadata_path = transaction / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["stable_entrypoint"] = str(
+        (installer.runtime_root / "current/bin/cross-agent-chat").relative_to(home)
+    )
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(SettingsError, match="owner-local"):
+        installer._recover_unfinished_transaction()
+
+    assert stage.exists()
 
 
 def test_runtime_switching_recovery_restores_pointer_and_entrypoint(
@@ -1703,7 +1790,7 @@ def test_runtime_switching_recovery_restores_pointer_and_entrypoint(
     installer.current_runtime.symlink_to("releases/release-previous")
     stage = _staged_runtime(installer)
     prepared = installer._prepare_setup()
-    transaction = installer.transactions / "interrupted"
+    transaction = installer.transactions / ("a" * 32)
     transaction.mkdir(parents=True, mode=0o700)
     installer._record_transaction(
         transaction,
@@ -1717,6 +1804,7 @@ def test_runtime_switching_recovery_restores_pointer_and_entrypoint(
         previous_broker_healthy=False,
         package_tree_sha256=_package_tree_digest(stage),
     )
+    _bind_transaction_marker(stage, transaction)
     installer.current_runtime.unlink()
     installer.current_runtime.symlink_to("releases/release-test")
     stable.unlink()
@@ -1740,7 +1828,7 @@ def test_recovery_stops_service_effect_after_service_starting_record(
     installer = Installer(home=home, executable=stable, device="studio")
     stage = _staged_runtime(installer)
     prepared = installer._prepare_setup()
-    transaction = installer.transactions / "interrupted"
+    transaction = installer.transactions / ("a" * 32)
     transaction.mkdir(parents=True, mode=0o700)
     transaction.chmod(0o700)
     installer._record_transaction(
@@ -1755,6 +1843,7 @@ def test_recovery_stops_service_effect_after_service_starting_record(
         previous_broker_healthy=False,
         package_tree_sha256=_package_tree_digest(stage),
     )
+    _bind_transaction_marker(stage, transaction)
     bootouts = 0
 
     def bootout() -> None:
@@ -1828,7 +1917,7 @@ def test_recovery_rejects_stable_entrypoint_parent_escape(
     installer = Installer(home=home, executable=stable, device="studio")
     stage = _staged_runtime(installer)
     prepared = installer._prepare_setup()
-    transaction = installer.transactions / "retained"
+    transaction = installer.transactions / ("a" * 32)
     transaction.mkdir(parents=True, mode=0o700)
     transaction.chmod(0o700)
     installer._record_transaction(
@@ -1843,6 +1932,7 @@ def test_recovery_rejects_stable_entrypoint_parent_escape(
         previous_broker_healthy=False,
         package_tree_sha256=_package_tree_digest(stage),
     )
+    _bind_transaction_marker(stage, transaction)
     metadata_path = transaction / "metadata.json"
     metadata = json.loads(metadata_path.read_text())
     metadata["stable_entrypoint"] = "../outside/cross-agent-chat"
@@ -1874,7 +1964,7 @@ def test_interrupted_transaction_restores_pointer_entrypoint_and_configuration(
     entrypoint_snapshot = _snapshot_path(stable)
     prepared = installer._prepare_setup()
     digest = _package_tree_digest(stage)
-    transaction = installer.transactions / "interrupted"
+    transaction = installer.transactions / ("a" * 32)
     transaction.mkdir(parents=True, mode=0o700)
     transaction.chmod(0o700)
     installer._record_transaction(
@@ -1889,6 +1979,7 @@ def test_interrupted_transaction_restores_pointer_entrypoint_and_configuration(
         previous_broker_healthy=False,
         package_tree_sha256=digest,
     )
+    _bind_transaction_marker(stage, transaction)
     installer.current_runtime.unlink()
     installer.current_runtime.symlink_to("releases/release-test")
     stable.unlink()
@@ -2057,6 +2148,7 @@ def test_rollback_restores_loaded_unhealthy_predecessor_without_health_promotion
 
     monkeypatch.setattr(installer, "_stop_broker", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
     monkeypatch.setattr(
         installer,
         "_wait_for_previous_broker_health",
@@ -2079,6 +2171,36 @@ def test_rollback_restores_loaded_unhealthy_predecessor_without_health_promotion
     assert activations == 1
     assert not candidate.exists()
     assert not transaction.exists()
+
+
+def test_rollback_rejects_unloaded_previously_loaded_unhealthy_predecessor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=home / "bin/cross-agent-chat", device="studio")
+    candidate = _staged_runtime(installer)
+    transaction = installer.transactions / "retained"
+    transaction.mkdir(parents=True)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+    monkeypatch.setattr(installer, "activate", lambda: None)
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+
+    with pytest.raises(SettingsError, match="previous broker did not become loaded"):
+        installer._rollback_transition(
+            transaction_path=transaction,
+            config_backup=home / "unused-backup",
+            current_snapshot=_snapshot_path(installer.current_runtime),
+            entrypoint_snapshot=_snapshot_path(home / "bin/cross-agent-chat"),
+            candidate=candidate,
+            runtime_transition_started=False,
+            config_transition_started=False,
+            service_transition_started=True,
+            previous_broker_loaded=True,
+            previous_broker_healthy=False,
+        )
+
+    assert candidate.exists()
+    assert transaction.exists()
 
 
 def test_staged_install_retains_evidence_when_predecessor_restart_fails(
@@ -2505,6 +2627,17 @@ def test_broker_health_uses_bounded_ten_second_local_request(
     assert installer.broker_is_healthy()
     assert len(timeouts) == 1
     assert 9.0 < timeouts[0] <= BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_tailnet",
+        lambda *_args, **_kwargs: {
+            "schema_version": 1,
+            "status": "READY",
+            "pid": 4242,
+            "version": "9.9.9",
+            "module_path": str(module),
+        },
+    )
+    assert not installer.broker_is_healthy()
 
 
 def test_candidate_health_wait_has_one_monotonic_total_deadline(
@@ -2636,6 +2769,37 @@ def test_uninstall_through_release_binary_removes_persisted_public_entrypoint(
 
     direct.uninstall()
 
+    assert not stable.exists()
+    assert not current.exists()
+    assert not release.exists()
+
+
+def test_uninstall_ignores_unrelated_broken_default_symlink_after_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    stable = home / "custom-bin/cross-agent-chat"
+    release = home / ".local/share/cross-agent-chat-runtime/releases/release-current"
+    candidate = release / "bin/cross-agent-chat"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("candidate")
+    (release / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
+    current = home / ".local/share/cross-agent-chat-runtime/current"
+    current.symlink_to("releases/release-current")
+    stable.parent.mkdir(parents=True)
+    stable.symlink_to(current / "bin/cross-agent-chat")
+    installed = Installer(home=home, executable=stable, device="studio")
+    installed.setup()
+    default = home / ".local/bin/cross-agent-chat"
+    default.parent.mkdir(parents=True)
+    default.symlink_to(home / "missing-unrelated")
+    monkeypatch.setattr(installed, "_stop_broker", lambda: None)
+    monkeypatch.setattr(installed, "_stop_couriers", lambda: None)
+
+    installed.uninstall()
+
+    assert default.is_symlink()
+    assert not default.exists()
     assert not stable.exists()
     assert not current.exists()
     assert not release.exists()
