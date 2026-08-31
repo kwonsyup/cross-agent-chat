@@ -12,7 +12,8 @@
 - Bind broker readiness to the exact running launchd PID, version, and runtime, and safely
   retire only a verified owner-local predecessor broker that still owns the port.
 - Serialize setup/install/uninstall, recover interrupted transitions from private transaction
-  state, and delete only marker-owned committed runtimes.
+  state, and limit deletion to marker-owned committed releases plus staging owned by the active
+  installer or proven abandoned by its recorded process incarnation.
 
 ## 0.1.1 - 2026-08-29
 
