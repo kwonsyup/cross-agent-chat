@@ -1448,15 +1448,16 @@ class Installer:
             )
         except (OSError, RuntimeError, SettingsError, subprocess.SubprocessError):
             return False
-        if service.program != self.executable:
-            return response.get("schema_version") == 1 and response.get("status") == "READY"
+        if response.get("schema_version") != 1 or response.get("status") != "READY":
+            return False
+        identity_fields = ("pid", "version", "module_path")
+        if not any(field in response for field in identity_fields):
+            return True
         pid = response.get("pid")
         version = response.get("version")
         module_path = response.get("module_path")
         if (
-            response.get("schema_version") != 1
-            or response.get("status") != "READY"
-            or not isinstance(pid, int)
+            not isinstance(pid, int)
             or isinstance(pid, bool)
             or pid != service.pid
             or version != __version__
@@ -1464,7 +1465,7 @@ class Installer:
         ):
             return False
         try:
-            runtime = self.executable.resolve(strict=True).parent.parent
+            runtime = service.program.resolve(strict=True).parent.parent
             module = Path(module_path).resolve(strict=True)
         except OSError:
             return False

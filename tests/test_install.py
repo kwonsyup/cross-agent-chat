@@ -2080,6 +2080,33 @@ def test_previous_broker_health_accepts_legacy_response_only_from_launchd_pid(
     assert installer._previous_broker_is_healthy()
 
 
+def test_previous_broker_health_accepts_same_program_legacy_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "legacy-runtime" / "bin" / "cross-agent-chat"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("legacy")
+    installer = Installer(home=tmp_path / "home", executable=executable, device="studio")
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if command[0] == "/usr/sbin/lsof":
+            return subprocess.CompletedProcess(command, 0, "4242\n", "")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            f"state = running\nprogram = {executable}\npid = 4242\n",
+            "",
+        )
+
+    monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_tailnet",
+        lambda *_args, **_kwargs: {"schema_version": 1, "status": "READY"},
+    )
+
+    assert installer._previous_broker_is_healthy()
+
+
 def test_broker_health_reports_timeout_as_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
