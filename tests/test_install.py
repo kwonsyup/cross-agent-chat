@@ -22,11 +22,13 @@ from cross_agent_chat.install import (
     BrokerService,
     Installer,
     InstallReport,
+    PathSnapshot,
     SettingsError,
     SetupRollbackError,
     _owned_hook,
     _package_tree_digest,
     _process_identity_digest,
+    _restore_path,
     _snapshot_path,
     discover_executable,
 )
@@ -1216,6 +1218,23 @@ def _bind_transaction_marker(stage: Path, transaction: Path) -> None:
     )
 
 
+def test_restore_absent_path_fsyncs_parent_after_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pointer = tmp_path / "runtime/current"
+    pointer.parent.mkdir()
+    pointer.symlink_to("candidate")
+    fsynced: list[Path] = []
+    monkeypatch.setattr(
+        "cross_agent_chat.install._fsync_directory", lambda path: fsynced.append(path)
+    )
+
+    _restore_path(PathSnapshot(path=pointer, kind="absent"))
+
+    assert not pointer.exists()
+    assert fsynced == [pointer.parent]
+
+
 def test_staged_install_commits_stable_runtime_and_provider_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1243,6 +1262,29 @@ def test_staged_install_commits_stable_runtime_and_provider_paths(
     assert str(stable) in installer.codex_config.read_text()
     assert str(stable) in installer.launch_agent.read_text()
     assert not list(installer.transactions.iterdir())
+
+
+def test_staged_upgrade_persists_entrypoint_selected_for_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    previous_stable = home / "previous-bin/cross-agent-chat"
+    installer = Installer(home=home, executable=previous_stable, device="studio")
+    installer.setup()
+    selected_stable = home / "selected-bin/cross-agent-chat"
+    stage = _staged_runtime(installer)
+    monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+    monkeypatch.setattr(installer, "activate", lambda: None)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: True)
+
+    installer.install_staged(stage, selected_stable)
+
+    metadata = json.loads(installer.install_state.read_text())
+    assert metadata["stable_entrypoint"] == str(selected_stable.relative_to(home))
 
 
 def test_staged_install_fsyncs_backup_and_journal_parents_before_first_effect(
@@ -1560,6 +1602,43 @@ def test_staged_install_rejects_stable_parent_symlink_outside_home(tmp_path: Pat
         installer._validate_stable_entrypoint(linked_parent / "cross-agent-chat")
 
 
+def test_durable_parent_rejects_escape_before_creating_external_child(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    (home / ".config").symlink_to(outside, target_is_directory=True)
+    installer = Installer(
+        home=home, executable=home / ".local/bin/cross-agent-chat", device="studio"
+    )
+
+    with pytest.raises(SettingsError, match="escapes home"):
+        installer._ensure_durable_parent(home / ".config/cross-agent-chat")
+
+    assert not (outside / "cross-agent-chat").exists()
+
+
+def test_durable_parent_creates_private_managed_directories(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    installer = Installer(
+        home=home, executable=home / ".local/bin/cross-agent-chat", device="studio"
+    )
+    parents = (
+        home / ".claude",
+        home / ".codex",
+        home / ".config/cross-agent-chat",
+        home / ".local/bin",
+        home / "Library/LaunchAgents",
+    )
+
+    for parent in parents:
+        installer._ensure_durable_parent(parent)
+
+    for parent in parents:
+        assert stat.S_IMODE(parent.stat().st_mode) == 0o700
+
+
 def test_staged_install_canonicalizes_entrypoint_under_symlinked_home(tmp_path: Path) -> None:
     physical_home = tmp_path / "physical-home"
     physical_home.mkdir()
@@ -1866,7 +1945,9 @@ def test_runtime_switching_recovery_restores_pointer_and_entrypoint(
     assert not stage.exists()
 
 
-def test_committing_recovery_finalizes_durable_committed_candidate(tmp_path: Path) -> None:
+def test_committing_recovery_conservatively_rolls_back_committed_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     stable = home / "bin/cross-agent-chat"
     installer = Installer(home=home, executable=stable, device="studio")
@@ -1891,12 +1972,13 @@ def test_committing_recovery_finalizes_durable_committed_candidate(tmp_path: Pat
     stable.parent.mkdir(parents=True)
     stable.symlink_to(installer.current_runtime / "bin/cross-agent-chat")
     (stage / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
 
     installer._recover_unfinished_transaction()
 
-    assert installer.current_runtime.resolve() == stage.resolve()
-    assert stable.resolve() == stage / "bin/cross-agent-chat"
-    assert stage.exists()
+    assert not installer.current_runtime.exists()
+    assert not stable.exists()
+    assert not stage.exists()
     assert not transaction.exists()
 
 
@@ -2501,6 +2583,41 @@ def test_uninstall_preserves_shared_claude_cross_session_setting(tmp_path: Path)
     assert json.loads(settings.read_text())["crossSessionInbound"] == "accept"
 
 
+def test_uninstall_preserves_in_home_provider_configuration_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    shared = home / "shared-config"
+    shared.mkdir(parents=True)
+    provider_paths = (
+        installer.claude_settings,
+        installer.claude_config,
+        installer.codex_config,
+        installer.codex_hooks,
+        installer.launch_agent,
+    )
+    targets: dict[Path, Path] = {}
+    for index, path in enumerate(provider_paths):
+        target = shared / f"provider-{index}"
+        target.write_text("" if path == installer.codex_config else "{}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(target)
+        targets[path] = target
+    installer.setup()
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+
+    installer.uninstall()
+
+    assert all(path.is_symlink() for path in provider_paths)
+    assert not targets[installer.launch_agent].exists()
+    assert json.loads(targets[installer.claude_config].read_text()).get("mcpServers", {}) == {}
+    hooks = json.loads(targets[installer.codex_hooks].read_text()).get("hooks", {})
+    assert all(not _owned_hook(group) for groups in hooks.values() for group in groups)
+
+
 def test_uninstall_restores_absent_claude_cross_session_setting(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
@@ -2953,6 +3070,37 @@ def test_uninstall_ignores_unrelated_broken_default_symlink_after_preflight(
     assert not stable.exists()
     assert not current.exists()
     assert not release.exists()
+
+
+def test_runtime_removal_revalidates_entrypoint_before_unlink(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    stable = home / "custom-bin/cross-agent-chat"
+    installer = Installer(home=home, executable=stable, device="studio")
+    release = installer.releases / "release-current"
+    candidate = release / "bin/cross-agent-chat"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("candidate")
+    (release / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
+    installer.current_runtime.symlink_to("releases/release-current")
+    stable.parent.mkdir(parents=True)
+    stable.symlink_to(installer.current_runtime / "bin/cross-agent-chat")
+    plan = installer._prepare_runtime_removal(stable)
+    assert plan is not None
+    replacement = home / "replacement"
+    replacement.write_text("unrelated")
+    stable.unlink()
+    stable.symlink_to(replacement)
+
+    with pytest.raises(SettingsError, match="ownership changed"):
+        installer._remove_installed_runtime(plan)
+
+    assert stable.is_symlink()
+    assert stable.resolve() == replacement
+    assert replacement.read_text() == "unrelated"
+    assert installer.current_runtime.resolve() == release.resolve()
+    assert release.exists()
 
 
 def test_uninstall_removes_stable_runtime_but_not_legacy_predecessor(

@@ -218,8 +218,11 @@ def _fsync_tree(root: Path) -> None:
 
 
 def _restore_path(snapshot: PathSnapshot) -> None:
+    existed = snapshot.path.is_symlink() or snapshot.path.exists()
     _remove_path(snapshot.path)
     if snapshot.kind == "absent":
+        if existed:
+            _fsync_directory(snapshot.path.parent)
         return
     if snapshot.kind == "symlink":
         if snapshot.target is None:
@@ -573,10 +576,22 @@ class Installer:
                 raise SettingsError("runtime ownership is invalid")
 
     def _ensure_durable_parent(self, parent: Path) -> None:
-        parent.mkdir(parents=True, exist_ok=True)
-        resolved = parent.resolve(strict=True)
+        if not self.home.exists():
+            self.home.mkdir(mode=0o700, exist_ok=True)
+        resolved = parent.resolve(strict=False)
         if not resolved.is_relative_to(self.home):
             raise SettingsError("managed path parent escapes home")
+        current = self.home
+        for part in resolved.relative_to(self.home).parts:
+            current /= part
+            if current.exists():
+                if not current.is_dir():
+                    raise SettingsError("managed path parent is invalid")
+            else:
+                current.mkdir(mode=0o700, exist_ok=True)
+                if not current.is_dir():
+                    raise SettingsError("managed path parent is invalid")
+                _fsync_directory(current.parent)
         current = resolved
         while True:
             _fsync_directory(current)
@@ -595,7 +610,10 @@ class Installer:
             return
         local_root = self.home / ".local"
         share_root = local_root / "share"
-        share_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            self._ensure_durable_parent(share_root)
+        except SettingsError as error:
+            raise SettingsError("install lock ownership is invalid") from error
         if not share_root.resolve(strict=True).is_relative_to(self.home.resolve(strict=True)):
             raise SettingsError("install lock ownership is invalid")
         flags = os.O_CREAT | os.O_RDWR
@@ -614,7 +632,11 @@ class Installer:
         finally:
             os.close(descriptor)
 
-    def _install_metadata(self, settings: dict[str, object]) -> dict[str, object]:
+    def _install_metadata(
+        self,
+        settings: dict[str, object],
+        stable_entrypoint: Path | None = None,
+    ) -> dict[str, object]:
         if self.install_state.exists():
             metadata = _json_object(self.install_state)
             previous = metadata.get("claude_cross_session_inbound")
@@ -650,6 +672,8 @@ class Installer:
                     stable = self._validate_stable_entrypoint(self.home / stable_relative)
                 except SettingsError as error:
                     raise SettingsError("Cross Agent Chat install state is invalid") from error
+            if stable_entrypoint is not None:
+                stable = self._validate_stable_entrypoint(stable_entrypoint)
             return {
                 "schema_version": 2,
                 "claude_cross_session_inbound": previous,
@@ -683,9 +707,9 @@ class Installer:
             }
         return plistlib.dumps(payload, sort_keys=True)
 
-    def _payloads(self) -> dict[Path, bytes]:
+    def _payloads(self, stable_entrypoint: Path | None = None) -> dict[Path, bytes]:
         claude_settings = _json_object(self.claude_settings)
-        install_metadata = self._install_metadata(claude_settings)
+        install_metadata = self._install_metadata(claude_settings, stable_entrypoint)
         claude_settings["crossSessionInbound"] = "accept"
         for event in ("SessionStart", "SessionEnd"):
             _merge_hook(
@@ -766,18 +790,29 @@ class Installer:
         _fsync_directory(self.home)
         return destination
 
-    def _prepare_setup(self) -> PreparedSetup:
-        payloads = self._payloads()
+    def _configuration_destinations(self) -> dict[Path, Path]:
         destinations: dict[Path, Path] = {}
-        originals: dict[Path, PathSnapshot] = {}
-        for path in payloads:
+        for path in self.config_paths:
             destination = path
             if path.is_symlink():
-                destination = path.resolve(strict=True)
+                try:
+                    destination = path.resolve(strict=True)
+                except OSError as error:
+                    raise SettingsError(
+                        f"managed configuration symlink is unavailable: {path}"
+                    ) from error
                 if not destination.is_relative_to(self.home):
                     raise SettingsError(f"managed configuration symlink escapes home: {path}")
-                originals[path] = _snapshot_path(path)
             destinations[path] = destination
+        return destinations
+
+    def _prepare_setup(self, stable_entrypoint: Path | None = None) -> PreparedSetup:
+        payloads = self._payloads(stable_entrypoint)
+        destinations = self._configuration_destinations()
+        originals: dict[Path, PathSnapshot] = {}
+        for path, destination in destinations.items():
+            if destination != path:
+                originals[path] = _snapshot_path(path)
             originals[destination] = _snapshot_path(destination)
         if self.legacy_peers.exists():
             originals[self.legacy_peers] = _snapshot_path(self.legacy_peers)
@@ -1103,8 +1138,6 @@ class Installer:
                 COMMITTED_RELEASE_MARKER,
                 f"cross-agent-chat-runtime-v1:transaction:{transaction.name}\n",
             }
-            if marker_text == COMMITTED_RELEASE_MARKER:
-                phase = "committed"
         else:
             marker_matches = marker_text == (
                 f"cross-agent-chat-runtime-v1:transaction:{transaction.name}\n"
@@ -1317,7 +1350,7 @@ class Installer:
         if not previous_broker_loaded and not self._broker_port_is_available():
             raise SettingsError("predecessor broker state is unmanaged; no changes were made")
         previous_broker_healthy = previous_broker_loaded and self._wait_for_previous_broker_health()
-        prepared_setup = self._prepare_setup()
+        prepared_setup = self._prepare_setup(stable)
         for parent in {
             stable.parent,
             *(destination.parent for destination in prepared_setup.destinations.values()),
@@ -1972,9 +2005,19 @@ class Installer:
         )
 
     def _remove_installed_runtime(self, plan: RuntimeRemovalPlan | None) -> None:
-        self._prune_abandoned_staged_releases()
         if plan is None:
+            self._prune_abandoned_staged_releases()
             return
+        expected = plan.current / "bin" / SERVER_NAME
+        try:
+            if self.current_runtime.resolve(strict=True) != plan.current:
+                raise SettingsError("installed runtime ownership changed during uninstall")
+            for entrypoint in plan.entrypoints:
+                if not entrypoint.is_symlink() or entrypoint.resolve(strict=True) != expected:
+                    raise SettingsError("installed runtime ownership changed during uninstall")
+        except OSError as error:
+            raise SettingsError("installed runtime ownership changed during uninstall") from error
+        self._prune_abandoned_staged_releases()
         for public_entrypoint in plan.entrypoints:
             public_entrypoint.unlink()
         self.current_runtime.unlink()
@@ -1993,6 +2036,7 @@ class Installer:
 
     def _uninstall(self) -> None:
         self._recover_unfinished_transaction()
+        destinations = self._configuration_destinations()
         metadata = self._install_metadata(_json_object(self.claude_settings))
         stable_entrypoint = self.home / cast(str, metadata["stable_entrypoint"])
         runtime_removal = self._prepare_runtime_removal(stable_entrypoint)
@@ -2007,26 +2051,26 @@ class Installer:
                 claude_settings["crossSessionInbound"] = previous["value"]
             else:
                 claude_settings.pop("crossSessionInbound", None)
-        _atomic_write(self.claude_settings, _json_bytes(claude_settings))
+        _atomic_write(destinations[self.claude_settings], _json_bytes(claude_settings))
 
         claude = _json_object(self.claude_config)
         servers = claude.get("mcpServers")
         if isinstance(servers, dict):
             cast(dict[str, object], servers).pop(SERVER_NAME, None)
-        _atomic_write(self.claude_config, _json_bytes(claude))
+        _atomic_write(destinations[self.claude_config], _json_bytes(claude))
 
         codex_hooks = _json_object(self.codex_hooks)
         owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
         if self.codex_config.exists():
             cleaned = OWNED_TOML_RE.sub("\n", self.codex_config.read_text())
             cleaned = _remove_owned_hook_trust(cleaned, owned_trust_keys).lstrip("\n")
-            _atomic_write(self.codex_config, cleaned.encode())
+            _atomic_write(destinations[self.codex_config], cleaned.encode())
 
         _remove_hooks(codex_hooks)
-        _atomic_write(self.codex_hooks, _json_bytes(codex_hooks))
-        self.launch_agent.unlink(missing_ok=True)
+        _atomic_write(destinations[self.codex_hooks], _json_bytes(codex_hooks))
+        destinations[self.launch_agent].unlink(missing_ok=True)
         self.legacy_peers.unlink(missing_ok=True)
-        self.install_state.unlink(missing_ok=True)
+        destinations[self.install_state].unlink(missing_ok=True)
         with suppress(OSError):
             self.install_state.parent.rmdir()
         if self.cache.exists():
