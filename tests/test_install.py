@@ -2123,7 +2123,7 @@ def test_broker_health_reports_timeout_as_unavailable(
     assert not installer.broker_is_healthy()
 
 
-def test_broker_health_uses_bounded_three_second_local_request(
+def test_broker_health_uses_bounded_ten_second_local_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
@@ -2157,7 +2157,7 @@ def test_broker_health_uses_bounded_three_second_local_request(
 
     assert installer.broker_is_healthy()
     assert len(timeouts) == 1
-    assert 2.9 < timeouts[0] <= BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS
+    assert 9.0 < timeouts[0] <= BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS
 
 
 def test_candidate_health_wait_has_one_monotonic_total_deadline(
