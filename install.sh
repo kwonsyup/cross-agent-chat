@@ -47,7 +47,10 @@ cleanup() {
         rm -rf "$bootstrap_dir"
     fi
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 python_is_compatible() {
     command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'
@@ -77,11 +80,16 @@ else
     "$staged_runtime/bin/python" -m pip install "$source_ref"
 fi
 
+stable_entrypoint=$home_root/.local/bin/cross-agent-chat
 previous_executable=$(command -v cross-agent-chat 2>/dev/null || true)
-case "$previous_executable" in
-    "$HOME"/*) stable_entrypoint=$previous_executable ;;
-    *) stable_entrypoint=$HOME/.local/bin/cross-agent-chat ;;
-esac
+if [ -n "$previous_executable" ]; then
+    previous_parent=$(cd "$(dirname "$previous_executable")" 2>/dev/null && pwd -P || true)
+    previous_canonical=$previous_parent/cross-agent-chat
+    case "$previous_canonical" in
+        "$product_root"/*) ;;
+        "$home_root"/*) stable_entrypoint=$previous_canonical ;;
+    esac
+fi
 
 "$staged_runtime/bin/python" -c 'import cross_agent_chat'
 "$staged_runtime/bin/cross-agent-chat" --version

@@ -43,6 +43,9 @@ COMMITTED_RELEASE_MARKER: Final = "cross-agent-chat-runtime-v1:committed\n"
 STAGED_RELEASE_MARKER_RE: Final = re.compile(
     r"cross-agent-chat-runtime-v1:staged:(?P<pid>[1-9][0-9]*):(?P<identity>[0-9a-f]{64})\n"
 )
+TRANSACTION_RELEASE_MARKER_RE: Final = re.compile(
+    r"cross-agent-chat-runtime-v1:transaction:(?P<transaction>[0-9a-f]{32})\n"
+)
 OWNED_TOML_RE: Final = re.compile(
     rf"\n?{re.escape(OWNED_TOML_START)}.*?{re.escape(OWNED_TOML_END)}\n?", re.DOTALL
 )
@@ -145,11 +148,7 @@ def _atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         path.chmod(mode)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        _fsync_directory(path.parent)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -183,13 +182,17 @@ def _atomic_symlink(target: str, path: Path) -> None:
     try:
         os.symlink(target, temporary)
         os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _restore_path(snapshot: PathSnapshot) -> None:
@@ -350,6 +353,9 @@ def _merge_hook(config: dict[str, object], event: str, owned: dict[str, object])
     existing = hook_map.get(event, [])
     if not isinstance(existing, list):
         raise SettingsError(f"provider hook {event} must be a list")
+    owned_indices = [index for index, item in enumerate(existing) if _owned_hook(item)]
+    if len(owned_indices) > 1:
+        raise SettingsError(f"provider hook {event} ownership is ambiguous")
     merged: list[object] = []
     replaced = False
     for item in existing:
@@ -578,23 +584,55 @@ class Installer:
         if self.install_state.exists():
             metadata = _json_object(self.install_state)
             previous = metadata.get("claude_cross_session_inbound")
+            stable_relative = metadata.get("stable_entrypoint")
             if (
-                set(metadata) != {"schema_version", "claude_cross_session_inbound"}
-                or metadata.get("schema_version") != 1
+                metadata.get("schema_version") not in {1, 2}
                 or not isinstance(previous, dict)
                 or set(previous) != {"present", "value"}
                 or not isinstance(previous.get("present"), bool)
                 or (previous.get("present") is False and previous.get("value") is not None)
             ):
                 raise SettingsError("Cross Agent Chat install state is invalid")
-            return metadata
+            if metadata["schema_version"] == 1:
+                if set(metadata) != {"schema_version", "claude_cross_session_inbound"}:
+                    raise SettingsError("Cross Agent Chat install state is invalid")
+                try:
+                    stable = self._validate_stable_entrypoint(self.executable)
+                except SettingsError:
+                    stable = self._validate_stable_entrypoint(
+                        self.home / ".local" / "bin" / SERVER_NAME
+                    )
+            else:
+                if (
+                    set(metadata)
+                    != {"schema_version", "claude_cross_session_inbound", "stable_entrypoint"}
+                    or not isinstance(stable_relative, str)
+                    or Path(stable_relative).is_absolute()
+                    or ".." in Path(stable_relative).parts
+                    or Path(stable_relative).name != SERVER_NAME
+                ):
+                    raise SettingsError("Cross Agent Chat install state is invalid")
+                try:
+                    stable = self._validate_stable_entrypoint(self.home / stable_relative)
+                except SettingsError as error:
+                    raise SettingsError("Cross Agent Chat install state is invalid") from error
+            return {
+                "schema_version": 2,
+                "claude_cross_session_inbound": previous,
+                "stable_entrypoint": str(stable.relative_to(self.home)),
+            }
         present = "crossSessionInbound" in settings
+        try:
+            stable = self._validate_stable_entrypoint(self.executable)
+        except SettingsError:
+            stable = self._validate_stable_entrypoint(self.home / ".local" / "bin" / SERVER_NAME)
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "claude_cross_session_inbound": {
                 "present": present,
                 "value": settings.get("crossSessionInbound") if present else None,
             },
+            "stable_entrypoint": str(stable.relative_to(self.home)),
         }
 
     def _launch_agent_payload(self) -> bytes:
@@ -683,11 +721,14 @@ class Installer:
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         destination = root / f"{stamp}-{uuid4().hex[:8]}"
         ensure_private_dir(destination)
-        manifest = {
+        manifest: dict[str, object] = {
             str(path.relative_to(self.home)): _snapshot_json(snapshot)
             for path, snapshot in originals.items()
         }
-        atomic_json(destination / "manifest.json", manifest)
+        _atomic_write(destination / "manifest.json", _json_bytes(manifest))
+        _fsync_directory(root)
+        _fsync_directory(root.parent)
+        _fsync_directory(root.parent.parent)
         return destination
 
     def _prepare_setup(self) -> PreparedSetup:
@@ -809,9 +850,8 @@ class Installer:
                 try:
                     if service_transition_started:
                         self.activate()
-                    if not self._wait_for_previous_broker_health():
-                        qualifier = "previous healthy" if previous_broker_healthy else "previous"
-                        raise SettingsError(f"{qualifier} broker did not become healthy")
+                    if previous_broker_healthy and not self._wait_for_previous_broker_health():
+                        raise SettingsError("previous healthy broker did not become healthy")
                 except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as error:
                     rollback_failures.append(f"predecessor broker restore failed: {error}")
             if rollback_failures:
@@ -912,10 +952,12 @@ class Installer:
         if not stable_entrypoint.is_absolute() or stable_entrypoint.name != SERVER_NAME:
             raise SettingsError("stable entrypoint is invalid")
         parent = stable_entrypoint.parent.resolve(strict=False)
-        if not parent.is_relative_to(self.home):
+        runtime_root = self.runtime_root.resolve(strict=False)
+        if not parent.is_relative_to(self.home) or parent.is_relative_to(runtime_root):
             raise SettingsError("stable entrypoint must be owner-local")
-        _snapshot_path(stable_entrypoint)
-        return stable_entrypoint
+        canonical = parent / SERVER_NAME
+        _snapshot_path(canonical)
+        return canonical
 
     def _record_transaction(
         self,
@@ -1007,7 +1049,7 @@ class Installer:
         stable = self.home / stable_path
         backup = self.home / backup_path
         candidate = self.releases / candidate_name
-        if not stable.parent.resolve(strict=True).is_relative_to(self.home) or backup.resolve(
+        if not stable.parent.resolve(strict=False).is_relative_to(self.home) or backup.resolve(
             strict=True
         ).parent != (self.cache / "backups").resolve(strict=True):
             raise SettingsError("transaction metadata is invalid")
@@ -1037,6 +1079,7 @@ class Installer:
         config_transition_started: bool,
         service_transition_started: bool,
         previous_broker_loaded: bool,
+        previous_broker_healthy: bool,
         cleanup_on_success: bool = True,
     ) -> None:
         failures: list[str] = []
@@ -1064,7 +1107,7 @@ class Installer:
         if service_transition_started and previous_broker_loaded and service_stopped:
             try:
                 self.activate()
-                if not self._wait_for_previous_broker_health():
+                if previous_broker_healthy and not self._wait_for_previous_broker_health():
                     raise SettingsError("previous broker did not become healthy")
             except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as error:
                 failures.append(f"predecessor broker restore failed: {error}")
@@ -1104,6 +1147,11 @@ class Installer:
                 raise SettingsError("committed transaction state is invalid") from error
             shutil.rmtree(transaction_path)
             return
+        if transaction.phase == "prepared":
+            if transaction.candidate.exists():
+                self._remove_release(transaction.candidate)
+            shutil.rmtree(transaction_path)
+            return
         try:
             self._rollback_transition(
                 transaction_path=transaction_path,
@@ -1117,6 +1165,7 @@ class Installer:
                 service_transition_started=transaction.phase
                 in {"service_starting", "service_started"},
                 previous_broker_loaded=transaction.previous_broker_loaded,
+                previous_broker_healthy=transaction.previous_broker_healthy,
             )
         except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as error:
             raise SettingsError(f"unfinished transaction recovery failed: {error}") from error
@@ -1138,6 +1187,7 @@ class Installer:
             or (
                 marker_text != COMMITTED_RELEASE_MARKER
                 and STAGED_RELEASE_MARKER_RE.fullmatch(marker_text) is None
+                and TRANSACTION_RELEASE_MARKER_RE.fullmatch(marker_text) is None
             )
         ):
             raise SettingsError("refusing to remove an unowned runtime")
@@ -1167,8 +1217,18 @@ class Installer:
         for release in self.releases.iterdir():
             if release.is_symlink() or not release.is_dir() or release.resolve() in keep:
                 continue
-            owner = _staged_release_owner(release / RELEASE_MARKER)
-            if owner is not None and _process_identity_digest(owner[0]) != owner[1]:
+            marker = release / RELEASE_MARKER
+            owner = _staged_release_owner(marker)
+            marker_text = (
+                marker.read_text(encoding="utf-8")
+                if marker.is_file() and not marker.is_symlink()
+                else ""
+            )
+            transaction_owner = TRANSACTION_RELEASE_MARKER_RE.fullmatch(marker_text)
+            if (owner is not None and _process_identity_digest(owner[0]) != owner[1]) or (
+                transaction_owner is not None
+                and not (self.transactions / transaction_owner.group("transaction")).exists()
+            ):
                 self._remove_release(release)
 
     def install_staged(self, staged_runtime: Path, stable_entrypoint: Path) -> InstallReport:
@@ -1190,6 +1250,8 @@ class Installer:
         package_digest = _package_tree_digest(staged)
 
         ensure_private_dir(self.transactions)
+        _fsync_directory(self.runtime_root)
+        _fsync_directory(self.runtime_root.parent)
         transaction_id = uuid4().hex
         preparing_transaction = self.transactions / f".preparing-{transaction_id}"
         transaction = self.transactions / transaction_id
@@ -1222,7 +1284,13 @@ class Installer:
             previous_broker_healthy=previous_broker_healthy,
             package_tree_sha256=package_digest,
         )
+        _atomic_write(
+            final_runtime / RELEASE_MARKER,
+            f"cross-agent-chat-runtime-v1:transaction:{transaction_id}\n".encode(),
+        )
+        _fsync_directory(self.releases)
         os.replace(preparing_transaction, transaction)
+        _fsync_directory(self.transactions)
         report: InstallReport | None = None
         service_transition_started = False
         runtime_transition_started = False
@@ -1264,6 +1332,7 @@ class Installer:
                     config_transition_started=config_transition_started,
                     service_transition_started=service_transition_started,
                     previous_broker_loaded=previous_broker_loaded,
+                    previous_broker_healthy=previous_broker_healthy,
                     cleanup_on_success=not setup_rollback_failed,
                 )
                 if setup_rollback_failed:
@@ -1394,7 +1463,8 @@ class Installer:
             or not isinstance(pid, int)
             or isinstance(pid, bool)
             or pid != service.pid
-            or version != __version__
+            or not isinstance(version, str)
+            or not version
             or not isinstance(module_path, str)
         ):
             return False
@@ -1460,16 +1530,32 @@ class Installer:
             not isinstance(pid, int)
             or isinstance(pid, bool)
             or pid != service.pid
-            or version != __version__
+            or not isinstance(version, str)
+            or not version
             or not isinstance(module_path, str)
         ):
             return False
         try:
             runtime = service.program.resolve(strict=True).parent.parent
             module = Path(module_path).resolve(strict=True)
-        except OSError:
+            remaining = health_deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            reported = subprocess.run(
+                [str(service.program), "--version"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=min(5.0, remaining),
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
             return False
-        return module.is_relative_to(runtime)
+        return (
+            module.is_relative_to(runtime)
+            and reported.returncode == 0
+            and reported.stdout.strip() == f"{SERVER_NAME} {version}"
+        )
 
     def _wait_for_previous_broker_health(self) -> bool:
         deadline = time.monotonic() + BROKER_HEALTH_WAIT_SECONDS
@@ -1736,7 +1822,7 @@ class Installer:
         if self.state.exists():
             shutil.rmtree(self.state)
 
-    def _remove_installed_runtime(self) -> None:
+    def _remove_installed_runtime(self, stable_entrypoint: Path | None = None) -> None:
         self._prune_abandoned_staged_releases()
         if not self.current_runtime.is_symlink():
             return
@@ -1769,8 +1855,15 @@ class Installer:
             and not (release / RELEASE_MARKER).is_symlink()
             and (release / RELEASE_MARKER).read_text(encoding="utf-8") == COMMITTED_RELEASE_MARKER
         ]
-        if self.executable.is_symlink():
-            self.executable.unlink()
+        public_entrypoints = {self.executable, self.home / ".local" / "bin" / SERVER_NAME}
+        if stable_entrypoint is not None:
+            public_entrypoints.add(stable_entrypoint)
+        for public_entrypoint in public_entrypoints:
+            if (
+                public_entrypoint.is_symlink()
+                and public_entrypoint.resolve(strict=True) == expected
+            ):
+                public_entrypoint.unlink()
         self.current_runtime.unlink()
         for release in owned_releases:
             self._remove_release(release)
@@ -1786,7 +1879,9 @@ class Installer:
             self._uninstall()
 
     def _uninstall(self) -> None:
+        self._recover_unfinished_transaction()
         metadata = self._install_metadata(_json_object(self.claude_settings))
+        stable_entrypoint = self.home / cast(str, metadata["stable_entrypoint"])
         self._stop_broker()
         self._stop_couriers()
         self._remove_runtime_state()
@@ -1822,7 +1917,7 @@ class Installer:
             self.install_state.parent.rmdir()
         if self.cache.exists():
             shutil.rmtree(self.cache)
-        self._remove_installed_runtime()
+        self._remove_installed_runtime(stable_entrypoint)
 
 
 def discover_executable(invoked_as: Path | None = None) -> Path:
