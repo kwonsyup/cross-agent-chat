@@ -1079,6 +1079,7 @@ def test_staged_install_commits_stable_runtime_and_provider_paths(
     stage = _staged_runtime(installer)
     monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", lambda: None)
@@ -1126,6 +1127,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
     source_root = Path(__file__).resolve().parents[1] / "src"
     monkeypatch.setenv("PYTHONPATH", str(source_root))
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", lambda: None)
@@ -1166,6 +1168,7 @@ def test_staged_install_setup_failure_restores_public_entrypoint_and_pointer(
 
     monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "setup", fail_setup)
 
