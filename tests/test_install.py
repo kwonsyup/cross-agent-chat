@@ -582,6 +582,7 @@ def test_activate_stops_only_verified_owner_local_orphan_broker(
         return subprocess.CompletedProcess(command, 113, "", "not found")
 
     monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: False)
     monkeypatch.setattr(installer, "_wait_for_broker_port_release", lambda: next(released))
     monkeypatch.setattr(
         "cross_agent_chat.install.os.kill",
@@ -618,6 +619,7 @@ def test_orphan_stop_rejects_process_incarnation_change_before_signal(
         return subprocess.CompletedProcess(command, 113, "", "not found")
 
     monkeypatch.setattr("cross_agent_chat.install.subprocess.run", run)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: False)
     monkeypatch.setattr(
         "cross_agent_chat.install._process_identity_digest", lambda _pid: next(identities)
     )
@@ -661,6 +663,22 @@ def test_stop_broker_requires_port_release_after_label_disappears(
     installer._stop_broker()
 
     assert calls == ["bootout", "orphan"]
+
+
+def test_orphan_probe_accepts_port_released_before_listener_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    port_checks = iter((False, True))
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: next(port_checks))
+    monkeypatch.setattr(
+        "cross_agent_chat.install.subprocess.run",
+        lambda command, **_: subprocess.CompletedProcess(command, 1, "", "not found"),
+    )
+
+    installer._stop_owned_orphan_broker()
 
 
 def test_install_restores_provider_files_if_activation_fails(

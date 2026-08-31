@@ -1476,6 +1476,8 @@ class Installer:
         return False
 
     def _stop_owned_orphan_broker(self) -> None:
+        if self._broker_port_is_available():
+            return
         listener = subprocess.run(
             ["/usr/sbin/lsof", "-nP", "-t", f"-iTCP:{LOCAL_BROKER_PORT}", "-sTCP:LISTEN"],
             stdin=subprocess.DEVNULL,
@@ -1486,6 +1488,8 @@ class Installer:
         )
         raw_pids = [line.strip() for line in listener.stdout.splitlines() if line.strip()]
         if listener.returncode != 0 or len(raw_pids) != 1 or not raw_pids[0].isdigit():
+            if self._broker_port_is_available():
+                return
             raise SettingsError("local broker port is occupied by an unverified process")
         pid = int(raw_pids[0])
         process_identity = _process_identity_digest(pid)
