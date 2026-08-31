@@ -1277,6 +1277,14 @@ def test_staged_install_fsyncs_backup_and_journal_parents_before_first_effect(
     assert f"fsync:{installer.transactions}" in before_effect
     assert f"fsync:{stage}" in before_effect
     assert f"fsync:{installer.releases}" in before_effect
+    for durable_parent in (
+        stable.parent,
+        installer.claude_settings.parent,
+        installer.codex_config.parent,
+        installer.install_state.parent,
+        installer.launch_agent.parent,
+    ):
+        assert f"fsync:{durable_parent}" in before_effect
     assert f"fsync:{home}" in before_effect
 
 
@@ -1704,6 +1712,46 @@ def test_prepared_recovery_accepts_absent_entrypoint_parent(tmp_path: Path) -> N
     assert not transaction.exists()
 
 
+def test_prepared_recovery_drops_journal_before_candidate_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    stable = home / "bin/cross-agent-chat"
+    installer = Installer(home=home, executable=stable, device="studio")
+    stage = _staged_runtime(installer)
+    prepared = installer._prepare_setup()
+    transaction = installer.transactions / ("a" * 32)
+    transaction.mkdir(parents=True, mode=0o700)
+    installer._record_transaction(
+        transaction,
+        phase="prepared",
+        staged=stage,
+        stable_entrypoint=stable,
+        current_snapshot=_snapshot_path(installer.current_runtime),
+        entrypoint_snapshot=_snapshot_path(stable),
+        config_backup=prepared.backup,
+        previous_broker_loaded=False,
+        previous_broker_healthy=False,
+        package_tree_sha256=_package_tree_digest(stage),
+    )
+    _bind_transaction_marker(stage, transaction)
+    original_remove = installer._remove_release
+    monkeypatch.setattr(
+        installer,
+        "_remove_release",
+        lambda _candidate: (_ for _ in ()).throw(OSError("interrupted cleanup")),
+    )
+
+    with pytest.raises(OSError, match="interrupted cleanup"):
+        installer._recover_unfinished_transaction()
+
+    assert not transaction.exists()
+    assert stage.exists()
+    monkeypatch.setattr(installer, "_remove_release", original_remove)
+    installer._prune_abandoned_staged_releases()
+    assert not stage.exists()
+
+
 def test_recovery_rejects_transaction_that_names_active_committed_release(
     tmp_path: Path,
 ) -> None:
@@ -1816,6 +1864,40 @@ def test_runtime_switching_recovery_restores_pointer_and_entrypoint(
     assert os.readlink(installer.current_runtime) == "releases/release-previous"
     assert stable.read_text() == "predecessor"
     assert not stage.exists()
+
+
+def test_committing_recovery_finalizes_durable_committed_candidate(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    stable = home / "bin/cross-agent-chat"
+    installer = Installer(home=home, executable=stable, device="studio")
+    stage = _staged_runtime(installer)
+    prepared = installer._prepare_setup()
+    transaction = installer.transactions / ("a" * 32)
+    transaction.mkdir(parents=True, mode=0o700)
+    digest = _package_tree_digest(stage)
+    installer._record_transaction(
+        transaction,
+        phase="committing",
+        staged=stage,
+        stable_entrypoint=stable,
+        current_snapshot=_snapshot_path(installer.current_runtime),
+        entrypoint_snapshot=_snapshot_path(stable),
+        config_backup=prepared.backup,
+        previous_broker_loaded=False,
+        previous_broker_healthy=False,
+        package_tree_sha256=digest,
+    )
+    installer.current_runtime.symlink_to("releases/release-test")
+    stable.parent.mkdir(parents=True)
+    stable.symlink_to(installer.current_runtime / "bin/cross-agent-chat")
+    (stage / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
+
+    installer._recover_unfinished_transaction()
+
+    assert installer.current_runtime.resolve() == stage.resolve()
+    assert stable.resolve() == stage / "bin/cross-agent-chat"
+    assert stage.exists()
+    assert not transaction.exists()
 
 
 def test_recovery_stops_service_effect_after_service_starting_record(
@@ -2201,6 +2283,43 @@ def test_rollback_rejects_unloaded_previously_loaded_unhealthy_predecessor(
 
     assert candidate.exists()
     assert transaction.exists()
+
+
+def test_rollback_durably_drops_journal_before_candidate_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=home / "bin/cross-agent-chat", device="studio")
+    candidate = _staged_runtime(installer)
+    transaction = installer.transactions / ("a" * 32)
+    transaction.mkdir(parents=True)
+    _bind_transaction_marker(candidate, transaction)
+    original_remove = installer._remove_release
+    monkeypatch.setattr(
+        installer,
+        "_remove_release",
+        lambda _candidate: (_ for _ in ()).throw(OSError("interrupted cleanup")),
+    )
+
+    with pytest.raises(OSError, match="interrupted cleanup"):
+        installer._rollback_transition(
+            transaction_path=transaction,
+            config_backup=home / "unused-backup",
+            current_snapshot=_snapshot_path(installer.current_runtime),
+            entrypoint_snapshot=_snapshot_path(home / "bin/cross-agent-chat"),
+            candidate=candidate,
+            runtime_transition_started=False,
+            config_transition_started=False,
+            service_transition_started=False,
+            previous_broker_loaded=False,
+            previous_broker_healthy=False,
+        )
+
+    assert not transaction.exists()
+    assert candidate.exists()
+    monkeypatch.setattr(installer, "_remove_release", original_remove)
+    installer._prune_abandoned_staged_releases()
+    assert not candidate.exists()
 
 
 def test_staged_install_retains_evidence_when_predecessor_restart_fails(
@@ -2743,6 +2862,37 @@ def test_uninstall_recovery_failure_precedes_all_configuration_mutation(
     )
 
     with pytest.raises(SettingsError, match="recovery failed"):
+        installer.uninstall()
+
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("residue", ["current-file", "committed-release"])
+def test_uninstall_rejects_malformed_runtime_before_configuration_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, residue: str
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(
+        home=home, executable=home / ".local/bin/cross-agent-chat", device="studio"
+    )
+    installer.setup()
+    if residue == "current-file":
+        installer.current_runtime.parent.mkdir(parents=True, exist_ok=True)
+        installer.current_runtime.write_text("malformed")
+    else:
+        release = installer.releases / "release-residue"
+        release.mkdir(parents=True)
+        (release / ".cross-agent-chat-release").write_text(
+            "cross-agent-chat-runtime-v1:committed\n"
+        )
+    before = {path: path.read_bytes() for path in installer.config_paths if path.exists()}
+    monkeypatch.setattr(
+        installer,
+        "_stop_broker",
+        lambda: pytest.fail("uninstall effect ran before runtime ownership preflight"),
+    )
+
+    with pytest.raises(SettingsError, match="installed runtime ownership is invalid"):
         installer.uninstall()
 
     assert {path: path.read_bytes() for path in before} == before

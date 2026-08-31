@@ -572,6 +572,18 @@ class Installer:
             if root.exists() and not root.resolve(strict=True).is_relative_to(self.home):
                 raise SettingsError("runtime ownership is invalid")
 
+    def _ensure_durable_parent(self, parent: Path) -> None:
+        parent.mkdir(parents=True, exist_ok=True)
+        resolved = parent.resolve(strict=True)
+        if not resolved.is_relative_to(self.home):
+            raise SettingsError("managed path parent escapes home")
+        current = resolved
+        while True:
+            _fsync_directory(current)
+            if current == self.home:
+                return
+            current = current.parent
+
     @contextmanager
     def _exclusive_lock(self) -> Iterator[None]:
         if self._lock_depth > 0:
@@ -1049,6 +1061,7 @@ class Installer:
                 "config_written",
                 "service_starting",
                 "service_started",
+                "committing",
                 "committed",
             }
             or not isinstance(candidate_name, str)
@@ -1085,6 +1098,13 @@ class Installer:
         )
         if phase == "committed":
             marker_matches = marker_text == COMMITTED_RELEASE_MARKER
+        elif phase == "committing":
+            marker_matches = marker_text in {
+                COMMITTED_RELEASE_MARKER,
+                f"cross-agent-chat-runtime-v1:transaction:{transaction.name}\n",
+            }
+            if marker_text == COMMITTED_RELEASE_MARKER:
+                phase = "committed"
         else:
             marker_matches = marker_text == (
                 f"cross-agent-chat-runtime-v1:transaction:{transaction.name}\n"
@@ -1155,9 +1175,10 @@ class Installer:
         if failures:
             raise SettingsError("; ".join(failures))
         if cleanup_on_success:
+            shutil.rmtree(transaction_path)
+            _fsync_directory(transaction_path.parent)
             if candidate.exists():
                 self._remove_release(candidate)
-            shutil.rmtree(transaction_path)
 
     def _recover_unfinished_transaction(self) -> None:
         self._validate_runtime_roots()
@@ -1187,11 +1208,13 @@ class Installer:
             except OSError as error:
                 raise SettingsError("committed transaction state is invalid") from error
             shutil.rmtree(transaction_path)
+            _fsync_directory(transaction_path.parent)
             return
         if transaction.phase == "prepared":
+            shutil.rmtree(transaction_path)
+            _fsync_directory(transaction_path.parent)
             if transaction.candidate.exists():
                 self._remove_release(transaction.candidate)
-            shutil.rmtree(transaction_path)
             return
         try:
             self._rollback_transition(
@@ -1202,9 +1225,15 @@ class Installer:
                 candidate=transaction.candidate,
                 runtime_transition_started=True,
                 config_transition_started=transaction.phase
-                in {"config_writing", "config_written", "service_starting", "service_started"},
+                in {
+                    "config_writing",
+                    "config_written",
+                    "service_starting",
+                    "service_started",
+                    "committing",
+                },
                 service_transition_started=transaction.phase
-                in {"service_starting", "service_started"},
+                in {"service_starting", "service_started", "committing"},
                 previous_broker_loaded=transaction.previous_broker_loaded,
                 previous_broker_healthy=transaction.previous_broker_healthy,
             )
@@ -1289,6 +1318,11 @@ class Installer:
             raise SettingsError("predecessor broker state is unmanaged; no changes were made")
         previous_broker_healthy = previous_broker_loaded and self._wait_for_previous_broker_health()
         prepared_setup = self._prepare_setup()
+        for parent in {
+            stable.parent,
+            *(destination.parent for destination in prepared_setup.destinations.values()),
+        }:
+            self._ensure_durable_parent(parent)
         _fsync_tree(staged)
         package_digest = _package_tree_digest(staged)
 
@@ -1363,6 +1397,7 @@ class Installer:
                 )
             ):
                 raise SettingsError("background broker did not become healthy")
+            record("committing")
             _atomic_write(final_runtime / RELEASE_MARKER, COMMITTED_RELEASE_MARKER.encode())
         except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as failure:
             setup_rollback_failed = isinstance(failure, SetupRollbackError)
@@ -1393,6 +1428,7 @@ class Installer:
         record("committed")
         self._prune_committed_releases(final_runtime, current_snapshot)
         shutil.rmtree(transaction)
+        _fsync_directory(self.transactions)
         return report
 
     def verify_configuration(self) -> bool:
@@ -1867,9 +1903,27 @@ class Installer:
             shutil.rmtree(self.state)
 
     def _prepare_runtime_removal(self, stable_entrypoint: Path | None) -> RuntimeRemovalPlan | None:
-        if not self.current_runtime.is_symlink():
-            return None
         self._validate_runtime_roots()
+        if not self.current_runtime.is_symlink():
+            owned_residue = False
+            if self.releases.exists():
+                for release in self.releases.iterdir():
+                    marker = release / RELEASE_MARKER
+                    marker_text = (
+                        marker.read_text(encoding="utf-8")
+                        if marker.is_file() and not marker.is_symlink()
+                        else ""
+                    )
+                    if (
+                        marker_text == COMMITTED_RELEASE_MARKER
+                        or STAGED_RELEASE_MARKER_RE.fullmatch(marker_text) is not None
+                        or TRANSACTION_RELEASE_MARKER_RE.fullmatch(marker_text) is not None
+                    ):
+                        owned_residue = True
+                        break
+            if self.current_runtime.exists() or owned_residue:
+                raise SettingsError("installed runtime ownership is invalid")
+            return None
         try:
             current = self.current_runtime.resolve(strict=True)
             releases = self.releases.resolve(strict=True)
