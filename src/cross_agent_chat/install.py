@@ -39,7 +39,7 @@ OWNED_TOML_END: Final = "# cross-agent-chat:end"
 RELEASE_MARKER: Final = ".cross-agent-chat-release"
 COMMITTED_RELEASE_MARKER: Final = "cross-agent-chat-runtime-v1:committed\n"
 STAGED_RELEASE_MARKER_RE: Final = re.compile(
-    r"cross-agent-chat-runtime-v1:staged:(?P<pid>[1-9][0-9]*)\n"
+    r"cross-agent-chat-runtime-v1:staged:(?P<pid>[1-9][0-9]*):(?P<identity>[0-9a-f]{64})\n"
 )
 OWNED_TOML_RE: Final = re.compile(
     rf"\n?{re.escape(OWNED_TOML_START)}.*?{re.escape(OWNED_TOML_END)}\n?", re.DOTALL
@@ -265,21 +265,24 @@ def _package_tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _staged_release_pid(marker: Path) -> int | None:
+def _staged_release_owner(marker: Path) -> tuple[int, str] | None:
     if marker.is_symlink() or not marker.is_file():
         return None
     match = STAGED_RELEASE_MARKER_RE.fullmatch(marker.read_text(encoding="utf-8"))
-    return None if match is None else int(match.group("pid"))
+    return None if match is None else (int(match.group("pid")), match.group("identity"))
 
 
-def _pid_is_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+def _process_identity_digest(pid: int) -> str | None:
+    result = subprocess.run(
+        ["/bin/ps", "-ww", "-p", str(pid), "-o", "lstart=", "-o", "command="],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=5.0,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout:
+        return None
+    return hashlib.sha256(result.stdout).hexdigest()
 
 
 def _hook_command(executable: Path, provider: str, device: str, event: str) -> str:
@@ -529,6 +532,13 @@ class Installer:
             self.launch_agent,
             self.install_state,
         )
+
+    def _validate_runtime_roots(self) -> None:
+        for root in (self.runtime_root, self.releases, self.transactions):
+            if root.is_symlink():
+                raise SettingsError("runtime ownership is invalid")
+            if root.exists() and not root.resolve(strict=True).is_relative_to(self.home):
+                raise SettingsError("runtime ownership is invalid")
 
     @contextmanager
     def _exclusive_lock(self) -> Iterator[None]:
@@ -797,12 +807,8 @@ class Installer:
         return report
 
     def _validate_staged_runtime(self, staged_runtime: Path) -> Path:
-        if (
-            self.runtime_root.is_symlink()
-            or self.releases.is_symlink()
-            or staged_runtime.is_symlink()
-            or not staged_runtime.is_dir()
-        ):
+        self._validate_runtime_roots()
+        if staged_runtime.is_symlink() or not staged_runtime.is_dir():
             raise SettingsError("candidate staging failed: staged runtime is unavailable")
         try:
             staged = staged_runtime.resolve(strict=True)
@@ -816,7 +822,7 @@ class Installer:
             not releases.is_relative_to(self.home)
             or staged.parent != releases
             or not staged.name.startswith("release-")
-            or _staged_release_pid(marker) is None
+            or _staged_release_owner(marker) is None
         ):
             raise SettingsError(
                 "candidate staging failed: staged runtime is outside owned releases"
@@ -953,8 +959,10 @@ class Installer:
             or phase
             not in {
                 "prepared",
+                "runtime_switching",
                 "runtime_switched",
                 "config_written",
+                "service_starting",
                 "service_started",
                 "committed",
             }
@@ -1041,17 +1049,18 @@ class Installer:
             shutil.rmtree(transaction_path)
 
     def _recover_unfinished_transaction(self) -> None:
+        self._validate_runtime_roots()
         if not self.transactions.exists():
             return
         for preparing in self.transactions.glob(".preparing-*"):
             if preparing.is_dir() and not preparing.is_symlink():
                 shutil.rmtree(preparing)
-        transactions = [item for item in self.transactions.iterdir() if item.is_dir()]
-        if not transactions and not list(self.transactions.iterdir()):
+        entries = list(self.transactions.iterdir())
+        if not entries:
             return
-        if len(transactions) != 1 or len(list(self.transactions.iterdir())) != 1:
+        if len(entries) != 1 or entries[0].is_symlink() or not entries[0].is_dir():
             raise SettingsError("predecessor state is unknown: transaction state is ambiguous")
-        transaction_path = transactions[0]
+        transaction_path = entries[0]
         transaction = self._read_transaction(transaction_path)
         if transaction.phase == "committed":
             try:
@@ -1075,16 +1084,23 @@ class Installer:
                 current_snapshot=transaction.current_snapshot,
                 entrypoint_snapshot=transaction.entrypoint_snapshot,
                 candidate=transaction.candidate,
-                runtime_transition_started=transaction.phase != "prepared",
-                service_transition_started=transaction.phase == "service_started",
+                runtime_transition_started=True,
+                service_transition_started=transaction.phase
+                in {"service_starting", "service_started"},
                 previous_broker_loaded=transaction.previous_broker_loaded,
             )
         except (OSError, subprocess.SubprocessError, ChatError, SettingsError) as error:
             raise SettingsError(f"unfinished transaction recovery failed: {error}") from error
 
     def _remove_release(self, release: Path) -> None:
-        if self.runtime_root.is_symlink() or self.releases.is_symlink():
-            raise SettingsError("runtime ownership is invalid")
+        self._validate_runtime_roots()
+        if (
+            release.is_symlink()
+            or not release.is_dir()
+            or release.parent != self.releases
+            or not release.name.startswith("release-")
+        ):
+            raise SettingsError("refusing to remove an unowned runtime")
         releases = self.releases.resolve(strict=True)
         resolved = release.resolve(strict=True)
         marker = resolved / RELEASE_MARKER
@@ -1092,7 +1108,6 @@ class Installer:
         if (
             not releases.is_relative_to(self.home)
             or resolved.parent != releases
-            or not resolved.name.startswith("release-")
             or marker.is_symlink()
             or not marker.is_file()
             or (
@@ -1120,16 +1135,15 @@ class Installer:
                 self._remove_release(release)
 
     def _prune_abandoned_staged_releases(self, retained: set[Path] | None = None) -> None:
-        if self.runtime_root.is_symlink() or self.releases.is_symlink():
-            raise SettingsError("runtime ownership is invalid")
+        self._validate_runtime_roots()
         if not self.releases.exists():
             return
         keep = set() if retained is None else {path.resolve() for path in retained}
         for release in self.releases.iterdir():
             if release.is_symlink() or not release.is_dir() or release.resolve() in keep:
                 continue
-            pid = _staged_release_pid(release / RELEASE_MARKER)
-            if pid is not None and not _pid_is_alive(pid):
+            owner = _staged_release_owner(release / RELEASE_MARKER)
+            if owner is not None and _process_identity_digest(owner[0]) != owner[1]:
                 self._remove_release(release)
 
     def install_staged(self, staged_runtime: Path, stable_entrypoint: Path) -> InstallReport:
@@ -1189,6 +1203,7 @@ class Installer:
         runtime_transition_started = False
         try:
             self._stop_couriers()
+            record("runtime_switching")
             runtime_transition_started = True
             _atomic_symlink(f"releases/{final_runtime.name}", self.current_runtime)
             _atomic_symlink(str(self.current_runtime / "bin" / SERVER_NAME), stable)
@@ -1196,6 +1211,7 @@ class Installer:
             report = self.setup(prepared=prepared_setup)
             record("config_written")
             self._remove_runtime_state()
+            record("service_starting")
             service_transition_started = True
             self.activate()
             record("service_started")
@@ -1585,8 +1601,7 @@ class Installer:
         self._prune_abandoned_staged_releases()
         if not self.current_runtime.is_symlink():
             return
-        if self.runtime_root.is_symlink() or self.releases.is_symlink():
-            raise SettingsError("installed runtime ownership is invalid")
+        self._validate_runtime_roots()
         try:
             current = self.current_runtime.resolve(strict=True)
             releases = self.releases.resolve(strict=True)

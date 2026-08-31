@@ -63,7 +63,8 @@ if [ -n "$uv_command" ]; then
 else
     python3 -m venv "$staged_runtime"
 fi
-printf '%s:%s\n' 'cross-agent-chat-runtime-v1:staged' "$$" > "$staged_runtime/.cross-agent-chat-release"
+owner_identity=$(/bin/ps -ww -p "$$" -o lstart= -o command= | shasum -a 256 | awk '{print $1}')
+printf '%s:%s:%s\n' 'cross-agent-chat-runtime-v1:staged' "$$" "$owner_identity" > "$staged_runtime/.cross-agent-chat-release"
 chmod 600 "$staged_runtime/.cross-agent-chat-release"
 if [ -n "$uv_command" ]; then
     "$uv_command" pip install --python "$staged_runtime/bin/python" "$source_ref"
