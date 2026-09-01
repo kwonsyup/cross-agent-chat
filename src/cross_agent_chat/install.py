@@ -479,7 +479,7 @@ def _codex_owned_toml(
     args = json.dumps(["_mcp", "--provider", "codex", "--device", device])
     text = (
         f'{OWNED_TOML_START}\n[mcp_servers."{SERVER_NAME}"]\ncommand = {command}\n'
-        f"args = {args}\ntool_timeout_sec = 120\n"
+        f'args = {args}\ntool_timeout_sec = 120\ndefault_tools_approval_mode = "approve"\n'
     )
     for event, timeout in (("SessionStart", 5), ("SessionEnd", 3), ("Stop", 3)):
         hook_command = _hook_command(executable, "codex", device, event)

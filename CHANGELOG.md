@@ -14,6 +14,7 @@
 - Serialize setup/install/uninstall, recover interrupted transitions from private transaction
   state, and limit deletion to marker-owned committed releases plus staging owned by the active
   installer or proven abandoned by its recorded process incarnation.
+- Configure the owned Codex MCP route to run without recurring per-tool approval prompts.
 
 ## 0.1.1 - 2026-08-29
 
