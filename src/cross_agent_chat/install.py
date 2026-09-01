@@ -19,14 +19,16 @@ import subprocess
 import tempfile
 import time
 import tomllib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, MutableMapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
-from datetime import time as datetime_time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, Literal, cast
 from uuid import uuid4
+
+import tomlkit
+from tomlkit.exceptions import ParseError
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import ChatError, atomic_json, ensure_private_dir, valid_device
@@ -447,86 +449,20 @@ def _hook_trust_hash(command: str, event: str, timeout: int) -> str:
 
 def _enable_hooks_feature(text: str) -> str:
     try:
-        tomllib.loads(text)
-    except tomllib.TOMLDecodeError as error:
+        document = tomlkit.parse(text)
+    except ParseError as error:
         raise SettingsError("Codex config.toml is invalid") from error
-    exact_features_header = any(
-        path == ("features",) and not is_array for path, is_array in _toml_headers(text)
-    )
-    table_path: tuple[str, ...] = ()
-    retained: list[str] = []
-    pending: list[str] = []
-    hooks_written = False
-    for line in text.splitlines(keepends=True):
-        if not pending:
-            path = _toml_table_path(line)
-            if path is not None:
-                is_array = line.lstrip().startswith("[[")
-                table_path = ("__array__", *path) if is_array else path
-                if not is_array and path[:2] == ("features", "hooks"):
-                    continue
-                if not is_array and path == ("features",):
-                    retained.append(line)
-                    if not hooks_written:
-                        retained.append("hooks = true\n")
-                        hooks_written = True
-                    continue
-                if (
-                    not is_array
-                    and not exact_features_header
-                    and path[:1] == ("features",)
-                    and not hooks_written
-                ):
-                    retained.extend(["[features]\n", "hooks = true\n", "\n"])
-                    hooks_written = True
-                retained.append(line)
-                continue
-            if not line.strip() or line.lstrip().startswith("#"):
-                retained.append(line)
-                continue
-        pending.append(line)
-        statement = "".join(pending)
-        try:
-            tomllib.loads(statement)
-        except tomllib.TOMLDecodeError:
-            continue
-        assignment = _toml_assignment(statement)
-        if assignment is None:
-            retained.append(statement)
-        else:
-            _key_text, assignment_path, _value = assignment
-            full_path = (*table_path, *assignment_path)
-            if full_path[:2] == ("features", "hooks"):
-                if table_path[:2] == ("features", "hooks"):
-                    pass
-                elif not hooks_written:
-                    ending = "\r\n" if statement.endswith("\r\n") else "\n"
-                    replacement = "features.hooks" if table_path == () else "hooks"
-                    retained.append(f"{replacement} = true{ending}")
-                    hooks_written = True
-            else:
-                if (
-                    not exact_features_header
-                    and table_path == ()
-                    and full_path[:1] == ("features",)
-                    and not hooks_written
-                ):
-                    retained.append("features.hooks = true\n")
-                    hooks_written = True
-                retained.append(statement)
-        pending.clear()
-    if pending:
-        raise SettingsError("Codex config.toml contains an unsupported statement")
-    if not hooks_written:
-        if text and not text.endswith("\n"):
-            retained.append("\n")
-        retained.extend(["\n[features]\n", "hooks = true\n"])
-    return "".join(retained)
+    features = document.get("features")
+    if not isinstance(features, MutableMapping):
+        features = tomlkit.table()
+        document["features"] = features
+    features["hooks"] = True
+    return tomlkit.dumps(document)
 
 
 def _toml_table_path(line: str) -> tuple[str, ...] | None:
     stripped = line.strip()
-    if not stripped.startswith("["):
+    if not stripped.startswith("[") or stripped.startswith("[["):
         return None
     marker = "__cross_agent_chat_table_path__"
     try:
@@ -535,12 +471,6 @@ def _toml_table_path(line: str) -> tuple[str, ...] | None:
         return None
 
     def find(value: object, path: tuple[str, ...]) -> tuple[str, ...] | None:
-        if isinstance(value, list):
-            for child in value:
-                found = find(child, path)
-                if found is not None:
-                    return found
-            return None
         if not isinstance(value, dict):
             return None
         if value.get(marker) is True:
@@ -554,67 +484,6 @@ def _toml_table_path(line: str) -> tuple[str, ...] | None:
         return None
 
     return find(parsed, ())
-
-
-def _toml_headers(text: str) -> list[tuple[tuple[str, ...], bool]]:
-    headers: list[tuple[tuple[str, ...], bool]] = []
-    pending: list[str] = []
-    for line in text.splitlines(keepends=True):
-        if not pending:
-            path = _toml_table_path(line)
-            if path is not None:
-                headers.append((path, line.lstrip().startswith("[[")))
-                continue
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-        pending.append(line)
-        try:
-            tomllib.loads("".join(pending))
-        except tomllib.TOMLDecodeError:
-            continue
-        pending.clear()
-    return headers
-
-
-def _toml_assignment(statement: str) -> tuple[str, tuple[str, ...], object] | None:
-    quote: str | None = None
-    escaped = False
-    equals = None
-    for index, character in enumerate(statement):
-        if quote is not None:
-            if quote == '"' and character == "\\" and not escaped:
-                escaped = True
-                continue
-            if character == quote and not escaped:
-                quote = None
-            escaped = False
-            continue
-        if character in {'"', "'"}:
-            quote = character
-        elif character == "=":
-            equals = index
-            break
-    if equals is None:
-        return None
-    key_text = statement[:equals].strip()
-    try:
-        key_only: object = tomllib.loads(f"{key_text} = 0")
-        parsed: object = tomllib.loads(statement)
-    except tomllib.TOMLDecodeError:
-        return None
-    path: list[str] = []
-    cursor = key_only
-    while isinstance(cursor, dict) and len(cursor) == 1:
-        key, cursor = next(iter(cursor.items()))
-        path.append(key)
-    if not path or isinstance(cursor, dict):
-        return None
-    value = parsed
-    for key in path:
-        if not isinstance(value, dict) or key not in value:
-            return None
-        value = value[key]
-    return key_text, tuple(path), value
 
 
 def _toml_string(value: str) -> str:
@@ -641,125 +510,39 @@ def _toml_string(value: str) -> str:
     return '"' + "".join(encoded) + '"'
 
 
-def _toml_inline_value(value: object) -> str:
-    if isinstance(value, str):
-        return _toml_string(value)
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return repr(value)
-    if isinstance(value, (datetime, date, datetime_time)):
-        return value.isoformat()
-    if isinstance(value, list):
-        return "[" + ", ".join(_toml_inline_value(item) for item in value) + "]"
-    if isinstance(value, dict):
-        fields = ", ".join(
-            f"{_toml_string(str(key))} = {_toml_inline_value(item)}" for key, item in value.items()
-        )
-        return "{ " + fields + " }"
-    raise SettingsError("Codex config.toml contains an unsupported value")
-
-
-def _remove_nested_key(value: object, path: tuple[str, ...]) -> bool:
-    if not path or not isinstance(value, dict):
-        return False
-    cursor = value
-    for key in path[:-1]:
-        child = cursor.get(key)
-        if not isinstance(child, dict):
-            return False
-        cursor = child
-    return cursor.pop(path[-1], None) is not None
-
-
-def _rewrite_owned_codex_tool_assignment(statement: str, table_path: tuple[str, ...]) -> str:
-    assignment = _toml_assignment(statement)
-    if assignment is None:
-        return statement
-    key_text, assignment_path, value = assignment
-    base_path = (*table_path, *assignment_path)
-    targets = (
-        ("mcp_servers", SERVER_NAME, "tools", "chat_peers", "approval_mode"),
-        ("mcp_servers", SERVER_NAME, "tools", "chat_send", "approval_mode"),
-    )
-    changed = False
-    for target in targets:
-        if base_path == target:
-            return ""
-        if target[: len(base_path)] == base_path:
-            changed = _remove_nested_key(value, target[len(base_path) :]) or changed
-    if not changed:
-        return statement
-    ending = "\r\n" if statement.endswith("\r\n") else "\n" if statement.endswith("\n") else ""
-    return f"{key_text} = {_toml_inline_value(value)}{ending}"
-
-
 def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
     try:
-        parsed = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as error:
+        document = tomlkit.parse(text)
+    except ParseError as error:
         raise SettingsError("Codex config.toml is invalid") from error
-    server_path = ("mcp_servers", SERVER_NAME)
-    preserved_tools: dict[str, object] = {}
-    raw_servers = parsed.get("mcp_servers")
-    if isinstance(raw_servers, dict):
-        raw_server = raw_servers.get(SERVER_NAME)
-        if isinstance(raw_server, dict) and isinstance(raw_server.get("tools"), dict):
-            preserved_tools = copy.deepcopy(cast(dict[str, object], raw_server["tools"]))
-            for name in ("chat_peers", "chat_send"):
-                tool = preserved_tools.get(name)
-                if isinstance(tool, dict):
-                    tool.pop("approval_mode", None)
-    table_path: tuple[str, ...] = ()
-    retained: list[str] = []
-    pending: list[str] = []
-    removed_server_table = False
-    dropped_tools: set[str] = set()
-    for line in text.splitlines(keepends=True):
-        if not pending:
-            path = _toml_table_path(line)
-            if path is not None:
-                table_path = path
-                if path == server_path:
-                    removed_server_table = True
-                    continue
-                retained.append(line)
-                continue
-            if line.lstrip().startswith("[["):
-                table_path = ()
-                retained.append(line)
-                continue
-            if not line.strip() or line.lstrip().startswith("#"):
-                retained.append(line)
-                continue
-        pending.append(line)
-        statement = "".join(pending)
-        try:
-            tomllib.loads(statement)
-        except tomllib.TOMLDecodeError:
-            continue
-        if table_path == server_path:
-            assignment = _toml_assignment(statement)
-            if assignment is not None and assignment[1] == ("tools",):
-                if isinstance(assignment[2], dict):
-                    dropped_tools.update(str(name) for name in assignment[2])
-            elif assignment is not None and len(assignment[1]) >= 2 and assignment[1][0] == "tools":
-                dropped_tools.add(assignment[1][1])
-        else:
-            retained.append(_rewrite_owned_codex_tool_assignment(statement, table_path))
-        pending.clear()
-    if pending:
-        raise SettingsError("Codex config.toml contains an unsupported statement")
-    if removed_server_table and dropped_tools:
-        retained.append(f'\n[mcp_servers."{SERVER_NAME}".tools]\n')
-        retained.extend(
-            f"{_toml_string(name)} = {_toml_inline_value(preserved_tools[name])}\n"
-            for name in sorted(dropped_tools)
-            if name in preserved_tools
-        )
-    return "".join(retained)
+    preserved_tools: MutableMapping[str, object] | None = None
+    servers = document.get("mcp_servers")
+    if isinstance(servers, MutableMapping):
+        server = servers.pop(SERVER_NAME, None)
+        if isinstance(server, MutableMapping):
+            tools = server.get("tools")
+            if isinstance(tools, MutableMapping):
+                preserved_tools = copy.deepcopy(tools)
+                for name in ("chat_peers", "chat_send"):
+                    tool = preserved_tools.get(name)
+                    if isinstance(tool, MutableMapping):
+                        tool.pop("approval_mode", None)
+    elif servers is not None:
+        document.pop("mcp_servers")
+    cleaned = tomlkit.dumps(document).rstrip()
+    if preserved_tools:
+        preserved_document = tomlkit.document()
+        preserved_servers = tomlkit.table()
+        preserved_server = tomlkit.table()
+        preserved_tool_table = tomlkit.table()
+        for name, value in preserved_tools.items():
+            preserved_tool_table.add(name, copy.deepcopy(value))
+        preserved_server.add("tools", preserved_tool_table)
+        preserved_servers.add(SERVER_NAME, preserved_server)
+        preserved_document.add("mcp_servers", preserved_servers)
+        preserved = tomlkit.dumps(preserved_document).rstrip()
+        cleaned = f"{cleaned}\n\n{preserved}" if cleaned else preserved
+    return cleaned + ("\n" if cleaned else "")
 
 
 def _codex_owned_toml(
@@ -769,7 +552,13 @@ def _codex_owned_toml(
     hook_indices: dict[str, int],
 ) -> str:
     command = _toml_string(str(executable))
-    args = _toml_inline_value(["_mcp", "--provider", "codex", "--device", device])
+    args = (
+        "["
+        + ", ".join(
+            _toml_string(item) for item in ("_mcp", "--provider", "codex", "--device", device)
+        )
+        + "]"
+    )
     text = (
         f'{OWNED_TOML_START}\n[mcp_servers."{SERVER_NAME}"]\ncommand = {command}\n'
         f'args = {args}\ntool_timeout_sec = 120\ndefault_tools_approval_mode = "approve"\n'

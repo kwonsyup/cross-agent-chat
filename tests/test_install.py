@@ -737,6 +737,33 @@ def test_setup_ignores_features_header_text_inside_multiline_string(tmp_path: Pa
     assert installer.verify_configuration()
 
 
+@pytest.mark.parametrize(
+    ("feature_config", "expected"),
+    (
+        ("features = { hooks = false, x = 1 }\n", {"hooks": True, "x": 1}),
+        ("features = true\n", {"hooks": True}),
+        (
+            '[[features.hooks.entries]]\nname = "a"\n',
+            {"hooks": True},
+        ),
+    ),
+)
+def test_setup_normalizes_inline_scalar_or_array_hooks_features(
+    tmp_path: Path, feature_config: str, expected: dict[str, object]
+) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text(feature_config)
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    assert config["features"] == expected
+    assert installer.verify_configuration()
+
+
 def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
