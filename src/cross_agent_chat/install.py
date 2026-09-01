@@ -450,6 +450,9 @@ def _enable_hooks_feature(text: str) -> str:
         tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         raise SettingsError("Codex config.toml is invalid") from error
+    exact_features_header = any(
+        path == ("features",) and not is_array for path, is_array in _toml_headers(text)
+    )
     table_path: tuple[str, ...] = ()
     retained: list[str] = []
     pending: list[str] = []
@@ -458,19 +461,24 @@ def _enable_hooks_feature(text: str) -> str:
         if not pending:
             path = _toml_table_path(line)
             if path is not None:
-                table_path = path
-                if path[:1] == ("features",) and not hooks_written:
-                    if path != ("features",):
-                        retained.extend(["[features]\n", "hooks = true\n", "\n"])
-                    retained.append(line)
-                    if path == ("features",):
-                        retained.append("hooks = true\n")
-                    hooks_written = True
+                is_array = line.lstrip().startswith("[[")
+                table_path = ("__array__", *path) if is_array else path
+                if not is_array and path[:2] == ("features", "hooks"):
                     continue
-                retained.append(line)
-                continue
-            if line.lstrip().startswith("[["):
-                table_path = ()
+                if not is_array and path == ("features",):
+                    retained.append(line)
+                    if not hooks_written:
+                        retained.append("hooks = true\n")
+                        hooks_written = True
+                    continue
+                if (
+                    not is_array
+                    and not exact_features_header
+                    and path[:1] == ("features",)
+                    and not hooks_written
+                ):
+                    retained.extend(["[features]\n", "hooks = true\n", "\n"])
+                    hooks_written = True
                 retained.append(line)
                 continue
             if not line.strip() or line.lstrip().startswith("#"):
@@ -486,15 +494,23 @@ def _enable_hooks_feature(text: str) -> str:
         if assignment is None:
             retained.append(statement)
         else:
-            key_text, assignment_path, _value = assignment
+            _key_text, assignment_path, _value = assignment
             full_path = (*table_path, *assignment_path)
-            if full_path == ("features", "hooks"):
-                if not hooks_written:
+            if full_path[:2] == ("features", "hooks"):
+                if table_path[:2] == ("features", "hooks"):
+                    pass
+                elif not hooks_written:
                     ending = "\r\n" if statement.endswith("\r\n") else "\n"
-                    retained.append(f"{key_text} = true{ending}")
+                    replacement = "features.hooks" if table_path == () else "hooks"
+                    retained.append(f"{replacement} = true{ending}")
                     hooks_written = True
             else:
-                if table_path == () and full_path[:1] == ("features",) and not hooks_written:
+                if (
+                    not exact_features_header
+                    and table_path == ()
+                    and full_path[:1] == ("features",)
+                    and not hooks_written
+                ):
                     retained.append("features.hooks = true\n")
                     hooks_written = True
                 retained.append(statement)
@@ -510,7 +526,7 @@ def _enable_hooks_feature(text: str) -> str:
 
 def _toml_table_path(line: str) -> tuple[str, ...] | None:
     stripped = line.strip()
-    if not stripped.startswith("[") or stripped.startswith("[["):
+    if not stripped.startswith("["):
         return None
     marker = "__cross_agent_chat_table_path__"
     try:
@@ -519,6 +535,12 @@ def _toml_table_path(line: str) -> tuple[str, ...] | None:
         return None
 
     def find(value: object, path: tuple[str, ...]) -> tuple[str, ...] | None:
+        if isinstance(value, list):
+            for child in value:
+                found = find(child, path)
+                if found is not None:
+                    return found
+            return None
         if not isinstance(value, dict):
             return None
         if value.get(marker) is True:
@@ -532,6 +554,26 @@ def _toml_table_path(line: str) -> tuple[str, ...] | None:
         return None
 
     return find(parsed, ())
+
+
+def _toml_headers(text: str) -> list[tuple[tuple[str, ...], bool]]:
+    headers: list[tuple[tuple[str, ...], bool]] = []
+    pending: list[str] = []
+    for line in text.splitlines(keepends=True):
+        if not pending:
+            path = _toml_table_path(line)
+            if path is not None:
+                headers.append((path, line.lstrip().startswith("[[")))
+                continue
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+        pending.append(line)
+        try:
+            tomllib.loads("".join(pending))
+        except tomllib.TOMLDecodeError:
+            continue
+        pending.clear()
+    return headers
 
 
 def _toml_assignment(statement: str) -> tuple[str, tuple[str, ...], object] | None:
@@ -1733,6 +1775,9 @@ class Installer:
             codex_text = self.codex_config.read_text()
             parsed_codex: object = tomllib.loads(codex_text)
             if not isinstance(parsed_codex, dict):
+                return False
+            features = parsed_codex.get("features")
+            if not isinstance(features, dict) or features.get("hooks") is not True:
                 return False
             codex_servers = parsed_codex.get("mcp_servers")
             if not isinstance(codex_servers, dict):

@@ -660,6 +660,83 @@ def test_setup_normalizes_commented_or_dotted_features_table(
     assert installer.verify_configuration()
 
 
+@pytest.mark.parametrize(
+    "feature_config",
+    (
+        "[features.sub]\nx = 1\n\n[features]\nhooks = false\n",
+        "[features.sub]\nx = 1\n",
+    ),
+)
+def test_setup_normalizes_features_subtable_before_or_without_parent(
+    tmp_path: Path, feature_config: str
+) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text(feature_config)
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    assert config["features"] == {"hooks": True, "sub": {"x": 1}}
+    assert installer.verify_configuration()
+
+
+def test_setup_tracks_array_table_context_when_enabling_hooks(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text("[[servers]]\nfeatures.enabled = true\n\n[features]\nhooks = false\n")
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    assert config["servers"] == [{"features": {"enabled": True}}]
+    assert config["features"] == {"hooks": True}
+    assert installer.verify_configuration()
+
+
+@pytest.mark.parametrize(
+    "feature_config",
+    (
+        "features.hooks.trusted = true\n",
+        "[features]\nhooks.trusted = true\n",
+        "[features.hooks]\ntrusted = true\n",
+    ),
+)
+def test_setup_replaces_conflicting_features_hooks_descendants(
+    tmp_path: Path, feature_config: str
+) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text(feature_config)
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    assert config["features"] == {"hooks": True}
+    assert installer.verify_configuration()
+
+
+def test_setup_ignores_features_header_text_inside_multiline_string(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text('description = """before\n[features]\nafter\n"""\n')
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    assert config["description"] == "before\n[features]\nafter\n"
+    assert config["features"] == {"hooks": True}
+    assert installer.verify_configuration()
+
+
 def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
