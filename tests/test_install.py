@@ -637,6 +637,29 @@ def test_setup_writes_non_bmp_owned_paths_as_valid_toml(tmp_path: Path) -> None:
     assert installer.verify_configuration()
 
 
+@pytest.mark.parametrize(
+    "feature_config",
+    (
+        "[features] # user comment\nhooks = false\nother = true\n",
+        "features.hooks = false\nfeatures.other = true\n",
+    ),
+)
+def test_setup_normalizes_commented_or_dotted_features_table(
+    tmp_path: Path, feature_config: str
+) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text(feature_config)
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    assert config["features"] == {"hooks": True, "other": True}
+    assert installer.verify_configuration()
+
+
 def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")

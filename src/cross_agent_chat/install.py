@@ -446,24 +446,66 @@ def _hook_trust_hash(command: str, event: str, timeout: int) -> str:
 
 
 def _enable_hooks_feature(text: str) -> str:
-    lines = text.splitlines(keepends=True)
-
-    def heading(line: str) -> str | None:
-        stripped = line.strip()
-        if not stripped.startswith("[") or not stripped.endswith("]") or stripped.startswith("[["):
-            return None
-        return stripped[1:-1]
-
-    index = next((offset for offset, line in enumerate(lines) if heading(line) == "features"), None)
-    if index is None:
-        suffix = "" if not text or text.endswith("\n") else "\n"
-        return text + suffix + "\n[features]\nhooks = true\n"
-    end = next(
-        (offset for offset in range(index + 1, len(lines)) if heading(lines[offset]) is not None),
-        len(lines),
-    )
-    section = [line for line in lines[index + 1 : end] if re.match(r"^\s*hooks\s*=", line) is None]
-    return "".join([*lines[: index + 1], "hooks = true\n", *section, *lines[end:]])
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise SettingsError("Codex config.toml is invalid") from error
+    table_path: tuple[str, ...] = ()
+    retained: list[str] = []
+    pending: list[str] = []
+    hooks_written = False
+    for line in text.splitlines(keepends=True):
+        if not pending:
+            path = _toml_table_path(line)
+            if path is not None:
+                table_path = path
+                if path[:1] == ("features",) and not hooks_written:
+                    if path != ("features",):
+                        retained.extend(["[features]\n", "hooks = true\n", "\n"])
+                    retained.append(line)
+                    if path == ("features",):
+                        retained.append("hooks = true\n")
+                    hooks_written = True
+                    continue
+                retained.append(line)
+                continue
+            if line.lstrip().startswith("[["):
+                table_path = ()
+                retained.append(line)
+                continue
+            if not line.strip() or line.lstrip().startswith("#"):
+                retained.append(line)
+                continue
+        pending.append(line)
+        statement = "".join(pending)
+        try:
+            tomllib.loads(statement)
+        except tomllib.TOMLDecodeError:
+            continue
+        assignment = _toml_assignment(statement)
+        if assignment is None:
+            retained.append(statement)
+        else:
+            key_text, assignment_path, _value = assignment
+            full_path = (*table_path, *assignment_path)
+            if full_path == ("features", "hooks"):
+                if not hooks_written:
+                    ending = "\r\n" if statement.endswith("\r\n") else "\n"
+                    retained.append(f"{key_text} = true{ending}")
+                    hooks_written = True
+            else:
+                if table_path == () and full_path[:1] == ("features",) and not hooks_written:
+                    retained.append("features.hooks = true\n")
+                    hooks_written = True
+                retained.append(statement)
+        pending.clear()
+    if pending:
+        raise SettingsError("Codex config.toml contains an unsupported statement")
+    if not hooks_written:
+        if text and not text.endswith("\n"):
+            retained.append("\n")
+        retained.extend(["\n[features]\n", "hooks = true\n"])
+    return "".join(retained)
 
 
 def _toml_table_path(line: str) -> tuple[str, ...] | None:
