@@ -16,10 +16,13 @@ it as peer/user content rather than system or developer authority.
 
 ## Local approval posture
 
-Setup configures only the owned Cross Agent Chat Codex MCP server to run its two tools,
-`chat_peers` and `chat_send`, without recurring per-call approval prompts. It does not change
-global Codex approvals or unrelated MCP servers. Uninstall removes the owned server block and
-leaves unrelated Codex configuration unchanged.
+Setup configures only the owned Cross Agent Chat Codex MCP server to run without recurring
+per-call approval prompts. The server-wide default covers the tools that server exposes,
+currently `chat_peers` and `chat_send`; it does not change global Codex approvals or unrelated
+MCP servers. Because peer content may ask an agent to reply, this accepts that a Codex agent can
+send that reply without another confirmation. Treat Tailnet peers as trusted to initiate
+conversations. Uninstall removes the owned server block and leaves unrelated Codex
+configuration unchanged.
 
 ## Local data
 

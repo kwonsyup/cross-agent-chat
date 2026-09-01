@@ -419,7 +419,13 @@ def test_setup_trusts_each_owned_codex_hook(tmp_path: Path) -> None:
     )
 
 
-def test_verify_configuration_requires_codex_auto_approval(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "replacement",
+    ("", 'default_tools_approval_mode = "prompt"\n'),
+)
+def test_verify_configuration_requires_codex_auto_approval(
+    tmp_path: Path, replacement: str
+) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
     installer.setup()
@@ -427,7 +433,21 @@ def test_verify_configuration_requires_codex_auto_approval(tmp_path: Path) -> No
 
     codex_config = home / ".codex" / "config.toml"
     codex_config.write_text(
-        codex_config.read_text().replace('default_tools_approval_mode = "approve"\n', "")
+        codex_config.read_text().replace('default_tools_approval_mode = "approve"\n', replacement)
+    )
+
+    assert not installer.verify_configuration()
+
+
+def test_verify_configuration_rejects_prompting_tool_override(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.write_text(
+        codex_config.read_text()
+        + '\n[mcp_servers."cross-agent-chat".tools.chat_send]\napproval_mode = "prompt"\n'
     )
 
     assert not installer.verify_configuration()
