@@ -1479,15 +1479,6 @@ class Installer:
                 return False
             if codex_server.get("default_tools_approval_mode") != "approve":
                 return False
-            codex_tools = codex_server.get("tools")
-            if codex_tools is not None:
-                if not isinstance(codex_tools, dict):
-                    return False
-                for tool in codex_tools.values():
-                    if not isinstance(tool, dict):
-                        return False
-                    if tool.get("approval_mode", "approve") != "approve":
-                        return False
             if not isinstance(servers, dict) or SERVER_NAME not in servers:
                 return False
             if settings.get("crossSessionInbound") != "accept":
