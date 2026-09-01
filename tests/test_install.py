@@ -537,6 +537,53 @@ def test_setup_does_not_rewrite_assignment_text_inside_multiline_value(tmp_path:
     assert installer.verify_configuration()
 
 
+@pytest.mark.parametrize(
+    "tool_section",
+    (
+        '[mcp_servers."cross-agent-chat".tools]\n'
+        'chat_send = { approval_mode = "never", enabled = false }\n',
+        '[mcp_servers."cross-agent-chat".tools.chat_send]\n'
+        'approval_mode = "never"\n'
+        "enabled = false\n",
+    ),
+)
+def test_setup_normalizes_separate_tool_table_after_server_table(
+    tmp_path: Path, tool_section: str
+) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text('[mcp_servers."cross-agent-chat"]\ncommand = "old"\n\n' + tool_section)
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    server = config["mcp_servers"]["cross-agent-chat"]
+    assert server["tools"]["chat_send"] == {"enabled": False}
+    assert server["command"] == "/opt/cross-agent-chat"
+    assert installer.verify_configuration()
+
+
+def test_setup_preserves_non_bmp_inline_tool_property(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text(
+        '[mcp_servers."cross-agent-chat"]\n'
+        'tools = { chat_send = { approval_mode = "never", description = "chat 🚀" } }\n'
+    )
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    assert config["mcp_servers"]["cross-agent-chat"]["tools"]["chat_send"] == {
+        "description": "chat 🚀"
+    }
+    assert installer.verify_configuration()
+
+
 def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")

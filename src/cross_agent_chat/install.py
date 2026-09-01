@@ -535,7 +535,7 @@ def _toml_assignment(statement: str) -> tuple[str, tuple[str, ...], object] | No
 
 def _toml_inline_value(value: object) -> str:
     if isinstance(value, str):
-        return json.dumps(value)
+        return json.dumps(value, ensure_ascii=False)
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
@@ -548,7 +548,8 @@ def _toml_inline_value(value: object) -> str:
         return "[" + ", ".join(_toml_inline_value(item) for item in value) + "]"
     if isinstance(value, dict):
         fields = ", ".join(
-            f"{json.dumps(str(key))} = {_toml_inline_value(item)}" for key, item in value.items()
+            f"{json.dumps(str(key), ensure_ascii=False)} = {_toml_inline_value(item)}"
+            for key, item in value.items()
         )
         return "{ " + fields + " }"
     raise SettingsError("Codex config.toml contains an unsupported value")
@@ -608,6 +609,7 @@ def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
     retained: list[str] = []
     pending: list[str] = []
     removed_server_table = False
+    dropped_tools_assignment = False
     for line in text.splitlines(keepends=True):
         if not pending:
             path = _toml_table_path(line)
@@ -631,15 +633,20 @@ def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
             tomllib.loads(statement)
         except tomllib.TOMLDecodeError:
             continue
-        if table_path != server_path:
+        if table_path == server_path:
+            assignment = _toml_assignment(statement)
+            dropped_tools_assignment = (
+                assignment is not None and bool(assignment[1]) and assignment[1][0] == "tools"
+            ) or dropped_tools_assignment
+        else:
             retained.append(_rewrite_owned_codex_tool_assignment(statement, table_path))
         pending.clear()
     if pending:
         raise SettingsError("Codex config.toml contains an unsupported statement")
-    if removed_server_table and preserved_tools:
+    if removed_server_table and dropped_tools_assignment and preserved_tools:
         retained.append(f'\n[mcp_servers."{SERVER_NAME}".tools]\n')
         retained.extend(
-            f"{json.dumps(name)} = {_toml_inline_value(value)}\n"
+            f"{json.dumps(name, ensure_ascii=False)} = {_toml_inline_value(value)}\n"
             for name, value in preserved_tools.items()
         )
     return "".join(retained)
