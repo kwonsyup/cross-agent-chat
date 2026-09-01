@@ -449,6 +449,8 @@ def test_setup_removes_owned_tool_approval_overrides_and_preserves_other_propert
         '[mcp_servers."cross-agent-chat".tools.chat_send]\n'
         'approval_mode = "prompt"\n'
         "enabled = false\n"
+        "\n[[unrelated]]\n"
+        'approval_mode = "prompt"\n'
         '\n[mcp_servers."other"]\n'
         'command = "other"\n'
     )
@@ -460,6 +462,7 @@ def test_setup_removes_owned_tool_approval_overrides_and_preserves_other_propert
     server = config["mcp_servers"]["cross-agent-chat"]
     assert server["default_tools_approval_mode"] == "approve"
     assert server["tools"]["chat_send"] == {"enabled": False}
+    assert config["unrelated"] == [{"approval_mode": "prompt"}]
     assert config["mcp_servers"]["other"] == {"command": "other"}
     assert installer.verify_configuration()
 
