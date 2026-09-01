@@ -483,13 +483,14 @@ def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
     retained: list[str] = []
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith("[[") and stripped.endswith("]]"):
+        if stripped.startswith("["):
             owned_tool_section = False
             server_section = False
-        elif stripped.startswith("[") and stripped.endswith("]"):
-            heading = stripped[1:-1]
-            owned_tool_section = heading in tool_headings
-            server_section = heading in server_headings
+            match = re.fullmatch(r"\[([^\[\]]+)\]\s*(?:#.*)?", stripped)
+            if match is not None:
+                heading = match.group(1).strip()
+                owned_tool_section = heading in tool_headings
+                server_section = heading in server_headings
         if owned_tool_section and re.match(r"^\s*approval_mode\s*=", line):
             continue
         if server_section and re.match(
