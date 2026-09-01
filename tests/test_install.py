@@ -521,7 +521,9 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     assert len(owned) == 3
 
     stale = "".join(
-        f"[hooks.state.{json.dumps(key)}]\ntrusted_hash = {json.dumps(trusted_hash)}\n\n"
+        f"[hooks.state.{json.dumps(key)}] # stale owned trust\n"
+        f"# formatting must not block repair\n"
+        f"trusted_hash = {json.dumps(trusted_hash)}\n\n"
         for key, trusted_hash in owned.items()
     )
     unrelated_key = f"{installer.codex_hooks}:stop:0:0"

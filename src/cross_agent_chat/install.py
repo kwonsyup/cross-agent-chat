@@ -49,11 +49,6 @@ TRANSACTION_RELEASE_MARKER_RE: Final = re.compile(
 OWNED_TOML_RE: Final = re.compile(
     rf"\n?{re.escape(OWNED_TOML_START)}.*?{re.escape(OWNED_TOML_END)}\n?", re.DOTALL
 )
-HOOK_TRUST_TABLE_RE: Final = re.compile(
-    r"^\[hooks\.state\.(?P<key>\"(?:[^\"\\]|\\.)*\")\]\n"
-    r"trusted_hash = (?P<trusted_hash>\"(?:[^\"\\]|\\.)*\")\n(?:\n|$)",
-    re.MULTILINE,
-)
 
 
 class SettingsError(RuntimeError):
@@ -576,20 +571,20 @@ def _owned_hook_trust_keys(config: dict[str, object], hooks_path: Path) -> set[s
 
 
 def _remove_owned_hook_trust(text: str, owned_keys: set[str]) -> str:
-
-    def remove_owned(match: re.Match[str]) -> str:
-        try:
-            raw_key: object = json.loads(match.group("key"))
-            raw_hash: object = json.loads(match.group("trusted_hash"))
-        except json.JSONDecodeError:
-            return match.group(0)
-        if not isinstance(raw_key, str) or not isinstance(raw_hash, str):
-            return match.group(0)
-        if raw_key in owned_keys:
-            return ""
-        return match.group(0)
-
-    return HOOK_TRUST_TABLE_RE.sub(remove_owned, text)
+    removing = False
+    retained: list[str] = []
+    for line in text.splitlines(keepends=True):
+        if line.strip().startswith("["):
+            path = _toml_table_path(line)
+            removing = (
+                path is not None
+                and len(path) == 3
+                and path[:2] == ("hooks", "state")
+                and path[2] in owned_keys
+            )
+        if not removing:
+            retained.append(line)
+    return "".join(retained)
 
 
 class Installer:
