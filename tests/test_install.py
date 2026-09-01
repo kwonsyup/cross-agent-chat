@@ -439,6 +439,44 @@ def test_verify_configuration_requires_codex_auto_approval(
     assert not installer.verify_configuration()
 
 
+def test_setup_removes_owned_tool_approval_overrides_and_preserves_other_properties(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text(
+        '[mcp_servers."cross-agent-chat".tools.chat_send]\n'
+        'approval_mode = "prompt"\n'
+        "enabled = false\n"
+        '\n[mcp_servers."other"]\n'
+        'command = "other"\n'
+    )
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    server = config["mcp_servers"]["cross-agent-chat"]
+    assert server["default_tools_approval_mode"] == "approve"
+    assert server["tools"]["chat_send"] == {"enabled": False}
+    assert config["mcp_servers"]["other"] == {"command": "other"}
+    assert installer.verify_configuration()
+
+
+def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.write_text(
+        codex_config.read_text()
+        + '\n[mcp_servers."cross-agent-chat".tools.chat_send]\napproval_mode = "prompt"\n'
+    )
+
+    assert not installer.verify_configuration()
+
+
 def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     tmp_path: Path,
 ) -> None:

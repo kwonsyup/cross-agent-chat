@@ -469,6 +469,35 @@ def _enable_hooks_feature(text: str) -> str:
     return "".join([*lines[: index + 1], "hooks = true\n", *section, *lines[end:]])
 
 
+def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    owned_tool_section = False
+    server_section = False
+    tool_headings = {
+        f'mcp_servers."{SERVER_NAME}".tools.chat_peers',
+        f'mcp_servers."{SERVER_NAME}".tools.chat_send',
+        f"mcp_servers.{SERVER_NAME}.tools.chat_peers",
+        f"mcp_servers.{SERVER_NAME}.tools.chat_send",
+    }
+    server_headings = {f'mcp_servers."{SERVER_NAME}"', f"mcp_servers.{SERVER_NAME}"}
+    retained: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]") and not stripped.startswith("[["):
+            heading = stripped[1:-1]
+            owned_tool_section = heading in tool_headings
+            server_section = heading in server_headings
+        if owned_tool_section and re.match(r"^\s*approval_mode\s*=", line):
+            continue
+        if server_section and re.match(
+            r'^\s*tools\.(?:chat_peers|chat_send|"chat_peers"|"chat_send")\.approval_mode\s*=',
+            line,
+        ):
+            continue
+        retained.append(line)
+    return "".join(retained)
+
+
 def _codex_owned_toml(
     executable: Path,
     device: str,
@@ -756,6 +785,7 @@ class Installer:
             codex_text,
             _owned_hook_trust_keys(codex_hooks, self.codex_hooks),
         ).rstrip()
+        codex_text = _remove_owned_codex_tool_approval_overrides(codex_text).rstrip()
         codex_text = _enable_hooks_feature(codex_text).rstrip() + "\n\n"
         codex_text += _codex_owned_toml(
             self.executable,
@@ -1479,6 +1509,16 @@ class Installer:
                 return False
             if codex_server.get("default_tools_approval_mode") != "approve":
                 return False
+            codex_tools = codex_server.get("tools")
+            if codex_tools is not None:
+                if not isinstance(codex_tools, dict):
+                    return False
+                for name in ("chat_peers", "chat_send"):
+                    tool = codex_tools.get(name)
+                    if not isinstance(tool, dict):
+                        continue
+                    if tool.get("approval_mode", "approve") != "approve":
+                        return False
             if not isinstance(servers, dict) or SERVER_NAME not in servers:
                 return False
             if settings.get("crossSessionInbound") != "accept":

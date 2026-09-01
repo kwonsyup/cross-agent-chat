@@ -19,10 +19,12 @@ it as peer/user content rather than system or developer authority.
 Setup configures only the owned Cross Agent Chat Codex MCP server to run without recurring
 per-call approval prompts. The server-wide default covers the tools that server exposes,
 currently `chat_peers` and `chat_send`; it does not change global Codex approvals or unrelated
-MCP servers. Auto-approval means a Codex agent can send arbitrary agent-authored text without
-another confirmation. A compromised or prompt-injected peer can try to induce an outbound send,
-including attempted data disclosure, so do not admit untrusted nodes to the Tailnet perimeter.
-Uninstall removes the owned server block and leaves unrelated Codex configuration unchanged.
+MCP servers. Setup clears conflicting approval overrides for those two owned tools while
+preserving their other properties. Auto-approval means a Codex agent can send arbitrary
+agent-authored text without another confirmation. A compromised or prompt-injected peer can try
+to induce an outbound send, including attempted data disclosure, so do not admit untrusted nodes
+to the Tailnet perimeter. Uninstall removes the owned server block and leaves unrelated Codex
+configuration unchanged.
 
 ## Local data
 
