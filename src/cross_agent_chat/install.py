@@ -469,34 +469,69 @@ def _enable_hooks_feature(text: str) -> str:
     return "".join([*lines[: index + 1], "hooks = true\n", *section, *lines[end:]])
 
 
+def _toml_table_path(line: str) -> tuple[str, ...] | None:
+    stripped = line.strip()
+    if not stripped.startswith("[") or stripped.startswith("[["):
+        return None
+    marker = "__cross_agent_chat_table_path__"
+    try:
+        parsed = tomllib.loads(f"{line.rstrip()}\n{marker} = true\n")
+    except tomllib.TOMLDecodeError:
+        return None
+
+    def find(value: object, path: tuple[str, ...]) -> tuple[str, ...] | None:
+        if not isinstance(value, dict):
+            return None
+        if value.get(marker) is True:
+            return path
+        for key, child in value.items():
+            if key == marker:
+                continue
+            found = find(child, (*path, key))
+            if found is not None:
+                return found
+        return None
+
+    return find(parsed, ())
+
+
+def _toml_assignment_path(line: str) -> tuple[str, ...] | None:
+    try:
+        value: object = tomllib.loads(line)
+    except tomllib.TOMLDecodeError:
+        return None
+    path: list[str] = []
+    while isinstance(value, dict) and len(value) == 1:
+        key, value = next(iter(value.items()))
+        path.append(key)
+    return tuple(path) if path and not isinstance(value, dict) else None
+
+
 def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
     lines = text.splitlines(keepends=True)
     owned_tool_section = False
     server_section = False
-    tool_headings = {
-        f'mcp_servers."{SERVER_NAME}".tools.chat_peers',
-        f'mcp_servers."{SERVER_NAME}".tools.chat_send',
-        f"mcp_servers.{SERVER_NAME}.tools.chat_peers",
-        f"mcp_servers.{SERVER_NAME}.tools.chat_send",
+    tool_paths = {
+        ("mcp_servers", SERVER_NAME, "tools", "chat_peers"),
+        ("mcp_servers", SERVER_NAME, "tools", "chat_send"),
     }
-    server_headings = {f'mcp_servers."{SERVER_NAME}"', f"mcp_servers.{SERVER_NAME}"}
+    server_path = ("mcp_servers", SERVER_NAME)
     retained: list[str] = []
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("["):
             owned_tool_section = False
             server_section = False
-            match = re.fullmatch(r"\[([^\[\]]+)\]\s*(?:#.*)?", stripped)
-            if match is not None:
-                heading = match.group(1).strip()
-                owned_tool_section = heading in tool_headings
-                server_section = heading in server_headings
-        if owned_tool_section and re.match(r"^\s*approval_mode\s*=", line):
+            path = _toml_table_path(line)
+            owned_tool_section = path in tool_paths
+            server_section = path == server_path
+        assignment = _toml_assignment_path(line)
+        if owned_tool_section and assignment == ("approval_mode",):
             continue
-        if server_section and re.match(
-            r'^\s*tools\.(?:chat_peers|chat_send|"chat_peers"|"chat_send")\.approval_mode\s*=',
-            line,
-        ):
+        if server_section and assignment in {
+            ("tools", "chat_peers", "approval_mode"),
+            ("tools", "chat_send", "approval_mode"),
+        }:
             continue
         retained.append(line)
     return "".join(retained)

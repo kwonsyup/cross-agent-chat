@@ -446,8 +446,8 @@ def test_setup_removes_owned_tool_approval_overrides_and_preserves_other_propert
     codex_config = home / ".codex" / "config.toml"
     codex_config.parent.mkdir(parents=True)
     codex_config.write_text(
-        '[mcp_servers."cross-agent-chat".tools.chat_send] # owned tool\n'
-        'approval_mode = "prompt"\n'
+        "[mcp_servers.'cross-agent-chat'.tools.chat_send] # owned tool\n"
+        '"approval_mode" = "prompt"\n'
         "enabled = false\n"
         "\n[[unrelated]]\n"
         'approval_mode = "prompt"\n'
