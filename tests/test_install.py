@@ -481,7 +481,7 @@ def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: 
 
 
 def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
@@ -548,6 +548,7 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     assert set(repaired_owned) == {*owned, unrelated_key}
     assert repaired_trust[unrelated_key] == {"trusted_hash": unrelated_hash}
 
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
     installer.uninstall()
 
     uninstalled = tomllib.loads(config.read_text())
@@ -1114,6 +1115,7 @@ def test_install_restores_provider_files_if_activation_fails(
 
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
     monkeypatch.setattr(installer, "activate", fail)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
 
     with pytest.raises(SettingsError, match="activation failed"):
         installer.install()
@@ -1207,6 +1209,7 @@ def test_install_restores_and_restarts_healthy_broker_after_activation_failure(
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
 
     with pytest.raises(SettingsError, match="activation failed"):
         installer.install()
@@ -1236,6 +1239,7 @@ def test_install_restores_and_restarts_healthy_broker_after_candidate_health_fai
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
     monkeypatch.setattr(installer, "verify", lambda **_kwargs: False)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
     monkeypatch.setattr("cross_agent_chat.install.time.sleep", lambda _: None)
 
     with pytest.raises(SettingsError, match="background broker did not become healthy"):
@@ -1264,6 +1268,7 @@ def test_install_reports_primary_and_rollback_restart_failures(
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
 
     with pytest.raises(SettingsError) as captured:
         installer.install()
@@ -1559,6 +1564,7 @@ def test_staged_install_activation_failure_restores_custom_symlink_and_broker(
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
 
     with pytest.raises(
         SettingsError,
@@ -2093,6 +2099,7 @@ def test_recovery_stops_service_effect_after_service_starting_record(
         bootouts += 1
 
     monkeypatch.setattr(installer, "_bootout", bootout)
+    monkeypatch.setattr(installer, "_wait_for_broker_port_release", lambda: True)
 
     installer._recover_unfinished_transaction()
 
@@ -2363,6 +2370,7 @@ def test_staged_install_health_failure_restores_predecessor(
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
     monkeypatch.setattr(installer, "verify", lambda **_kwargs: False)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
     monkeypatch.setattr("cross_agent_chat.install.time.sleep", lambda _: None)
 
     with pytest.raises(SettingsError, match="background broker did not become healthy"):
@@ -2509,6 +2517,7 @@ def test_staged_install_retains_evidence_when_predecessor_restart_fails(
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
     monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
     monkeypatch.setattr(installer, "activate", activate)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
 
     with pytest.raises(SettingsError, match="transition and rollback failed") as captured:
         installer.install_staged(stage, stable)
@@ -2648,7 +2657,9 @@ def test_uninstall_removes_only_owned_background_surfaces(
     ] in calls
 
 
-def test_uninstall_preserves_shared_claude_cross_session_setting(tmp_path: Path) -> None:
+def test_uninstall_preserves_shared_claude_cross_session_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     settings = home / ".claude" / "settings.json"
     settings.parent.mkdir(parents=True)
@@ -2656,6 +2667,7 @@ def test_uninstall_preserves_shared_claude_cross_session_setting(tmp_path: Path)
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
     installer.setup()
 
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
     installer.uninstall()
 
     assert json.loads(settings.read_text())["crossSessionInbound"] == "accept"
@@ -2701,17 +2713,22 @@ def test_uninstall_preserves_in_home_provider_configuration_symlinks(
     assert all(target.exists() for target in targets.values())
 
 
-def test_uninstall_restores_absent_claude_cross_session_setting(tmp_path: Path) -> None:
+def test_uninstall_restores_absent_claude_cross_session_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
     installer.setup()
 
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
     installer.uninstall()
 
     assert "crossSessionInbound" not in json.loads(installer.claude_settings.read_text())
 
 
-def test_uninstall_restores_prior_claude_cross_session_setting(tmp_path: Path) -> None:
+def test_uninstall_restores_prior_claude_cross_session_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     settings = home / ".claude" / "settings.json"
     settings.parent.mkdir(parents=True)
@@ -2719,6 +2736,7 @@ def test_uninstall_restores_prior_claude_cross_session_setting(tmp_path: Path) -
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
     installer.setup()
 
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
     installer.uninstall()
 
     assert json.loads(settings.read_text())["crossSessionInbound"] == "prompt"
@@ -3031,7 +3049,9 @@ def test_predecessor_health_wait_uses_one_request_per_iteration_and_total_deadli
     assert all(0 < timeout <= BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS for timeout in timeouts)
 
 
-def test_uninstall_removes_owned_runtime_state_and_backups(tmp_path: Path) -> None:
+def test_uninstall_removes_owned_runtime_state_and_backups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
     installer.setup()
@@ -3039,6 +3059,7 @@ def test_uninstall_removes_owned_runtime_state_and_backups(tmp_path: Path) -> No
     installer.state.chmod(0o700)
     (installer.state / "marker").write_text("owned")
 
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
     installer.uninstall()
 
     assert not installer.state.exists()
