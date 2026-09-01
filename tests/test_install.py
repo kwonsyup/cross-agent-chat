@@ -584,6 +584,59 @@ def test_setup_preserves_non_bmp_inline_tool_property(tmp_path: Path) -> None:
     assert installer.verify_configuration()
 
 
+def test_setup_normalizes_mixed_dotted_tool_and_separate_tool_table(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text(
+        '[mcp_servers."cross-agent-chat"]\n'
+        'command = "old"\n'
+        'tools.chat_send = { approval_mode = "never" }\n\n'
+        '[mcp_servers."cross-agent-chat".tools.chat_peers]\n'
+        "enabled = true\n"
+    )
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    tools = config["mcp_servers"]["cross-agent-chat"]["tools"]
+    assert tools["chat_send"] == {}
+    assert tools["chat_peers"] == {"enabled": True}
+    assert installer.verify_configuration()
+
+
+def test_setup_preserves_toml_escaped_delete_character(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text(
+        '[mcp_servers."cross-agent-chat"]\n'
+        'tools = { chat_send = { approval_mode = "never", description = "chat \\u007F" } }\n'
+    )
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    assert config["mcp_servers"]["cross-agent-chat"]["tools"]["chat_send"] == {
+        "description": "chat \x7f"
+    }
+    assert installer.verify_configuration()
+
+
+def test_setup_writes_non_bmp_owned_paths_as_valid_toml(tmp_path: Path) -> None:
+    home = tmp_path / "home-🚀"
+    executable = home / ".local/bin/cross-agent-chat"
+    installer = Installer(home=home, executable=executable, device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(installer.codex_config.read_text())
+    assert config["mcp_servers"]["cross-agent-chat"]["command"] == str(executable)
+    assert installer.verify_configuration()
+
+
 def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")

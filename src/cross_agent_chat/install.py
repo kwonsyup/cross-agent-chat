@@ -533,9 +533,33 @@ def _toml_assignment(statement: str) -> tuple[str, tuple[str, ...], object] | No
     return key_text, tuple(path), value
 
 
+def _toml_string(value: str) -> str:
+    short_escapes = {
+        "\b": "\\b",
+        "\t": "\\t",
+        "\n": "\\n",
+        "\f": "\\f",
+        "\r": "\\r",
+        '"': '\\"',
+        "\\": "\\\\",
+    }
+    encoded: list[str] = []
+    for character in value:
+        codepoint = ord(character)
+        if 0xD800 <= codepoint <= 0xDFFF:
+            raise SettingsError("Codex config.toml contains an invalid Unicode value")
+        if character in short_escapes:
+            encoded.append(short_escapes[character])
+        elif codepoint < 0x20 or codepoint == 0x7F:
+            encoded.append(f"\\u{codepoint:04X}")
+        else:
+            encoded.append(character)
+    return '"' + "".join(encoded) + '"'
+
+
 def _toml_inline_value(value: object) -> str:
     if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False)
+        return _toml_string(value)
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
@@ -548,8 +572,7 @@ def _toml_inline_value(value: object) -> str:
         return "[" + ", ".join(_toml_inline_value(item) for item in value) + "]"
     if isinstance(value, dict):
         fields = ", ".join(
-            f"{json.dumps(str(key), ensure_ascii=False)} = {_toml_inline_value(item)}"
-            for key, item in value.items()
+            f"{_toml_string(str(key))} = {_toml_inline_value(item)}" for key, item in value.items()
         )
         return "{ " + fields + " }"
     raise SettingsError("Codex config.toml contains an unsupported value")
@@ -609,7 +632,7 @@ def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
     retained: list[str] = []
     pending: list[str] = []
     removed_server_table = False
-    dropped_tools_assignment = False
+    dropped_tools: set[str] = set()
     for line in text.splitlines(keepends=True):
         if not pending:
             path = _toml_table_path(line)
@@ -635,19 +658,22 @@ def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
             continue
         if table_path == server_path:
             assignment = _toml_assignment(statement)
-            dropped_tools_assignment = (
-                assignment is not None and bool(assignment[1]) and assignment[1][0] == "tools"
-            ) or dropped_tools_assignment
+            if assignment is not None and assignment[1] == ("tools",):
+                if isinstance(assignment[2], dict):
+                    dropped_tools.update(str(name) for name in assignment[2])
+            elif assignment is not None and len(assignment[1]) >= 2 and assignment[1][0] == "tools":
+                dropped_tools.add(assignment[1][1])
         else:
             retained.append(_rewrite_owned_codex_tool_assignment(statement, table_path))
         pending.clear()
     if pending:
         raise SettingsError("Codex config.toml contains an unsupported statement")
-    if removed_server_table and dropped_tools_assignment and preserved_tools:
+    if removed_server_table and dropped_tools:
         retained.append(f'\n[mcp_servers."{SERVER_NAME}".tools]\n')
         retained.extend(
-            f"{json.dumps(name, ensure_ascii=False)} = {_toml_inline_value(value)}\n"
-            for name, value in preserved_tools.items()
+            f"{_toml_string(name)} = {_toml_inline_value(preserved_tools[name])}\n"
+            for name in sorted(dropped_tools)
+            if name in preserved_tools
         )
     return "".join(retained)
 
@@ -658,8 +684,8 @@ def _codex_owned_toml(
     hooks_path: Path,
     hook_indices: dict[str, int],
 ) -> str:
-    command = json.dumps(str(executable))
-    args = json.dumps(["_mcp", "--provider", "codex", "--device", device])
+    command = _toml_string(str(executable))
+    args = _toml_inline_value(["_mcp", "--provider", "codex", "--device", device])
     text = (
         f'{OWNED_TOML_START}\n[mcp_servers."{SERVER_NAME}"]\ncommand = {command}\n'
         f'args = {args}\ntool_timeout_sec = 120\ndefault_tools_approval_mode = "approve"\n'
@@ -668,8 +694,8 @@ def _codex_owned_toml(
         hook_command = _hook_command(executable, "codex", device, event)
         key = f"{hooks_path}:{_hook_event_name(event)}:{hook_indices[event]}:0"
         text += (
-            f"\n[hooks.state.{json.dumps(key)}]\n"
-            f"trusted_hash = {json.dumps(_hook_trust_hash(hook_command, event, timeout))}\n"
+            f"\n[hooks.state.{_toml_string(key)}]\n"
+            f"trusted_hash = {_toml_string(_hook_trust_hash(hook_command, event, timeout))}\n"
         )
     return text + f"{OWNED_TOML_END}\n"
 
