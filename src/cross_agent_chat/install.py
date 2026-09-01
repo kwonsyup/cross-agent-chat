@@ -28,7 +28,7 @@ from typing import Final, Literal, cast
 from uuid import uuid4
 
 import tomlkit
-from tomlkit.exceptions import ParseError
+from tomlkit.exceptions import TOMLKitError
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import ChatError, atomic_json, ensure_private_dir, valid_device
@@ -450,7 +450,7 @@ def _hook_trust_hash(command: str, event: str, timeout: int) -> str:
 def _enable_hooks_feature(text: str) -> str:
     try:
         document = tomlkit.parse(text)
-    except ParseError as error:
+    except TOMLKitError as error:
         raise SettingsError("Codex config.toml is invalid") from error
     features = document.get("features")
     if not isinstance(features, MutableMapping):
@@ -513,7 +513,7 @@ def _toml_string(value: str) -> str:
 def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
     try:
         document = tomlkit.parse(text)
-    except ParseError as error:
+    except TOMLKitError as error:
         raise SettingsError("Codex config.toml is invalid") from error
     preserved_tools: MutableMapping[str, object] | None = None
     servers = document.get("mcp_servers")
@@ -528,7 +528,7 @@ def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
                     if isinstance(tool, MutableMapping):
                         tool.pop("approval_mode", None)
     elif servers is not None:
-        document.pop("mcp_servers")
+        raise SettingsError("Codex mcp_servers must be a table")
     cleaned = tomlkit.dumps(document).rstrip()
     if preserved_tools:
         preserved_document = tomlkit.document()

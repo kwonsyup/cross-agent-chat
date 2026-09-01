@@ -764,6 +764,42 @@ def test_setup_normalizes_inline_scalar_or_array_hooks_features(
     assert installer.verify_configuration()
 
 
+@pytest.mark.parametrize(
+    "invalid_config",
+    (
+        '[mcp_servers.foo]\ncommand = "one"\n[mcp_servers.foo]\ncommand = "two"\n',
+        "value = 1\nvalue = 2\n",
+    ),
+)
+def test_setup_reports_invalid_codex_toml_without_writing(
+    tmp_path: Path, invalid_config: str
+) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text(invalid_config)
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    with pytest.raises(SettingsError, match=re.escape("Codex config.toml is invalid")):
+        installer.setup()
+
+    assert codex_config.read_text() == invalid_config
+
+
+def test_setup_rejects_non_table_codex_mcp_servers_without_writing(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    original = '[[mcp_servers]]\nname = "unrelated"\n'
+    codex_config.write_text(original)
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    with pytest.raises(SettingsError, match="Codex mcp_servers must be a table"):
+        installer.setup()
+
+    assert codex_config.read_text() == original
+
+
 def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
