@@ -1471,6 +1471,14 @@ class Installer:
             parsed_codex: object = tomllib.loads(codex_text)
             if not isinstance(parsed_codex, dict):
                 return False
+            codex_servers = parsed_codex.get("mcp_servers")
+            if not isinstance(codex_servers, dict):
+                return False
+            codex_server = codex_servers.get(SERVER_NAME)
+            if not isinstance(codex_server, dict):
+                return False
+            if codex_server.get("default_tools_approval_mode") != "approve":
+                return False
             if not isinstance(servers, dict) or SERVER_NAME not in servers:
                 return False
             if settings.get("crossSessionInbound") != "accept":

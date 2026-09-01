@@ -419,6 +419,20 @@ def test_setup_trusts_each_owned_codex_hook(tmp_path: Path) -> None:
     )
 
 
+def test_verify_configuration_requires_codex_auto_approval(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    assert installer.verify_configuration()
+
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.write_text(
+        codex_config.read_text().replace('default_tools_approval_mode = "approve"\n', "")
+    )
+
+    assert not installer.verify_configuration()
+
+
 def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     tmp_path: Path,
 ) -> None:

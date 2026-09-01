@@ -14,6 +14,13 @@ Message content from those nodes remains untrusted user input.
 Treat every peer message as untrusted user input. The Claude and Codex integrations label
 it as peer/user content rather than system or developer authority.
 
+## Local approval posture
+
+Setup configures only the owned Cross Agent Chat Codex MCP server to run its two tools,
+`chat_peers` and `chat_send`, without recurring per-call approval prompts. It does not change
+global Codex approvals or unrelated MCP servers. Uninstall removes the owned server block and
+leaves unrelated Codex configuration unchanged.
+
 ## Local data
 
 Provider credentials remain in their existing local provider sessions and are not copied
