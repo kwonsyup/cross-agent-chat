@@ -95,8 +95,19 @@ fi
 
 "$staged_runtime/bin/python" -c 'import cross_agent_chat'
 "$staged_runtime/bin/cross-agent-chat" --version
-"$staged_runtime/bin/cross-agent-chat" _install-staged \
+set -- \
     --staged-runtime "$staged_runtime" \
     --stable-entrypoint "$stable_entrypoint"
+if [ -n "${CROSS_AGENT_CHAT_DEVICE:-}" ]; then
+    set -- "$@" --device "$CROSS_AGENT_CHAT_DEVICE"
+fi
+"$staged_runtime/bin/cross-agent-chat" _install-staged "$@"
+
+published_executable=$(command -v cross-agent-chat 2>/dev/null || true)
+if [ "$published_executable" != "$stable_entrypoint" ]; then
+    printf '%s\n' \
+        "Cross Agent Chat installed at $stable_entrypoint, but your shell resolves ${published_executable:-no cross-agent-chat command}." \
+        "Put $(dirname "$stable_entrypoint") before older Cross Agent Chat locations on PATH." >&2
+fi
 
 staged_runtime=

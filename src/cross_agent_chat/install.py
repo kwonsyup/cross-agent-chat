@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import fcntl
 import hashlib
 import json
@@ -21,7 +22,8 @@ import tomllib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from datetime import time as datetime_time
 from pathlib import Path
 from typing import Final, Literal, cast
 from uuid import uuid4
@@ -490,45 +492,156 @@ def _toml_table_path(line: str) -> tuple[str, ...] | None:
     return find(parsed, ())
 
 
-def _toml_assignment_path(line: str) -> tuple[str, ...] | None:
+def _toml_assignment(statement: str) -> tuple[str, tuple[str, ...], object] | None:
+    quote: str | None = None
+    escaped = False
+    equals = None
+    for index, character in enumerate(statement):
+        if quote is not None:
+            if quote == '"' and character == "\\" and not escaped:
+                escaped = True
+                continue
+            if character == quote and not escaped:
+                quote = None
+            escaped = False
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character == "=":
+            equals = index
+            break
+    if equals is None:
+        return None
+    key_text = statement[:equals].strip()
     try:
-        value: object = tomllib.loads(line)
+        key_only: object = tomllib.loads(f"{key_text} = 0")
+        parsed: object = tomllib.loads(statement)
     except tomllib.TOMLDecodeError:
         return None
     path: list[str] = []
-    while isinstance(value, dict) and len(value) == 1:
-        key, value = next(iter(value.items()))
+    cursor = key_only
+    while isinstance(cursor, dict) and len(cursor) == 1:
+        key, cursor = next(iter(cursor.items()))
         path.append(key)
-    return tuple(path) if path and not isinstance(value, dict) else None
+    if not path or isinstance(cursor, dict):
+        return None
+    value = parsed
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    return key_text, tuple(path), value
+
+
+def _toml_inline_value(value: object) -> str:
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, (datetime, date, datetime_time)):
+        return value.isoformat()
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_inline_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        fields = ", ".join(
+            f"{json.dumps(str(key))} = {_toml_inline_value(item)}" for key, item in value.items()
+        )
+        return "{ " + fields + " }"
+    raise SettingsError("Codex config.toml contains an unsupported value")
+
+
+def _remove_nested_key(value: object, path: tuple[str, ...]) -> bool:
+    if not path or not isinstance(value, dict):
+        return False
+    cursor = value
+    for key in path[:-1]:
+        child = cursor.get(key)
+        if not isinstance(child, dict):
+            return False
+        cursor = child
+    return cursor.pop(path[-1], None) is not None
+
+
+def _rewrite_owned_codex_tool_assignment(statement: str, table_path: tuple[str, ...]) -> str:
+    assignment = _toml_assignment(statement)
+    if assignment is None:
+        return statement
+    key_text, assignment_path, value = assignment
+    base_path = (*table_path, *assignment_path)
+    targets = (
+        ("mcp_servers", SERVER_NAME, "tools", "chat_peers", "approval_mode"),
+        ("mcp_servers", SERVER_NAME, "tools", "chat_send", "approval_mode"),
+    )
+    changed = False
+    for target in targets:
+        if base_path == target:
+            return ""
+        if target[: len(base_path)] == base_path:
+            changed = _remove_nested_key(value, target[len(base_path) :]) or changed
+    if not changed:
+        return statement
+    ending = "\r\n" if statement.endswith("\r\n") else "\n" if statement.endswith("\n") else ""
+    return f"{key_text} = {_toml_inline_value(value)}{ending}"
 
 
 def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
-    lines = text.splitlines(keepends=True)
-    owned_tool_section = False
-    server_section = False
-    tool_paths = {
-        ("mcp_servers", SERVER_NAME, "tools", "chat_peers"),
-        ("mcp_servers", SERVER_NAME, "tools", "chat_send"),
-    }
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise SettingsError("Codex config.toml is invalid") from error
     server_path = ("mcp_servers", SERVER_NAME)
+    preserved_tools: dict[str, object] = {}
+    raw_servers = parsed.get("mcp_servers")
+    if isinstance(raw_servers, dict):
+        raw_server = raw_servers.get(SERVER_NAME)
+        if isinstance(raw_server, dict) and isinstance(raw_server.get("tools"), dict):
+            preserved_tools = copy.deepcopy(cast(dict[str, object], raw_server["tools"]))
+            for name in ("chat_peers", "chat_send"):
+                tool = preserved_tools.get(name)
+                if isinstance(tool, dict):
+                    tool.pop("approval_mode", None)
+    table_path: tuple[str, ...] = ()
     retained: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("["):
-            owned_tool_section = False
-            server_section = False
+    pending: list[str] = []
+    removed_server_table = False
+    for line in text.splitlines(keepends=True):
+        if not pending:
             path = _toml_table_path(line)
-            owned_tool_section = path in tool_paths
-            server_section = path == server_path
-        assignment = _toml_assignment_path(line)
-        if owned_tool_section and assignment == ("approval_mode",):
+            if path is not None:
+                table_path = path
+                if path == server_path:
+                    removed_server_table = True
+                    continue
+                retained.append(line)
+                continue
+            if line.lstrip().startswith("[["):
+                table_path = ()
+                retained.append(line)
+                continue
+            if not line.strip() or line.lstrip().startswith("#"):
+                retained.append(line)
+                continue
+        pending.append(line)
+        statement = "".join(pending)
+        try:
+            tomllib.loads(statement)
+        except tomllib.TOMLDecodeError:
             continue
-        if server_section and assignment in {
-            ("tools", "chat_peers", "approval_mode"),
-            ("tools", "chat_send", "approval_mode"),
-        }:
-            continue
-        retained.append(line)
+        if table_path != server_path:
+            retained.append(_rewrite_owned_codex_tool_assignment(statement, table_path))
+        pending.clear()
+    if pending:
+        raise SettingsError("Codex config.toml contains an unsupported statement")
+    if removed_server_table and preserved_tools:
+        retained.append(f'\n[mcp_servers."{SERVER_NAME}".tools]\n')
+        retained.extend(
+            f"{json.dumps(name)} = {_toml_inline_value(value)}\n"
+            for name, value in preserved_tools.items()
+        )
     return "".join(retained)
 
 
@@ -1281,13 +1394,24 @@ class Installer:
         for preparing in self.transactions.glob(".preparing-*"):
             if preparing.is_dir() and not preparing.is_symlink():
                 shutil.rmtree(preparing)
+        for residue in self.transactions.iterdir():
+            if residue.is_file() and not residue.is_symlink():
+                residue.unlink()
         entries = list(self.transactions.iterdir())
         if not entries:
             return
         if len(entries) != 1 or entries[0].is_symlink() or not entries[0].is_dir():
-            raise SettingsError("predecessor state is unknown: transaction state is ambiguous")
+            paths = ", ".join(str(entry) for entry in entries)
+            raise SettingsError(
+                f"predecessor state is unknown: transaction state is ambiguous: {paths}"
+            )
         transaction_path = entries[0]
-        transaction = self._read_transaction(transaction_path)
+        try:
+            transaction = self._read_transaction(transaction_path)
+        except SettingsError as error:
+            raise SettingsError(
+                f"transaction state at {transaction_path} is invalid: {error}"
+            ) from error
         if transaction.phase == "committed":
             try:
                 if (
@@ -2016,6 +2140,7 @@ class Installer:
 
     def _prepare_runtime_removal(self, stable_entrypoint: Path | None) -> RuntimeRemovalPlan | None:
         self._validate_runtime_roots()
+        self._prune_abandoned_staged_releases()
         if not self.current_runtime.is_symlink():
             owned_residue = False
             if self.releases.exists():

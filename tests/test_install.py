@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import re
 import signal
 import socket
 import stat
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from cross_agent_chat.cli import parser
 from cross_agent_chat.install import (
     BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
     BROKER_HEALTH_WAIT_SECONDS,
@@ -42,6 +44,24 @@ def test_install_script_stages_before_runtime_transition() -> None:
     assert "/usr/bin/python3" not in script
     assert "CROSS_AGENT_CHAT_PREVIOUS_RUNTIME" not in script
     assert "CROSS_AGENT_CHAT_RUNTIME_ROOT" not in script
+    assert "CROSS_AGENT_CHAT_DEVICE" in script
+    assert "your shell resolves" in script
+
+
+def test_staged_install_parser_accepts_explicit_device(tmp_path: Path) -> None:
+    arguments = parser().parse_args(
+        [
+            "_install-staged",
+            "--staged-runtime",
+            str(tmp_path / "stage"),
+            "--stable-entrypoint",
+            str(tmp_path / "bin/cross-agent-chat"),
+            "--device",
+            "mac",
+        ]
+    )
+
+    assert arguments.device == "mac"
 
 
 def test_install_script_package_failure_leaves_predecessor_untouched(tmp_path: Path) -> None:
@@ -464,6 +484,56 @@ def test_setup_removes_owned_tool_approval_overrides_and_preserves_other_propert
     assert server["tools"]["chat_send"] == {"enabled": False}
     assert config["unrelated"] == [{"approval_mode": "prompt"}]
     assert config["mcp_servers"]["other"] == {"command": "other"}
+    assert installer.verify_configuration()
+
+
+@pytest.mark.parametrize(
+    "owned_tools",
+    (
+        '[mcp_servers."cross-agent-chat".tools]\n'
+        'chat_send = { approval_mode = "never", enabled = false }\n',
+        '[mcp_servers."cross-agent-chat"]\n'
+        'tools = { chat_send = { approval_mode = "never", enabled = false }, '
+        'chat_peers = { approval_mode = "prompt", description = "peers" } }\n',
+    ),
+)
+def test_setup_removes_inline_owned_tool_approval_overrides(
+    tmp_path: Path, owned_tools: str
+) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text(owned_tools + '\n[mcp_servers."other"]\ncommand = "other"\n')
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    tools = config["mcp_servers"]["cross-agent-chat"]["tools"]
+    assert tools["chat_send"] == {"enabled": False}
+    if "chat_peers" in tools:
+        assert tools["chat_peers"] == {"description": "peers"}
+    assert config["mcp_servers"]["other"] == {"command": "other"}
+    assert installer.verify_configuration()
+
+
+def test_setup_does_not_rewrite_assignment_text_inside_multiline_value(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    description = 'first line\napproval_mode = "never"\nlast line\n'
+    codex_config.write_text(
+        '[mcp_servers."cross-agent-chat".tools.chat_send]\n'
+        'description = """first line\napproval_mode = "never"\nlast line\n"""\n'
+    )
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    assert config["mcp_servers"]["cross-agent-chat"]["tools"]["chat_send"] == {
+        "description": description
+    }
     assert installer.verify_configuration()
 
 
@@ -1805,6 +1875,31 @@ def test_recovery_discards_pre_mutation_preparing_directory(tmp_path: Path) -> N
     assert not list(installer.transactions.iterdir())
 
 
+def test_recovery_discards_non_transaction_file_residue(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    installer = Installer(
+        home=home, executable=home / ".local/bin/cross-agent-chat", device="studio"
+    )
+    installer.transactions.mkdir(parents=True)
+    (installer.transactions / ".DS_Store").write_text("residue")
+
+    installer._recover_unfinished_transaction()
+
+    assert not list(installer.transactions.iterdir())
+
+
+def test_recovery_names_ambiguous_transaction_directory(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    installer = Installer(
+        home=home, executable=home / ".local/bin/cross-agent-chat", device="studio"
+    )
+    ambiguous = installer.transactions / "unknown-directory"
+    ambiguous.mkdir(parents=True)
+
+    with pytest.raises(SettingsError, match=re.escape(str(ambiguous))):
+        installer._recover_unfinished_transaction()
+
+
 def test_prepared_recovery_preserves_newer_runtime_and_entrypoint_state(tmp_path: Path) -> None:
     home = tmp_path / "home"
     stable = home / "bin/cross-agent-chat"
@@ -3119,6 +3214,21 @@ def test_uninstall_rejects_malformed_runtime_before_configuration_mutation(
         installer.uninstall()
 
     assert {path: path.read_bytes() for path in before} == before
+
+
+def test_runtime_removal_preflight_prunes_abandoned_staging(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    installer = Installer(
+        home=home, executable=home / ".local/bin/cross-agent-chat", device="studio"
+    )
+    staging = installer.releases / "release-abandoned"
+    staging.mkdir(parents=True)
+    (staging / ".cross-agent-chat-release").write_text(
+        "cross-agent-chat-runtime-v1:staged:999999:" + "0" * 64 + "\n"
+    )
+
+    assert installer._prepare_runtime_removal(None) is None
+    assert not staging.exists()
 
 
 def test_uninstall_through_release_binary_removes_persisted_public_entrypoint(

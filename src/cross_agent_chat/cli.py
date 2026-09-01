@@ -217,6 +217,7 @@ def parser() -> argparse.ArgumentParser:
     staged_install = commands.add_parser("_install-staged")
     staged_install.add_argument("--staged-runtime", type=Path, required=True)
     staged_install.add_argument("--stable-entrypoint", type=Path, required=True)
+    staged_install.add_argument("--device")
     return root
 
 
@@ -283,7 +284,7 @@ def run(arguments: argparse.Namespace) -> int:
 
         return 0 if run_pretool_gate(arguments.expected, arguments.content_hmac_key) else 2
     elif command == "_install-staged":
-        device = default_device()
+        device = arguments.device or default_device()
         installer = Installer(
             home=Path.home(),
             executable=arguments.stable_entrypoint,
