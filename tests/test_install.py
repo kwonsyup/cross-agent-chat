@@ -960,19 +960,26 @@ def test_uninstall_retries_latest_codex_config_before_owned_write(
     assert config["mcp_servers"] == {"concurrent-user": {"command": "user"}}
 
 
-def test_uninstall_preserves_codex_config_mode_when_removing_owned_content(
+def test_uninstall_preserves_shared_file_modes_when_removing_owned_content(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
     installer.setup()
-    installer.codex_config.chmod(0o644)
+    shared = (
+        installer.claude_settings,
+        installer.claude_config,
+        installer.codex_config,
+        installer.codex_hooks,
+    )
+    for path in shared:
+        path.chmod(0o644)
     monkeypatch.setattr(installer, "_stop_broker", lambda: None)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
 
     installer.uninstall()
 
-    assert stat.S_IMODE(installer.codex_config.stat().st_mode) == 0o644
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o644 for path in shared)
 
 
 def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
@@ -1170,6 +1177,23 @@ def test_setup_success_preserves_existing_shared_file_modes(tmp_path: Path) -> N
 
     assert stat.S_IMODE(claude_config.stat().st_mode) == 0o644
     assert stat.S_IMODE(codex_config.stat().st_mode) == 0o640
+    assert stat.S_IMODE(installer.claude_settings.stat().st_mode) == 0o600
+    assert stat.S_IMODE(installer.codex_hooks.stat().st_mode) == 0o600
+    assert stat.S_IMODE(installer.launch_agent.stat().st_mode) == 0o600
+    assert stat.S_IMODE(installer.install_state.stat().st_mode) == 0o600
+
+
+def test_setup_clamps_world_writable_shared_file_mode(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    claude_config = home / ".claude.json"
+    claude_config.parent.mkdir(parents=True)
+    claude_config.write_text("{}")
+    claude_config.chmod(0o666)
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    assert stat.S_IMODE(claude_config.stat().st_mode) == 0o644
 
 
 def test_restore_rejects_missing_backup_manifest(tmp_path: Path) -> None:
@@ -1177,6 +1201,19 @@ def test_restore_rejects_missing_backup_manifest(tmp_path: Path) -> None:
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
     backup = home / ".cache/cross-agent-chat/backups/missing-manifest"
     backup.mkdir(parents=True)
+
+    with pytest.raises(SettingsError, match="backup manifest is invalid"):
+        installer._restore(backup)
+
+
+def test_restore_rejects_symlinked_backup_manifest(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    backup = home / ".cache/cross-agent-chat/backups/symlinked-manifest"
+    backup.mkdir(parents=True)
+    outside = tmp_path / "manifest.json"
+    outside.write_text("{}")
+    (backup / "manifest.json").symlink_to(outside)
 
     with pytest.raises(SettingsError, match="backup manifest is invalid"):
         installer._restore(backup)
@@ -2351,7 +2388,7 @@ def test_recovery_wraps_missing_backup_root_as_settings_error(tmp_path: Path) ->
     transaction.mkdir(parents=True, mode=0o700)
     installer._record_transaction(
         transaction,
-        phase="prepared",
+        phase="config_written",
         staged=candidate,
         stable_entrypoint=stable,
         current_snapshot=_snapshot_path(installer.current_runtime),
@@ -2369,6 +2406,35 @@ def test_recovery_wraps_missing_backup_root_as_settings_error(tmp_path: Path) ->
 
     assert transaction.exists()
     assert candidate.exists()
+
+
+def test_prepared_recovery_self_discards_after_backup_cache_cleanup(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    stable = home / "bin/cross-agent-chat"
+    installer = Installer(home=home, executable=stable, device="studio")
+    candidate = _staged_runtime(installer)
+    prepared = installer._prepare_setup()
+    transaction = installer.transactions / ("a" * 32)
+    transaction.mkdir(parents=True, mode=0o700)
+    installer._record_transaction(
+        transaction,
+        phase="prepared",
+        staged=candidate,
+        stable_entrypoint=stable,
+        current_snapshot=_snapshot_path(installer.current_runtime),
+        entrypoint_snapshot=_snapshot_path(stable),
+        config_backup=prepared.backup,
+        previous_broker_loaded=False,
+        previous_broker_healthy=False,
+        package_tree_sha256=_package_tree_digest(candidate),
+    )
+    _bind_transaction_marker(candidate, transaction)
+    shutil.rmtree(installer.cache / "backups")
+
+    installer._recover_unfinished_transaction()
+
+    assert not transaction.exists()
+    assert not candidate.exists()
 
 
 def test_recovery_discards_non_transaction_file_residue(tmp_path: Path) -> None:

@@ -160,6 +160,17 @@ def _atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
             temporary.unlink()
 
 
+def _safe_shared_mode(mode: int | None) -> int:
+    return 0o600 if mode is None else (mode & 0o755) | 0o600
+
+
+def _shared_path_mode(path: Path) -> int:
+    try:
+        return _safe_shared_mode(stat.S_IMODE(path.stat().st_mode))
+    except OSError:
+        return 0o600
+
+
 def _snapshot_path(path: Path) -> PathSnapshot:
     if path.is_symlink():
         return PathSnapshot(path=path, kind="symlink", target=os.readlink(path))
@@ -932,9 +943,15 @@ class Installer:
             for path, payload in transaction.payloads.items():
                 destination = transaction.destinations[path]
                 original = transaction.originals[destination]
+                shared = path in {
+                    self.claude_settings,
+                    self.claude_config,
+                    self.codex_config,
+                    self.codex_hooks,
+                }
                 mode = (
-                    original.mode
-                    if original.kind == "file" and original.mode is not None
+                    _safe_shared_mode(original.mode)
+                    if shared and original.kind == "file"
                     else 0o600
                 )
                 _atomic_write(destination, payload, mode=mode)
@@ -1220,14 +1237,15 @@ class Installer:
         stable = self._validate_stable_entrypoint(self.home / stable_path)
         backup = self.home / backup_path
         candidate = self.releases / candidate_name
-        try:
-            valid_backup = backup.resolve(strict=True).parent == (self.cache / "backups").resolve(
-                strict=True
-            )
-        except OSError as error:
-            raise SettingsError("transaction metadata is invalid") from error
-        if not valid_backup:
-            raise SettingsError("transaction metadata is invalid")
+        if phase != "prepared":
+            try:
+                valid_backup = backup.resolve(strict=True).parent == (
+                    self.cache / "backups"
+                ).resolve(strict=True)
+            except OSError as error:
+                raise SettingsError("transaction metadata is invalid") from error
+            if not valid_backup:
+                raise SettingsError("transaction metadata is invalid")
         marker = candidate / RELEASE_MARKER
         marker_text = (
             marker.read_text(encoding="utf-8")
@@ -2201,14 +2219,11 @@ class Installer:
                     time.sleep(0.05)
                 continue
             codex_destination = destinations[self.codex_config]
-            try:
-                mode = stat.S_IMODE(codex_destination.stat().st_mode) & 0o777
-            except OSError:
-                destinations = self._configuration_destinations()
-                if attempt < 4:
-                    time.sleep(0.05)
-                continue
-            _atomic_write(codex_destination, stripped.lstrip("\n").encode(), mode=mode)
+            _atomic_write(
+                codex_destination,
+                stripped.lstrip("\n").encode(),
+                mode=_shared_path_mode(codex_destination),
+            )
             break
         else:
             if broker_was_loaded:
@@ -2225,17 +2240,32 @@ class Installer:
                 claude_settings["crossSessionInbound"] = previous["value"]
             else:
                 claude_settings.pop("crossSessionInbound", None)
-        _atomic_write(destinations[self.claude_settings], _json_bytes(claude_settings))
+        claude_settings_destination = destinations[self.claude_settings]
+        _atomic_write(
+            claude_settings_destination,
+            _json_bytes(claude_settings),
+            mode=_shared_path_mode(claude_settings_destination),
+        )
 
         claude = _json_object(destinations[self.claude_config])
         servers = claude.get("mcpServers")
         if isinstance(servers, dict):
             cast(dict[str, object], servers).pop(SERVER_NAME, None)
-        _atomic_write(destinations[self.claude_config], _json_bytes(claude))
+        claude_destination = destinations[self.claude_config]
+        _atomic_write(
+            claude_destination,
+            _json_bytes(claude),
+            mode=_shared_path_mode(claude_destination),
+        )
 
         codex_hooks = _json_object(destinations[self.codex_hooks])
         _remove_hooks(codex_hooks)
-        _atomic_write(destinations[self.codex_hooks], _json_bytes(codex_hooks))
+        codex_hooks_destination = destinations[self.codex_hooks]
+        _atomic_write(
+            codex_hooks_destination,
+            _json_bytes(codex_hooks),
+            mode=_shared_path_mode(codex_hooks_destination),
+        )
         destinations[self.launch_agent].unlink(missing_ok=True)
         self.legacy_peers.unlink(missing_ok=True)
         destinations[self.install_state].unlink(missing_ok=True)
