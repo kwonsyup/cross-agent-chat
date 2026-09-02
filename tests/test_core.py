@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,7 @@ from cross_agent_chat.core import (
     IntentStore,
     Registry,
     Route,
+    atomic_json,
     authenticate_sender,
     bounded_message,
     resolve_target,
@@ -27,6 +29,7 @@ from cross_agent_chat.runtime import (
     courier_health,
     local_targets,
     pre_effect_error,
+    presence_is_enabled,
     send_local,
 )
 
@@ -124,6 +127,24 @@ def test_registry_schema_is_strict(tmp_path: Path) -> None:
 
     with pytest.raises(ChatError, match="schema"):
         registry.routes()
+
+
+def test_route_liveness_compacts_only_definitively_missing_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = route(tmp_path)
+    monkeypatch.setattr("cross_agent_chat.core.os.kill", lambda *_args: None)
+    assert item.process_is_live()
+    monkeypatch.setattr(
+        "cross_agent_chat.core.os.kill",
+        lambda *_args: (_ for _ in ()).throw(PermissionError()),
+    )
+    assert item.process_is_live()
+    monkeypatch.setattr(
+        "cross_agent_chat.core.os.kill",
+        lambda *_args: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+    assert not item.process_is_live()
 
 
 def test_authenticate_claude_sender_requires_unique_parent_pid(tmp_path: Path) -> None:
@@ -244,6 +265,60 @@ def test_live_route_discovery_does_not_apply_an_age_ttl(
     assert [target.alias for target in local_targets(root)] == [live.alias]
 
 
+def test_presence_parser_accepts_only_absent_empty_or_exact_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CROSS_AGENT_CHAT_PRESENCE", raising=False)
+    assert presence_is_enabled()
+    monkeypatch.setenv("CROSS_AGENT_CHAT_PRESENCE", "")
+    assert presence_is_enabled()
+    monkeypatch.setenv("CROSS_AGENT_CHAT_PRESENCE", "off")
+    assert not presence_is_enabled()
+    for value in ("OFF", " off", "on"):
+        monkeypatch.setenv("CROSS_AGENT_CHAT_PRESENCE", value)
+        with pytest.raises(ChatError, match="CROSS_AGENT_CHAT_PRESENCE must be empty or 'off'"):
+            presence_is_enabled()
+
+
+def test_presence_off_does_not_change_visible_sibling_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat.runtime import register
+
+    root = tmp_path / "state"
+    visible = route(tmp_path, pid=os.getpid(), project="visible")
+    Registry(root).upsert(visible)
+    monkeypatch.setenv("CROSS_AGENT_CHAT_PRESENCE", "off")
+
+    assert register("codex", "studio", os.getpid(), str(root)) is None
+    assert Registry(root).routes() == [visible]
+
+
+def test_local_discovery_compacts_dead_routes_and_preserves_live_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    registry = Registry(root)
+    live = route(tmp_path, pid=1001, project="native-app-server")
+    stale = [
+        route(tmp_path, pid=1002 + index, project=f"dead-worker-{index}") for index in range(7)
+    ]
+    atomic_json(registry.path, [live.to_dict(), *(item.to_dict() for item in stale)])
+    monkeypatch.setattr(Route, "process_is_live", lambda item: item.pid == live.pid)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda *_args, **_kwargs: {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": live.generation,
+            "alias": live.alias,
+        },
+    )
+
+    assert [target.alias for target in local_targets(root)] == [live.alias]
+    assert registry.routes() == [live]
+
+
 def test_local_route_health_checks_run_concurrently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -271,6 +346,36 @@ def test_local_route_health_checks_run_concurrently(
     monkeypatch.setattr("cross_agent_chat.runtime.request_socket", health)
 
     assert [target.alias for target in local_targets(root)] == [item.alias for item in routes]
+
+
+def test_local_route_health_checks_are_capped_at_thirty_two_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    routes = [route(tmp_path, pid=os.getpid(), project=f"route-{index}") for index in range(33)]
+    for item in routes:
+        Registry(root).upsert(item)
+    observed_workers: list[int] = []
+
+    def worker_pool(*, max_workers: int) -> ThreadPoolExecutor:
+        observed_workers.append(max_workers)
+        return ThreadPoolExecutor(max_workers=max_workers)
+
+    monkeypatch.setattr("cross_agent_chat.runtime.ThreadPoolExecutor", worker_pool)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda _path, payload, **_kwargs: {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": payload["generation"],
+            "alias": next(
+                item.alias for item in routes if item.generation == payload["generation"]
+            ),
+        },
+    )
+
+    assert [target.alias for target in local_targets(root)] == [item.alias for item in routes]
+    assert observed_workers == [32]
 
 
 def test_courier_health_emits_exact_ready_contract(tmp_path: Path) -> None:

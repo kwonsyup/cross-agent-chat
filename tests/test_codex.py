@@ -10,7 +10,7 @@ import pytest
 
 from cross_agent_chat.codex import CodexCourier, deliver_at_stop
 from cross_agent_chat.core import ChatError, UnknownDeliveryError
-from cross_agent_chat.runtime import codex_stop
+from cross_agent_chat.runtime import codex_stop, register, unregister
 
 
 def test_stop_without_registered_route_is_silent_noop(
@@ -26,6 +26,21 @@ def test_stop_without_registered_route_is_silent_noop(
     codex_stop(os.getpid(), str(tmp_path / "state"))
 
     assert capsys.readouterr().out == "{}\n"
+
+
+def test_presence_off_hooks_are_noops_before_state_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "missing-state"
+    monkeypatch.setenv("CROSS_AGENT_CHAT_PRESENCE", "off")
+    monkeypatch.setattr("sys.stdin", io.StringIO("not hook input"))
+
+    assert register("codex", "studio", os.getpid(), str(root)) is None
+    unregister("codex", os.getpid(), str(root))
+    codex_stop(os.getpid(), str(root))
+
+    assert capsys.readouterr().out == ""
+    assert not root.exists()
 
 
 def test_accept_keeps_message_in_memory_only() -> None:

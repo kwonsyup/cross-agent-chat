@@ -62,6 +62,8 @@ COURIER_READY_SECONDS: Final = 3.0
 REMOTE_TIMEOUT_SECONDS: Final = (
     HEALTH_TIMEOUT_SECONDS + AUTHORIZE_TIMEOUT_SECONDS + ACCEPT_TIMEOUT_SECONDS + 5.0
 )
+LOCAL_DISCOVERY_WORKERS: Final = 32
+PRESENCE_ENV_VAR: Final = "CROSS_AGENT_CHAT_PRESENCE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +100,15 @@ def state_root(value: str | None = None) -> Path:
         raise ChatError("state root must be absolute")
     ensure_private_dir(root)
     return root
+
+
+def presence_is_enabled() -> bool:
+    value = os.environ.get(PRESENCE_ENV_VAR)
+    if value in {None, ""}:
+        return True
+    if value == "off":
+        return False
+    raise ChatError(f"{PRESENCE_ENV_VAR} must be empty or 'off'")
 
 
 def socket_path(root: Path, route: Route) -> Path:
@@ -275,7 +286,9 @@ def _spawn_courier(root: Path, route: Route) -> None:
     raise ChatError("session courier did not become ready")
 
 
-def register(provider: str, device: str, pid: int, state_root_value: str | None) -> Route:
+def register(provider: str, device: str, pid: int, state_root_value: str | None) -> Route | None:
+    if not presence_is_enabled():
+        return None
     if provider not in {"claude", "codex"}:
         raise ChatError("provider is invalid")
     if isinstance(pid, bool) or pid <= 0:
@@ -289,7 +302,9 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
         pid=pid,
     )
     root = state_root(state_root_value)
-    Registry(root).upsert(route)
+    registry = Registry(root)
+    registry.compact_dead()
+    registry.upsert(route)
     try:
         _spawn_courier(root, route)
     except ChatError:
@@ -299,6 +314,8 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
 
 
 def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
+    if not presence_is_enabled():
+        return
     if provider not in {"claude", "codex"}:
         raise ChatError("provider is invalid")
     raw = hook_input("SessionEnd")
@@ -593,10 +610,10 @@ def _local_target(root: Path, route: Route) -> Target | None:
 
 
 def local_targets(root: Path) -> list[Target]:
-    routes = [route for route in Registry(root).routes() if route.process_is_live()]
+    routes = Registry(root).compact_dead()
     if not routes:
         return []
-    with ThreadPoolExecutor(max_workers=len(routes)) as workers:
+    with ThreadPoolExecutor(max_workers=min(LOCAL_DISCOVERY_WORKERS, len(routes))) as workers:
         targets = workers.map(lambda route: _local_target(root, route), routes)
         return [target for target in targets if target is not None]
 
@@ -981,6 +998,8 @@ def peers(root: Path, *, include_remote: bool = True, internal: bool = False) ->
 
 
 def codex_stop(pid: int, state_root_value: str | None) -> None:
+    if not presence_is_enabled():
+        return
     raw = hook_input("Stop")
     if raw.get("stop_hook_active") is True:
         print("{}", flush=True)

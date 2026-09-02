@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-source_ref=${CROSS_AGENT_CHAT_SOURCE:-git+https://github.com/kwonsyup/cross-agent-chat.git@v0.1.2}
+source_ref=${CROSS_AGENT_CHAT_SOURCE:-git+https://github.com/kwonsyup/cross-agent-chat.git@v0.1.3}
 home_root=$(cd "$HOME" && pwd -P)
 mkdir -p "$HOME/.local"
 local_root=$(cd "$HOME/.local" && pwd -P)
