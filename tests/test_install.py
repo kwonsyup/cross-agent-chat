@@ -899,6 +899,81 @@ def test_uninstall_re_resolves_codex_config_symlink_after_broker_stop(
     assert tomllib.loads(second.read_text())["mcp_servers"] == {"user": {"command": "user"}}
 
 
+def test_uninstall_re_resolves_all_provider_symlinks_after_broker_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    owned = installer.claude_settings.read_bytes()
+    first = home / ".claude/first-settings.json"
+    second = home / ".claude/second-settings.json"
+    first.write_bytes(owned)
+    second_payload = json.loads(owned)
+    second_payload["unrelated"] = True
+    second.write_text(json.dumps(second_payload))
+    installer.claude_settings.unlink()
+    installer.claude_settings.symlink_to(first.name)
+
+    def stop_broker() -> None:
+        installer.claude_settings.unlink()
+        installer.claude_settings.symlink_to(second.name)
+
+    monkeypatch.setattr(installer, "_stop_broker", stop_broker)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+
+    installer.uninstall()
+
+    assert first.read_bytes() == owned
+    updated = json.loads(second.read_text())
+    assert updated["unrelated"] is True
+    assert "crossSessionInbound" not in updated
+
+
+def test_uninstall_retries_latest_codex_config_before_owned_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    real_read = installer._codex_config_text
+    calls = 0
+    user_block = '\n[mcp_servers."concurrent-user"]\ncommand = "user"\n'
+
+    def changing_read() -> str | None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            current = real_read()
+            assert current is not None
+            installer.codex_config.write_text(current + user_block)
+        return real_read()
+
+    monkeypatch.setattr(installer, "_codex_config_text", changing_read)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+
+    installer.uninstall()
+
+    config = tomllib.loads(installer.codex_config.read_text())
+    assert config["mcp_servers"] == {"concurrent-user": {"command": "user"}}
+
+
+def test_uninstall_preserves_codex_config_mode_when_removing_owned_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    installer.codex_config.chmod(0o644)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+
+    installer.uninstall()
+
+    assert stat.S_IMODE(installer.codex_config.stat().st_mode) == 0o644
+
+
 def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
