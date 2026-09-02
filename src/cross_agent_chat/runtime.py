@@ -11,7 +11,14 @@ import stat
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+)
+from concurrent.futures import (
+    TimeoutError as FuturesTimeoutError,
+)
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
@@ -63,6 +70,7 @@ REMOTE_TIMEOUT_SECONDS: Final = (
     HEALTH_TIMEOUT_SECONDS + AUTHORIZE_TIMEOUT_SECONDS + ACCEPT_TIMEOUT_SECONDS + 5.0
 )
 LOCAL_DISCOVERY_WORKERS: Final = 32
+LOCAL_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS
 PRESENCE_ENV_VAR: Final = "CROSS_AGENT_CHAT_PRESENCE"
 
 
@@ -569,12 +577,14 @@ def shutdown_couriers(root: Path) -> None:
             raise ChatError("courier shutdown failed")
 
 
-def _local_target(root: Path, route: Route) -> Target | None:
+def _local_target(
+    root: Path, route: Route, *, timeout: float = HEALTH_TIMEOUT_SECONDS
+) -> Target | None:
     try:
         response = request_socket(
             socket_path(root, route),
             {"schema_version": 1, "operation": "health", "generation": route.generation},
-            timeout=HEALTH_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except UnknownDeliveryError:
         return None
@@ -609,13 +619,41 @@ def _local_target(root: Path, route: Route) -> Target | None:
         return None
 
 
+def _local_target_before_deadline(root: Path, route: Route, deadline: float) -> Target | None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return _local_target(root, route, timeout=min(HEALTH_TIMEOUT_SECONDS, remaining))
+
+
 def local_targets(root: Path) -> list[Target]:
     routes = [route for route in Registry(root).routes() if route.process_is_live()]
     if not routes:
         return []
-    with ThreadPoolExecutor(max_workers=min(LOCAL_DISCOVERY_WORKERS, len(routes))) as workers:
-        targets = workers.map(lambda route: _local_target(root, route), routes)
-        return [target for target in targets if target is not None]
+    deadline = time.monotonic() + LOCAL_DISCOVERY_TIMEOUT_SECONDS
+    workers = ThreadPoolExecutor(max_workers=min(LOCAL_DISCOVERY_WORKERS, len(routes)))
+    futures: list[Future[Target | None]] = []
+    results: list[Target | None] = [None] * len(routes)
+    future_indexes: dict[Future[Target | None], int] = {}
+    try:
+        for index, route in enumerate(routes):
+            if time.monotonic() >= deadline:
+                break
+            future = workers.submit(_local_target_before_deadline, root, route, deadline)
+            futures.append(future)
+            future_indexes[future] = index
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                for future in as_completed(futures, timeout=remaining):
+                    results[future_indexes[future]] = future.result()
+            except FuturesTimeoutError:
+                pass
+    finally:
+        for future in futures:
+            future.cancel()
+        workers.shutdown(wait=False, cancel_futures=True)
+    return [target for target in results if target is not None]
 
 
 def _targets_from_tailnet(address: str, raw: object) -> list[Target]:

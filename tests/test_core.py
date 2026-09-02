@@ -4,7 +4,9 @@ import io
 import json
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +26,8 @@ from cross_agent_chat.core import (
 )
 from cross_agent_chat.runtime import (
     HEALTH_TIMEOUT_SECONDS,
+    LOCAL_DISCOVERY_TIMEOUT_SECONDS,
+    REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     Target,
     _local_target,
     canonical_source_alias,
@@ -364,7 +368,7 @@ def test_local_route_health_checks_run_concurrently(
     rendezvous = threading.Barrier(2)
 
     def health(_path: Path, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
-        assert timeout == HEALTH_TIMEOUT_SECONDS
+        assert 0 < timeout <= HEALTH_TIMEOUT_SECONDS
         rendezvous.wait(timeout=5)
         item = by_generation[str(payload["generation"])]
         return {
@@ -407,6 +411,108 @@ def test_local_route_health_checks_are_capped_at_thirty_two_workers(
 
     assert [target.alias for target in local_targets(root)] == [item.alias for item in routes]
     assert observed_workers == [32]
+
+
+def test_local_discovery_deadline_matches_remote_broker_budget() -> None:
+    assert REMOTE_DISCOVERY_TIMEOUT_SECONDS == LOCAL_DISCOVERY_TIMEOUT_SECONDS + 5.0
+
+
+def test_local_discovery_deadline_cancels_queued_work_without_waiting_for_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    routes = [route(tmp_path, pid=os.getpid(), project=f"route-{index}") for index in range(33)]
+    for item in routes:
+        Registry(root).upsert(item)
+
+    class TimedOutWorkers:
+        def __init__(self, *, max_workers: int) -> None:
+            assert max_workers == 32
+            self.futures: list[Future[Target | None]] = []
+            self.shutdown_calls: list[tuple[bool, bool]] = []
+            workers.append(self)
+
+        def submit(self, _fn: object, *_args: object) -> Future[Target | None]:
+            future: Future[Target | None] = Future()
+            self.futures.append(future)
+            return future
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    workers: list[TimedOutWorkers] = []
+
+    def expired(
+        _futures: Iterable[Future[Target | None]], *, timeout: float | None = None
+    ) -> Iterator[Future[Target | None]]:
+        assert timeout is not None and 0 < timeout <= LOCAL_DISCOVERY_TIMEOUT_SECONDS
+        raise FuturesTimeoutError()
+
+    monkeypatch.setattr("cross_agent_chat.runtime.ThreadPoolExecutor", TimedOutWorkers)
+    monkeypatch.setattr("cross_agent_chat.runtime.as_completed", expired)
+
+    assert local_targets(root) == []
+    assert len(workers) == 1
+    assert len(workers[0].futures) == 33
+    assert all(future.cancelled() for future in workers[0].futures)
+    assert workers[0].shutdown_calls == [(False, True)]
+
+
+def test_local_discovery_returns_completed_targets_before_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    routes = [route(tmp_path, pid=os.getpid(), project=f"route-{index}") for index in range(33)]
+    for item in routes:
+        Registry(root).upsert(item)
+    first = routes[0]
+    expected = Target(
+        alias=first.alias,
+        provider=first.provider,
+        device=first.device,
+        project=first.project,
+        generation=first.generation,
+        session_key="a" * 64,
+        remote=False,
+        session_id=first.session_id,
+        cwd=first.cwd,
+        pid=first.pid,
+    )
+
+    class PartialWorkers:
+        def __init__(self, *, max_workers: int) -> None:
+            assert max_workers == 32
+            self.futures: list[Future[Target | None]] = []
+            self.shutdown_calls: list[tuple[bool, bool]] = []
+            workers.append(self)
+
+        def submit(self, _fn: object, *_args: object) -> Future[Target | None]:
+            future: Future[Target | None] = Future()
+            if not self.futures:
+                future.set_result(expected)
+            self.futures.append(future)
+            return future
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    workers: list[PartialWorkers] = []
+
+    def completed_then_expired(
+        futures: Iterable[Future[Target | None]], *, timeout: float | None = None
+    ) -> Iterator[Future[Target | None]]:
+        assert timeout is not None and 0 < timeout <= LOCAL_DISCOVERY_TIMEOUT_SECONDS
+        first_future, *_ = futures
+        yield first_future
+        raise FuturesTimeoutError()
+
+    monkeypatch.setattr("cross_agent_chat.runtime.ThreadPoolExecutor", PartialWorkers)
+    monkeypatch.setattr("cross_agent_chat.runtime.as_completed", completed_then_expired)
+
+    assert local_targets(root) == [expected]
+    assert len(workers) == 1
+    assert workers[0].shutdown_calls == [(False, True)]
+    assert all(future.cancelled() for future in workers[0].futures[1:])
 
 
 def test_courier_health_emits_exact_ready_contract(tmp_path: Path) -> None:
