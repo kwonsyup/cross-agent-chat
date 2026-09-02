@@ -53,6 +53,8 @@ mkdir -p "$releases_root"
 chmod 700 "$product_root" "$releases_root"
 staged_runtime=$(mktemp -d "$releases_root/release-XXXXXX")
 owner_identity=$(/bin/ps -ww -p "$$" -o lstart= -o command= | shasum -a 256 | awk '{print $1}')
+printf '%s:%s:%s\n' 'cross-agent-chat-runtime-v1:staged' "$$" "$owner_identity" > "$staged_runtime/.cross-agent-chat-release"
+chmod 600 "$staged_runtime/.cross-agent-chat-release"
 
 python_is_compatible() {
     command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'
@@ -74,8 +76,6 @@ if [ -n "$uv_command" ]; then
 else
     python3 -m venv "$staged_runtime"
 fi
-printf '%s:%s:%s\n' 'cross-agent-chat-runtime-v1:staged' "$$" "$owner_identity" > "$staged_runtime/.cross-agent-chat-release"
-chmod 600 "$staged_runtime/.cross-agent-chat-release"
 if [ -n "$uv_command" ]; then
     "$uv_command" pip install --python "$staged_runtime/bin/python" "$source_ref"
 else

@@ -44,6 +44,8 @@ def test_install_script_stages_before_runtime_transition() -> None:
     script = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
 
     assert script.index("pip install") < script.index("_install-staged")
+    marker = '> "$staged_runtime/.cross-agent-chat-release"'
+    assert script.index(marker) < script.index('venv --python 3.11 "$staged_runtime"')
     assert "uv tool install" not in script
     assert "/usr/bin/python3" not in script
     assert "CROSS_AGENT_CHAT_PREVIOUS_RUNTIME" not in script
@@ -491,6 +493,30 @@ def test_setup_removes_owned_tool_approval_overrides_and_preserves_other_propert
     assert installer.verify_configuration()
 
 
+def test_uninstall_removes_preserved_owned_tool_tables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex/config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text(
+        '[mcp_servers."cross-agent-chat".tools.chat_send]\n'
+        'approval_mode = "prompt"\n'
+        "enabled = false\n"
+        '\n[mcp_servers."user"]\ncommand = "user"\n'
+    )
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+
+    installer.uninstall()
+
+    config = tomllib.loads(codex_config.read_text())
+    assert "cross-agent-chat" not in config["mcp_servers"]
+    assert config["mcp_servers"]["user"] == {"command": "user"}
+
+
 @pytest.mark.parametrize(
     "owned_tools",
     (
@@ -739,6 +765,22 @@ def test_setup_ignores_features_header_text_inside_multiline_string(tmp_path: Pa
     assert config["description"] == "before\n[features]\nafter\n"
     assert config["features"] == {"hooks": True}
     assert installer.verify_configuration()
+
+
+def test_setup_preserves_owned_marker_text_inside_multiline_string(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex/config.toml"
+    codex_config.parent.mkdir(parents=True)
+    description = "before\n# cross-agent-chat:start\ninside\n# cross-agent-chat:end\nafter\n"
+    codex_config.write_text(
+        'description = """before\n# cross-agent-chat:start\ninside\n'
+        '# cross-agent-chat:end\nafter\n"""\n'
+    )
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    assert tomllib.loads(codex_config.read_text())["description"] == description
 
 
 @pytest.mark.parametrize(
@@ -1141,6 +1183,22 @@ def test_setup_rolls_back_when_verification_fails(tmp_path: Path) -> None:
     assert settings.read_bytes() == original
 
 
+def test_setup_rejects_provider_change_after_payload_preparation(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    claude_config = home / ".claude.json"
+    claude_config.parent.mkdir(parents=True)
+    claude_config.write_text(json.dumps({"before": True}))
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    prepared = installer._prepare_setup()
+    concurrent = json.dumps({"concurrent": True})
+    claude_config.write_text(concurrent)
+
+    with pytest.raises(SettingsError, match="changed before setup write"):
+        installer.setup(prepared=prepared)
+
+    assert claude_config.read_text() == concurrent
+
+
 def test_setup_rollback_preserves_in_home_symlink_and_target_mode(tmp_path: Path) -> None:
     home = tmp_path / "home"
     target = home / "shared/claude-settings.json"
@@ -1258,6 +1316,36 @@ def test_activate_starts_only_owned_launch_agent(
         f"gui/{__import__('os').getuid()}",
         str(installer.launch_agent),
     ] in calls
+
+
+def test_install_recovers_unfinished_transaction_before_broker_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    events: list[str] = []
+    monkeypatch.setattr(
+        installer, "_recover_unfinished_transaction", lambda: events.append("recover")
+    )
+
+    def broker_loaded() -> bool:
+        events.append("broker")
+        return False
+
+    monkeypatch.setattr(installer, "broker_is_loaded", broker_loaded)
+    monkeypatch.setattr(
+        installer,
+        "setup",
+        lambda: InstallReport(changed_paths=(), backup=tmp_path / "unused-backup"),
+    )
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+    monkeypatch.setattr(installer, "activate", lambda: None)
+    monkeypatch.setattr(installer, "_wait_for_broker_health", lambda _probe: True)
+
+    installer._install()
+
+    assert events[:2] == ["recover", "broker"]
 
 
 def test_activate_reloads_existing_owned_launch_agent(

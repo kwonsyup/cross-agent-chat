@@ -556,6 +556,23 @@ def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
     return cleaned + ("\n" if cleaned else "")
 
 
+def _strip_owned_toml_block(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    nonblank = [index for index, line in enumerate(lines) if line.strip()]
+    if not nonblank or lines[nonblank[-1]].strip() != OWNED_TOML_END:
+        return text
+    end = nonblank[-1]
+    starts = [index for index in range(end) if lines[index].strip() == OWNED_TOML_START]
+    if not starts:
+        return text
+    candidate = "".join(lines[: starts[-1]] + lines[end + 1 :])
+    try:
+        tomlkit.parse(candidate)
+    except TOMLKitError:
+        return text
+    return candidate
+
+
 def _codex_owned_toml(
     executable: Path,
     device: str,
@@ -601,20 +618,30 @@ def _owned_hook_trust_keys(config: dict[str, object], hooks_path: Path) -> set[s
 
 
 def _remove_owned_hook_trust(text: str, owned_keys: set[str]) -> str:
-    removing = False
-    retained: list[str] = []
-    for line in text.splitlines(keepends=True):
-        if line.strip().startswith("["):
-            path = _toml_table_path(line)
-            removing = (
-                path is not None
-                and len(path) == 3
-                and path[:2] == ("hooks", "state")
-                and path[2] in owned_keys
-            )
-        if not removing:
-            retained.append(line)
-    return "".join(retained)
+    try:
+        document = tomlkit.parse(text)
+    except TOMLKitError as error:
+        raise SettingsError("Codex config.toml is invalid") from error
+    hooks = document.get("hooks")
+    if isinstance(hooks, MutableMapping):
+        state = hooks.get("state")
+        if isinstance(state, MutableMapping):
+            for key in owned_keys:
+                state.pop(key, None)
+    return tomlkit.dumps(document)
+
+
+def _remove_owned_codex_server(text: str) -> str:
+    try:
+        document = tomlkit.parse(text)
+    except TOMLKitError as error:
+        raise SettingsError("Codex config.toml is invalid") from error
+    servers = document.get("mcp_servers")
+    if isinstance(servers, MutableMapping):
+        servers.pop(SERVER_NAME, None)
+    elif servers is not None:
+        raise SettingsError("Codex mcp_servers must be a table")
+    return tomlkit.dumps(document)
 
 
 class Installer:
@@ -852,7 +879,7 @@ class Installer:
             hook_indices[event] = indices[0]
 
         codex_text = self._codex_config_text() or ""
-        codex_text = OWNED_TOML_RE.sub("\n", codex_text)
+        codex_text = _strip_owned_toml_block(codex_text)
         codex_text = _remove_owned_hook_trust(
             codex_text,
             _owned_hook_trust_keys(codex_hooks, self.codex_hooks),
@@ -940,6 +967,11 @@ class Installer:
         transaction = self._prepare_setup() if prepared is None else prepared
         written: list[Path] = []
         try:
+            if any(
+                _snapshot_path(original.path) != original
+                for original in transaction.originals.values()
+            ):
+                raise SettingsError("provider configuration changed before setup write")
             for path, payload in transaction.payloads.items():
                 destination = transaction.destinations[path]
                 original = transaction.originals[destination]
@@ -1005,6 +1037,7 @@ class Installer:
             return self._install()
 
     def _install(self) -> InstallReport:
+        self._recover_unfinished_transaction()
         previous_broker_loaded = self.broker_is_loaded()
         previous_broker_healthy = previous_broker_loaded and self._wait_for_previous_broker_health()
         report = self.setup()
@@ -1541,6 +1574,11 @@ class Installer:
         config_transition_started = False
         try:
             self._stop_couriers()
+            if (
+                _snapshot_path(self.current_runtime) != current_snapshot
+                or _snapshot_path(stable) != entrypoint_snapshot
+            ):
+                raise SettingsError("runtime ownership changed before transition")
             record("runtime_switching")
             runtime_transition_started = True
             _atomic_symlink(f"releases/{final_runtime.name}", self.current_runtime)
@@ -2208,9 +2246,9 @@ class Installer:
             codex_text = self._codex_config_text()
             if codex_text is None:
                 break
-            stripped = _remove_owned_hook_trust(
-                OWNED_TOML_RE.sub("\n", codex_text), owned_trust_keys
-            )
+            stripped = _strip_owned_toml_block(codex_text)
+            stripped = _remove_owned_codex_server(stripped)
+            stripped = _remove_owned_hook_trust(stripped, owned_trust_keys)
             if stripped == codex_text:
                 break
             if self._codex_config_text() != codex_text:
