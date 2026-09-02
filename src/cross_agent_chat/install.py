@@ -2166,6 +2166,8 @@ class Installer:
         runtime_removal = self._prepare_runtime_removal(stable_entrypoint)
         broker_was_loaded = self.broker_is_loaded()
         self._stop_broker()
+        self._stop_couriers()
+        self._remove_runtime_state()
         destinations = self._configuration_destinations()
         for attempt in range(5):
             destinations = self._configuration_destinations()
@@ -2201,8 +2203,6 @@ class Installer:
                 f"Codex config.toml kept changing during uninstall: {self.codex_config}; "
                 "re-run uninstall"
             )
-        self._stop_couriers()
-        self._remove_runtime_state()
         claude_settings = _json_object(destinations[self.claude_settings])
         _remove_hooks(claude_settings)
         previous = cast(dict[str, object], metadata["claude_cross_session_inbound"])
@@ -2219,6 +2219,7 @@ class Installer:
             cast(dict[str, object], servers).pop(SERVER_NAME, None)
         _atomic_write(destinations[self.claude_config], _json_bytes(claude))
 
+        codex_hooks = _json_object(destinations[self.codex_hooks])
         _remove_hooks(codex_hooks)
         _atomic_write(destinations[self.codex_hooks], _json_bytes(codex_hooks))
         destinations[self.launch_agent].unlink(missing_ok=True)
