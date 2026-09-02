@@ -610,7 +610,7 @@ def _local_target(root: Path, route: Route) -> Target | None:
 
 
 def local_targets(root: Path) -> list[Target]:
-    routes = Registry(root).compact_dead()
+    routes = [route for route in Registry(root).routes() if route.process_is_live()]
     if not routes:
         return []
     with ThreadPoolExecutor(max_workers=min(LOCAL_DISCOVERY_WORKERS, len(routes))) as workers:

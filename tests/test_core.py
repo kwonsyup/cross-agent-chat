@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import threading
@@ -294,17 +295,47 @@ def test_presence_off_does_not_change_visible_sibling_route(
     assert Registry(root).routes() == [visible]
 
 
-def test_local_discovery_compacts_dead_routes_and_preserves_live_routes(
+def test_registration_compacts_dead_routes_and_preserves_live_routes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from cross_agent_chat.runtime import register
+
     root = tmp_path / "state"
     registry = Registry(root)
-    live = route(tmp_path, pid=1001, project="native-app-server")
+    live = route(tmp_path, pid=os.getpid(), project="native-app-server")
     stale = [
         route(tmp_path, pid=1002 + index, project=f"dead-worker-{index}") for index in range(7)
     ]
     atomic_json(registry.path, [live.to_dict(), *(item.to_dict() for item in stale)])
     monkeypatch.setattr(Route, "process_is_live", lambda item: item.pid == live.pid)
+    monkeypatch.setattr("cross_agent_chat.runtime._spawn_courier", lambda *_args: None)
+    hook = {
+        "hook_event_name": "SessionStart",
+        "session_id": str(uuid4()),
+        "cwd": str(tmp_path),
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(hook)))
+
+    registered = register("codex", "studio", os.getpid(), str(root))
+
+    assert registered is not None
+    assert registry.routes() == [live, registered]
+
+
+def test_local_discovery_filters_dead_routes_without_state_lock_or_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    registry = Registry(root)
+    live = route(tmp_path, pid=os.getpid(), project="native-app-server")
+    stale = route(tmp_path, pid=1002, project="dead-worker")
+    atomic_json(registry.path, [live.to_dict(), stale.to_dict()])
+    before = registry.path.read_bytes()
+    monkeypatch.setattr(Route, "process_is_live", lambda item: item.pid == live.pid)
+    monkeypatch.setattr(
+        "cross_agent_chat.core.state_lock",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("discovery must not lock state")),
+    )
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_socket",
         lambda *_args, **_kwargs: {
@@ -316,7 +347,7 @@ def test_local_discovery_compacts_dead_routes_and_preserves_live_routes(
     )
 
     assert [target.alias for target in local_targets(root)] == [live.alias]
-    assert registry.routes() == [live]
+    assert registry.path.read_bytes() == before
 
 
 def test_local_route_health_checks_run_concurrently(
