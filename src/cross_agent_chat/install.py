@@ -2164,13 +2164,13 @@ class Installer:
         metadata = self._install_metadata(_json_object(self.claude_settings))
         stable_entrypoint = self.home / cast(str, metadata["stable_entrypoint"])
         runtime_removal = self._prepare_runtime_removal(stable_entrypoint)
+        broker_was_loaded = self.broker_is_loaded()
         self._stop_broker()
-        self._stop_couriers()
-        self._remove_runtime_state()
         destinations = self._configuration_destinations()
-        codex_hooks = _json_object(self.codex_hooks)
-        owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
-        for _attempt in range(3):
+        for attempt in range(5):
+            destinations = self._configuration_destinations()
+            codex_hooks = _json_object(destinations[self.codex_hooks])
+            owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
             codex_text = self._codex_config_text()
             if codex_text is None:
                 break
@@ -2181,17 +2181,29 @@ class Installer:
                 break
             if self._codex_config_text() != codex_text:
                 destinations = self._configuration_destinations()
+                if attempt < 4:
+                    time.sleep(0.05)
                 continue
             codex_destination = destinations[self.codex_config]
-            mode = stat.S_IMODE(codex_destination.stat().st_mode)
+            try:
+                mode = stat.S_IMODE(codex_destination.stat().st_mode) & 0o777
+            except OSError:
+                destinations = self._configuration_destinations()
+                if attempt < 4:
+                    time.sleep(0.05)
+                continue
             _atomic_write(codex_destination, stripped.lstrip("\n").encode(), mode=mode)
             break
         else:
+            if broker_was_loaded:
+                self.activate()
             raise SettingsError(
                 f"Codex config.toml kept changing during uninstall: {self.codex_config}; "
                 "re-run uninstall"
             )
-        claude_settings = _json_object(self.claude_settings)
+        self._stop_couriers()
+        self._remove_runtime_state()
+        claude_settings = _json_object(destinations[self.claude_settings])
         _remove_hooks(claude_settings)
         previous = cast(dict[str, object], metadata["claude_cross_session_inbound"])
         if claude_settings.get("crossSessionInbound") == "accept":
@@ -2201,7 +2213,7 @@ class Installer:
                 claude_settings.pop("crossSessionInbound", None)
         _atomic_write(destinations[self.claude_settings], _json_bytes(claude_settings))
 
-        claude = _json_object(self.claude_config)
+        claude = _json_object(destinations[self.claude_config])
         servers = claude.get("mcpServers")
         if isinstance(servers, dict):
             cast(dict[str, object], servers).pop(SERVER_NAME, None)
