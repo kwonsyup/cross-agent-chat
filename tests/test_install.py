@@ -863,10 +863,11 @@ def test_uninstall_never_overwrites_codex_config_changed_during_broker_stop(
     monkeypatch.setattr(installer, "_stop_broker", stop_broker)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
 
-    with pytest.raises(SettingsError, match="changed during uninstall"):
-        installer.uninstall()
+    installer.uninstall()
 
     assert installer.codex_config.read_text() == replacement
+    assert not installer.launch_agent.exists()
+    assert not installer.install_state.exists()
 
 
 def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:

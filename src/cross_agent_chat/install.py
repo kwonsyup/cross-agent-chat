@@ -2158,7 +2158,7 @@ class Installer:
             self._uninstall()
 
     def _uninstall(self) -> None:
-        codex_text = self._codex_config_text()
+        self._codex_config_text()
         self._recover_unfinished_transaction()
         destinations = self._configuration_destinations()
         metadata = self._install_metadata(_json_object(self.claude_settings))
@@ -2167,8 +2167,6 @@ class Installer:
         self._stop_broker()
         self._stop_couriers()
         self._remove_runtime_state()
-        if self._codex_config_text() != codex_text:
-            raise SettingsError(f"Codex config.toml changed during uninstall: {self.codex_config}")
         claude_settings = _json_object(self.claude_settings)
         _remove_hooks(claude_settings)
         previous = cast(dict[str, object], metadata["claude_cross_session_inbound"])
@@ -2187,14 +2185,23 @@ class Installer:
 
         codex_hooks = _json_object(self.codex_hooks)
         owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
-        if codex_text is not None:
-            if self._codex_config_text() != codex_text:
-                raise SettingsError(
-                    f"Codex config.toml changed during uninstall: {self.codex_config}"
-                )
+        for _attempt in range(3):
+            codex_text = self._codex_config_text()
+            if codex_text is None:
+                break
             cleaned = OWNED_TOML_RE.sub("\n", codex_text)
             cleaned = _remove_owned_hook_trust(cleaned, owned_trust_keys).lstrip("\n")
+            if cleaned == codex_text:
+                break
+            if self._codex_config_text() != codex_text:
+                continue
             _atomic_write(destinations[self.codex_config], cleaned.encode())
+            break
+        else:
+            raise SettingsError(
+                f"Codex config.toml kept changing during uninstall: {self.codex_config}; "
+                "re-run uninstall"
+            )
 
         _remove_hooks(codex_hooks)
         _atomic_write(destinations[self.codex_hooks], _json_bytes(codex_hooks))
