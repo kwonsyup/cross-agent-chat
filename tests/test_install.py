@@ -783,6 +783,31 @@ def test_setup_preserves_owned_marker_text_inside_multiline_string(tmp_path: Pat
     assert tomllib.loads(codex_config.read_text())["description"] == description
 
 
+def test_setup_and_uninstall_remove_owned_block_before_trailing_user_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    installer.codex_config.write_text(
+        installer.codex_config.read_text()
+        + '\n[mcp_servers."user-after-owned"]\ncommand = "user"\n'
+    )
+
+    installer.setup()
+
+    text = installer.codex_config.read_text()
+    assert text.count("# cross-agent-chat:start") == 1
+    assert text.count("# cross-agent-chat:end") == 1
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    installer.uninstall()
+    cleaned = installer.codex_config.read_text()
+    assert "# cross-agent-chat:start" not in cleaned
+    assert "# cross-agent-chat:end" not in cleaned
+    assert tomllib.loads(cleaned)["mcp_servers"]["user-after-owned"] == {"command": "user"}
+
+
 @pytest.mark.parametrize(
     ("feature_config", "expected"),
     (
@@ -3867,14 +3892,19 @@ def test_uninstall_resumes_committed_release_cleanup_without_current_pointer(
     )
     installer.setup()
     release = installer.releases / "release-residue"
-    release.mkdir(parents=True)
+    (release / "bin").mkdir(parents=True)
+    (release / "bin/cross-agent-chat").write_text("owned")
     (release / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
+    installer.executable.parent.mkdir(parents=True, exist_ok=True)
+    installer.executable.symlink_to(release / "bin/cross-agent-chat")
     monkeypatch.setattr(installer, "_stop_broker", lambda: None)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
 
     installer.uninstall()
 
     assert not release.exists()
+    assert not installer.executable.exists()
+    assert not installer.executable.is_symlink()
     assert not installer.install_state.exists()
 
 

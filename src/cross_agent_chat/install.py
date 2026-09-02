@@ -59,6 +59,10 @@ class SettingsError(RuntimeError):
     """A safe setup or configuration failure."""
 
 
+class ConfigurationChangedError(SettingsError):
+    """Provider configuration changed before any setup write."""
+
+
 class SetupRollbackError(SettingsError):
     """Setup failed and its provider-file rollback also failed."""
 
@@ -558,19 +562,28 @@ def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
 
 def _strip_owned_toml_block(text: str) -> str:
     lines = text.splitlines(keepends=True)
-    nonblank = [index for index, line in enumerate(lines) if line.strip()]
-    if not nonblank or lines[nonblank[-1]].strip() != OWNED_TOML_END:
-        return text
-    end = nonblank[-1]
-    starts = [index for index in range(end) if lines[index].strip() == OWNED_TOML_START]
-    if not starts:
-        return text
-    candidate = "".join(lines[: starts[-1]] + lines[end + 1 :])
-    try:
-        tomlkit.parse(candidate)
-    except TOMLKitError:
-        return text
-    return candidate
+    while True:
+        removed = False
+        ends = [index for index, line in enumerate(lines) if line.strip() == OWNED_TOML_END]
+        for end in reversed(ends):
+            starts = [index for index in range(end) if lines[index].strip() == OWNED_TOML_START]
+            if not starts:
+                continue
+            start = starts[-1]
+            try:
+                owned = tomlkit.parse("".join(lines[start + 1 : end]))
+            except TOMLKitError:
+                continue
+            if not owned or set(owned).difference({"mcp_servers", "hooks"}):
+                continue
+            servers = owned.get("mcp_servers")
+            if isinstance(servers, MutableMapping) and set(servers).difference({SERVER_NAME}):
+                continue
+            lines = lines[:start] + lines[end + 1 :]
+            removed = True
+            break
+        if not removed:
+            return "".join(lines)
 
 
 def _codex_owned_toml(
@@ -932,15 +945,24 @@ class Installer:
         return destinations
 
     def _prepare_setup(self, stable_entrypoint: Path | None = None) -> PreparedSetup:
-        destinations = self._configuration_destinations()
-        payloads = self._payloads(stable_entrypoint)
-        originals: dict[Path, PathSnapshot] = {}
-        for path, destination in destinations.items():
-            if path.is_symlink():
-                originals[path] = _snapshot_path(path)
-            originals[destination] = _snapshot_path(destination)
-        if self.legacy_peers.exists():
+        for attempt in range(5):
+            destinations = self._configuration_destinations()
+            originals: dict[Path, PathSnapshot] = {}
+            for path, destination in destinations.items():
+                if path.is_symlink():
+                    originals[path] = _snapshot_path(path)
+                originals[destination] = _snapshot_path(destination)
             originals[self.legacy_peers] = _snapshot_path(self.legacy_peers)
+            payloads = self._payloads(stable_entrypoint)
+            stable = self._configuration_destinations() == destinations and all(
+                _snapshot_path(original.path) == original for original in originals.values()
+            )
+            if stable:
+                break
+            if attempt < 4:
+                time.sleep(0.05)
+        else:
+            raise ConfigurationChangedError("provider configuration kept changing during setup")
         backup = self._backup(originals)
         return PreparedSetup(
             payloads=payloads,
@@ -971,7 +993,7 @@ class Installer:
                 _snapshot_path(original.path) != original
                 for original in transaction.originals.values()
             ):
-                raise SettingsError("provider configuration changed before setup write")
+                raise ConfigurationChangedError("provider configuration changed before setup write")
             for path, payload in transaction.payloads.items():
                 destination = transaction.destinations[path]
                 original = transaction.originals[destination]
@@ -1586,7 +1608,11 @@ class Installer:
             record("runtime_switched")
             record("config_writing")
             config_transition_started = True
-            report = self.setup(prepared=prepared_setup)
+            try:
+                report = self.setup(prepared=prepared_setup)
+            except ConfigurationChangedError:
+                config_transition_started = False
+                raise
             record("config_written")
             self._remove_runtime_state()
             record("service_starting")
@@ -2152,12 +2178,16 @@ class Installer:
             if not owned_releases:
                 return None
             expected = (self.current_runtime / "bin" / SERVER_NAME).resolve(strict=False)
+            owned_targets = {
+                expected,
+                *(release / "bin" / SERVER_NAME for release in owned_releases),
+            }
             residue_entrypoints = tuple(
                 path
                 for path in {stable_entrypoint, self.executable}
                 if path is not None
                 and path.is_symlink()
-                and (path.parent / os.readlink(path)).resolve(strict=False) == expected
+                and (path.parent / os.readlink(path)).resolve(strict=False) in owned_targets
             )
             return RuntimeRemovalPlan(
                 current=None,
@@ -2226,9 +2256,13 @@ class Installer:
                 if plan.current is not None:
                     matches = entrypoint.resolve(strict=True) == expected
                 else:
+                    owned_targets = {
+                        expected,
+                        *(release / "bin" / SERVER_NAME for release in plan.owned_releases),
+                    }
                     matches = (entrypoint.parent / os.readlink(entrypoint)).resolve(
                         strict=False
-                    ) == expected
+                    ) in owned_targets
                 if not matches:
                     raise SettingsError("installed runtime ownership changed during uninstall")
         except OSError as error:

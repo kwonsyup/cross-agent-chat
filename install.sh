@@ -72,7 +72,7 @@ else
 fi
 
 if [ -n "$uv_command" ]; then
-    "$uv_command" venv --python 3.11 "$staged_runtime"
+    "$uv_command" venv --python 3.11 "$staged_runtime" --allow-existing
 else
     python3 -m venv "$staged_runtime"
 fi
