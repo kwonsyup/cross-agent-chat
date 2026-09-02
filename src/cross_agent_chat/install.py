@@ -113,7 +113,7 @@ class RecoveryTransaction:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeRemovalPlan:
-    current: Path
+    current: Path | None
     owned_releases: tuple[Path, ...]
     entrypoints: tuple[Path, ...]
 
@@ -2131,26 +2131,39 @@ class Installer:
     def _prepare_runtime_removal(self, stable_entrypoint: Path | None) -> RuntimeRemovalPlan | None:
         self._validate_runtime_roots()
         self._prune_abandoned_staged_releases()
+        owned_releases = (
+            tuple(
+                release
+                for release in self.releases.iterdir()
+                if release.is_dir()
+                and not release.is_symlink()
+                and release.name.startswith("release-")
+                and (release / RELEASE_MARKER).is_file()
+                and not (release / RELEASE_MARKER).is_symlink()
+                and (release / RELEASE_MARKER).read_text(encoding="utf-8")
+                == COMMITTED_RELEASE_MARKER
+            )
+            if self.releases.exists()
+            else ()
+        )
         if not self.current_runtime.is_symlink():
-            owned_residue = False
-            if self.releases.exists():
-                for release in self.releases.iterdir():
-                    marker = release / RELEASE_MARKER
-                    marker_text = (
-                        marker.read_text(encoding="utf-8")
-                        if marker.is_file() and not marker.is_symlink()
-                        else ""
-                    )
-                    if (
-                        marker_text == COMMITTED_RELEASE_MARKER
-                        or STAGED_RELEASE_MARKER_RE.fullmatch(marker_text) is not None
-                        or TRANSACTION_RELEASE_MARKER_RE.fullmatch(marker_text) is not None
-                    ):
-                        owned_residue = True
-                        break
-            if self.current_runtime.exists() or owned_residue:
+            if self.current_runtime.exists():
                 raise SettingsError("installed runtime ownership is invalid")
-            return None
+            if not owned_releases:
+                return None
+            expected = (self.current_runtime / "bin" / SERVER_NAME).resolve(strict=False)
+            residue_entrypoints = tuple(
+                path
+                for path in {stable_entrypoint, self.executable}
+                if path is not None
+                and path.is_symlink()
+                and (path.parent / os.readlink(path)).resolve(strict=False) == expected
+            )
+            return RuntimeRemovalPlan(
+                current=None,
+                owned_releases=owned_releases,
+                entrypoints=residue_entrypoints,
+            )
         try:
             current = self.current_runtime.resolve(strict=True)
             releases = self.releases.resolve(strict=True)
@@ -2169,16 +2182,6 @@ class Installer:
             or current_marker.read_text(encoding="utf-8") != COMMITTED_RELEASE_MARKER
         ):
             raise SettingsError("installed runtime ownership is invalid")
-        owned_releases = tuple(
-            release
-            for release in self.releases.iterdir()
-            if release.is_dir()
-            and not release.is_symlink()
-            and release.name.startswith("release-")
-            and (release / RELEASE_MARKER).is_file()
-            and not (release / RELEASE_MARKER).is_symlink()
-            and (release / RELEASE_MARKER).read_text(encoding="utf-8") == COMMITTED_RELEASE_MARKER
-        )
         entrypoints: list[Path] = []
         if stable_entrypoint is not None and stable_entrypoint.is_symlink():
             try:
@@ -2202,19 +2205,39 @@ class Installer:
         if plan is None:
             self._prune_abandoned_staged_releases()
             return
-        expected = plan.current / "bin" / SERVER_NAME
+        expected = (
+            plan.current / "bin" / SERVER_NAME
+            if plan.current is not None
+            else (self.current_runtime / "bin" / SERVER_NAME).resolve(strict=False)
+        )
         try:
-            if self.current_runtime.resolve(strict=True) != plan.current:
+            if (
+                plan.current is not None
+                and self.current_runtime.resolve(strict=True) != plan.current
+            ):
+                raise SettingsError("installed runtime ownership changed during uninstall")
+            if plan.current is None and (
+                self.current_runtime.exists() or self.current_runtime.is_symlink()
+            ):
                 raise SettingsError("installed runtime ownership changed during uninstall")
             for entrypoint in plan.entrypoints:
-                if not entrypoint.is_symlink() or entrypoint.resolve(strict=True) != expected:
+                if not entrypoint.is_symlink():
+                    raise SettingsError("installed runtime ownership changed during uninstall")
+                if plan.current is not None:
+                    matches = entrypoint.resolve(strict=True) == expected
+                else:
+                    matches = (entrypoint.parent / os.readlink(entrypoint)).resolve(
+                        strict=False
+                    ) == expected
+                if not matches:
                     raise SettingsError("installed runtime ownership changed during uninstall")
         except OSError as error:
             raise SettingsError("installed runtime ownership changed during uninstall") from error
         self._prune_abandoned_staged_releases()
         for public_entrypoint in plan.entrypoints:
             public_entrypoint.unlink()
-        self.current_runtime.unlink()
+        if plan.current is not None:
+            self.current_runtime.unlink()
         for release in plan.owned_releases:
             self._remove_release(release)
         with suppress(OSError):

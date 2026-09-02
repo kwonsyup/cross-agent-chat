@@ -3835,24 +3835,16 @@ def test_uninstall_recovery_failure_precedes_all_configuration_mutation(
     assert {path: path.read_bytes() for path in before} == before
 
 
-@pytest.mark.parametrize("residue", ["current-file", "committed-release"])
 def test_uninstall_rejects_malformed_runtime_before_configuration_mutation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, residue: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
     installer = Installer(
         home=home, executable=home / ".local/bin/cross-agent-chat", device="studio"
     )
     installer.setup()
-    if residue == "current-file":
-        installer.current_runtime.parent.mkdir(parents=True, exist_ok=True)
-        installer.current_runtime.write_text("malformed")
-    else:
-        release = installer.releases / "release-residue"
-        release.mkdir(parents=True)
-        (release / ".cross-agent-chat-release").write_text(
-            "cross-agent-chat-runtime-v1:committed\n"
-        )
+    installer.current_runtime.parent.mkdir(parents=True, exist_ok=True)
+    installer.current_runtime.write_text("malformed")
     before = {path: path.read_bytes() for path in installer.config_paths if path.exists()}
     monkeypatch.setattr(
         installer,
@@ -3864,6 +3856,26 @@ def test_uninstall_rejects_malformed_runtime_before_configuration_mutation(
         installer.uninstall()
 
     assert {path: path.read_bytes() for path in before} == before
+
+
+def test_uninstall_resumes_committed_release_cleanup_without_current_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(
+        home=home, executable=home / ".local/bin/cross-agent-chat", device="studio"
+    )
+    installer.setup()
+    release = installer.releases / "release-residue"
+    release.mkdir(parents=True)
+    (release / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+
+    installer.uninstall()
+
+    assert not release.exists()
+    assert not installer.install_state.exists()
 
 
 def test_runtime_removal_preflight_prunes_abandoned_staging(tmp_path: Path) -> None:
