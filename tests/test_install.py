@@ -845,6 +845,30 @@ def test_uninstall_rejects_undecodable_codex_config_before_any_mutation(
     assert {path: path.read_bytes() for path in before} == before
 
 
+@pytest.mark.parametrize("initially_present", (False, True))
+def test_uninstall_never_overwrites_codex_config_changed_during_broker_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, initially_present: bool
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    if not initially_present:
+        installer.codex_config.unlink()
+    replacement = '[mcp_servers."new-user-server"]\ncommand = "new"\n'
+
+    def stop_broker() -> None:
+        installer.codex_config.parent.mkdir(parents=True, exist_ok=True)
+        installer.codex_config.write_text(replacement)
+
+    monkeypatch.setattr(installer, "_stop_broker", stop_broker)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+
+    with pytest.raises(SettingsError, match="changed during uninstall"):
+        installer.uninstall()
+
+    assert installer.codex_config.read_text() == replacement
+
+
 def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")

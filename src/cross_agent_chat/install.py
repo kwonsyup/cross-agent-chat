@@ -789,9 +789,9 @@ class Installer:
             }
         return plistlib.dumps(payload, sort_keys=True)
 
-    def _codex_config_text(self) -> str:
+    def _codex_config_text(self) -> str | None:
         if not self.codex_config.exists():
-            return ""
+            return None
         try:
             return self.codex_config.read_text(encoding="utf-8")
         except UnicodeDecodeError as error:
@@ -840,7 +840,7 @@ class Installer:
                 raise SettingsError(f"Codex hook {event} ownership is ambiguous")
             hook_indices[event] = indices[0]
 
-        codex_text = self._codex_config_text()
+        codex_text = self._codex_config_text() or ""
         codex_text = OWNED_TOML_RE.sub("\n", codex_text)
         codex_text = _remove_owned_hook_trust(
             codex_text,
@@ -1570,6 +1570,8 @@ class Installer:
             settings = _json_object(self.claude_settings)
             codex_hooks = _json_object(self.codex_hooks)
             codex_text = self._codex_config_text()
+            if codex_text is None:
+                return False
             parsed_codex: object = tomllib.loads(codex_text)
             if not isinstance(parsed_codex, dict):
                 return False
@@ -2156,15 +2158,17 @@ class Installer:
             self._uninstall()
 
     def _uninstall(self) -> None:
+        codex_text = self._codex_config_text()
         self._recover_unfinished_transaction()
         destinations = self._configuration_destinations()
         metadata = self._install_metadata(_json_object(self.claude_settings))
         stable_entrypoint = self.home / cast(str, metadata["stable_entrypoint"])
         runtime_removal = self._prepare_runtime_removal(stable_entrypoint)
-        codex_text = self._codex_config_text()
         self._stop_broker()
         self._stop_couriers()
         self._remove_runtime_state()
+        if self._codex_config_text() != codex_text:
+            raise SettingsError(f"Codex config.toml changed during uninstall: {self.codex_config}")
         claude_settings = _json_object(self.claude_settings)
         _remove_hooks(claude_settings)
         previous = cast(dict[str, object], metadata["claude_cross_session_inbound"])
@@ -2183,7 +2187,11 @@ class Installer:
 
         codex_hooks = _json_object(self.codex_hooks)
         owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
-        if self.codex_config.exists():
+        if codex_text is not None:
+            if self._codex_config_text() != codex_text:
+                raise SettingsError(
+                    f"Codex config.toml changed during uninstall: {self.codex_config}"
+                )
             cleaned = OWNED_TOML_RE.sub("\n", codex_text)
             cleaned = _remove_owned_hook_trust(cleaned, owned_trust_keys).lstrip("\n")
             _atomic_write(destinations[self.codex_config], cleaned.encode())
