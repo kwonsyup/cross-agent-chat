@@ -789,6 +789,14 @@ class Installer:
             }
         return plistlib.dumps(payload, sort_keys=True)
 
+    def _codex_config_text(self) -> str:
+        if not self.codex_config.exists():
+            return ""
+        try:
+            return self.codex_config.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise SettingsError(f"Codex config.toml is invalid: {self.codex_config}") from error
+
     def _payloads(self, stable_entrypoint: Path | None = None) -> dict[Path, bytes]:
         claude_settings = _json_object(self.claude_settings)
         install_metadata = self._install_metadata(claude_settings, stable_entrypoint)
@@ -832,7 +840,7 @@ class Installer:
                 raise SettingsError(f"Codex hook {event} ownership is ambiguous")
             hook_indices[event] = indices[0]
 
-        codex_text = self.codex_config.read_text() if self.codex_config.exists() else ""
+        codex_text = self._codex_config_text()
         codex_text = OWNED_TOML_RE.sub("\n", codex_text)
         codex_text = _remove_owned_hook_trust(
             codex_text,
@@ -1561,7 +1569,7 @@ class Installer:
             servers = claude.get("mcpServers")
             settings = _json_object(self.claude_settings)
             codex_hooks = _json_object(self.codex_hooks)
-            codex_text = self.codex_config.read_text()
+            codex_text = self._codex_config_text()
             parsed_codex: object = tomllib.loads(codex_text)
             if not isinstance(parsed_codex, dict):
                 return False
@@ -2153,6 +2161,7 @@ class Installer:
         metadata = self._install_metadata(_json_object(self.claude_settings))
         stable_entrypoint = self.home / cast(str, metadata["stable_entrypoint"])
         runtime_removal = self._prepare_runtime_removal(stable_entrypoint)
+        codex_text = self._codex_config_text()
         self._stop_broker()
         self._stop_couriers()
         self._remove_runtime_state()
@@ -2175,7 +2184,7 @@ class Installer:
         codex_hooks = _json_object(self.codex_hooks)
         owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
         if self.codex_config.exists():
-            cleaned = OWNED_TOML_RE.sub("\n", self.codex_config.read_text())
+            cleaned = OWNED_TOML_RE.sub("\n", codex_text)
             cleaned = _remove_owned_hook_trust(cleaned, owned_trust_keys).lstrip("\n")
             _atomic_write(destinations[self.codex_config], cleaned.encode())
 

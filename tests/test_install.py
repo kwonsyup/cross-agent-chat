@@ -12,10 +12,13 @@ import sys
 import threading
 import time
 import tomllib
+from collections.abc import MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+import tomlkit
+from tomlkit.exceptions import TOMLKitError
 
 from cross_agent_chat.cli import parser
 from cross_agent_chat.install import (
@@ -798,6 +801,48 @@ def test_setup_rejects_non_table_codex_mcp_servers_without_writing(tmp_path: Pat
         installer.setup()
 
     assert codex_config.read_text() == original
+
+
+def test_tomlkit_dependency_contract() -> None:
+    with pytest.raises(TOMLKitError):
+        tomlkit.parse("value = 1\nvalue = 2\n")
+
+    array = tomlkit.parse('[[mcp_servers]]\nname = "unrelated"\n')["mcp_servers"]
+    assert not isinstance(array, MutableMapping)
+
+
+def test_setup_rejects_undecodable_codex_config_without_writing(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    original = b"\xff\xfeinvalid"
+    codex_config.write_bytes(original)
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    with pytest.raises(SettingsError, match=re.escape(str(codex_config))):
+        installer.setup()
+
+    assert codex_config.read_bytes() == original
+
+
+def test_uninstall_rejects_undecodable_codex_config_before_any_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    installer.codex_config.write_bytes(b"\xff\xfeinvalid")
+    before = {path: path.read_bytes() for path in installer.config_paths if path.exists()}
+    monkeypatch.setattr(
+        installer,
+        "_stop_broker",
+        lambda: pytest.fail("uninstall mutated state before validating Codex config.toml"),
+    )
+
+    with pytest.raises(SettingsError, match=re.escape(str(installer.codex_config))):
+        installer.uninstall()
+
+    assert {path: path.read_bytes() for path in before} == before
 
 
 def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
