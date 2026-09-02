@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.2 - 2026-08-30
+
+- Stage and verify a product-owned runtime before changing the public command, provider
+  configuration, or broker.
+- Switch one stable executable identity atomically across uv, pipx, local-venv, custom-root,
+  and symlinked predecessor layouts without guessing package-manager internals.
+- Restore the exact previous pointer, public entrypoint, configuration, and broker state when
+  transition or candidate-health verification fails; retain evidence on compound rollback
+  failure.
+- Bind broker readiness to the exact running launchd PID, version, and runtime, and safely
+  retire only a verified owner-local predecessor broker that still owns the port.
+- Serialize setup/install/uninstall, recover interrupted transitions from private transaction
+  state, and limit deletion to marker-owned committed releases plus staging owned by the active
+  installer or proven abandoned by its recorded process incarnation.
+- Configure the owned Codex MCP route to run without recurring per-tool approval prompts.
+
 ## 0.1.1 - 2026-08-29
 
 - Report exact-agent lookup, ListAgents discovery, and route revalidation failures before

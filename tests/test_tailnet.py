@@ -11,6 +11,8 @@ from uuid import uuid4
 
 import pytest
 
+import cross_agent_chat.tailnet_broker as tailnet_broker_module
+from cross_agent_chat import __version__
 from cross_agent_chat.cli import parser
 from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, session_key
 from cross_agent_chat.runtime import (
@@ -27,6 +29,7 @@ from cross_agent_chat.tailnet_broker import (
     BrokerAdmission,
     broker_bindings,
     dispatch_broker_connection,
+    dispatch_ready_brokers,
     handle_broker_request,
     serve_broker_connection,
 )
@@ -137,11 +140,18 @@ def test_tailnet_client_crosses_real_tcp_boundary(tmp_path: Path) -> None:
     thread = threading.Thread(target=serve)
     thread.start()
     try:
-        assert request_tailnet(
+        response = request_tailnet(
             "127.0.0.1",
             {"schema_version": 1, "operation": "health"},
             port=port,
-        ) == {"schema_version": 1, "status": "READY"}
+        )
+        assert response == {
+            "schema_version": 1,
+            "status": "READY",
+            "pid": os.getpid(),
+            "version": __version__,
+            "module_path": str(Path(tailnet_broker_module.__file__).resolve()),
+        }
     finally:
         thread.join(timeout=5)
         listener.close()
@@ -165,6 +175,59 @@ def test_silent_connection_does_not_block_another_broker_request(tmp_path: Path)
 
         silent_client.close()
         active_client.close()
+
+
+def test_vanished_ready_connection_does_not_block_broker_loop(tmp_path: Path) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.setblocking(False)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            assert (
+                dispatch_ready_brokers(
+                    workers,
+                    tmp_path,
+                    [listener],
+                    BrokerAdmission(),
+                )
+                == 0
+            )
+    finally:
+        listener.close()
+
+
+def test_aborted_ready_connection_does_not_block_another_listener(tmp_path: Path) -> None:
+    class AbortedListener(socket.socket):
+        def accept(self) -> tuple[socket.socket, tuple[str, int]]:
+            raise ConnectionAbortedError
+
+    aborted = AbortedListener(socket.AF_INET, socket.SOCK_STREAM)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.setblocking(False)
+    client = socket.create_connection(listener.getsockname(), timeout=2)
+    client.sendall(b'{"schema_version":1,"operation":"health"}\n')
+    client.shutdown(socket.SHUT_WR)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            assert (
+                dispatch_ready_brokers(
+                    workers,
+                    tmp_path,
+                    [aborted, listener],
+                    BrokerAdmission(),
+                )
+                == 1
+            )
+        client.settimeout(2)
+        response = json.loads(client.recv(4096))
+        assert response["status"] == "READY"
+    finally:
+        client.close()
+        listener.close()
+        aborted.close()
 
 
 def test_broker_admission_rejects_third_connection_from_one_peer() -> None:
