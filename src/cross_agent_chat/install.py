@@ -951,6 +951,7 @@ class Installer:
         return destinations
 
     def _prepare_setup(self, stable_entrypoint: Path | None = None) -> PreparedSetup:
+        last_error: OSError | None = None
         for attempt in range(5):
             try:
                 destinations = self._configuration_destinations()
@@ -964,14 +965,17 @@ class Installer:
                 stable = self._configuration_destinations() == destinations and all(
                     _snapshot_path(original.path) == original for original in originals.values()
                 )
-            except OSError:
+            except OSError as error:
+                last_error = error
                 stable = False
             if stable:
                 break
             if attempt < 4:
                 time.sleep(0.05)
         else:
-            raise ConfigurationChangedError("provider configuration kept changing during setup")
+            raise ConfigurationChangedError(
+                "provider configuration kept changing during setup"
+            ) from last_error
         backup = self._backup(originals)
         return PreparedSetup(
             payloads=payloads,

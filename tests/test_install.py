@@ -1281,6 +1281,20 @@ def test_prepare_setup_fails_cleanly_when_provider_keeps_changing(
     assert calls == 5
 
 
+def test_prepare_setup_preserves_persistent_io_error_as_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    failure = PermissionError("provider config is unreadable")
+    monkeypatch.setattr(installer, "_payloads", lambda _stable=None: (_ for _ in ()).throw(failure))
+
+    with pytest.raises(ConfigurationChangedError) as captured:
+        installer._prepare_setup()
+
+    assert captured.value.__cause__ is failure
+
+
 def test_setup_rollback_preserves_in_home_symlink_and_target_mode(tmp_path: Path) -> None:
     home = tmp_path / "home"
     target = home / "shared/claude-settings.json"
