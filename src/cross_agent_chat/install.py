@@ -931,7 +931,13 @@ class Installer:
         try:
             for path, payload in transaction.payloads.items():
                 destination = transaction.destinations[path]
-                _atomic_write(destination, payload)
+                original = transaction.originals[destination]
+                mode = (
+                    original.mode
+                    if original.kind == "file" and original.mode is not None
+                    else 0o600
+                )
+                _atomic_write(destination, payload, mode=mode)
                 written.append(destination)
             if self.legacy_peers.exists():
                 self.legacy_peers.unlink()
@@ -949,7 +955,10 @@ class Installer:
         return InstallReport(tuple(transaction.payloads), transaction.backup)
 
     def _restore(self, backup: Path) -> None:
-        manifest = _json_object(backup / "manifest.json")
+        manifest_path = backup / "manifest.json"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise SettingsError("backup manifest is invalid")
+        manifest = _json_object(manifest_path)
         for relative, encoded in manifest.items():
             if not isinstance(relative, str):
                 raise SettingsError("backup manifest is invalid")
@@ -1211,7 +1220,13 @@ class Installer:
         stable = self._validate_stable_entrypoint(self.home / stable_path)
         backup = self.home / backup_path
         candidate = self.releases / candidate_name
-        if backup.resolve(strict=True).parent != (self.cache / "backups").resolve(strict=True):
+        try:
+            valid_backup = backup.resolve(strict=True).parent == (self.cache / "backups").resolve(
+                strict=True
+            )
+        except OSError as error:
+            raise SettingsError("transaction metadata is invalid") from error
+        if not valid_backup:
             raise SettingsError("transaction metadata is invalid")
         marker = candidate / RELEASE_MARKER
         marker_text = (
@@ -2168,7 +2183,6 @@ class Installer:
         self._stop_broker()
         self._stop_couriers()
         self._remove_runtime_state()
-        destinations = self._configuration_destinations()
         for attempt in range(5):
             destinations = self._configuration_destinations()
             codex_hooks = _json_object(destinations[self.codex_hooks])

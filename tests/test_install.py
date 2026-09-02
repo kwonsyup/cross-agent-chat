@@ -4,6 +4,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import signal
 import socket
 import stat
@@ -1151,6 +1152,34 @@ def test_setup_rollback_preserves_in_home_symlink_and_target_mode(tmp_path: Path
     assert settings.resolve() == target
     assert json.loads(target.read_text()) == {"theme": "light"}
     assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+def test_setup_success_preserves_existing_shared_file_modes(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    claude_config = home / ".claude.json"
+    codex_config = home / ".codex/config.toml"
+    claude_config.parent.mkdir(parents=True)
+    codex_config.parent.mkdir(parents=True)
+    claude_config.write_text("{}")
+    codex_config.write_text("[features]\nhooks = false\n")
+    claude_config.chmod(0o644)
+    codex_config.chmod(0o640)
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    assert stat.S_IMODE(claude_config.stat().st_mode) == 0o644
+    assert stat.S_IMODE(codex_config.stat().st_mode) == 0o640
+
+
+def test_restore_rejects_missing_backup_manifest(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    backup = home / ".cache/cross-agent-chat/backups/missing-manifest"
+    backup.mkdir(parents=True)
+
+    with pytest.raises(SettingsError, match="backup manifest is invalid"):
+        installer._restore(backup)
 
 
 def test_setup_rejects_configuration_parent_symlink_outside_home(tmp_path: Path) -> None:
@@ -2310,6 +2339,36 @@ def test_recovery_discards_pre_mutation_preparing_directory(tmp_path: Path) -> N
 
     assert not preparing.exists()
     assert not list(installer.transactions.iterdir())
+
+
+def test_recovery_wraps_missing_backup_root_as_settings_error(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    stable = home / "bin/cross-agent-chat"
+    installer = Installer(home=home, executable=stable, device="studio")
+    candidate = _staged_runtime(installer)
+    prepared = installer._prepare_setup()
+    transaction = installer.transactions / ("a" * 32)
+    transaction.mkdir(parents=True, mode=0o700)
+    installer._record_transaction(
+        transaction,
+        phase="prepared",
+        staged=candidate,
+        stable_entrypoint=stable,
+        current_snapshot=_snapshot_path(installer.current_runtime),
+        entrypoint_snapshot=_snapshot_path(stable),
+        config_backup=prepared.backup,
+        previous_broker_loaded=False,
+        previous_broker_healthy=False,
+        package_tree_sha256=_package_tree_digest(candidate),
+    )
+    _bind_transaction_marker(candidate, transaction)
+    shutil.rmtree(installer.cache / "backups")
+
+    with pytest.raises(SettingsError, match="transaction metadata is invalid"):
+        installer._recover_unfinished_transaction()
+
+    assert transaction.exists()
+    assert candidate.exists()
 
 
 def test_recovery_discards_non_transaction_file_residue(tmp_path: Path) -> None:
