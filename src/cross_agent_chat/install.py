@@ -781,13 +781,14 @@ class Installer:
             previous = metadata.get("claude_cross_session_inbound")
             stable_relative = metadata.get("stable_entrypoint")
             if (
-                metadata.get("schema_version") not in {1, 2}
+                metadata.get("schema_version") not in {1, 2, 3}
                 or not isinstance(previous, dict)
                 or set(previous) != {"present", "value"}
                 or not isinstance(previous.get("present"), bool)
                 or (previous.get("present") is False and previous.get("value") is not None)
             ):
                 raise SettingsError("Cross Agent Chat install state is invalid")
+            managed: list[Path]
             if metadata["schema_version"] == 1:
                 if set(metadata) != {"schema_version", "claude_cross_session_inbound"}:
                     raise SettingsError("Cross Agent Chat install state is invalid")
@@ -797,7 +798,8 @@ class Installer:
                     stable = self._validate_stable_entrypoint(
                         self.home / ".local" / "bin" / SERVER_NAME
                     )
-            else:
+                managed = [stable]
+            elif metadata["schema_version"] == 2:
                 if (
                     set(metadata)
                     != {"schema_version", "claude_cross_session_inbound", "stable_entrypoint"}
@@ -811,12 +813,44 @@ class Installer:
                     stable = self._validate_stable_entrypoint(self.home / stable_relative)
                 except SettingsError as error:
                     raise SettingsError("Cross Agent Chat install state is invalid") from error
+                managed = [stable]
+            else:
+                raw_managed = metadata.get("managed_entrypoints")
+                if (
+                    set(metadata)
+                    != {
+                        "schema_version",
+                        "claude_cross_session_inbound",
+                        "stable_entrypoint",
+                        "managed_entrypoints",
+                    }
+                    or not isinstance(stable_relative, str)
+                    or not isinstance(raw_managed, list)
+                    or not raw_managed
+                    or not all(isinstance(item, str) for item in raw_managed)
+                ):
+                    raise SettingsError("Cross Agent Chat install state is invalid")
+                try:
+                    managed = [
+                        self._validate_stable_entrypoint(self.home / cast(str, item))
+                        for item in raw_managed
+                    ]
+                    stable = self._validate_stable_entrypoint(self.home / stable_relative)
+                except SettingsError as error:
+                    raise SettingsError("Cross Agent Chat install state is invalid") from error
+                if stable not in managed:
+                    raise SettingsError("Cross Agent Chat install state is invalid")
             if stable_entrypoint is not None:
                 stable = self._validate_stable_entrypoint(stable_entrypoint)
+            if stable not in managed:
+                managed.append(stable)
             return {
-                "schema_version": 2,
+                "schema_version": 3,
                 "claude_cross_session_inbound": previous,
                 "stable_entrypoint": str(stable.relative_to(self.home)),
+                "managed_entrypoints": [
+                    str(path.relative_to(self.home)) for path in dict.fromkeys(managed)
+                ],
             }
         present = "crossSessionInbound" in settings
         try:
@@ -824,12 +858,13 @@ class Installer:
         except SettingsError:
             stable = self._validate_stable_entrypoint(self.home / ".local" / "bin" / SERVER_NAME)
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "claude_cross_session_inbound": {
                 "present": present,
                 "value": settings.get("crossSessionInbound") if present else None,
             },
             "stable_entrypoint": str(stable.relative_to(self.home)),
+            "managed_entrypoints": [str(stable.relative_to(self.home))],
         }
 
     def _launch_agent_payload(self) -> bytes:
@@ -1542,10 +1577,6 @@ class Installer:
         staged = self._validate_staged_runtime(staged_runtime)
         self._recover_unfinished_transaction()
         self._prune_abandoned_staged_releases({staged})
-        previous_stable: Path | None = None
-        if self.install_state.exists():
-            previous_metadata = self._install_metadata(_json_object(self.claude_settings))
-            previous_stable = self.home / cast(str, previous_metadata["stable_entrypoint"])
         stable = self._validate_stable_entrypoint(stable_entrypoint)
         self.executable = stable
         current_snapshot = self._validate_runtime_pointer()
@@ -1672,18 +1703,6 @@ class Installer:
         if report is None:
             raise SettingsError("installation transaction did not produce a report")
         record("committed")
-        if (
-            previous_stable is not None
-            and previous_stable != stable
-            and previous_stable.is_symlink()
-        ):
-            try:
-                expected = (self.current_runtime / "bin" / SERVER_NAME).resolve(strict=True)
-                if previous_stable.resolve(strict=True) == expected:
-                    previous_stable.unlink()
-                    _fsync_directory(previous_stable.parent)
-            except OSError as error:
-                raise SettingsError("previous public entrypoint cleanup failed") from error
         self._prune_committed_releases(final_runtime, current_snapshot)
         shutil.rmtree(transaction)
         _fsync_directory(self.transactions)
@@ -2183,7 +2202,11 @@ class Installer:
         if self.state.exists():
             shutil.rmtree(self.state)
 
-    def _prepare_runtime_removal(self, stable_entrypoint: Path | None) -> RuntimeRemovalPlan | None:
+    def _prepare_runtime_removal(
+        self,
+        stable_entrypoint: Path | None,
+        managed_entrypoints: tuple[Path, ...] = (),
+    ) -> RuntimeRemovalPlan | None:
         self._validate_runtime_roots()
         self._prune_abandoned_staged_releases()
         owned_releases = (
@@ -2216,7 +2239,7 @@ class Installer:
             }
             residue_entrypoints = tuple(
                 path
-                for path in {stable_entrypoint, self.executable}
+                for path in {stable_entrypoint, self.executable, *managed_entrypoints}
                 if path is not None
                 and path.is_symlink()
                 and (path.parent / os.readlink(path)).resolve(strict=False) in owned_targets
@@ -2245,16 +2268,12 @@ class Installer:
         ):
             raise SettingsError("installed runtime ownership is invalid")
         entrypoints: list[Path] = []
-        if stable_entrypoint is not None and stable_entrypoint.is_symlink():
+        for candidate in {stable_entrypoint, self.executable, *managed_entrypoints}:
+            if candidate is None or not candidate.is_symlink() or candidate in entrypoints:
+                continue
             try:
-                if stable_entrypoint.resolve(strict=True) == expected:
-                    entrypoints.append(stable_entrypoint)
-            except OSError as error:
-                raise SettingsError("installed runtime ownership is invalid") from error
-        if self.executable.is_symlink() and self.executable not in entrypoints:
-            try:
-                if self.executable.resolve(strict=True) == expected:
-                    entrypoints.append(self.executable)
+                if candidate.resolve(strict=True) == expected:
+                    entrypoints.append(candidate)
             except OSError as error:
                 raise SettingsError("installed runtime ownership is invalid") from error
         return RuntimeRemovalPlan(
@@ -2326,7 +2345,11 @@ class Installer:
         destinations = self._configuration_destinations()
         metadata = self._install_metadata(_json_object(self.claude_settings))
         stable_entrypoint = self.home / cast(str, metadata["stable_entrypoint"])
-        runtime_removal = self._prepare_runtime_removal(stable_entrypoint)
+        managed_entrypoints = tuple(
+            self.home / cast(str, item)
+            for item in cast(list[object], metadata["managed_entrypoints"])
+        )
+        runtime_removal = self._prepare_runtime_removal(stable_entrypoint, managed_entrypoints)
         broker_was_loaded = self.broker_is_loaded()
         self._stop_broker()
         self._stop_couriers()
@@ -2398,12 +2421,12 @@ class Installer:
         )
         destinations[self.launch_agent].unlink(missing_ok=True)
         self.legacy_peers.unlink(missing_ok=True)
-        destinations[self.install_state].unlink(missing_ok=True)
-        with suppress(OSError):
-            self.install_state.parent.rmdir()
         if self.cache.exists():
             shutil.rmtree(self.cache)
         self._remove_installed_runtime(runtime_removal)
+        destinations[self.install_state].unlink(missing_ok=True)
+        with suppress(OSError):
+            self.install_state.parent.rmdir()
 
 
 def discover_executable(invoked_as: Path | None = None) -> Path:

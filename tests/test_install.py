@@ -2126,7 +2126,12 @@ def test_staged_upgrade_persists_entrypoint_selected_for_transition(
     installer.install_staged(stage, selected_stable)
 
     metadata = json.loads(installer.install_state.read_text())
+    assert metadata["schema_version"] == 3
     assert metadata["stable_entrypoint"] == str(selected_stable.relative_to(home))
+    assert set(metadata["managed_entrypoints"]) == {
+        str(previous_stable.relative_to(home)),
+        str(selected_stable.relative_to(home)),
+    }
 
 
 def test_staged_install_fsyncs_backup_and_journal_parents_before_first_effect(
