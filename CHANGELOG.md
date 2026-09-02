@@ -4,8 +4,8 @@
 
 - Let disposable provider workers opt out with `CROSS_AGENT_CHAT_PRESENCE=off` without
   registering routes, spawning couriers, or exposing MCP chat tools.
-- Compact only definitively dead provider routes during normal registration and local discovery,
-  while preserving live shared process routes.
+- Compact only definitively dead provider routes during normal registration while preserving live
+  shared process routes.
 - Bound local courier health discovery to 32 workers.
 
 ## 0.1.2 - 2026-08-30
