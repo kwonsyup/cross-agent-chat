@@ -26,6 +26,7 @@ from cross_agent_chat.install import (
     BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
     BROKER_HEALTH_WAIT_SECONDS,
     BrokerService,
+    ConfigurationChangedError,
     Installer,
     InstallReport,
     PathSnapshot,
@@ -771,9 +772,13 @@ def test_setup_preserves_owned_marker_text_inside_multiline_string(tmp_path: Pat
     home = tmp_path / "home"
     codex_config = home / ".codex/config.toml"
     codex_config.parent.mkdir(parents=True)
-    description = "before\n# cross-agent-chat:start\ninside\n# cross-agent-chat:end\nafter\n"
+    description = (
+        'before\n# cross-agent-chat:start\n[mcp_servers."cross-agent-chat"]\n'
+        'command = "/x"\n# cross-agent-chat:end\nafter\n'
+    )
     codex_config.write_text(
-        'description = """before\n# cross-agent-chat:start\ninside\n'
+        'description = """before\n# cross-agent-chat:start\n'
+        '[mcp_servers."cross-agent-chat"]\ncommand = "/x"\n'
         '# cross-agent-chat:end\nafter\n"""\n'
     )
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
@@ -1218,10 +1223,62 @@ def test_setup_rejects_provider_change_after_payload_preparation(tmp_path: Path)
     concurrent = json.dumps({"concurrent": True})
     claude_config.write_text(concurrent)
 
-    with pytest.raises(SettingsError, match="changed before setup write"):
+    with pytest.raises(ConfigurationChangedError, match="changed before setup write"):
         installer.setup(prepared=prepared)
 
     assert claude_config.read_text() == concurrent
+
+
+def test_prepare_setup_retries_and_converges_on_transient_provider_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    claude_config = home / ".claude.json"
+    claude_config.parent.mkdir(parents=True)
+    claude_config.write_text("{}")
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    real_payloads = installer._payloads
+    calls = 0
+
+    def changing_payloads(stable: Path | None = None) -> dict[Path, bytes]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            claude_config.write_text(json.dumps({"concurrent": True}))
+        return real_payloads(stable)
+
+    monkeypatch.setattr(installer, "_payloads", changing_payloads)
+
+    prepared = installer._prepare_setup()
+    installer.setup(prepared=prepared)
+
+    assert calls == 2
+    assert json.loads(claude_config.read_text())["concurrent"] is True
+
+
+def test_prepare_setup_fails_cleanly_when_provider_keeps_changing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    claude_config = home / ".claude.json"
+    claude_config.parent.mkdir(parents=True)
+    claude_config.write_text("{}")
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    real_payloads = installer._payloads
+    calls = 0
+
+    def changing_payloads(stable: Path | None = None) -> dict[Path, bytes]:
+        nonlocal calls
+        calls += 1
+        claude_config.write_text(json.dumps({"attempt": calls}))
+        return real_payloads(stable)
+
+    monkeypatch.setattr(installer, "_payloads", changing_payloads)
+
+    with pytest.raises(ConfigurationChangedError, match="kept changing during setup"):
+        installer._prepare_setup()
+
+    assert calls == 5
 
 
 def test_setup_rollback_preserves_in_home_symlink_and_target_mode(tmp_path: Path) -> None:

@@ -571,15 +571,21 @@ def _strip_owned_toml_block(text: str) -> str:
                 continue
             start = starts[-1]
             try:
+                tomlkit.parse("".join(lines[:start]))
                 owned = tomlkit.parse("".join(lines[start + 1 : end]))
             except TOMLKitError:
                 continue
-            if not owned or set(owned).difference({"mcp_servers", "hooks"}):
+            if set(owned).difference({"mcp_servers", "hooks"}):
                 continue
             servers = owned.get("mcp_servers")
             if isinstance(servers, MutableMapping) and set(servers).difference({SERVER_NAME}):
                 continue
-            lines = lines[:start] + lines[end + 1 :]
+            candidate = lines[:start] + lines[end + 1 :]
+            try:
+                tomlkit.parse("".join(candidate))
+            except TOMLKitError:
+                continue
+            lines = candidate
             removed = True
             break
         if not removed:
@@ -946,17 +952,20 @@ class Installer:
 
     def _prepare_setup(self, stable_entrypoint: Path | None = None) -> PreparedSetup:
         for attempt in range(5):
-            destinations = self._configuration_destinations()
-            originals: dict[Path, PathSnapshot] = {}
-            for path, destination in destinations.items():
-                if path.is_symlink():
-                    originals[path] = _snapshot_path(path)
-                originals[destination] = _snapshot_path(destination)
-            originals[self.legacy_peers] = _snapshot_path(self.legacy_peers)
-            payloads = self._payloads(stable_entrypoint)
-            stable = self._configuration_destinations() == destinations and all(
-                _snapshot_path(original.path) == original for original in originals.values()
-            )
+            try:
+                destinations = self._configuration_destinations()
+                originals: dict[Path, PathSnapshot] = {}
+                for path, destination in destinations.items():
+                    if path.is_symlink():
+                        originals[path] = _snapshot_path(path)
+                    originals[destination] = _snapshot_path(destination)
+                originals[self.legacy_peers] = _snapshot_path(self.legacy_peers)
+                payloads = self._payloads(stable_entrypoint)
+                stable = self._configuration_destinations() == destinations and all(
+                    _snapshot_path(original.path) == original for original in originals.values()
+                )
+            except OSError:
+                stable = False
             if stable:
                 break
             if attempt < 4:
@@ -2180,7 +2189,10 @@ class Installer:
             expected = (self.current_runtime / "bin" / SERVER_NAME).resolve(strict=False)
             owned_targets = {
                 expected,
-                *(release / "bin" / SERVER_NAME for release in owned_releases),
+                *(
+                    (release / "bin" / SERVER_NAME).resolve(strict=False)
+                    for release in owned_releases
+                ),
             }
             residue_entrypoints = tuple(
                 path
@@ -2258,7 +2270,10 @@ class Installer:
                 else:
                     owned_targets = {
                         expected,
-                        *(release / "bin" / SERVER_NAME for release in plan.owned_releases),
+                        *(
+                            (release / "bin" / SERVER_NAME).resolve(strict=False)
+                            for release in plan.owned_releases
+                        ),
                     }
                     matches = (entrypoint.parent / os.readlink(entrypoint)).resolve(
                         strict=False
