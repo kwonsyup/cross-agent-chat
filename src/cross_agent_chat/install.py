@@ -2167,6 +2167,16 @@ class Installer:
         self._stop_broker()
         self._stop_couriers()
         self._remove_runtime_state()
+        codex_hooks = _json_object(self.codex_hooks)
+        owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
+        codex_text = self._codex_config_text()
+        if codex_text is not None:
+            stripped = _remove_owned_hook_trust(
+                OWNED_TOML_RE.sub("\n", codex_text), owned_trust_keys
+            )
+            if stripped != codex_text:
+                codex_destination = self._configuration_destinations()[self.codex_config]
+                _atomic_write(codex_destination, stripped.lstrip("\n").encode())
         claude_settings = _json_object(self.claude_settings)
         _remove_hooks(claude_settings)
         previous = cast(dict[str, object], metadata["claude_cross_session_inbound"])
@@ -2182,26 +2192,6 @@ class Installer:
         if isinstance(servers, dict):
             cast(dict[str, object], servers).pop(SERVER_NAME, None)
         _atomic_write(destinations[self.claude_config], _json_bytes(claude))
-
-        codex_hooks = _json_object(self.codex_hooks)
-        owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
-        for _attempt in range(3):
-            codex_text = self._codex_config_text()
-            if codex_text is None:
-                break
-            cleaned = OWNED_TOML_RE.sub("\n", codex_text)
-            cleaned = _remove_owned_hook_trust(cleaned, owned_trust_keys).lstrip("\n")
-            if cleaned == codex_text:
-                break
-            if self._codex_config_text() != codex_text:
-                continue
-            _atomic_write(destinations[self.codex_config], cleaned.encode())
-            break
-        else:
-            raise SettingsError(
-                f"Codex config.toml kept changing during uninstall: {self.codex_config}; "
-                "re-run uninstall"
-            )
 
         _remove_hooks(codex_hooks)
         _atomic_write(destinations[self.codex_hooks], _json_bytes(codex_hooks))

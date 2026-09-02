@@ -854,11 +854,12 @@ def test_uninstall_never_overwrites_codex_config_changed_during_broker_stop(
     installer.setup()
     if not initially_present:
         installer.codex_config.unlink()
-    replacement = '[mcp_servers."new-user-server"]\ncommand = "new"\n'
+    replacement = '\n[mcp_servers."new-user-server"]\ncommand = "new"\n'
 
     def stop_broker() -> None:
         installer.codex_config.parent.mkdir(parents=True, exist_ok=True)
         installer.codex_config.write_text(replacement)
+        installer.codex_config.chmod(0o644)
 
     monkeypatch.setattr(installer, "_stop_broker", stop_broker)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
@@ -866,8 +867,36 @@ def test_uninstall_never_overwrites_codex_config_changed_during_broker_stop(
     installer.uninstall()
 
     assert installer.codex_config.read_text() == replacement
+    assert stat.S_IMODE(installer.codex_config.stat().st_mode) == 0o644
     assert not installer.launch_agent.exists()
     assert not installer.install_state.exists()
+
+
+def test_uninstall_re_resolves_codex_config_symlink_after_broker_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    owned = installer.codex_config.read_text()
+    first = home / ".codex/first.toml"
+    second = home / ".codex/second.toml"
+    first.write_text(owned)
+    second.write_text(owned + '\n[mcp_servers."user"]\ncommand = "user"\n')
+    installer.codex_config.unlink()
+    installer.codex_config.symlink_to(first.name)
+
+    def stop_broker() -> None:
+        installer.codex_config.unlink()
+        installer.codex_config.symlink_to(second.name)
+
+    monkeypatch.setattr(installer, "_stop_broker", stop_broker)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+
+    installer.uninstall()
+
+    assert first.read_text() == owned
+    assert tomllib.loads(second.read_text())["mcp_servers"] == {"user": {"command": "user"}}
 
 
 def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
