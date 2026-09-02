@@ -1542,6 +1542,10 @@ class Installer:
         staged = self._validate_staged_runtime(staged_runtime)
         self._recover_unfinished_transaction()
         self._prune_abandoned_staged_releases({staged})
+        previous_stable: Path | None = None
+        if self.install_state.exists():
+            previous_metadata = self._install_metadata(_json_object(self.claude_settings))
+            previous_stable = self.home / cast(str, previous_metadata["stable_entrypoint"])
         stable = self._validate_stable_entrypoint(stable_entrypoint)
         self.executable = stable
         current_snapshot = self._validate_runtime_pointer()
@@ -1668,6 +1672,18 @@ class Installer:
         if report is None:
             raise SettingsError("installation transaction did not produce a report")
         record("committed")
+        if (
+            previous_stable is not None
+            and previous_stable != stable
+            and previous_stable.is_symlink()
+        ):
+            try:
+                expected = (self.current_runtime / "bin" / SERVER_NAME).resolve(strict=True)
+                if previous_stable.resolve(strict=True) == expected:
+                    previous_stable.unlink()
+                    _fsync_directory(previous_stable.parent)
+            except OSError as error:
+                raise SettingsError("previous public entrypoint cleanup failed") from error
         self._prune_committed_releases(final_runtime, current_snapshot)
         shutil.rmtree(transaction)
         _fsync_directory(self.transactions)
