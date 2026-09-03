@@ -253,8 +253,10 @@ class Route:
     def process_is_live(self) -> bool:
         try:
             os.kill(self.pid, 0)
-        except OSError:
+        except ProcessLookupError:
             return False
+        except OSError:
+            return True
         return True
 
 
@@ -357,6 +359,15 @@ class Registry:
 
     def current(self, route: Route) -> bool:
         return any(item == route for item in self.routes())
+
+    def compact_dead(self) -> list[Route]:
+        """Remove only routes whose provider process is definitively gone."""
+        with state_lock(self.root, "routes"):
+            existing = self.routes()
+            retained = [item for item in existing if item.process_is_live()]
+            if len(retained) != len(existing):
+                atomic_json(self.path, [item.to_dict() for item in retained])
+            return retained
 
 
 @dataclass(frozen=True, slots=True)

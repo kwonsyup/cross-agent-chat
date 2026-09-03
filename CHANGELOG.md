@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 - 2026-09-02
+
+- Let disposable provider workers opt out with `CROSS_AGENT_CHAT_PRESENCE=off` without
+  registering routes, spawning couriers, or exposing MCP chat tools.
+- Compact only definitively dead provider routes during normal registration while preserving live
+  shared process routes.
+- Bound local courier health discovery to 32 workers.
+
 ## 0.1.2 - 2026-08-30
 
 - Stage and verify a product-owned runtime before changing the public command, provider

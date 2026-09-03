@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import threading
+from collections.abc import Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,18 +19,22 @@ from cross_agent_chat.core import (
     IntentStore,
     Registry,
     Route,
+    atomic_json,
     authenticate_sender,
     bounded_message,
     resolve_target,
 )
 from cross_agent_chat.runtime import (
     HEALTH_TIMEOUT_SECONDS,
+    LOCAL_DISCOVERY_TIMEOUT_SECONDS,
+    REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     Target,
     _local_target,
     canonical_source_alias,
     courier_health,
     local_targets,
     pre_effect_error,
+    presence_is_enabled,
     send_local,
 )
 
@@ -124,6 +132,24 @@ def test_registry_schema_is_strict(tmp_path: Path) -> None:
 
     with pytest.raises(ChatError, match="schema"):
         registry.routes()
+
+
+def test_route_liveness_compacts_only_definitively_missing_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = route(tmp_path)
+    monkeypatch.setattr("cross_agent_chat.core.os.kill", lambda *_args: None)
+    assert item.process_is_live()
+    monkeypatch.setattr(
+        "cross_agent_chat.core.os.kill",
+        lambda *_args: (_ for _ in ()).throw(PermissionError()),
+    )
+    assert item.process_is_live()
+    monkeypatch.setattr(
+        "cross_agent_chat.core.os.kill",
+        lambda *_args: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+    assert not item.process_is_live()
 
 
 def test_authenticate_claude_sender_requires_unique_parent_pid(tmp_path: Path) -> None:
@@ -244,6 +270,90 @@ def test_live_route_discovery_does_not_apply_an_age_ttl(
     assert [target.alias for target in local_targets(root)] == [live.alias]
 
 
+def test_presence_parser_accepts_only_absent_empty_or_exact_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CROSS_AGENT_CHAT_PRESENCE", raising=False)
+    assert presence_is_enabled()
+    monkeypatch.setenv("CROSS_AGENT_CHAT_PRESENCE", "")
+    assert presence_is_enabled()
+    monkeypatch.setenv("CROSS_AGENT_CHAT_PRESENCE", "off")
+    assert not presence_is_enabled()
+    for value in ("OFF", " off", "on"):
+        monkeypatch.setenv("CROSS_AGENT_CHAT_PRESENCE", value)
+        with pytest.raises(ChatError, match="CROSS_AGENT_CHAT_PRESENCE must be empty or 'off'"):
+            presence_is_enabled()
+
+
+def test_presence_off_does_not_change_visible_sibling_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat.runtime import register
+
+    root = tmp_path / "state"
+    visible = route(tmp_path, pid=os.getpid(), project="visible")
+    Registry(root).upsert(visible)
+    monkeypatch.setenv("CROSS_AGENT_CHAT_PRESENCE", "off")
+
+    assert register("codex", "studio", os.getpid(), str(root)) is None
+    assert Registry(root).routes() == [visible]
+
+
+def test_registration_compacts_dead_routes_and_preserves_live_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat.runtime import register
+
+    root = tmp_path / "state"
+    registry = Registry(root)
+    live = route(tmp_path, pid=os.getpid(), project="native-app-server")
+    stale = [
+        route(tmp_path, pid=1002 + index, project=f"dead-worker-{index}") for index in range(7)
+    ]
+    atomic_json(registry.path, [live.to_dict(), *(item.to_dict() for item in stale)])
+    monkeypatch.setattr(Route, "process_is_live", lambda item: item.pid == live.pid)
+    monkeypatch.setattr("cross_agent_chat.runtime._spawn_courier", lambda *_args: None)
+    hook = {
+        "hook_event_name": "SessionStart",
+        "session_id": str(uuid4()),
+        "cwd": str(tmp_path),
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(hook)))
+
+    registered = register("codex", "studio", os.getpid(), str(root))
+
+    assert registered is not None
+    assert registry.routes() == [live, registered]
+
+
+def test_local_discovery_filters_dead_routes_without_state_lock_or_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    registry = Registry(root)
+    live = route(tmp_path, pid=os.getpid(), project="native-app-server")
+    stale = route(tmp_path, pid=1002, project="dead-worker")
+    atomic_json(registry.path, [live.to_dict(), stale.to_dict()])
+    before = registry.path.read_bytes()
+    monkeypatch.setattr(Route, "process_is_live", lambda item: item.pid == live.pid)
+    monkeypatch.setattr(
+        "cross_agent_chat.core.state_lock",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("discovery must not lock state")),
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda *_args, **_kwargs: {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": live.generation,
+            "alias": live.alias,
+        },
+    )
+
+    assert [target.alias for target in local_targets(root)] == [live.alias]
+    assert registry.path.read_bytes() == before
+
+
 def test_local_route_health_checks_run_concurrently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -258,7 +368,7 @@ def test_local_route_health_checks_run_concurrently(
     rendezvous = threading.Barrier(2)
 
     def health(_path: Path, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
-        assert timeout == HEALTH_TIMEOUT_SECONDS
+        assert 0 < timeout <= HEALTH_TIMEOUT_SECONDS
         rendezvous.wait(timeout=5)
         item = by_generation[str(payload["generation"])]
         return {
@@ -271,6 +381,138 @@ def test_local_route_health_checks_run_concurrently(
     monkeypatch.setattr("cross_agent_chat.runtime.request_socket", health)
 
     assert [target.alias for target in local_targets(root)] == [item.alias for item in routes]
+
+
+def test_local_route_health_checks_are_capped_at_thirty_two_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    routes = [route(tmp_path, pid=os.getpid(), project=f"route-{index}") for index in range(33)]
+    for item in routes:
+        Registry(root).upsert(item)
+    observed_workers: list[int] = []
+
+    def worker_pool(*, max_workers: int) -> ThreadPoolExecutor:
+        observed_workers.append(max_workers)
+        return ThreadPoolExecutor(max_workers=max_workers)
+
+    monkeypatch.setattr("cross_agent_chat.runtime.ThreadPoolExecutor", worker_pool)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda _path, payload, **_kwargs: {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": payload["generation"],
+            "alias": next(
+                item.alias for item in routes if item.generation == payload["generation"]
+            ),
+        },
+    )
+
+    assert [target.alias for target in local_targets(root)] == [item.alias for item in routes]
+    assert observed_workers == [32]
+
+
+def test_local_discovery_deadline_matches_remote_broker_budget() -> None:
+    assert REMOTE_DISCOVERY_TIMEOUT_SECONDS == LOCAL_DISCOVERY_TIMEOUT_SECONDS + 5.0
+
+
+def test_local_discovery_deadline_cancels_queued_work_without_waiting_for_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    routes = [route(tmp_path, pid=os.getpid(), project=f"route-{index}") for index in range(33)]
+    for item in routes:
+        Registry(root).upsert(item)
+
+    class TimedOutWorkers:
+        def __init__(self, *, max_workers: int) -> None:
+            assert max_workers == 32
+            self.futures: list[Future[Target | None]] = []
+            self.shutdown_calls: list[tuple[bool, bool]] = []
+            workers.append(self)
+
+        def submit(self, _fn: object, *_args: object) -> Future[Target | None]:
+            future: Future[Target | None] = Future()
+            self.futures.append(future)
+            return future
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    workers: list[TimedOutWorkers] = []
+
+    def expired(
+        _futures: Iterable[Future[Target | None]], *, timeout: float | None = None
+    ) -> Iterator[Future[Target | None]]:
+        assert timeout is not None and 0 < timeout <= LOCAL_DISCOVERY_TIMEOUT_SECONDS
+        raise FuturesTimeoutError()
+
+    monkeypatch.setattr("cross_agent_chat.runtime.ThreadPoolExecutor", TimedOutWorkers)
+    monkeypatch.setattr("cross_agent_chat.runtime.as_completed", expired)
+
+    assert local_targets(root) == []
+    assert len(workers) == 1
+    assert len(workers[0].futures) == 33
+    assert all(future.cancelled() for future in workers[0].futures)
+    assert workers[0].shutdown_calls == [(False, True)]
+
+
+def test_local_discovery_returns_completed_targets_before_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    routes = [route(tmp_path, pid=os.getpid(), project=f"route-{index}") for index in range(33)]
+    for item in routes:
+        Registry(root).upsert(item)
+    first = routes[0]
+    expected = Target(
+        alias=first.alias,
+        provider=first.provider,
+        device=first.device,
+        project=first.project,
+        generation=first.generation,
+        session_key="a" * 64,
+        remote=False,
+        session_id=first.session_id,
+        cwd=first.cwd,
+        pid=first.pid,
+    )
+
+    class PartialWorkers:
+        def __init__(self, *, max_workers: int) -> None:
+            assert max_workers == 32
+            self.futures: list[Future[Target | None]] = []
+            self.shutdown_calls: list[tuple[bool, bool]] = []
+            workers.append(self)
+
+        def submit(self, _fn: object, *_args: object) -> Future[Target | None]:
+            future: Future[Target | None] = Future()
+            if not self.futures:
+                future.set_result(expected)
+            self.futures.append(future)
+            return future
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    workers: list[PartialWorkers] = []
+
+    def completed_then_expired(
+        futures: Iterable[Future[Target | None]], *, timeout: float | None = None
+    ) -> Iterator[Future[Target | None]]:
+        assert timeout is not None and 0 < timeout <= LOCAL_DISCOVERY_TIMEOUT_SECONDS
+        first_future, *_ = futures
+        yield first_future
+        raise FuturesTimeoutError()
+
+    monkeypatch.setattr("cross_agent_chat.runtime.ThreadPoolExecutor", PartialWorkers)
+    monkeypatch.setattr("cross_agent_chat.runtime.as_completed", completed_then_expired)
+
+    assert local_targets(root) == [expected]
+    assert len(workers) == 1
+    assert workers[0].shutdown_calls == [(False, True)]
+    assert all(future.cancelled() for future in workers[0].futures[1:])
 
 
 def test_courier_health_emits_exact_ready_contract(tmp_path: Path) -> None:

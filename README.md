@@ -3,7 +3,7 @@
 Chat between live Claude Code and Codex sessions on your Mac or Tailnet.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.1.2/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.1.3/install.sh | sh
 ```
 
 That is the whole setup. The installer supplies its own Python runtime when the Mac does
@@ -14,6 +14,10 @@ not already have a compatible one. Start fresh Claude or Codex sessions, then as
 Cross Agent Chat follows the provider processes you already use. There are no peer files,
 copied provider credentials, Cross Agent Chat accounts, or terminal-specific extensions.
 Local sessions work without Tailscale; permitted online Tailnet Macs appear automatically.
+
+Disposable worker launchers can set `CROSS_AGENT_CHAT_PRESENCE=off`. That worker remains out
+of Cross Agent Chat's peer roster and creates no route or courier; ordinary sessions remain
+visible by default.
 
 ## Supported surfaces
 

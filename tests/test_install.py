@@ -199,7 +199,7 @@ def test_install_script_does_not_delete_committed_runtime_after_late_failure(
         "  cat > \"$stage/bin/cross-agent-chat\" <<'SCRIPT'\n"
         "#!/bin/sh\n"
         'if [ "$1" = --version ]; then\n'
-        "  echo cross-agent-chat 0.1.2\n"
+        "  echo cross-agent-chat 0.1.3\n"
         "  exit 0\n"
         "fi\n"
         'stage="$3"\n'
@@ -414,7 +414,7 @@ def test_setup_installs_owned_background_broker(tmp_path: Path) -> None:
     }
 
 
-def test_setup_passes_auto_discovered_tailnet_address_to_broker(tmp_path: Path) -> None:
+def test_setup_passes_known_tailnet_address_to_broker(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(
         home=home,
@@ -2195,7 +2195,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.1.2')\n"
+        "    print('cross-agent-chat 0.1.3')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -2221,7 +2221,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.1.2"
+    assert completed.stdout.strip() == "cross-agent-chat 0.1.3"
     assert stage.exists()
 
 
@@ -3625,7 +3625,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.1.2",
+            "version": "0.1.3",
             "module_path": str(module),
         },
     )
@@ -3803,7 +3803,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.1.2",
+            "version": "0.1.3",
             "module_path": str(module),
         }
 

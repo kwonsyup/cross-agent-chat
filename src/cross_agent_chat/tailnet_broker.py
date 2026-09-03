@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import select
@@ -32,6 +33,7 @@ from cross_agent_chat.tailnet import (
 
 MAX_BROKER_CONNECTIONS = 16
 MAX_BROKER_CONNECTIONS_PER_PEER = 2
+TAILNET_BIND_RETRY_SECONDS = 5.0
 
 
 @dataclass(slots=True)
@@ -69,12 +71,29 @@ def broker_bindings() -> list[tuple[str, int]]:
     """Return the exact interfaces owned by this broker process."""
     bindings = [(LOCAL_BROKER_HOST, LOCAL_BROKER_PORT)]
     configured = os.environ.get("CROSS_AGENT_CHAT_TAILNET_ADDRESS")
-    tailnet_address = (
-        valid_tailnet_address(configured) if configured is not None else local_tailnet_address()
-    )
+    configured_address = valid_tailnet_address(configured) if configured is not None else None
+    tailnet_address = local_tailnet_address() or configured_address
     if tailnet_address is not None:
         bindings.append((tailnet_address, TAILNET_PORT))
     return bindings
+
+
+def bind_broker_listener(
+    binding: tuple[str, int], *, allow_unavailable: bool = False
+) -> socket.socket | None:
+    """Bind one listener, deferring only a Tailnet address that is not ready yet."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(binding)
+        server.listen(16)
+        server.setblocking(False)
+    except OSError as error:
+        server.close()
+        if allow_unavailable and error.errno == errno.EADDRNOTAVAIL:
+            return None
+        raise
+    return server
 
 
 def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[str, object]:
@@ -206,20 +225,30 @@ def broker_server(state_root_value: str | None) -> None:
     root = state_root(state_root_value)
     servers: list[socket.socket] = []
     try:
-        for host, port in broker_bindings():
-            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind((host, port))
-            server.listen(16)
-            server.setblocking(False)
-            servers.append(server)
+        local_server = bind_broker_listener((LOCAL_BROKER_HOST, LOCAL_BROKER_PORT))
+        if local_server is None:  # Defensive: the required local bind never permits deferral.
+            raise RuntimeError("local broker listener could not be created")
+        servers.append(local_server)
+        tailnet_binding: tuple[str, int] | None = None
+        tailnet_server: socket.socket | None = None
         admission = BrokerAdmission()
         with ThreadPoolExecutor(
             max_workers=MAX_BROKER_CONNECTIONS,
             thread_name_prefix="cross-agent-chat",
         ) as workers:
             while True:
-                readable, _, _ = select.select(servers, [], [])
+                current_bindings = broker_bindings()
+                desired_tailnet = current_bindings[1] if len(current_bindings) == 2 else None
+                if desired_tailnet is not None and desired_tailnet != tailnet_binding:
+                    replacement = bind_broker_listener(desired_tailnet, allow_unavailable=True)
+                    if replacement is not None:
+                        servers.append(replacement)
+                        if tailnet_server is not None:
+                            servers.remove(tailnet_server)
+                            tailnet_server.close()
+                        tailnet_server = replacement
+                        tailnet_binding = desired_tailnet
+                readable, _, _ = select.select(servers, [], [], TAILNET_BIND_RETRY_SECONDS)
                 dispatch_ready_brokers(workers, root, readable, admission)
     finally:
         for server in servers:

@@ -23,12 +23,13 @@ from cross_agent_chat.runtime import (
     codex_stop,
     courier_server,
     peers,
+    presence_is_enabled,
     register,
     send,
     state_root,
     unregister,
 )
-from cross_agent_chat.tailnet import local_tailnet_address
+from cross_agent_chat.tailnet import known_tailnet_address
 from cross_agent_chat.tailnet_broker import broker_server
 
 
@@ -41,7 +42,7 @@ def _installer(device: str | None) -> Installer:
         home=Path.home(),
         executable=discover_executable(Path(sys.argv[0])),
         device=default_device() if device is None else device,
-        tailnet_address=local_tailnet_address(),
+        tailnet_address=known_tailnet_address(),
     )
 
 
@@ -57,7 +58,8 @@ def _mcp_response(
 
 
 def mcp(provider: str, device: str, state_root_value: str | None) -> None:
-    root = state_root(state_root_value)
+    presence_enabled = presence_is_enabled()
+    root = state_root(state_root_value) if presence_enabled else None
     for line in sys.stdin:
         if len(line.encode()) > 65536:
             _mcp_response(None, error=(-32700, "request exceeds the bounded limit"))
@@ -93,7 +95,9 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                 _mcp_response(
                     identifier,
                     result={
-                        "tools": [
+                        "tools": []
+                        if not presence_enabled
+                        else [
                             {
                                 "name": "chat_peers",
                                 "description": (
@@ -127,12 +131,15 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                     },
                 )
             elif method == "tools/call":
+                if not presence_enabled:
+                    _fail("Cross Agent Chat presence is disabled")
                 name = typed_params.get("name")
                 arguments = typed_params.get("arguments", {})
                 if not isinstance(name, str) or not isinstance(arguments, dict):
                     _fail("MCP tool call is invalid")
                 typed_arguments = cast(dict[str, object], arguments)
                 if name == "chat_peers" and not typed_arguments:
+                    assert root is not None
                     result = peers(root)
                 elif name == "chat_send":
                     target, message = normalize_send_arguments(typed_arguments)
@@ -145,6 +152,7 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                         if not isinstance(raw_thread, str):
                             _fail("Codex host thread identity is required")
                         thread_id = raw_thread
+                    assert root is not None
                     source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
                     result = send(root, source, target, message)
                 else:
@@ -289,7 +297,7 @@ def run(arguments: argparse.Namespace) -> int:
             home=Path.home(),
             executable=arguments.stable_entrypoint,
             device=device,
-            tailnet_address=local_tailnet_address(),
+            tailnet_address=known_tailnet_address(),
         )
         installer.install_staged(arguments.staged_runtime, arguments.stable_entrypoint)
         print(f"Cross Agent Chat is ready on {device}. Start fresh Claude/Codex sessions.")
