@@ -26,7 +26,11 @@ from cross_agent_chat.runtime import (
     request_tailnet,
     send,
 )
-from cross_agent_chat.tailnet import parse_local_tailnet_address, parse_tailnet_nodes
+from cross_agent_chat.tailnet import (
+    parse_known_tailnet_address,
+    parse_local_tailnet_address,
+    parse_tailnet_nodes,
+)
 from cross_agent_chat.tailnet_broker import (
     BrokerAdmission,
     bind_broker_listener,
@@ -85,6 +89,17 @@ def test_local_tailnet_address_uses_only_running_self_ipv4() -> None:
         )
         is None
     )
+
+
+def test_known_tailnet_address_survives_stopped_backend() -> None:
+    payload = json.dumps(
+        {
+            "BackendState": "Stopped",
+            "Self": {"TailscaleIPs": ["100.64.0.13", "fd7a:115c:a1e0::1"]},
+        }
+    )
+
+    assert parse_known_tailnet_address(payload) == "100.64.0.13"
 
 
 def test_tailnet_broker_exposes_only_local_live_peers(tmp_path: Path) -> None:

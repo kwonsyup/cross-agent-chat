@@ -29,6 +29,7 @@ from cross_agent_chat.runtime import (
     state_root,
     unregister,
 )
+from cross_agent_chat.tailnet import known_tailnet_address
 from cross_agent_chat.tailnet_broker import broker_server
 
 
@@ -41,6 +42,7 @@ def _installer(device: str | None) -> Installer:
         home=Path.home(),
         executable=discover_executable(Path(sys.argv[0])),
         device=default_device() if device is None else device,
+        tailnet_address=known_tailnet_address(),
     )
 
 
@@ -295,6 +297,7 @@ def run(arguments: argparse.Namespace) -> int:
             home=Path.home(),
             executable=arguments.stable_entrypoint,
             device=device,
+            tailnet_address=known_tailnet_address(),
         )
         installer.install_staged(arguments.staged_runtime, arguments.stable_entrypoint)
         print(f"Cross Agent Chat is ready on {device}. Start fresh Claude/Codex sessions.")

@@ -414,18 +414,19 @@ def test_setup_installs_owned_background_broker(tmp_path: Path) -> None:
     }
 
 
-def test_setup_keeps_launch_agent_stable_across_tailnet_state(tmp_path: Path) -> None:
+def test_setup_passes_known_tailnet_address_to_broker(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(
         home=home,
         executable=Path("/opt/cross-agent-chat"),
         device="studio",
+        tailnet_address="100.64.0.10",
     )
 
     installer.setup()
 
     payload = plistlib.loads(installer.launch_agent.read_bytes())
-    assert "EnvironmentVariables" not in payload
+    assert payload["EnvironmentVariables"] == {"CROSS_AGENT_CHAT_TAILNET_ADDRESS": "100.64.0.10"}
 
 
 def test_setup_trusts_each_owned_codex_hook(tmp_path: Path) -> None:

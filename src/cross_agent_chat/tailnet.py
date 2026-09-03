@@ -67,17 +67,17 @@ def parse_tailnet_nodes(text: str) -> list[str]:
     return sorted(addresses)
 
 
-def parse_local_tailnet_address(text: str) -> str | None:
-    """Return this node's Tailnet IPv4 address when Tailscale is running."""
+def _parse_status(text: str) -> dict[object, object]:
     try:
         raw: object = json.loads(text)
     except json.JSONDecodeError as error:
         raise ChatError("Tailscale status is invalid") from error
     if not isinstance(raw, dict):
         raise ChatError("Tailscale status is invalid")
-    status = cast(dict[object, object], raw)
-    if status.get("BackendState") != "Running":
-        return None
+    return cast(dict[object, object], raw)
+
+
+def _self_tailnet_address(status: dict[object, object]) -> str | None:
     self_value = status.get("Self")
     if not isinstance(self_value, dict):
         raise ChatError("Tailscale status is invalid")
@@ -94,6 +94,19 @@ def parse_local_tailnet_address(text: str) -> str | None:
         if address.version == 4 and address in TAILNET_NETWORK:
             return valid_tailnet_address(str(address))
     return None
+
+
+def parse_local_tailnet_address(text: str) -> str | None:
+    """Return this node's Tailnet IPv4 address when Tailscale is running."""
+    status = _parse_status(text)
+    if status.get("BackendState") != "Running":
+        return None
+    return _self_tailnet_address(status)
+
+
+def parse_known_tailnet_address(text: str) -> str | None:
+    """Return this node's assigned Tailnet IPv4 even while its backend is stopped."""
+    return _self_tailnet_address(_parse_status(text))
 
 
 def tailscale_binary() -> Path | None:
@@ -149,5 +162,16 @@ def local_tailnet_address() -> str | None:
         return None
     try:
         return parse_local_tailnet_address(output)
+    except ChatError:
+        return None
+
+
+def known_tailnet_address() -> str | None:
+    """Return this Mac's assigned Tailnet IPv4 without requiring an online backend."""
+    output = _status_output()
+    if output is None:
+        return None
+    try:
+        return parse_known_tailnet_address(output)
     except ChatError:
         return None
