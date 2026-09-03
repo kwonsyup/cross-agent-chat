@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import select
@@ -7,6 +8,7 @@ import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 from uuid import uuid4
 
 import pytest
@@ -27,7 +29,9 @@ from cross_agent_chat.runtime import (
 from cross_agent_chat.tailnet import parse_local_tailnet_address, parse_tailnet_nodes
 from cross_agent_chat.tailnet_broker import (
     BrokerAdmission,
+    bind_broker_listener,
     broker_bindings,
+    broker_server,
     dispatch_broker_connection,
     dispatch_ready_brokers,
     handle_broker_request,
@@ -100,6 +104,86 @@ def test_broker_binds_localhost_and_installer_discovered_tailnet_address(
         ("127.0.0.1", 47072),
         ("100.64.0.13", 47071),
     ]
+
+
+def test_tailnet_listener_defers_only_until_address_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    listener = mock.Mock()
+    listener.bind.side_effect = OSError(errno.EADDRNOTAVAIL, "fixture")
+    monkeypatch.setattr("cross_agent_chat.tailnet_broker.socket.socket", lambda *_args: listener)
+
+    assert bind_broker_listener(("100.64.0.13", 47071), allow_unavailable=True) is None
+    listener.close.assert_called_once_with()
+
+
+def test_local_listener_does_not_suppress_unavailable_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    listener = mock.Mock()
+    listener.bind.side_effect = OSError(errno.EADDRNOTAVAIL, "fixture")
+    monkeypatch.setattr("cross_agent_chat.tailnet_broker.socket.socket", lambda *_args: listener)
+
+    with pytest.raises(OSError) as error:
+        bind_broker_listener(("127.0.0.1", 47072))
+
+    assert error.value.errno == errno.EADDRNOTAVAIL
+    listener.close.assert_called_once_with()
+
+
+def test_tailnet_listener_does_not_suppress_address_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    listener = mock.Mock()
+    listener.bind.side_effect = OSError(errno.EADDRINUSE, "fixture")
+    monkeypatch.setattr("cross_agent_chat.tailnet_broker.socket.socket", lambda *_args: listener)
+
+    with pytest.raises(OSError) as error:
+        bind_broker_listener(("100.64.0.13", 47071), allow_unavailable=True)
+
+    assert error.value.errno == errno.EADDRINUSE
+    listener.close.assert_called_once_with()
+
+
+def test_broker_keeps_local_listener_and_retries_deferred_tailnet_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local_listener = mock.Mock()
+    tailnet_listener = mock.Mock()
+    bindings: list[tuple[tuple[str, int], bool]] = []
+    tailnet_attempts = iter((None, tailnet_listener))
+
+    def bind(binding: tuple[str, int], *, allow_unavailable: bool = False) -> object:
+        bindings.append((binding, allow_unavailable))
+        if allow_unavailable:
+            return next(tailnet_attempts)
+        return local_listener
+
+    select_timeouts: list[float | None] = []
+
+    def select_once_then_stop(
+        _readers: object, _writers: object, _errors: object, timeout: float | None
+    ) -> tuple[list[object], list[object], list[object]]:
+        select_timeouts.append(timeout)
+        if len(select_timeouts) == 2:
+            raise RuntimeError("stop fixture")
+        return [], [], []
+
+    monkeypatch.setattr("cross_agent_chat.tailnet_broker.bind_broker_listener", bind)
+    monkeypatch.setattr("cross_agent_chat.tailnet_broker.select.select", select_once_then_stop)
+    monkeypatch.setenv("CROSS_AGENT_CHAT_TAILNET_ADDRESS", "100.64.0.13")
+
+    with pytest.raises(RuntimeError, match="stop fixture"):
+        broker_server(str(tmp_path))
+
+    assert bindings == [
+        (("127.0.0.1", 47072), False),
+        (("100.64.0.13", 47071), True),
+        (("100.64.0.13", 47071), True),
+    ]
+    assert select_timeouts == [1.0, None]
+    local_listener.close.assert_called_once_with()
+    tailnet_listener.close.assert_called_once_with()
 
 
 def test_tailnet_broker_rejects_extra_request_fields(tmp_path: Path) -> None:

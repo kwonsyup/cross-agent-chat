@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import select
@@ -32,6 +33,7 @@ from cross_agent_chat.tailnet import (
 
 MAX_BROKER_CONNECTIONS = 16
 MAX_BROKER_CONNECTIONS_PER_PEER = 2
+TAILNET_BIND_RETRY_SECONDS = 1.0
 
 
 @dataclass(slots=True)
@@ -75,6 +77,24 @@ def broker_bindings() -> list[tuple[str, int]]:
     if tailnet_address is not None:
         bindings.append((tailnet_address, TAILNET_PORT))
     return bindings
+
+
+def bind_broker_listener(
+    binding: tuple[str, int], *, allow_unavailable: bool = False
+) -> socket.socket | None:
+    """Bind one listener, deferring only a Tailnet address that is not ready yet."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(binding)
+        server.listen(16)
+        server.setblocking(False)
+    except OSError as error:
+        server.close()
+        if allow_unavailable and error.errno == errno.EADDRNOTAVAIL:
+            return None
+        raise
+    return server
 
 
 def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[str, object]:
@@ -206,20 +226,29 @@ def broker_server(state_root_value: str | None) -> None:
     root = state_root(state_root_value)
     servers: list[socket.socket] = []
     try:
-        for host, port in broker_bindings():
-            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind((host, port))
-            server.listen(16)
-            server.setblocking(False)
-            servers.append(server)
+        bindings = broker_bindings()
+        local_server = bind_broker_listener(bindings[0])
+        if local_server is None:  # Defensive: the required local bind never permits deferral.
+            raise RuntimeError("local broker listener could not be created")
+        servers.append(local_server)
+        tailnet_binding = bindings[1] if len(bindings) == 2 else None
+        tailnet_server: socket.socket | None = None
         admission = BrokerAdmission()
         with ThreadPoolExecutor(
             max_workers=MAX_BROKER_CONNECTIONS,
             thread_name_prefix="cross-agent-chat",
         ) as workers:
             while True:
-                readable, _, _ = select.select(servers, [], [])
+                if tailnet_binding is not None and tailnet_server is None:
+                    tailnet_server = bind_broker_listener(tailnet_binding, allow_unavailable=True)
+                    if tailnet_server is not None:
+                        servers.append(tailnet_server)
+                retry_timeout = (
+                    TAILNET_BIND_RETRY_SECONDS
+                    if tailnet_binding is not None and tailnet_server is None
+                    else None
+                )
+                readable, _, _ = select.select(servers, [], [], retry_timeout)
                 dispatch_ready_brokers(workers, root, readable, admission)
     finally:
         for server in servers:
