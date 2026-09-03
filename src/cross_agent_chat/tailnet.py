@@ -17,6 +17,7 @@ TAILNET_PORT: Final = 47071
 LOCAL_BROKER_HOST: Final = "127.0.0.1"
 LOCAL_BROKER_PORT: Final = 47072
 TAILSCALE_APP_BINARY: Final = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+IFCONFIG_BINARY: Final = Path("/sbin/ifconfig")
 
 
 def valid_tailnet_address(value: str) -> str:
@@ -109,6 +110,26 @@ def parse_known_tailnet_address(text: str) -> str | None:
     return _self_tailnet_address(_parse_status(text))
 
 
+def parse_ifconfig_tailnet_address(text: str) -> str | None:
+    """Return one Tailnet IPv4 assigned to a macOS tunnel interface."""
+    interface = ""
+    addresses: set[str] = set()
+    for line in text.splitlines():
+        if line and not line[0].isspace() and ":" in line:
+            interface = line.split(":", maxsplit=1)[0]
+            continue
+        if not interface.startswith("utun"):
+            continue
+        fields = line.split()
+        if len(fields) < 2 or fields[0] != "inet":
+            continue
+        try:
+            addresses.add(valid_tailnet_address(fields[1]))
+        except ChatError:
+            continue
+    return next(iter(addresses)) if len(addresses) == 1 else None
+
+
 def tailscale_binary() -> Path | None:
     """Find an executable Tailscale CLI without modifying the user's PATH."""
     candidate = shutil.which("tailscale")
@@ -144,6 +165,23 @@ def _status_output() -> str | None:
         return None
 
 
+def _ifconfig_tailnet_address() -> str | None:
+    try:
+        completed = subprocess.run(
+            [str(IFCONFIG_BINARY)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return None
+        return parse_ifconfig_tailnet_address(completed.stdout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def tailnet_nodes() -> list[str]:
     """Return currently online Tailnet nodes, or none when Tailscale is unavailable."""
     output = _status_output()
@@ -158,12 +196,14 @@ def tailnet_nodes() -> list[str]:
 def local_tailnet_address() -> str | None:
     """Return this Mac's Tailnet IPv4 address without changing Tailscale state."""
     output = _status_output()
-    if output is None:
-        return None
-    try:
-        return parse_local_tailnet_address(output)
-    except ChatError:
-        return None
+    if output is not None:
+        try:
+            address = parse_local_tailnet_address(output)
+        except ChatError:
+            address = None
+        if address is not None:
+            return address
+    return _ifconfig_tailnet_address()
 
 
 def known_tailnet_address() -> str | None:

@@ -71,9 +71,8 @@ def broker_bindings() -> list[tuple[str, int]]:
     """Return the exact interfaces owned by this broker process."""
     bindings = [(LOCAL_BROKER_HOST, LOCAL_BROKER_PORT)]
     configured = os.environ.get("CROSS_AGENT_CHAT_TAILNET_ADDRESS")
-    tailnet_address = (
-        valid_tailnet_address(configured) if configured is not None else local_tailnet_address()
-    )
+    configured_address = valid_tailnet_address(configured) if configured is not None else None
+    tailnet_address = local_tailnet_address() or configured_address
     if tailnet_address is not None:
         bindings.append((tailnet_address, TAILNET_PORT))
     return bindings
@@ -238,15 +237,18 @@ def broker_server(state_root_value: str | None) -> None:
             thread_name_prefix="cross-agent-chat",
         ) as workers:
             while True:
-                if tailnet_server is None:
-                    current_bindings = broker_bindings()
-                    tailnet_binding = current_bindings[1] if len(current_bindings) == 2 else None
-                if tailnet_binding is not None and tailnet_server is None:
-                    tailnet_server = bind_broker_listener(tailnet_binding, allow_unavailable=True)
-                    if tailnet_server is not None:
-                        servers.append(tailnet_server)
-                retry_timeout = TAILNET_BIND_RETRY_SECONDS if tailnet_server is None else None
-                readable, _, _ = select.select(servers, [], [], retry_timeout)
+                current_bindings = broker_bindings()
+                desired_tailnet = current_bindings[1] if len(current_bindings) == 2 else None
+                if desired_tailnet is not None and desired_tailnet != tailnet_binding:
+                    replacement = bind_broker_listener(desired_tailnet, allow_unavailable=True)
+                    if replacement is not None:
+                        servers.append(replacement)
+                        if tailnet_server is not None:
+                            servers.remove(tailnet_server)
+                            tailnet_server.close()
+                        tailnet_server = replacement
+                        tailnet_binding = desired_tailnet
+                readable, _, _ = select.select(servers, [], [], TAILNET_BIND_RETRY_SECONDS)
                 dispatch_ready_brokers(workers, root, readable, admission)
     finally:
         for server in servers:
