@@ -32,7 +32,7 @@ from tomlkit.exceptions import TOMLKitError
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import ChatError, atomic_json, ensure_private_dir, valid_device
-from cross_agent_chat.tailnet import LOCAL_BROKER_HOST, LOCAL_BROKER_PORT, valid_tailnet_address
+from cross_agent_chat.tailnet import LOCAL_BROKER_HOST, LOCAL_BROKER_PORT
 
 SERVER_NAME: Final = "cross-agent-chat"
 LAUNCH_AGENT_LABEL: Final = "io.github.kwonsyup.cross-agent-chat"
@@ -672,14 +672,10 @@ class Installer:
         home: Path,
         executable: Path,
         device: str,
-        tailnet_address: str | None = None,
     ) -> None:
         self.home = home.resolve()
         self.executable = executable if executable.is_absolute() else executable.absolute()
         self.device = valid_device(device)
-        self.tailnet_address = (
-            None if tailnet_address is None else valid_tailnet_address(tailnet_address)
-        )
         self.state = self.home / ".local" / "state" / SERVER_NAME
         self.install_state = self.home / ".config" / SERVER_NAME / "install.json"
         self.cache = self.home / ".cache" / SERVER_NAME
@@ -875,10 +871,6 @@ class Installer:
             "KeepAlive": True,
             "ProcessType": "Background",
         }
-        if self.tailnet_address is not None:
-            payload["EnvironmentVariables"] = {
-                "CROSS_AGENT_CHAT_TAILNET_ADDRESS": self.tailnet_address
-            }
         return plistlib.dumps(payload, sort_keys=True)
 
     def _codex_config_text(self) -> str | None:

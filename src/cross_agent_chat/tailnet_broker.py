@@ -33,7 +33,7 @@ from cross_agent_chat.tailnet import (
 
 MAX_BROKER_CONNECTIONS = 16
 MAX_BROKER_CONNECTIONS_PER_PEER = 2
-TAILNET_BIND_RETRY_SECONDS = 1.0
+TAILNET_BIND_RETRY_SECONDS = 5.0
 
 
 @dataclass(slots=True)
@@ -226,12 +226,11 @@ def broker_server(state_root_value: str | None) -> None:
     root = state_root(state_root_value)
     servers: list[socket.socket] = []
     try:
-        bindings = broker_bindings()
-        local_server = bind_broker_listener(bindings[0])
+        local_server = bind_broker_listener((LOCAL_BROKER_HOST, LOCAL_BROKER_PORT))
         if local_server is None:  # Defensive: the required local bind never permits deferral.
             raise RuntimeError("local broker listener could not be created")
         servers.append(local_server)
-        tailnet_binding = bindings[1] if len(bindings) == 2 else None
+        tailnet_binding: tuple[str, int] | None = None
         tailnet_server: socket.socket | None = None
         admission = BrokerAdmission()
         with ThreadPoolExecutor(
@@ -239,15 +238,14 @@ def broker_server(state_root_value: str | None) -> None:
             thread_name_prefix="cross-agent-chat",
         ) as workers:
             while True:
+                if tailnet_server is None:
+                    current_bindings = broker_bindings()
+                    tailnet_binding = current_bindings[1] if len(current_bindings) == 2 else None
                 if tailnet_binding is not None and tailnet_server is None:
                     tailnet_server = bind_broker_listener(tailnet_binding, allow_unavailable=True)
                     if tailnet_server is not None:
                         servers.append(tailnet_server)
-                retry_timeout = (
-                    TAILNET_BIND_RETRY_SECONDS
-                    if tailnet_binding is not None and tailnet_server is None
-                    else None
-                )
+                retry_timeout = TAILNET_BIND_RETRY_SECONDS if tailnet_server is None else None
                 readable, _, _ = select.select(servers, [], [], retry_timeout)
                 dispatch_ready_brokers(workers, root, readable, admission)
     finally:

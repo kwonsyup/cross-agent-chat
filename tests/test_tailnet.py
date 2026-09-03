@@ -145,18 +145,17 @@ def test_tailnet_listener_does_not_suppress_address_conflict(
     listener.close.assert_called_once_with()
 
 
-def test_broker_keeps_local_listener_and_retries_deferred_tailnet_bind(
+def test_broker_keeps_local_listener_and_discovers_tailnet_after_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     local_listener = mock.Mock()
     tailnet_listener = mock.Mock()
     bindings: list[tuple[tuple[str, int], bool]] = []
-    tailnet_attempts = iter((None, tailnet_listener))
 
     def bind(binding: tuple[str, int], *, allow_unavailable: bool = False) -> object:
         bindings.append((binding, allow_unavailable))
         if allow_unavailable:
-            return next(tailnet_attempts)
+            return tailnet_listener
         return local_listener
 
     select_timeouts: list[float | None] = []
@@ -171,7 +170,13 @@ def test_broker_keeps_local_listener_and_retries_deferred_tailnet_bind(
 
     monkeypatch.setattr("cross_agent_chat.tailnet_broker.bind_broker_listener", bind)
     monkeypatch.setattr("cross_agent_chat.tailnet_broker.select.select", select_once_then_stop)
-    monkeypatch.setenv("CROSS_AGENT_CHAT_TAILNET_ADDRESS", "100.64.0.13")
+    discovered = iter(
+        (
+            [("127.0.0.1", 47072)],
+            [("127.0.0.1", 47072), ("100.64.0.13", 47071)],
+        )
+    )
+    monkeypatch.setattr("cross_agent_chat.tailnet_broker.broker_bindings", lambda: next(discovered))
 
     with pytest.raises(RuntimeError, match="stop fixture"):
         broker_server(str(tmp_path))
@@ -179,9 +184,8 @@ def test_broker_keeps_local_listener_and_retries_deferred_tailnet_bind(
     assert bindings == [
         (("127.0.0.1", 47072), False),
         (("100.64.0.13", 47071), True),
-        (("100.64.0.13", 47071), True),
     ]
-    assert select_timeouts == [1.0, None]
+    assert select_timeouts == [5.0, None]
     local_listener.close.assert_called_once_with()
     tailnet_listener.close.assert_called_once_with()
 
