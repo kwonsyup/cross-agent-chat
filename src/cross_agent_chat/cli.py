@@ -286,8 +286,10 @@ def run(arguments: argparse.Namespace) -> int:
         )
         return 0 if healthy else 1
     elif command == "uninstall":
-        _installer(arguments.device).uninstall()
+        retained = _installer(arguments.device).uninstall()
         print("Removed Cross Agent Chat-owned provider and background configuration.")
+        if retained:
+            print("Delivery intent records remain available for owner inspection.")
     elif command == "peers":
         peer_result = peers(state_root(), include_remote=not arguments.local_only)
         if arguments.json:
