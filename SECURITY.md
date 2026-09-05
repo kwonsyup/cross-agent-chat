@@ -33,8 +33,11 @@ between devices. Delivered message bodies can appear in provider transcripts. Pe
 Cross Agent Chat state contains route metadata, generations, identity hashes, event IDs,
 payload digests, statuses, and timestamps, but not message bodies.
 
-Codex pending messages exist only in the recipient process's memory. If that process exits
-before its next natural Stop, the pending messages are lost.
+By default, Codex pending messages exist only in the recipient courier's memory. If that
+process exits before its next natural Stop, the pending messages are lost. With the explicit
+experimental native queue opt-in, Codex stores pending input in its own queue and later in its
+transcript. Cross Agent Chat sends that input over stdio, never as command-line arguments,
+and does not maintain another durable message store. Acceptance still does not prove consumption.
 
 ## Reporting a vulnerability
 

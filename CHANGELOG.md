@@ -9,10 +9,13 @@
   reports the selected profile's queue mode.
 - Keep stale workspace metadata structurally readable while excluding unavailable routes from live
   discovery and delivery.
+- Fix a fast-reply socket close race that intermittently hid healthy peers during discovery.
+- Support Claude's native background session inventory and ListAgents display format.
 - Accept ordinary Unicode project names and bound rendered peer labels without using display text as
   route authority.
 - Preserve a live courier generation and its in-memory queue when a provider repeats SessionStart
-  for the same process, session, device, and working directory.
+  for the same verified process birth, executable, profile, session, and working directory. A busy
+  courier is preserved; a missing courier can recover with a fresh generation.
 - Drain Codex courier queues in whole bounded frame batches, preserving ordered remainder for a
   later natural provider boundary.
 - Align the Codex MCP tool timeout with the bounded remote delivery operation.

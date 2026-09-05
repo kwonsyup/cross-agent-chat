@@ -144,6 +144,10 @@ def bounded_message(message: str) -> str:
         fail("message must not be empty")
     if "\x00" in message or len(encoded) > MAX_MESSAGE_BYTES:
         fail("message exceeds the 16 KiB limit")
+    # Leave room for provenance and protocol fields within the 64 KiB frame,
+    # including control characters that expand to six bytes in JSON.
+    if len(json.dumps(message, ensure_ascii=False).encode()) > 2 * MAX_MESSAGE_BYTES + 2:
+        fail("message exceeds the encoded frame budget")
     return message
 
 
@@ -172,6 +176,7 @@ class Route:
     pid: int
     last_seen: str
     owner_identity: str | None = None
+    profile_root: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -195,6 +200,10 @@ class Route:
             and re.fullmatch(r"[0-9a-f]{64}", self.owner_identity) is None
         ):
             fail("route owner identity is invalid")
+        if self.profile_root is not None:
+            stored_cwd(self.profile_root)
+            if self.owner_identity is None:
+                fail("route profile has no owner identity")
 
     @classmethod
     def create(
@@ -207,6 +216,7 @@ class Route:
         pid: int,
         generation: str | None = None,
         owner_identity: str | None = None,
+        profile_root: str | None = None,
     ) -> Route:
         if provider not in {"claude", "codex"}:
             fail("route provider is invalid")
@@ -227,6 +237,7 @@ class Route:
             pid=pid,
             last_seen=utc_now(),
             owner_identity=owner_identity,
+            profile_root=profile_root,
         )
 
     @classmethod
@@ -244,7 +255,12 @@ class Route:
             "last_seen",
         }
         if not isinstance(raw, dict) or (
-            set(raw) != fields and set(raw) != fields | {"owner_identity"}
+            set(raw)
+            not in (
+                fields,
+                fields | {"owner_identity"},
+                fields | {"owner_identity", "profile_root"},
+            )
         ):
             fail("route schema is unsupported")
         values = cast(dict[str, object], raw)
@@ -267,6 +283,7 @@ class Route:
             or not isinstance(values["pid"], int)
             or isinstance(values["pid"], bool)
             or ("owner_identity" in values and not isinstance(values["owner_identity"], str))
+            or ("profile_root" in values and not isinstance(values["profile_root"], str))
         ):
             fail("route schema is unsupported")
         return cls(
@@ -281,6 +298,7 @@ class Route:
             pid=values["pid"],
             last_seen=cast(str, values["last_seen"]),
             owner_identity=cast(str | None, values.get("owner_identity")),
+            profile_root=cast(str | None, values.get("profile_root")),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -298,6 +316,8 @@ class Route:
         }
         if self.owner_identity is not None:
             result["owner_identity"] = self.owner_identity
+        if self.profile_root is not None:
+            result["profile_root"] = self.profile_root
         return result
 
     def process_is_live(self) -> bool:

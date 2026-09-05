@@ -132,9 +132,7 @@ def test_running_tailscale_identity_requires_the_current_interface_address(
 ) -> None:
     monkeypatch.setattr(
         "cross_agent_chat.tailnet._status_output",
-        lambda: json.dumps(
-            {"BackendState": "Running", "Self": {"TailscaleIPs": ["100.64.0.13"]}}
-        ),
+        lambda: json.dumps({"BackendState": "Running", "Self": {"TailscaleIPs": ["100.64.0.13"]}}),
     )
     monkeypatch.setattr(
         "cross_agent_chat.tailnet._ifconfig_output", lambda: "utun4:\n inet 100.64.0.13"
@@ -563,7 +561,7 @@ def test_remote_targets_are_discovered_without_peer_configuration(
     def request(address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         assert address == "100.64.0.11"
         assert payload == {"schema_version": 1, "operation": "peers"}
-        assert timeout == REMOTE_DISCOVERY_TIMEOUT_SECONDS
+        assert 0 < timeout <= REMOTE_DISCOVERY_TIMEOUT_SECONDS
         return {
             "schema_version": 1,
             "peers": [

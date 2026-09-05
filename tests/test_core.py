@@ -20,6 +20,7 @@ from cross_agent_chat.core import (
     IntentStore,
     Registry,
     Route,
+    UnknownDeliveryError,
     atomic_json,
     authenticate_sender,
     bounded_message,
@@ -29,6 +30,7 @@ from cross_agent_chat.runtime import (
     HEALTH_TIMEOUT_SECONDS,
     LOCAL_DISCOVERY_TIMEOUT_SECONDS,
     MCP_TOOL_TIMEOUT_SECONDS,
+    OPERATION_TIMEOUT_SECONDS,
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     REMOTE_TIMEOUT_SECONDS,
     Target,
@@ -296,9 +298,14 @@ def test_pre_effect_rejection_does_not_block_fresh_intent(tmp_path: Path) -> Non
 
 
 def test_configured_tool_deadline_covers_one_remote_discovery_and_delivery() -> None:
-    assert MCP_TOOL_TIMEOUT_SECONDS >= (
-        LOCAL_DISCOVERY_TIMEOUT_SECONDS + REMOTE_DISCOVERY_TIMEOUT_SECONDS + REMOTE_TIMEOUT_SECONDS
+    assert OPERATION_TIMEOUT_SECONDS >= (
+        LOCAL_DISCOVERY_TIMEOUT_SECONDS
+        + REMOTE_DISCOVERY_TIMEOUT_SECONDS
+        + REMOTE_TIMEOUT_SECONDS
+        + 5
+        + 15
     )
+    assert MCP_TOOL_TIMEOUT_SECONDS >= OPERATION_TIMEOUT_SECONDS + 10
 
 
 def test_local_send_does_not_wait_for_remote_discovery(
@@ -340,8 +347,9 @@ def test_local_send_does_not_wait_for_remote_discovery(
     assert send(root, source, target.alias, "hello")["status"] == "TRANSPORT_ACCEPTED"
 
 
+@pytest.mark.parametrize("health_timeout", [False, True])
 def test_healthy_duplicate_registration_keeps_generation_and_pending_courier_event(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, health_timeout: bool
 ) -> None:
     from cross_agent_chat import runtime
 
@@ -394,13 +402,25 @@ def test_healthy_duplicate_registration_keeps_generation_and_pending_courier_eve
         runtime, "_spawn_courier", lambda *_: pytest.fail("duplicate spawned courier")
     )
 
-    repeated = runtime.register("codex", "studio", os.getpid(), str(root))
+    if health_timeout:
 
-    assert repeated is not None and repeated.generation == first.generation
-    peek = request_socket(
-        path, {"schema_version": 1, "operation": "peek", "generation": first.generation}
-    )
-    assert peek["messages"] == [{"event_id": event_id, "message": "pending"}]
+        def busy_health(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise UnknownDeliveryError("busy courier") from TimeoutError()
+
+        monkeypatch.setattr(runtime, "request_socket", busy_health)
+    try:
+        repeated = runtime.register("codex", "studio", os.getpid(), str(root))
+        assert repeated is not None and repeated.generation == first.generation
+        peek = request_socket(
+            path, {"schema_version": 1, "operation": "peek", "generation": first.generation}
+        )
+        assert peek["messages"] == [{"event_id": event_id, "message": "pending"}]
+    finally:
+        request_socket(
+            path, {"schema_version": 1, "operation": "shutdown", "generation": first.generation}
+        )
+        worker.join(timeout=2)
+    assert not worker.is_alive()
 
 
 def test_missing_courier_duplicate_registration_replaces_generation(
@@ -890,3 +910,56 @@ def test_pre_effect_response_parser_rejects_untrusted_variants() -> None:
         response | {"extra": True},
     ):
         assert pre_effect_error(changed, event_id, "claude") is None
+
+
+def test_route_owner_check_uses_recipient_profile_not_broker_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    profile_a = str(tmp_path / "profile-a")
+    monkeypatch.setenv("CODEX_HOME", profile_a)
+    identity, _ = runtime.recipient_owner_identity("codex", os.getpid())
+    owned = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity=identity,
+        profile_root=profile_a,
+    )
+    root = tmp_path / "state"
+    Registry(root).upsert(owned)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "broker-profile"))
+    assert runtime._route_current(root, owned)
+    assert Registry(root).routes()[0].profile_root == profile_a
+    changed = replace(owned, profile_root=str(tmp_path / "different-recipient"))
+    Registry(root).upsert(changed)
+    assert not runtime._route_current(root, changed)
+
+
+def test_remote_discovery_uses_one_deadline_for_queued_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    release = threading.Event()
+    started: list[str] = []
+
+    def wait_for_peer(address: str, deadline: float | None = None) -> list[Target]:
+        assert deadline is not None
+        started.append(address)
+        release.wait(1)
+        return []
+
+    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [str(i) for i in range(48)])
+    monkeypatch.setattr(runtime, "_remote_node_targets", wait_for_peer)
+    monkeypatch.setattr(runtime, "REMOTE_DISCOVERY_TIMEOUT_SECONDS", 0.05)
+    start = time.monotonic()
+    try:
+        assert runtime.remote_targets(tmp_path) == []
+        assert time.monotonic() - start < 0.5
+        assert len(started) <= 16
+    finally:
+        release.set()

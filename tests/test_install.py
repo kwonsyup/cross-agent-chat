@@ -657,7 +657,7 @@ def test_setup_trusts_each_owned_codex_hook(tmp_path: Path) -> None:
 
     config = tomllib.loads((home / ".codex" / "config.toml").read_text())
     trusted = config["hooks"]["state"]
-    assert config["mcp_servers"]["cross-agent-chat"]["tool_timeout_sec"] == 240
+    assert config["mcp_servers"]["cross-agent-chat"]["tool_timeout_sec"] == 270
     assert config["mcp_servers"]["cross-agent-chat"]["default_tools_approval_mode"] == "approve"
     assert len(trusted) == 3
     assert all(

@@ -23,9 +23,9 @@ visible by default.
 
 | Surface | Support |
 |---|---|
-| Claude Code in any terminal | Yes |
-| Codex CLI in any terminal | Yes |
-| Codex Native App | Yes |
+| Claude Code 2.1.261 | Interactive and native background sessions; native SendMessage delivery |
+| Codex CLI 0.152.1 / 0.153.2 | Next-turn delivery; idle wake with explicit experimental queue opt-in |
+| Codex Native, embedded 0.153.1 | Next-turn delivery; idle wake with explicit experimental queue opt-in |
 | Same Mac | Yes |
 | Tailnet Mac | Yes, subject to your Tailscale ACL |
 | ChatGPT web or Claude web | No |
@@ -52,6 +52,8 @@ state remains content-free. The experimental path was observed on Codex Native 0
 0.152.1/0.153.2; it is not enabled by default and must not be treated as a fleet-wide guarantee.
 Active work is not interrupted. Provider transcripts contain delivered messages; persistent
 Cross Agent Chat state contains metadata and digests, never message bodies.
+Claude delivery uses two constrained Haiku helper calls, so its latency and account quota also
+depend on those calls. Helpers retain the recipient's executable and selected profile context.
 
 ## Commands
 
@@ -75,6 +77,8 @@ and MCP routes.
 `CODEX_HOME` for `config.toml` and `hooks.json`. Configure each selected root separately; setup,
 doctor, backups, and uninstall stay on that exact root. Existing same-root account switches need
 fresh provider sessions; Cross Agent Chat does not copy credentials or retarget live sessions.
+Use `setup --disable-experimental-codex-native-queue` to return that profile's fresh Codex
+sessions to next-turn delivery.
 
 ## Architecture
 

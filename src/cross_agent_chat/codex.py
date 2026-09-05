@@ -9,6 +9,7 @@ import subprocess
 import time
 from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Final, cast
 
@@ -100,27 +101,36 @@ def queue_native_input(
         if Path(reported_home).resolve() != Path(expected_home).resolve():
             raise ChatError("Codex native queue profile changed")
         write({"method": "initialized"})
-        write(queue)
         queue_sent = True
+        write(queue)
         queued_response = read_response(1)
-    except (OSError, TimeoutError, json.JSONDecodeError) as error:
+    except (OSError, TimeoutError, ValueError, ChatError) as error:
         if queue_sent:
             raise UnknownDeliveryError("Codex native queue outcome is unknown") from error
+        if isinstance(error, ChatError):
+            raise
         raise ChatError("Codex native queue preflight failed") from error
     finally:
         selector.close()
-        stdin.close()
+        with suppress(OSError):
+            stdin.close()
         try:
             process.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
             process.terminate()
-            process.wait(timeout=2.0)
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2.0)
+        stdout.close()
     explicit_error = queued_response.get("error")
     if isinstance(explicit_error, dict):
-        message = explicit_error.get("message")
-        if isinstance(message, str) and message and not any(item in message for item in "\r\n\0"):
+        # Protocol/parameter rejections prove that enqueue never ran. Internal
+        # errors can follow a storage effect and must remain uncertain.
+        if explicit_error.get("code") in {-32600, -32601, -32602}:
             raise ChatError("Codex native queue rejected the message before acceptance")
-        raise ChatError("Codex native queue rejected the message before acceptance")
+        raise UnknownDeliveryError("Codex native queue outcome is unknown")
     result = queued_response.get("result")
     queued = result.get("queuedSubmission") if isinstance(result, dict) else None
     if not isinstance(queued, dict):
@@ -207,7 +217,15 @@ class CodexCourier:
             encoded = (
                 json.dumps(response, separators=(",", ":"), ensure_ascii=False) + "\n"
             ).encode()
-            if len(encoded) > MAX_PEEK_FRAME_BYTES:
+            continuation = (
+                json.dumps(
+                    {"decision": "block", "reason": hook_context(candidate)},
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode()
+            if max(len(encoded), len(continuation)) > MAX_PEEK_FRAME_BYTES:
                 if not messages:
                     raise ChatError("Codex courier message exceeds the bounded frame")
                 break

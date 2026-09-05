@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -63,7 +64,8 @@ from cross_agent_chat.transport import remote_envelope
 
 MAX_FRAME_BYTES: Final = 64 * 1024
 SOCKET_TIMEOUT_SECONDS: Final = 5.0
-MCP_TOOL_TIMEOUT_SECONDS: Final = 240.0
+MCP_TOOL_TIMEOUT_SECONDS: Final = 270.0
+OPERATION_TIMEOUT_SECONDS: Final = 260.0
 HEALTH_TIMEOUT_SECONDS: Final = AGENTS_TIMEOUT_SECONDS + 2.0
 REMOTE_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS + 5.0
 ACCEPT_TIMEOUT_SECONDS: Final = (
@@ -81,7 +83,15 @@ PROC_PIDTBSDINFO: Final = 3
 PROC_BSDINFO_SIZE: Final = 136
 
 
-def recipient_owner_identity(provider: str, pid: int) -> tuple[str, Path]:
+def recipient_profile_root(provider: str) -> str:
+    value = os.environ.get("CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR")
+    root = Path(value) if value else Path.home() / (".codex" if provider == "codex" else ".claude")
+    return str(root.expanduser().resolve(strict=False))
+
+
+def recipient_owner_identity(
+    provider: str, pid: int, profile_root: str | None = None
+) -> tuple[str, Path]:
     """Bind a route to the provider executable, process birth, uid, and selected root."""
     libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
     path_buffer = ctypes.create_string_buffer(4096)
@@ -96,10 +106,7 @@ def recipient_owner_identity(provider: str, pid: int) -> tuple[str, Path]:
     start_seconds = int.from_bytes(info.raw[120:128], sys.byteorder)
     start_microseconds = int.from_bytes(info.raw[128:136], sys.byteorder)
     binary = Path(path_buffer.value.decode()).resolve(strict=True)
-    profile = os.environ.get("CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR")
-    if profile is None:
-        profile = str(Path.home() / (".codex" if provider == "codex" else ".claude"))
-    root = Path(profile).expanduser().resolve(strict=False)
+    root = Path(profile_root or recipient_profile_root(provider)).expanduser().resolve(strict=False)
     payload = f"{provider}\0{binary}\0{uid}\0{start_seconds}\0{start_microseconds}\0{root}".encode()
     return hashlib.sha256(payload).hexdigest(), binary
 
@@ -265,7 +272,7 @@ def executable() -> Path:
 
 def _spawn_courier(root: Path, route: Route) -> None:
     path = socket_path(root, route)
-    owner_binary = recipient_owner_identity(route.provider, route.pid)[1]
+    owner_binary = recipient_owner_identity(route.provider, route.pid, route.profile_root)[1]
     if path.exists() or path.is_symlink():
         raise ChatError("session courier socket already exists")
     command = [
@@ -293,6 +300,7 @@ def _spawn_courier(root: Path, route: Route) -> None:
             for key in (*COURIER_ENV_KEYS, "CODEX_HOME", "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE")
             if key in os.environ
         }
+        environment["CODEX_HOME"] = route.profile_root or recipient_profile_root("codex")
         codex = str(owner_binary) if owner_binary is not None else shutil.which("codex")
         if codex is not None:
             with suppress(OSError):
@@ -349,6 +357,7 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
         cwd=cast(str, raw["cwd"]),
         pid=pid,
         owner_identity=owner_identity,
+        profile_root=recipient_profile_root(provider),
     )
     root = state_root(state_root_value)
     registry = Registry(root)
@@ -363,14 +372,24 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
                     "operation": "health",
                     "generation": registered.generation,
                 },
-                timeout=SOCKET_TIMEOUT_SECONDS,
+                timeout=0.5,
             )
-        except UnknownDeliveryError:
-            registry.upsert(route)
-        else:
-            if health == courier_health(registered):
+        except UnknownDeliveryError as error:
+            cause = error.__cause__
+            missing = not socket_path(root, registered).exists()
+            refused = isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
+            if not missing and not refused:
+                # A busy courier may still own an accepted provider effect. A
+                # health timeout is not evidence authorizing queue replacement.
                 return registered
             registry.upsert(route)
+        else:
+            if (
+                health.get("status") == "READY"
+                and health.get("generation") == registered.generation
+            ):
+                return registered
+            raise ChatError("existing courier ownership could not be verified")
     try:
         _spawn_courier(root, route)
     except ChatError:
@@ -410,11 +429,18 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
 
 
 def _route_current(root: Path, expected: Route) -> bool:
-    if (
-        expected.owner_identity is not None
-        and recipient_owner_identity(expected.provider, expected.pid)[0] != expected.owner_identity
-    ):
-        return False
+    if expected.owner_identity is not None:
+        profile = expected.profile_root or str(
+            Path.home() / (".codex" if expected.provider == "codex" else ".claude")
+        )
+        try:
+            if (
+                recipient_owner_identity(expected.provider, expected.pid, profile)[0]
+                != expected.owner_identity
+            ):
+                return False
+        except (ChatError, OSError):
+            return False
     return (
         Registry(root).current(expected)
         and expected.process_is_live()
@@ -688,8 +714,11 @@ def _local_target(
     if route.provider == "codex":
         if alias != route.alias:
             return None
-    elif not alias.startswith(f"claude@{route.device}:{route.project}:"):
-        return None
+    else:
+        prefix = f"claude@{route.device}:{route.project}:"
+        shortened = prefix[:115] + "~" + session_key("claude", route.session_id)[:12]
+        if not alias.startswith(prefix) and not (len(prefix) > 115 and alias == shortened):
+            return None
     try:
         return Target(
             alias=valid_name(alias, "route alias"),
@@ -799,13 +828,18 @@ def _targets_from_tailnet(address: str, raw: object) -> list[Target]:
     return targets
 
 
-def _remote_node_targets(address: str) -> list[Target]:
+def _remote_node_targets(address: str, deadline: float | None = None) -> list[Target]:
+    remaining = (
+        REMOTE_DISCOVERY_TIMEOUT_SECONDS if deadline is None else deadline - time.monotonic()
+    )
+    if remaining <= 0:
+        return []
     try:
         raw = request_tailnet(
             address,
             {"schema_version": SCHEMA_VERSION, "operation": "peers"},
             # The remote broker may spend HEALTH_TIMEOUT_SECONDS validating local routes.
-            timeout=REMOTE_DISCOVERY_TIMEOUT_SECONDS,
+            timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining),
         )
         return _targets_from_tailnet(address, raw)
     except (ChatError, UnknownDeliveryError):
@@ -817,10 +851,18 @@ def remote_targets(_root: Path) -> list[Target]:
     if not addresses:
         return []
     targets: list[Target] = []
-    with ThreadPoolExecutor(max_workers=min(16, len(addresses))) as workers:
-        results = workers.map(_remote_node_targets, addresses)
-        for result in results:
-            targets.extend(result)
+    deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
+    workers = ThreadPoolExecutor(max_workers=min(16, len(addresses)))
+    futures = [workers.submit(_remote_node_targets, address, deadline) for address in addresses]
+    try:
+        for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
+            targets.extend(future.result())
+    except FuturesTimeoutError:
+        pass
+    finally:
+        for future in futures:
+            future.cancel()
+        workers.shutdown(wait=False, cancel_futures=True)
     return targets
 
 
@@ -954,13 +996,13 @@ def _send_local_target(
 
 
 def send_local(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
-    deadline = time.monotonic() + MCP_TOOL_TIMEOUT_SECONDS
+    deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
     target = resolve_target(local_targets(root), target_query)
     return _send_local_target(root, source, target, message, deadline=deadline)
 
 
 def send(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
-    deadline = time.monotonic() + MCP_TOOL_TIMEOUT_SECONDS
+    deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
     local_matches = [
         target for target in local_targets(root) if _target_matches(target, target_query)
     ]
@@ -1197,7 +1239,7 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
         snapshot.accept(item["event_id"], item["message"])
 
     def emit(payload: dict[str, object]) -> None:
-        print(json.dumps(payload, separators=(",", ":")), flush=True)
+        print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
 
     deliver_at_stop(snapshot, stop_hook_active=False, emit=emit)
     try:
