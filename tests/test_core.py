@@ -4,6 +4,7 @@ import io
 import json
 import os
 import threading
+import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -34,11 +35,14 @@ from cross_agent_chat.runtime import (
     _local_target,
     canonical_source_alias,
     courier_health,
+    courier_server,
     local_targets,
     pre_effect_error,
     presence_is_enabled,
+    request_socket,
     send,
     send_local,
+    socket_path,
 )
 
 
@@ -334,6 +338,117 @@ def test_local_send_does_not_wait_for_remote_discovery(
     )
 
     assert send(root, source, target.alias, "hello")["status"] == "TRANSPORT_ACCEPTED"
+
+
+def test_healthy_duplicate_registration_keeps_generation_and_pending_courier_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    project = tmp_path / "project"
+    project.mkdir()
+    root = tmp_path / "state"
+    session_id = str(uuid4())
+    identity, _ = runtime.recipient_owner_identity("codex", os.getpid())
+    first = Route.create(
+        provider="codex",
+        session_id=session_id,
+        device="studio",
+        cwd=str(project),
+        pid=os.getpid(),
+        owner_identity=identity,
+    )
+    Registry(root).upsert(first)
+    worker = threading.Thread(
+        target=courier_server,
+        kwargs={
+            "provider": "codex",
+            "state_root_value": str(root),
+            "session_id": session_id,
+            "cwd": str(project),
+            "generation": first.generation,
+            "pid": os.getpid(),
+        },
+        daemon=True,
+    )
+    worker.start()
+    path = socket_path(root, first)
+    deadline = time.monotonic() + 2
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.exists()
+    event_id = str(uuid4())
+    request_socket(
+        path,
+        {
+            "schema_version": 1,
+            "operation": "accept",
+            "generation": first.generation,
+            "event_id": event_id,
+            "message": "pending",
+        },
+    )
+    hook = {"hook_event_name": "SessionStart", "session_id": session_id, "cwd": str(project)}
+    monkeypatch.setattr(runtime, "hook_input", lambda _: hook)
+    monkeypatch.setattr(
+        runtime, "_spawn_courier", lambda *_: pytest.fail("duplicate spawned courier")
+    )
+
+    repeated = runtime.register("codex", "studio", os.getpid(), str(root))
+
+    assert repeated is not None and repeated.generation == first.generation
+    peek = request_socket(
+        path, {"schema_version": 1, "operation": "peek", "generation": first.generation}
+    )
+    assert peek["messages"] == [{"event_id": event_id, "message": "pending"}]
+
+
+def test_missing_courier_duplicate_registration_replaces_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    project = tmp_path / "project"
+    project.mkdir()
+    root = tmp_path / "state"
+    session_id = str(uuid4())
+    identity, _ = runtime.recipient_owner_identity("codex", os.getpid())
+    first = Route.create(
+        provider="codex",
+        session_id=session_id,
+        device="studio",
+        cwd=str(project),
+        pid=os.getpid(),
+        owner_identity=identity,
+    )
+    Registry(root).upsert(first)
+    hook = {"hook_event_name": "SessionStart", "session_id": session_id, "cwd": str(project)}
+    monkeypatch.setattr(runtime, "hook_input", lambda _: hook)
+    spawned: list[Route] = []
+    monkeypatch.setattr(runtime, "_spawn_courier", lambda _root, route: spawned.append(route))
+
+    replacement = runtime.register("codex", "studio", os.getpid(), str(root))
+
+    assert replacement is not None and replacement.generation != first.generation
+    assert spawned == [replacement]
+
+
+@pytest.mark.parametrize("owner_identity", ["a" * 64, "b" * 64])
+def test_owner_identity_change_never_reuses_a_route(tmp_path: Path, owner_identity: str) -> None:
+    registry = Registry(tmp_path / "state")
+    first = route(tmp_path, pid=os.getpid())
+    first = replace(first, owner_identity="0" * 64)
+    replacement = Route.create(
+        provider=first.provider,
+        session_id=first.session_id,
+        device=first.device,
+        cwd=first.cwd,
+        pid=first.pid,
+        owner_identity=owner_identity,
+    )
+    registry.upsert(first)
+
+    assert registry.upsert_or_reuse_live_owner(replacement) == replacement
 
 
 def test_live_route_discovery_does_not_apply_an_age_ttl(
