@@ -2359,9 +2359,25 @@ class Installer:
 
         shutdown_couriers(self.state)
 
-    def _remove_runtime_state(self) -> None:
-        if self.state.exists():
-            shutil.rmtree(self.state)
+    def _remove_runtime_state(self) -> bool:
+        """Retire transient routes without erasing durable delivery intent evidence.
+
+        Returns whether durable intent state remains for the owner to inspect.
+        """
+        if not self.state.exists():
+            return False
+        if self.state.is_symlink() or not self.state.is_dir():
+            raise SettingsError("runtime state ownership is invalid")
+        routes = self.state / "routes.json"
+        if routes.is_symlink() or routes.is_file():
+            routes.unlink()
+        elif routes.exists():
+            raise SettingsError("transient route state is invalid")
+        intents = self.state / "intents.json"
+        if intents.exists() or intents.is_symlink():
+            return True
+        shutil.rmtree(self.state)
+        return False
 
     def _other_profile_install_states(self) -> bool:
         if not self.install_state.parent.exists():
@@ -2505,11 +2521,11 @@ class Installer:
         with suppress(OSError):
             self.runtime_root.rmdir()
 
-    def uninstall(self) -> None:
+    def uninstall(self) -> bool:
         with self._exclusive_lock():
-            self._uninstall()
+            return self._uninstall()
 
-    def _uninstall(self) -> None:
+    def _uninstall(self) -> bool:
         self._codex_config_text()
         self._recover_unfinished_transaction()
         destinations = self._configuration_destinations()
@@ -2526,10 +2542,11 @@ class Installer:
             else self._prepare_runtime_removal(stable_entrypoint, managed_entrypoints)
         )
         broker_was_loaded = False if other_profile_installs else self.broker_is_loaded()
+        durable_intents_preserved = (self.state / "intents.json").exists()
         if not other_profile_installs:
             self._stop_broker()
             self._stop_couriers()
-            self._remove_runtime_state()
+            durable_intents_preserved = self._remove_runtime_state()
         for attempt in range(5):
             destinations = self._configuration_destinations()
             codex_hooks = _json_object(destinations[self.codex_hooks])
@@ -2605,6 +2622,7 @@ class Installer:
         destinations[self.install_state].unlink(missing_ok=True)
         with suppress(OSError):
             self.install_state.parent.rmdir()
+        return durable_intents_preserved
 
 
 def discover_executable(invoked_as: Path | None = None) -> Path:

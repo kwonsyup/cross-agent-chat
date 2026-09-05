@@ -43,6 +43,50 @@ from cross_agent_chat.install import (
 )
 
 
+def _seed_durable_intents(installer: Installer) -> bytes:
+    installer.state.mkdir(parents=True, mode=0o700, exist_ok=True)
+    installer.state.chmod(0o700)
+    payload = (
+        json.dumps(
+            [
+                {
+                    "schema_version": 1,
+                    "event_id": "00000000-0000-4000-8000-000000000001",
+                    "source_key": "a" * 64,
+                    "source_generation": "00000000-0000-4000-8000-000000000003",
+                    "source_alias": "claude@studio:source:00000000",
+                    "target_key": "b" * 64,
+                    "target_generation": "00000000-0000-4000-8000-000000000004",
+                    "payload_digest": "c" * 64,
+                    "status": "UNKNOWN_DELIVERY",
+                    "timestamp": "2026-09-04T00:00:00+00:00",
+                },
+                {
+                    "schema_version": 1,
+                    "event_id": "00000000-0000-4000-8000-000000000002",
+                    "source_key": "d" * 64,
+                    "source_generation": "00000000-0000-4000-8000-000000000005",
+                    "source_alias": "codex@studio:source:00000000",
+                    "target_key": "e" * 64,
+                    "target_generation": "00000000-0000-4000-8000-000000000006",
+                    "payload_digest": "f" * 64,
+                    "status": "TRANSPORT_ACCEPTED",
+                    "timestamp": "2026-09-04T00:00:01+00:00",
+                },
+            ],
+            indent=2,
+        ).encode()
+        + b"\n"
+    )
+    intents = installer.state / "intents.json"
+    intents.write_bytes(payload)
+    intents.chmod(0o600)
+    lock = installer.state / ".intents.lock"
+    lock.write_bytes(b"")
+    lock.chmod(0o600)
+    return payload
+
+
 def test_install_script_stages_before_runtime_transition() -> None:
     script = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
 
@@ -505,6 +549,17 @@ def test_setup_uses_the_explicit_codex_profile_root(tmp_path: Path) -> None:
     assert not (home / ".codex" / "config.toml").exists()
 
 
+def test_setup_preserves_durable_unknown_and_accepted_intent_bytes(tmp_path: Path) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    original = _seed_durable_intents(installer)
+
+    installer.setup()
+
+    assert (installer.state / "intents.json").read_bytes() == original
+
+
 def test_setup_uses_the_explicit_claude_profile_root_without_touching_default(
     tmp_path: Path,
 ) -> None:
@@ -633,13 +688,14 @@ def test_uninstall_keeps_shared_runtime_when_another_profile_is_configured(
     )
     default.setup()
     alternate.setup()
+    original = _seed_durable_intents(default)
     monkeypatch.setattr(
         alternate,
         "_stop_broker",
         lambda: pytest.fail("alternate-profile uninstall stopped the shared broker"),
     )
 
-    alternate.uninstall()
+    assert alternate.uninstall()
 
     assert default.install_state.exists()
     assert default.launch_agent.exists()
@@ -647,6 +703,7 @@ def test_uninstall_keeps_shared_runtime_when_another_profile_is_configured(
     assert "cross-agent-chat" not in json.loads(alternate.claude_config.read_text()).get(
         "mcpServers", {}
     )
+    assert (default.state / "intents.json").read_bytes() == original
 
 
 def test_setup_trusts_each_owned_codex_hook(tmp_path: Path) -> None:
@@ -731,7 +788,7 @@ def test_uninstall_removes_preserved_owned_tool_tables(
     monkeypatch.setattr(installer, "_stop_broker", lambda: None)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
 
-    installer.uninstall()
+    assert not installer.uninstall()
 
     config = tomllib.loads(codex_config.read_text())
     assert "cross-agent-chat" not in config["mcp_servers"]
@@ -2324,6 +2381,50 @@ def test_staged_install_commits_stable_runtime_and_provider_paths(
     assert str(stable) in installer.codex_config.read_text()
     assert str(stable) in installer.launch_agent.read_text()
     assert not list(installer.transactions.iterdir())
+
+
+def test_staged_upgrade_preserves_durable_unknown_and_accepted_intent_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    stable = home / "custom-tools" / "cross-agent-chat"
+    installer = Installer(home=home, executable=stable, device="studio")
+    original = _seed_durable_intents(installer)
+    stage = _staged_runtime(installer)
+    monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
+    monkeypatch.setattr(installer, "activate", lambda: None)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: True)
+
+    installer.install_staged(stage, stable)
+
+    assert (installer.state / "intents.json").read_bytes() == original
+    assert (installer.state / ".intents.lock").exists()
+    assert not (installer.state / "routes.json").exists()
+
+
+def test_failed_staged_upgrade_rollback_preserves_unknown_intent_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    stable = home / "custom-tools" / "cross-agent-chat"
+    installer = Installer(home=home, executable=stable, device="studio")
+    original = _seed_durable_intents(installer)
+    stage = _staged_runtime(installer)
+    monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
+    monkeypatch.setattr(installer, "activate", lambda: None)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: False)
+    monkeypatch.setattr(installer, "_wait_for_broker_health", lambda _: False)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+
+    with pytest.raises(SettingsError, match="background broker did not become healthy"):
+        installer.install_staged(stage, stable)
+
+    assert (installer.state / "intents.json").read_bytes() == original
+    assert (installer.state / ".intents.lock").exists()
 
 
 def test_staged_upgrade_persists_entrypoint_selected_for_transition(
@@ -4128,11 +4229,29 @@ def test_uninstall_removes_owned_runtime_state_and_backups(
     (installer.state / "marker").write_text("owned")
 
     monkeypatch.setattr(installer, "_stop_broker", lambda: None)
-    installer.uninstall()
+    assert not installer.uninstall()
 
     assert not installer.state.exists()
     assert not installer.cache.exists()
     assert not installer.install_state.exists()
+
+
+def test_uninstall_preserves_durable_intents_without_resolving_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    original = _seed_durable_intents(installer)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+
+    assert installer.uninstall()
+
+    assert (installer.state / "intents.json").read_bytes() == original
+    assert (installer.state / ".intents.lock").exists()
+    statuses = {item["status"] for item in json.loads(original)}
+    assert statuses == {"UNKNOWN_DELIVERY", "TRANSPORT_ACCEPTED"}
+    assert not installer.launch_agent.exists()
 
 
 def test_uninstall_recovery_failure_precedes_all_configuration_mutation(

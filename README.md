@@ -66,10 +66,11 @@ cross-agent-chat uninstall
 ```
 
 Running the installer again upgrades and repairs the owned configuration. `uninstall`
-removes only Cross Agent Chat-owned runtime, hooks, MCP routes, service, and state, and restores
-the prior shared Claude inbound setting. When another configured profile remains, uninstall keeps
-the shared runtime and broker for that profile while removing only the selected profile's hooks
-and MCP routes.
+removes only Cross Agent Chat-owned runtime, hooks, MCP routes, service, and transient route
+state, and restores the prior shared Claude inbound setting. Durable content-free delivery intents
+remain intact, including unresolved delivery records; uninstall never resolves or replays them.
+When another configured profile remains, uninstall keeps the shared runtime and broker for that
+profile while removing only the selected profile's hooks and MCP routes.
 
 `setup` uses the active provider roots: by default Claude reads `~/.claude/settings.json` and
 `~/.claude.json`, while an explicit `CLAUDE_CONFIG_DIR=/path/to/profile` reads
