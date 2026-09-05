@@ -532,6 +532,34 @@ def test_uninstall_rechecks_recorded_paths_after_broker_stop(
     assert replacement.read_bytes() == before
 
 
+@pytest.mark.parametrize("path_name", ("claude_settings", "codex_config"))
+def test_setup_rejects_retargeted_schema4_provider_path(tmp_path: Path, path_name: str) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    selected = getattr(installer, path_name)
+    selected.parent.mkdir(parents=True)
+    original = selected.parent / f"{path_name}-original"
+    replacement = selected.parent / f"{path_name}-replacement"
+    if path_name == "claude_settings":
+        original.write_text(json.dumps({"crossSessionInbound": "hold"}))
+        replacement.write_text(json.dumps({"crossSessionInbound": "prompt", "user_owned": True}))
+    else:
+        original.write_text("[features]\nhooks = false\n")
+        replacement.write_text("[features]\nhooks = true\n")
+    selected.symlink_to(original.name)
+    installer.setup()
+    state_before = installer.install_state.read_bytes()
+    replacement_before = replacement.read_bytes()
+    selected.unlink()
+    selected.symlink_to(replacement.name)
+
+    with pytest.raises(SettingsError, match="ownership changed"):
+        installer.setup()
+
+    assert installer.install_state.read_bytes() == state_before
+    assert replacement.read_bytes() == replacement_before
+
+
 def test_uninstall_rejects_malformed_sibling_state_before_effects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -565,6 +593,56 @@ def test_uninstall_preflights_malformed_json_before_broker_stop(
 
     assert malformed.read_text() == "{"
     assert installer.install_state.exists()
+
+
+def test_uninstall_preflights_malformed_toml_before_broker_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    installer.setup()
+    installer.codex_config.write_text("[")
+    monkeypatch.setattr(installer, "_stop_broker", lambda: pytest.fail("broker stop ran"))
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: pytest.fail("courier stop ran"))
+
+    with pytest.raises(SettingsError, match=r"Codex config\.toml is invalid"):
+        installer.uninstall()
+
+    assert installer.codex_config.read_text() == "["
+    assert installer.install_state.exists()
+
+
+def test_uninstall_reactivates_after_post_stop_retarget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    selected = installer.claude_settings
+    selected.parent.mkdir(parents=True)
+    original = selected.parent / "settings-original.json"
+    replacement = selected.parent / "settings-replacement.json"
+    original.write_text(json.dumps({"crossSessionInbound": "hold"}))
+    replacement.write_text(json.dumps({"crossSessionInbound": "accept", "user_owned": True}))
+    selected.symlink_to(original.name)
+    installer.setup()
+    replacement_before = replacement.read_bytes()
+    reactivated: list[bool] = []
+
+    def retarget_during_stop() -> None:
+        selected.unlink()
+        selected.symlink_to(replacement.name)
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
+    monkeypatch.setattr(installer, "_stop_broker", retarget_during_stop)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "activate", lambda: reactivated.append(True))
+
+    with pytest.raises(SettingsError, match="ownership changed"):
+        installer.uninstall()
+
+    assert replacement.read_bytes() == replacement_before
+    assert reactivated == [True]
 
 
 def test_uninstall_rolls_back_owned_writes_after_later_json_write_failure(

@@ -24,7 +24,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final, Literal, cast
+from typing import Final, Literal, NoReturn, cast
 from uuid import uuid4
 
 import tomlkit
@@ -983,6 +983,10 @@ class Installer:
                     raise SettingsError("Cross Agent Chat install state is invalid") from error
                 if stable not in managed:
                     raise SettingsError("Cross Agent Chat install state is invalid")
+                if metadata["schema_version"] == 4:
+                    recorded_paths = self._metadata_provider_paths(metadata)
+                    assert recorded_paths is not None
+                    self._require_recorded_provider_paths(recorded_paths)
             if stable_entrypoint is not None:
                 stable = self._validate_stable_entrypoint(stable_entrypoint)
             if stable not in managed:
@@ -1025,7 +1029,7 @@ class Installer:
 
     def _require_recorded_provider_paths(self, recorded: dict[str, str]) -> None:
         if self._provider_paths() != recorded:
-            raise SettingsError("provider configuration ownership changed during uninstall")
+            raise SettingsError("provider configuration ownership changed")
 
     def _update_json_for_uninstall(
         self,
@@ -1060,17 +1064,38 @@ class Installer:
         writes: dict[Path, tuple[PathSnapshot, bytes]],
         *,
         broker_was_loaded: bool,
-    ) -> None:
+    ) -> tuple[Exception, ...]:
+        failures: list[Exception] = []
         for path, (snapshot, payload) in reversed(tuple(writes.items())):
             try:
                 current = path.read_bytes() if path.exists() else None
                 if current == payload:
                     _restore_path(snapshot)
-            except OSError:
-                continue
+            except (OSError, SettingsError) as error:
+                failures.append(error)
         if broker_was_loaded:
-            with suppress(OSError, SettingsError):
+            try:
                 self.activate()
+            except (OSError, SettingsError) as error:
+                failures.append(error)
+        return tuple(failures)
+
+    def _raise_uninstall_failure(
+        self,
+        failure: Exception,
+        writes: dict[Path, tuple[PathSnapshot, bytes]],
+        *,
+        broker_was_loaded: bool,
+    ) -> NoReturn:
+        rollback_failures = self._rollback_uninstall_writes(
+            writes,
+            broker_was_loaded=broker_was_loaded,
+        )
+        if rollback_failures:
+            raise SettingsError(
+                f"uninstall failed: {failure}; rollback failed: {rollback_failures[0]}"
+            ) from failure
+        raise failure
 
     def _metadata_provider_paths(self, metadata: dict[str, object]) -> dict[str, str] | None:
         schema_version = metadata.get("schema_version")
@@ -2757,6 +2782,9 @@ class Installer:
         _json_object(destinations[self.claude_settings])
         _json_object(destinations[self.claude_config])
         _json_object(destinations[self.codex_hooks])
+        codex_preflight = self._codex_config_text()
+        if codex_preflight is not None:
+            _remove_owned_codex_server(_strip_owned_toml_block(codex_preflight))
         uninstall_writes: dict[Path, tuple[PathSnapshot, bytes]] = {}
         stable_entrypoint = self.home / cast(str, metadata["stable_entrypoint"])
         managed_entrypoints = tuple(
@@ -2789,7 +2817,14 @@ class Installer:
             self._stop_couriers()
             durable_intents_preserved = self._remove_runtime_state()
         if recorded_paths is not None:
-            self._require_recorded_provider_paths(recorded_paths)
+            try:
+                self._require_recorded_provider_paths(recorded_paths)
+            except SettingsError as failure:
+                self._raise_uninstall_failure(
+                    failure,
+                    uninstall_writes,
+                    broker_was_loaded=broker_was_loaded,
+                )
         if not codex_config_has_remaining_owner:
             for attempt in range(5):
                 if recorded_paths is not None:
@@ -2824,19 +2859,19 @@ class Installer:
                         payload,
                         mode=_shared_path_mode(codex_destination),
                     )
-                except (OSError, SettingsError):
-                    self._rollback_uninstall_writes(
-                        uninstall_writes,
-                        broker_was_loaded=broker_was_loaded,
+                except (OSError, SettingsError) as failure:
+                    self._raise_uninstall_failure(
+                        failure, uninstall_writes, broker_was_loaded=broker_was_loaded
                     )
-                    raise
                 break
             else:
-                if broker_was_loaded:
-                    self.activate()
-                raise SettingsError(
-                    f"Codex config.toml kept changing during uninstall: {self.codex_config}; "
-                    "re-run uninstall"
+                self._raise_uninstall_failure(
+                    SettingsError(
+                        f"Codex config.toml kept changing during uninstall: {self.codex_config}; "
+                        "re-run uninstall"
+                    ),
+                    uninstall_writes,
+                    broker_was_loaded=broker_was_loaded,
                 )
         if not codex_hooks_has_remaining_owner:
             codex_hooks_destination = destinations[self.codex_hooks]
@@ -2847,12 +2882,10 @@ class Installer:
                     recorded_paths=recorded_paths,
                     writes=uninstall_writes,
                 )
-            except (OSError, SettingsError):
-                self._rollback_uninstall_writes(
-                    uninstall_writes,
-                    broker_was_loaded=broker_was_loaded,
+            except (OSError, SettingsError) as failure:
+                self._raise_uninstall_failure(
+                    failure, uninstall_writes, broker_was_loaded=broker_was_loaded
                 )
-                raise
         if not claude_settings_has_remaining_owner:
             previous = cast(dict[str, object], metadata["claude_cross_session_inbound"])
             claude_settings_destination = destinations[self.claude_settings]
@@ -2872,12 +2905,10 @@ class Installer:
                     recorded_paths=recorded_paths,
                     writes=uninstall_writes,
                 )
-            except (OSError, SettingsError):
-                self._rollback_uninstall_writes(
-                    uninstall_writes,
-                    broker_was_loaded=broker_was_loaded,
+            except (OSError, SettingsError) as failure:
+                self._raise_uninstall_failure(
+                    failure, uninstall_writes, broker_was_loaded=broker_was_loaded
                 )
-                raise
 
         if not claude_config_has_remaining_owner:
             claude_destination = destinations[self.claude_config]
@@ -2894,12 +2925,10 @@ class Installer:
                     recorded_paths=recorded_paths,
                     writes=uninstall_writes,
                 )
-            except (OSError, SettingsError):
-                self._rollback_uninstall_writes(
-                    uninstall_writes,
-                    broker_was_loaded=broker_was_loaded,
+            except (OSError, SettingsError) as failure:
+                self._raise_uninstall_failure(
+                    failure, uninstall_writes, broker_was_loaded=broker_was_loaded
                 )
-                raise
         if not other_profile_installs:
             destinations[self.launch_agent].unlink(missing_ok=True)
             self.legacy_peers.unlink(missing_ok=True)
