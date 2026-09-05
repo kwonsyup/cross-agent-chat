@@ -1126,78 +1126,92 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
     event_id, source_alias, source_generation, target_alias, generation, message = (
         parse_remote_envelope(text)
     )
-    matches = [
-        target
-        for target in local_targets(root)
-        if target.alias == target_alias and target.generation == generation
-    ]
-    if len(matches) != 1:
-        raise ChatError("remote target changed before transport acceptance")
-    target = matches[0]
-    if target.session_id is None or target.pid is None or target.cwd is None:
-        raise ChatError("remote target route is incomplete")
-    target_key = session_key(target.provider, target.session_id)
-    payload_digest = hashlib.sha256(message.encode()).hexdigest()
-    authorization_request: dict[str, object] = {
-        "schema_version": SCHEMA_VERSION,
-        "operation": "authorize",
-        "event_id": event_id,
-        "source_alias": source_alias,
-        "source_generation": source_generation,
-        "target_key": target_key,
-        "target_generation": generation,
-        "payload_digest": payload_digest,
-    }
-    authorization = request_tailnet(
-        source_address,
-        authorization_request,
-        timeout=AUTHORIZE_TIMEOUT_SECONDS,
-    )
-    expected_authorization = {
-        key: value for key, value in authorization_request.items() if key != "operation"
-    }
-    expected_authorization["status"] = "AUTHORIZED"
-    if authorization != expected_authorization:
-        raise ChatError("remote envelope is not authorized")
-    routes = [
-        route
-        for route in Registry(root).routes()
-        if route.session_id == target.session_id
-        and route.pid == target.pid
-        and route.generation == target.generation
-        and route.cwd == target.cwd
-    ]
-    if len(routes) != 1:
-        raise ChatError("remote target changed before transport acceptance")
-    response = request_socket(
-        socket_path(root, routes[0]),
-        {
+    target_provider = target_alias.split("@", 1)[0]
+    if target_provider not in {"claude", "codex"}:
+        raise ChatError("remote target provider is invalid")
+    try:
+        matches = [
+            target
+            for target in local_targets(root)
+            if target.alias == target_alias and target.generation == generation
+        ]
+        if len(matches) != 1:
+            raise ChatError("remote target changed before transport acceptance")
+        target = matches[0]
+        if target.session_id is None or target.pid is None or target.cwd is None:
+            raise ChatError("remote target route is incomplete")
+        target_key = session_key(target.provider, target.session_id)
+        payload_digest = hashlib.sha256(message.encode()).hexdigest()
+        authorization_request: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
-            "operation": "accept",
-            "generation": generation,
+            "operation": "authorize",
             "event_id": event_id,
-            "message": message,
-        },
-        timeout=ACCEPT_TIMEOUT_SECONDS,
-    )
-    expected: dict[str, object] = {
-        "schema_version": SCHEMA_VERSION,
-        "event_id": event_id,
-        "status": "TRANSPORT_ACCEPTED",
-        "to": target.alias,
-        "provider": target.provider,
-    }
-    if pre_effect_error(response, event_id, target.provider) is not None:
+            "source_alias": source_alias,
+            "source_generation": source_generation,
+            "target_key": target_key,
+            "target_generation": generation,
+            "payload_digest": payload_digest,
+        }
+        authorization = request_tailnet(
+            source_address,
+            authorization_request,
+            timeout=AUTHORIZE_TIMEOUT_SECONDS,
+        )
+        expected_authorization = {
+            key: value for key, value in authorization_request.items() if key != "operation"
+        }
+        expected_authorization["status"] = "AUTHORIZED"
+        if authorization != expected_authorization:
+            raise ChatError("remote envelope is not authorized")
+        routes = [
+            route
+            for route in Registry(root).routes()
+            if route.session_id == target.session_id
+            and route.pid == target.pid
+            and route.generation == target.generation
+            and route.cwd == target.cwd
+        ]
+        if len(routes) != 1:
+            raise ChatError("remote target changed before transport acceptance")
+        response = request_socket(
+            socket_path(root, routes[0]),
+            {
+                "schema_version": SCHEMA_VERSION,
+                "operation": "accept",
+                "generation": generation,
+                "event_id": event_id,
+                "message": message,
+            },
+            timeout=ACCEPT_TIMEOUT_SECONDS,
+        )
+        expected: dict[str, object] = {
+            "schema_version": SCHEMA_VERSION,
+            "event_id": event_id,
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": target.provider,
+        }
+        if pre_effect_error(response, event_id, target.provider) is not None:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "event_id": event_id,
+                "status": "PRE_EFFECT_REJECTED",
+                "provider": target.provider,
+                "error": "remote destination rejected before provider effect",
+            }
+        if response != expected:
+            raise UnknownDeliveryError("remote delivery state is unknown")
+        return expected
+    except UnknownDeliveryError:
+        raise
+    except ChatError:
         return {
             "schema_version": SCHEMA_VERSION,
             "event_id": event_id,
             "status": "PRE_EFFECT_REJECTED",
-            "provider": target.provider,
+            "provider": target_provider,
             "error": "remote destination rejected before provider effect",
         }
-    if response != expected:
-        raise UnknownDeliveryError("remote delivery state is unknown")
-    return expected
 
 
 def peers(root: Path, *, include_remote: bool = True, internal: bool = False) -> dict[str, object]:

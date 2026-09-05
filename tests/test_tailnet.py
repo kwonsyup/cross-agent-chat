@@ -517,8 +517,9 @@ def test_remote_receive_requires_source_authorization_before_provider_effect(
 
     monkeypatch.setattr("cross_agent_chat.runtime.request_socket", provider_boundary)
 
-    with pytest.raises(ChatError, match="not authorized"):
-        receive_remote(tmp_path, envelope, "100.64.0.11")
+    response = receive_remote(tmp_path, envelope, "100.64.0.11")
+    assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["provider"] == "codex"
 
 
 def test_tailnet_client_keeps_write_side_open_for_serve_proxy() -> None:
@@ -884,3 +885,86 @@ def test_broker_revokes_listener_when_verified_identity_disappears(
     assert observed == [[local, private], [local]]
     private.close.assert_called_once_with()
     local.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "stage", ["authorize_pre", "accept_pre", "authorize_unknown", "accept_unknown"]
+)
+def test_broker_receive_preserves_proven_rejection_and_post_write_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from cross_agent_chat.core import UnknownDeliveryError
+
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(target)
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:project:sender",
+        source_generation=str(uuid4()),
+        target_alias=target.alias,
+        generation=target.generation,
+        message="controlled body",
+    )
+    effects: list[str] = []
+
+    def authorize(
+        _address: str, payload: dict[str, object], **_kwargs: object
+    ) -> dict[str, object]:
+        if stage == "authorize_pre":
+            raise ChatError("authorization connection unavailable")
+        if stage == "authorize_unknown":
+            raise UnknownDeliveryError("authorization receipt missing")
+        return {**{k: v for k, v in payload.items() if k != "operation"}, "status": "AUTHORIZED"}
+
+    def courier(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        if payload["operation"] == "health":
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "alias": target.alias,
+                "generation": target.generation,
+            }
+        if stage == "accept_pre":
+            raise ChatError("destination disappeared before connect")
+        effects.append("possible provider write")
+        raise UnknownDeliveryError("destination receipt missing")
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", authorize)
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", courier)
+    monkeypatch.setattr(
+        tailnet_broker_module,
+        "read_frame",
+        lambda _: json.dumps(
+            {"schema_version": 1, "operation": "receive", "envelope": envelope}
+        ).encode(),
+    )
+    emitted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        tailnet_broker_module,
+        "emit_frame_safely",
+        lambda _connection, response: emitted.append(response),
+    )
+    connection = mock.Mock()
+    if stage.endswith("unknown"):
+        with pytest.raises(UnknownDeliveryError):
+            tailnet_broker_module.serve_broker_connection(tmp_path, connection, "100.64.0.11")
+        assert emitted == []
+    else:
+        tailnet_broker_module.serve_broker_connection(tmp_path, connection, "100.64.0.11")
+        assert emitted == [
+            {
+                "schema_version": 1,
+                "event_id": event_id,
+                "status": "PRE_EFFECT_REJECTED",
+                "provider": "codex",
+                "error": "remote destination rejected before provider effect",
+            }
+        ]
+        assert effects == []
