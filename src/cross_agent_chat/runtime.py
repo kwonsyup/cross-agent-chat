@@ -179,7 +179,6 @@ def request_socket(
         require_socket(path)
         client.connect(str(path))
         emit_frame(client, payload)
-        client.shutdown(socket.SHUT_WR)
         raw = json.loads(read_frame(client))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError) as error:
         raise UnknownDeliveryError("delivery state is unknown") from error

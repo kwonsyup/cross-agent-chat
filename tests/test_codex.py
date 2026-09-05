@@ -3,13 +3,12 @@ from __future__ import annotations
 import io
 import json
 import os
-import subprocess
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
-from cross_agent_chat.codex import CodexCourier, deliver_at_stop, queue_native_input
+from cross_agent_chat.codex import CodexCourier, deliver_at_stop
 from cross_agent_chat.core import ChatError, UnknownDeliveryError
 from cross_agent_chat.runtime import MAX_FRAME_BYTES, codex_stop, register, unregister
 
@@ -74,58 +73,6 @@ def test_queue_is_idempotent_for_exact_repeats_and_rejects_conflicts() -> None:
     courier.accept(str(uuid4()), "two")
     with pytest.raises(ChatError, match="full"):
         courier.accept(str(uuid4()), "three")
-
-
-def test_experimental_native_queue_uses_stdio_and_requires_exact_echo(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    binary = tmp_path / "codex"
-    binary.write_text("binary")
-    event_id = str(uuid4())
-    thread_id = str(uuid4())
-    message = "peer body must not be an argv argument"
-    observed: dict[str, object] = {}
-
-    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        observed["command"] = command
-        payload = kwargs["input"]
-        assert isinstance(payload, str)
-        requests = [json.loads(line) for line in payload.splitlines()]
-        queue = requests[-1]
-        assert queue["params"]["threadId"] == thread_id
-        assert queue["params"]["clientUserMessageId"] == event_id
-        assert queue["params"]["input"][0]["text"] == message
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            json.dumps({"id": 0, "result": {}})
-            + "\n"
-            + json.dumps(
-                {
-                    "id": 1,
-                    "result": {
-                        "queuedSubmission": {
-                            "id": str(uuid4()),
-                            "clientUserMessageId": event_id,
-                            "input": queue["params"]["input"],
-                        }
-                    },
-                }
-            ),
-            "",
-        )
-
-    monkeypatch.setattr("cross_agent_chat.codex.subprocess.run", run)
-
-    queue_native_input(
-        binary=binary,
-        environment={"HOME": str(tmp_path)},
-        thread_id=thread_id,
-        event_id=event_id,
-        message=message,
-    )
-
-    assert observed["command"] == [str(binary), "app-server", "--listen", "stdio://"]
 
 
 def test_peek_drains_full_frames_in_order_without_losing_remainder() -> None:

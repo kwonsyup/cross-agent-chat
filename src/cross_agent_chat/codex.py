@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
+import selectors
 import subprocess
+import time
 from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 from cross_agent_chat.core import ChatError, UnknownDeliveryError, bounded_message, valid_uuid
 
 DEFAULT_CAPACITY: Final = 32
 MAX_PEEK_FRAME_BYTES: Final = 64 * 1024
 NATIVE_QUEUE_TIMEOUT_SECONDS: Final = 15.0
+MAX_NATIVE_STDOUT_BYTES: Final = 64 * 1024
 
 
 def queue_native_input(
@@ -41,34 +45,77 @@ def queue_native_input(
             "input": expected_input,
         },
     }
-    requests = (initialize, {"method": "initialized"}, queue)
-    request = "\n".join(json.dumps(item, separators=(",", ":")) for item in requests) + "\n"
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             [str(binary), "app-server", "--listen", "stdio://"],
-            input=request,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             env=environment,
-            capture_output=True,
-            text=True,
-            timeout=NATIVE_QUEUE_TIMEOUT_SECONDS,
-            check=False,
+            close_fds=True,
         )
-    except subprocess.TimeoutExpired as error:
-        raise UnknownDeliveryError("Codex native queue outcome is unknown") from error
     except OSError as error:
         raise ChatError("Codex native queue is unavailable") from error
-    response: object | None = None
+    if process.stdin is None or process.stdout is None:
+        process.terminate()
+        raise ChatError("Codex native queue is unavailable")
+    stdin = process.stdin
+    stdout = process.stdout
+    selector = selectors.DefaultSelector()
+    selector.register(stdout, selectors.EVENT_READ)
+    buffer = b""
+    deadline = time.monotonic() + NATIVE_QUEUE_TIMEOUT_SECONDS
+    queue_sent = False
+
+    def write(payload: dict[str, object]) -> None:
+        stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+        stdin.flush()
+
+    def read_response(identifier: int) -> dict[str, object]:
+        nonlocal buffer
+        while time.monotonic() < deadline:
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                value = json.loads(line)
+                if isinstance(value, dict) and value.get("id") == identifier:
+                    return cast(dict[str, object], value)
+            events = selector.select(max(0.0, deadline - time.monotonic()))
+            if events:
+                chunk = os.read(stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                buffer += chunk
+                if len(buffer) > MAX_NATIVE_STDOUT_BYTES:
+                    raise ChatError("Codex native queue response exceeds the bounded limit")
+        raise TimeoutError("Codex native queue response timed out")
+
     try:
-        for line in completed.stdout.splitlines():
-            value = json.loads(line)
-            if isinstance(value, dict) and value.get("id") == 1:
-                response = value
-                break
-    except json.JSONDecodeError as error:
-        raise UnknownDeliveryError("Codex native queue outcome is unknown") from error
-    if not isinstance(response, dict) or completed.returncode != 0:
-        raise UnknownDeliveryError("Codex native queue outcome is unknown")
-    result = response.get("result")
+        write(initialize)
+        initialized = read_response(0)
+        result = initialized.get("result")
+        expected_home = environment.get("CODEX_HOME")
+        reported_home = result.get("codexHome") if isinstance(result, dict) else None
+        if not isinstance(reported_home, str) or not isinstance(expected_home, str):
+            raise ChatError("Codex native queue is unavailable")
+        if Path(reported_home).resolve() != Path(expected_home).resolve():
+            raise ChatError("Codex native queue profile changed")
+        write({"method": "initialized"})
+        write(queue)
+        queue_sent = True
+        queued_response = read_response(1)
+    except (OSError, TimeoutError, json.JSONDecodeError) as error:
+        if queue_sent:
+            raise UnknownDeliveryError("Codex native queue outcome is unknown") from error
+        raise ChatError("Codex native queue preflight failed") from error
+    finally:
+        selector.close()
+        stdin.close()
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            process.wait(timeout=2.0)
+    result = queued_response.get("result")
     queued = result.get("queuedSubmission") if isinstance(result, dict) else None
     if not isinstance(queued, dict):
         raise UnknownDeliveryError("Codex native queue outcome is unknown")
