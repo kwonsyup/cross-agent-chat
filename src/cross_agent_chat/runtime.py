@@ -263,8 +263,9 @@ def executable() -> Path:
         raise ChatError("runtime executable is unavailable") from error
 
 
-def _spawn_courier(root: Path, route: Route, owner_binary: Path | None = None) -> None:
+def _spawn_courier(root: Path, route: Route) -> None:
     path = socket_path(root, route)
+    owner_binary = recipient_owner_identity(route.provider, route.pid)[1]
     if path.exists() or path.is_symlink():
         raise ChatError("session courier socket already exists")
     command = [
@@ -340,7 +341,7 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
     if isinstance(pid, bool) or pid <= 0:
         raise ChatError("provider process is invalid")
     raw = hook_input("SessionStart")
-    owner_identity, owner_binary = recipient_owner_identity(provider, pid)
+    owner_identity, _owner_binary = recipient_owner_identity(provider, pid)
     route = Route.create(
         provider=provider,
         session_id=cast(str, raw["session_id"]),
@@ -354,9 +355,24 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
     registry.compact_dead()
     registered = registry.upsert_or_reuse_live_owner(route)
     if registered != route:
-        return registered
+        try:
+            health = request_socket(
+                socket_path(root, registered),
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "operation": "health",
+                    "generation": registered.generation,
+                },
+                timeout=SOCKET_TIMEOUT_SECONDS,
+            )
+        except UnknownDeliveryError:
+            registry.upsert(route)
+        else:
+            if health == courier_health(registered):
+                return registered
+            registry.upsert(route)
     try:
-        _spawn_courier(root, route, owner_binary)
+        _spawn_courier(root, route)
     except ChatError:
         Registry(root).remove(route.provider, route.session_id, route.pid)
         raise
@@ -394,6 +410,11 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
 
 
 def _route_current(root: Path, expected: Route) -> bool:
+    if (
+        expected.owner_identity is not None
+        and recipient_owner_identity(expected.provider, expected.pid)[0] != expected.owner_identity
+    ):
+        return False
     return (
         Registry(root).current(expected)
         and expected.process_is_live()
