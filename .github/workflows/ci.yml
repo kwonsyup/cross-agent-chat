@@ -32,7 +32,7 @@ jobs:
           status=$?
           set -e
           test "$status" -eq 1
-          python -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value == {"integration":"needs setup","local_broker":"unavailable","next":"cross-agent-chat setup","remote_trust":"tailscale_acl","version":"0.1.4"}' "$RUNNER_TEMP/doctor.json"
+          python -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value == {"codex_native_queue":"stop-bound","integration":"needs setup","local_broker":"unavailable","next":"cross-agent-chat setup","remote_trust":"tailscale_acl","version":"0.1.4"}' "$RUNNER_TEMP/doctor.json"
       - name: Inspect wheel and sdist contents
         run: |
           python - <<'PY'

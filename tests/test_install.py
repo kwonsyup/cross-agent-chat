@@ -21,6 +21,7 @@ import pytest
 import tomlkit
 from tomlkit.exceptions import TOMLKitError
 
+from cross_agent_chat import cli
 from cross_agent_chat.cli import parser
 from cross_agent_chat.install import (
     BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
@@ -33,6 +34,7 @@ from cross_agent_chat.install import (
     SettingsError,
     SetupRollbackError,
     _owned_hook,
+    _owned_hook_native_queue,
     _package_tree_digest,
     _process_identity_digest,
     _restore_path,
@@ -69,6 +71,63 @@ def test_staged_install_parser_accepts_explicit_device(tmp_path: Path) -> None:
     )
 
     assert arguments.device == "mac"
+
+
+def test_setup_parser_accepts_explicit_native_queue_mode() -> None:
+    enabled = parser().parse_args(["setup", "--enable-experimental-codex-native-queue"])
+    disabled = parser().parse_args(["setup", "--disable-experimental-codex-native-queue"])
+
+    assert enabled.enable_experimental_codex_native_queue is True
+    assert enabled.disable_experimental_codex_native_queue is False
+    assert disabled.enable_experimental_codex_native_queue is False
+    assert disabled.disable_experimental_codex_native_queue is True
+
+
+def test_cli_maps_active_provider_profile_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    claude_profile = tmp_path / "claude-profile"
+    codex_profile = tmp_path / "codex-profile"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_profile))
+    monkeypatch.setenv("CODEX_HOME", str(codex_profile))
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: Path("/opt/cross-agent-chat"))
+
+    installer = cli._installer("studio")
+
+    assert installer.claude_settings == claude_profile / "settings.json"
+    assert installer.claude_config == claude_profile / ".claude.json"
+    assert installer.codex_config == codex_profile / "config.toml"
+    assert installer.codex_hooks == codex_profile / "hooks.json"
+
+
+def test_doctor_reports_the_selected_profile_queue_mode(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class ObservedInstaller:
+        def verify_configuration(self) -> bool:
+            return True
+
+        def broker_is_healthy(self) -> bool:
+            return True
+
+        def _codex_native_queue_enabled(self) -> bool:
+            return True
+
+    monkeypatch.setattr(cli, "_installer", lambda _: ObservedInstaller())
+
+    assert cli.run(parser().parse_args(["doctor", "--json"])) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "codex_native_queue": "experimental",
+        "integration": "healthy",
+        "local_broker": "healthy",
+        "next": "start fresh Claude/Codex sessions",
+        "remote_trust": "tailscale_acl",
+        "version": "0.1.4",
+    }
 
 
 def test_install_script_package_failure_leaves_predecessor_untouched(tmp_path: Path) -> None:
@@ -444,6 +503,150 @@ def test_setup_uses_the_explicit_codex_profile_root(tmp_path: Path) -> None:
     assert (profile / "config.toml").is_file()
     assert (profile / "hooks.json").is_file()
     assert not (home / ".codex" / "config.toml").exists()
+
+
+def test_setup_uses_the_explicit_claude_profile_root_without_touching_default(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    profile = tmp_path / "claude-profile"
+    default_settings = home / ".claude" / "settings.json"
+    default_config = home / ".claude.json"
+    default_settings.parent.mkdir(parents=True)
+    default_settings.write_text(json.dumps({"theme": "default"}))
+    default_config.write_text(json.dumps({"mcpServers": {"default": {}}}))
+    installer = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        claude_config_dir=profile,
+    )
+
+    installer.setup()
+
+    assert json.loads((profile / "settings.json").read_text())["crossSessionInbound"] == "accept"
+    assert "cross-agent-chat" in json.loads((profile / ".claude.json").read_text())["mcpServers"]
+    assert json.loads(default_settings.read_text()) == {"theme": "default"}
+    assert json.loads(default_config.read_text()) == {"mcpServers": {"default": {}}}
+    assert installer.install_state.name.startswith("install-")
+
+
+def test_explicit_profile_backup_restores_only_exact_claude_and_codex_roots(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    claude_profile = tmp_path / "claude-profile"
+    codex_profile = tmp_path / "codex-profile"
+    settings = claude_profile / "settings.json"
+    config = claude_profile / ".claude.json"
+    codex_config = codex_profile / "config.toml"
+    codex_hooks = codex_profile / "hooks.json"
+    settings.parent.mkdir(parents=True)
+    codex_profile.mkdir()
+    settings.write_text(json.dumps({"theme": "profile"}))
+    config.write_text(json.dumps({"mcpServers": {"profile": {}}}))
+    codex_config.write_text("[features]\nhooks = false\n")
+    codex_hooks.write_text(json.dumps({"hooks": {"Other": []}}))
+    installer = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        claude_config_dir=claude_profile,
+        codex_home=codex_profile,
+    )
+
+    report = installer.setup()
+    manifest = json.loads((report.backup / "manifest.json").read_text())
+    assert "CLAUDE_CONFIG_DIR/settings.json" in manifest
+    assert "CLAUDE_CONFIG_DIR/.claude.json" in manifest
+    assert "CODEX_HOME/config.toml" in manifest
+    assert "CODEX_HOME/hooks.json" in manifest
+    settings.write_text(json.dumps({"changed": True}))
+    config.write_text(json.dumps({"changed": True}))
+    codex_config.write_text("changed = true\n")
+    codex_hooks.write_text(json.dumps({"changed": True}))
+
+    installer._restore(report.backup)
+
+    assert json.loads(settings.read_text()) == {"theme": "profile"}
+    assert json.loads(config.read_text()) == {"mcpServers": {"profile": {}}}
+    assert codex_config.read_text() == "[features]\nhooks = false\n"
+    assert json.loads(codex_hooks.read_text()) == {"hooks": {"Other": []}}
+
+
+def test_experimental_native_queue_is_explicit_profile_local_opt_in(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    profile = tmp_path / "codex-profile"
+    installer = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        codex_home=profile,
+        codex_native_queue=True,
+    )
+
+    installer.setup()
+
+    hooks = json.loads(installer.codex_hooks.read_text())["hooks"]
+    assert all(
+        _owned_hook_native_queue(next(item for item in hooks[event] if _owned_hook(item)))
+        for event in ("SessionStart", "SessionEnd", "Stop")
+    )
+    assert installer.verify_configuration()
+    observed = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        codex_home=profile,
+    )
+    assert observed._codex_native_queue_enabled()
+    assert observed.verify_configuration()
+
+    disabled = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        codex_home=profile,
+        codex_native_queue=False,
+    )
+    disabled.setup()
+
+    hooks = json.loads(disabled.codex_hooks.read_text())["hooks"]
+    assert not any(
+        _owned_hook_native_queue(item)
+        for event in hooks.values()
+        for item in event
+        if _owned_hook(item)
+    )
+    assert disabled.verify_configuration()
+
+
+def test_uninstall_keeps_shared_runtime_when_another_profile_is_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    default = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    alternate = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        claude_config_dir=tmp_path / "claude-profile",
+        codex_home=tmp_path / "codex-profile",
+    )
+    default.setup()
+    alternate.setup()
+    monkeypatch.setattr(
+        alternate,
+        "_stop_broker",
+        lambda: pytest.fail("alternate-profile uninstall stopped the shared broker"),
+    )
+
+    alternate.uninstall()
+
+    assert default.install_state.exists()
+    assert default.launch_agent.exists()
+    assert "cross-agent-chat" in json.loads(default.claude_config.read_text())["mcpServers"]
+    assert "cross-agent-chat" not in json.loads(alternate.claude_config.read_text()).get(
+        "mcpServers", {}
+    )
 
 
 def test_setup_trusts_each_owned_codex_hook(tmp_path: Path) -> None:
@@ -2212,7 +2415,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-            "    print('cross-agent-chat 0.1.4')\n"
+        "    print('cross-agent-chat 0.1.4')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -3820,7 +4023,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-                "version": "0.1.4",
+            "version": "0.1.4",
             "module_path": str(module),
         }
 

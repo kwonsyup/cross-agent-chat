@@ -2,6 +2,11 @@
 
 ## 0.1.4 - 2026-09-04
 
+- Bind Claude setup to the active `CLAUDE_CONFIG_DIR` and Codex setup to the active `CODEX_HOME`,
+  with profile-scoped installer state and recoverable backups for explicit roots.
+- Add an explicit `setup --enable-experimental-codex-native-queue` opt-in that persists only in
+  the selected Codex profile's owned hooks. Ordinary setups remain natural-Stop-bound; doctor
+  reports the selected profile's queue mode.
 - Keep stale workspace metadata structurally readable while excluding unavailable routes from live
   discovery and delivery.
 - Accept ordinary Unicode project names and bound rendered peer labels without using display text as
