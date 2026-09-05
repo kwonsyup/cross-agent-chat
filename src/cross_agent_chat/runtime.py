@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -76,6 +77,31 @@ REMOTE_TIMEOUT_SECONDS: Final = (
 LOCAL_DISCOVERY_WORKERS: Final = 32
 LOCAL_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS
 PRESENCE_ENV_VAR: Final = "CROSS_AGENT_CHAT_PRESENCE"
+PROC_PIDTBSDINFO: Final = 3
+PROC_BSDINFO_SIZE: Final = 136
+
+
+def recipient_owner_identity(provider: str, pid: int) -> tuple[str, Path]:
+    """Bind a route to the provider executable, process birth, uid, and selected root."""
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+    path_buffer = ctypes.create_string_buffer(4096)
+    if libproc.proc_pidpath(pid, path_buffer, len(path_buffer)) <= 0:
+        raise ChatError("provider process identity is unavailable")
+    info = ctypes.create_string_buffer(PROC_BSDINFO_SIZE)
+    if libproc.proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, info, len(info)) != PROC_BSDINFO_SIZE:
+        raise ChatError("provider process identity is unavailable")
+    uid = int.from_bytes(info.raw[20:24], sys.byteorder)
+    if uid != os.getuid():
+        raise ChatError("provider process identity is unavailable")
+    start_seconds = int.from_bytes(info.raw[120:128], sys.byteorder)
+    start_microseconds = int.from_bytes(info.raw[128:136], sys.byteorder)
+    binary = Path(path_buffer.value.decode()).resolve(strict=True)
+    profile = os.environ.get("CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR")
+    if profile is None:
+        profile = str(Path.home() / (".codex" if provider == "codex" else ".claude"))
+    root = Path(profile).expanduser().resolve(strict=False)
+    payload = f"{provider}\0{binary}\0{uid}\0{start_seconds}\0{start_microseconds}\0{root}".encode()
+    return hashlib.sha256(payload).hexdigest(), binary
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,7 +263,7 @@ def executable() -> Path:
         raise ChatError("runtime executable is unavailable") from error
 
 
-def _spawn_courier(root: Path, route: Route) -> None:
+def _spawn_courier(root: Path, route: Route, owner_binary: Path | None = None) -> None:
     path = socket_path(root, route)
     if path.exists() or path.is_symlink():
         raise ChatError("session courier socket already exists")
@@ -259,14 +285,14 @@ def _spawn_courier(root: Path, route: Route) -> None:
     ]
     if route.provider == "claude":
         environment = courier_environment()
-        environment["CROSS_AGENT_CHAT_CLAUDE_BINARY"] = str(claude_binary())
+        environment["CROSS_AGENT_CHAT_CLAUDE_BINARY"] = str(owner_binary or claude_binary())
     else:
         environment = {
             key: os.environ[key]
             for key in (*COURIER_ENV_KEYS, "CODEX_HOME", "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE")
             if key in os.environ
         }
-        codex = shutil.which("codex")
+        codex = str(owner_binary) if owner_binary is not None else shutil.which("codex")
         if codex is not None:
             with suppress(OSError):
                 environment["CROSS_AGENT_CHAT_CODEX_BINARY"] = str(Path(codex).resolve(strict=True))
@@ -314,12 +340,14 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
     if isinstance(pid, bool) or pid <= 0:
         raise ChatError("provider process is invalid")
     raw = hook_input("SessionStart")
+    owner_identity, owner_binary = recipient_owner_identity(provider, pid)
     route = Route.create(
         provider=provider,
         session_id=cast(str, raw["session_id"]),
         device=valid_device(device),
         cwd=cast(str, raw["cwd"]),
         pid=pid,
+        owner_identity=owner_identity,
     )
     root = state_root(state_root_value)
     registry = Registry(root)
@@ -328,7 +356,7 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
     if registered != route:
         return registered
     try:
-        _spawn_courier(root, route)
+        _spawn_courier(root, route, owner_binary)
     except ChatError:
         Registry(root).remove(route.provider, route.session_id, route.pid)
         raise

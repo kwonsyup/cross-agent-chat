@@ -171,6 +171,7 @@ class Route:
     generation: str
     pid: int
     last_seen: str
+    owner_identity: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -189,6 +190,11 @@ class Route:
         if isinstance(self.pid, bool) or self.pid <= 0:
             fail("route process is invalid")
         _parse_timestamp(self.last_seen)
+        if (
+            self.owner_identity is not None
+            and re.fullmatch(r"[0-9a-f]{64}", self.owner_identity) is None
+        ):
+            fail("route owner identity is invalid")
 
     @classmethod
     def create(
@@ -200,6 +206,7 @@ class Route:
         cwd: str,
         pid: int,
         generation: str | None = None,
+        owner_identity: str | None = None,
     ) -> Route:
         if provider not in {"claude", "codex"}:
             fail("route provider is invalid")
@@ -219,6 +226,7 @@ class Route:
             else valid_uuid(generation, "route generation"),
             pid=pid,
             last_seen=utc_now(),
+            owner_identity=owner_identity,
         )
 
     @classmethod
@@ -235,7 +243,9 @@ class Route:
             "pid",
             "last_seen",
         }
-        if not isinstance(raw, dict) or set(raw) != fields:
+        if not isinstance(raw, dict) or (
+            set(raw) != fields and set(raw) != fields | {"owner_identity"}
+        ):
             fail("route schema is unsupported")
         values = cast(dict[str, object], raw)
         if (
@@ -256,6 +266,7 @@ class Route:
             )
             or not isinstance(values["pid"], int)
             or isinstance(values["pid"], bool)
+            or ("owner_identity" in values and not isinstance(values["owner_identity"], str))
         ):
             fail("route schema is unsupported")
         return cls(
@@ -269,10 +280,11 @@ class Route:
             generation=cast(str, values["generation"]),
             pid=values["pid"],
             last_seen=cast(str, values["last_seen"]),
+            owner_identity=cast(str | None, values.get("owner_identity")),
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "schema_version": self.schema_version,
             "provider": self.provider,
             "session_id": self.session_id,
@@ -284,6 +296,9 @@ class Route:
             "pid": self.pid,
             "last_seen": self.last_seen,
         }
+        if self.owner_identity is not None:
+            result["owner_identity"] = self.owner_identity
+        return result
 
     def process_is_live(self) -> bool:
         try:
@@ -400,6 +415,8 @@ class Registry:
                 and item.device == route.device
                 and item.cwd == route.cwd
                 and item.pid == route.pid
+                and item.owner_identity is not None
+                and item.owner_identity == route.owner_identity
             ]
             if len(matching) == 1:
                 return matching[0]
