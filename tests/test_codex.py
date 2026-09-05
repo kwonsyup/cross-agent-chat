@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 
-from cross_agent_chat.codex import CodexCourier, deliver_at_stop
+from cross_agent_chat.codex import CodexCourier, deliver_at_stop, queue_native_input
 from cross_agent_chat.core import ChatError, UnknownDeliveryError
 from cross_agent_chat.runtime import MAX_FRAME_BYTES, codex_stop, register, unregister
 
@@ -73,6 +73,64 @@ def test_queue_is_idempotent_for_exact_repeats_and_rejects_conflicts() -> None:
     courier.accept(str(uuid4()), "two")
     with pytest.raises(ChatError, match="full"):
         courier.accept(str(uuid4()), "three")
+
+
+def test_native_queue_stdin_contract_keeps_body_out_of_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    event_id = str(uuid4())
+    thread_id = str(uuid4())
+    home = str(tmp_path)
+    requests: list[dict[str, object]] = []
+
+    class FakeInput:
+        def write(self, raw: bytes) -> int:
+            request = json.loads(raw)
+            requests.append(request)
+            if request.get("id") == 0:
+                reply = {"id": 0, "result": {"codexHome": home}}
+                os.write(read_pipe[1], json.dumps(reply).encode() + b"\n")
+            if request.get("id") == 1:
+                params = request["params"]
+                os.write(
+                    read_pipe[1],
+                    json.dumps(
+                        {"id": 1, "result": {"queuedSubmission": {
+                            "id": str(uuid4()), "clientUserMessageId": event_id,
+                            "input": params["input"],
+                        }}}
+                    ).encode()
+                    + b"\n",
+                )
+            return len(raw)
+
+        def flush(self) -> None: pass
+        def close(self) -> None: pass
+
+    class FakeProcess:
+        stdin = FakeInput()
+        stdout = None
+        def wait(self, **_: object) -> int: return 0
+        def terminate(self) -> None: pass
+
+    read_pipe = os.pipe()
+    process = FakeProcess()
+    process.stdout = os.fdopen(read_pipe[0], "rb", buffering=0)
+    monkeypatch.setattr("cross_agent_chat.codex.subprocess.Popen", lambda command, **_: process)
+    body = "peer body only on stdin"
+
+    queue_native_input(
+        binary=Path("/opt/codex"), environment={"CODEX_HOME": home},
+        thread_id=thread_id, event_id=event_id, message=body,
+    )
+
+    assert [request.get("method") for request in requests] == [
+        "initialize", "initialized", "thread/queue/add"
+    ]
+    assert requests[-1]["params"] == {
+        "threadId": thread_id, "clientUserMessageId": event_id,
+        "input": [{"type": "text", "text": body, "text_elements": []}],
+    }
 
 
 def test_peek_drains_full_frames_in_order_without_losing_remainder() -> None:

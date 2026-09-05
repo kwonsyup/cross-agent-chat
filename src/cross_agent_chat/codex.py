@@ -115,6 +115,12 @@ def queue_native_input(
         except subprocess.TimeoutExpired:
             process.terminate()
             process.wait(timeout=2.0)
+    explicit_error = queued_response.get("error")
+    if isinstance(explicit_error, dict):
+        message = explicit_error.get("message")
+        if isinstance(message, str) and message and not any(item in message for item in "\r\n\0"):
+            raise ChatError("Codex native queue rejected the message before acceptance")
+        raise ChatError("Codex native queue rejected the message before acceptance")
     result = queued_response.get("result")
     queued = result.get("queuedSubmission") if isinstance(result, dict) else None
     if not isinstance(queued, dict):
