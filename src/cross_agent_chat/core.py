@@ -9,6 +9,7 @@ import os
 import re
 import stat
 import tempfile
+import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -30,8 +31,9 @@ IntentStatus = Literal[
 SCHEMA_VERSION: Final = 1
 MAX_MESSAGE_BYTES: Final = 16 * 1024
 CODEX_ALIAS_DIGEST_LENGTH: Final = 12
+MAX_NAME_CODEPOINTS: Final = 128
+MAX_ALIAS_CODEPOINTS: Final = 128
 SAFE_DEVICE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}\Z")
-SAFE_NAME_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._@:-]{0,127}\Z")
 UUID_RE: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 
 
@@ -70,7 +72,13 @@ def valid_device(value: str) -> str:
 
 
 def valid_name(value: str, field: str) -> str:
-    if SAFE_NAME_RE.fullmatch(value) is None:
+    if not value or len(value) > MAX_NAME_CODEPOINTS:
+        fail(f"{field} is invalid")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        fail(f"{field} is invalid")
+    if any(unicodedata.category(character).startswith("C") for character in value):
         fail(f"{field} is invalid")
     return value
 
@@ -88,16 +96,43 @@ def canonical_cwd(value: str) -> str:
     return str(resolved)
 
 
+def stored_cwd(value: str) -> str:
+    """Validate a persisted route path without requiring its workspace to survive."""
+    path = Path(value)
+    if (
+        not path.is_absolute()
+        or len(value) > 512
+        or "\x00" in value
+        or os.path.normpath(value) != value
+    ):
+        fail("working directory is invalid")
+    return value
+
+
 def session_key(provider: Provider, session_id: str) -> str:
     valid_uuid(session_id, "session id")
     return hashlib.sha256(f"{provider}:{session_id}".encode()).hexdigest()
 
 
 def friendly_alias(provider: Provider, device: str, project: str, session_id: str) -> str:
-    prefix = f"{provider}@{valid_device(device)}:{valid_name(project, 'project')}"
-    if provider == "codex":
-        return f"{prefix}:{session_key(provider, session_id)[:CODEX_ALIAS_DIGEST_LENGTH]}"
-    return prefix
+    prefix = f"{provider}@{valid_device(device)}:"
+    suffix = (
+        f":{session_key(provider, session_id)[:CODEX_ALIAS_DIGEST_LENGTH]}"
+        if provider == "codex"
+        else ""
+    )
+    exact_project = valid_name(project, "project")
+    available = MAX_ALIAS_CODEPOINTS - len(prefix) - len(suffix)
+    if available <= 0:
+        fail("route alias is invalid")
+    if len(exact_project) > available:
+        digest = hashlib.sha256(exact_project.encode()).hexdigest()[:CODEX_ALIAS_DIGEST_LENGTH]
+        marker = f"~{digest}"
+        exact_project = exact_project[: available - len(marker)] + marker
+    alias = f"{prefix}{exact_project}{suffix}"
+    if len(alias) > MAX_ALIAS_CODEPOINTS:
+        fail("route alias is invalid")
+    return alias
 
 
 def bounded_message(message: str) -> str:
@@ -109,6 +144,10 @@ def bounded_message(message: str) -> str:
         fail("message must not be empty")
     if "\x00" in message or len(encoded) > MAX_MESSAGE_BYTES:
         fail("message exceeds the 16 KiB limit")
+    # Leave room for provenance and protocol fields within the 64 KiB frame,
+    # including control characters that expand to six bytes in JSON.
+    if len(json.dumps(message, ensure_ascii=False).encode()) > 2 * MAX_MESSAGE_BYTES + 2:
+        fail("message exceeds the encoded frame budget")
     return message
 
 
@@ -136,6 +175,8 @@ class Route:
     generation: str
     pid: int
     last_seen: str
+    owner_identity: str | None = None
+    profile_root: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -145,7 +186,7 @@ class Route:
         valid_uuid(self.session_id, "session id")
         valid_uuid(self.generation, "route generation")
         valid_device(self.device)
-        if canonical_cwd(self.cwd) != self.cwd:
+        if stored_cwd(self.cwd) != self.cwd:
             fail("route working directory is not canonical")
         valid_name(self.project, "project")
         expected = friendly_alias(self.provider, self.device, self.project, self.session_id)
@@ -154,6 +195,15 @@ class Route:
         if isinstance(self.pid, bool) or self.pid <= 0:
             fail("route process is invalid")
         _parse_timestamp(self.last_seen)
+        if (
+            self.owner_identity is not None
+            and re.fullmatch(r"[0-9a-f]{64}", self.owner_identity) is None
+        ):
+            fail("route owner identity is invalid")
+        if self.profile_root is not None:
+            stored_cwd(self.profile_root)
+            if self.owner_identity is None:
+                fail("route profile has no owner identity")
 
     @classmethod
     def create(
@@ -165,6 +215,8 @@ class Route:
         cwd: str,
         pid: int,
         generation: str | None = None,
+        owner_identity: str | None = None,
+        profile_root: str | None = None,
     ) -> Route:
         if provider not in {"claude", "codex"}:
             fail("route provider is invalid")
@@ -184,6 +236,8 @@ class Route:
             else valid_uuid(generation, "route generation"),
             pid=pid,
             last_seen=utc_now(),
+            owner_identity=owner_identity,
+            profile_root=profile_root,
         )
 
     @classmethod
@@ -200,7 +254,14 @@ class Route:
             "pid",
             "last_seen",
         }
-        if not isinstance(raw, dict) or set(raw) != fields:
+        if not isinstance(raw, dict) or (
+            set(raw)
+            not in (
+                fields,
+                fields | {"owner_identity"},
+                fields | {"owner_identity", "profile_root"},
+            )
+        ):
             fail("route schema is unsupported")
         values = cast(dict[str, object], raw)
         if (
@@ -221,6 +282,8 @@ class Route:
             )
             or not isinstance(values["pid"], int)
             or isinstance(values["pid"], bool)
+            or ("owner_identity" in values and not isinstance(values["owner_identity"], str))
+            or ("profile_root" in values and not isinstance(values["profile_root"], str))
         ):
             fail("route schema is unsupported")
         return cls(
@@ -234,10 +297,12 @@ class Route:
             generation=cast(str, values["generation"]),
             pid=values["pid"],
             last_seen=cast(str, values["last_seen"]),
+            owner_identity=cast(str | None, values.get("owner_identity")),
+            profile_root=cast(str | None, values.get("profile_root")),
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "schema_version": self.schema_version,
             "provider": self.provider,
             "session_id": self.session_id,
@@ -249,6 +314,11 @@ class Route:
             "pid": self.pid,
             "last_seen": self.last_seen,
         }
+        if self.owner_identity is not None:
+            result["owner_identity"] = self.owner_identity
+        if self.profile_root is not None:
+            result["profile_root"] = self.profile_root
+        return result
 
     def process_is_live(self) -> bool:
         try:
@@ -258,6 +328,12 @@ class Route:
         except OSError:
             return True
         return True
+
+    def cwd_is_available(self) -> bool:
+        try:
+            return canonical_cwd(self.cwd) == self.cwd
+        except ChatError:
+            return False
 
 
 def ensure_private_dir(path: Path) -> None:
@@ -347,13 +423,41 @@ class Registry:
             ]
             atomic_json(self.path, [item.to_dict() for item in [*existing, route]])
 
-    def remove(self, provider: Provider, session_id: str, pid: int) -> None:
+    def upsert_or_reuse_live_owner(self, route: Route) -> Route:
+        """Preserve a live generation when an identical provider hook repeats."""
+        with state_lock(self.root, "routes"):
+            existing = self.routes()
+            matching = [
+                item
+                for item in existing
+                if item.provider == route.provider
+                and item.session_id == route.session_id
+                and item.device == route.device
+                and item.cwd == route.cwd
+                and item.pid == route.pid
+                and item.owner_identity is not None
+                and item.owner_identity == route.owner_identity
+            ]
+            if len(matching) == 1:
+                return matching[0]
+            retained = [
+                item
+                for item in existing
+                if (item.provider, item.session_id) != (route.provider, route.session_id)
+            ]
+            atomic_json(self.path, [item.to_dict() for item in [*retained, route]])
+            return route
+
+    def remove(
+        self, provider: Provider, session_id: str, pid: int, *, generation: str | None = None
+    ) -> None:
         with state_lock(self.root, "routes"):
             existing = self.routes()
             retained = [
                 item
                 for item in existing
                 if (item.provider, item.session_id, item.pid) != (provider, session_id, pid)
+                or (generation is not None and item.generation != generation)
             ]
             atomic_json(self.path, [item.to_dict() for item in retained])
 
@@ -667,8 +771,8 @@ def authenticate_sender(
 def _query_matches(route: Route, query: str) -> bool:
     if query.casefold() == route.alias.casefold():
         return True
-    query_tokens = [token for token in re.split(r"[^A-Za-z0-9]+", query.casefold()) if token]
-    route_tokens = {token for token in re.split(r"[^A-Za-z0-9]+", route.alias.casefold()) if token}
+    query_tokens = re.findall(r"[^\W_]+", query.casefold())
+    route_tokens = set(re.findall(r"[^\W_]+", route.alias.casefold()))
     return bool(query_tokens) and all(token in route_tokens for token in query_tokens)
 
 

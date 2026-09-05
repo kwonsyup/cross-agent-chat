@@ -93,6 +93,18 @@ def test_claude_binary_uses_fixed_user_local_fallback(
     assert claude_binary() == binary.resolve()
 
 
+def test_claude_binary_keeps_the_recipient_bound_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = tmp_path / "profile-a-claude"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o700)
+    monkeypatch.setenv("CROSS_AGENT_CHAT_CLAUDE_BINARY", str(binary))
+    monkeypatch.setattr("cross_agent_chat.claude_runtime.shutil.which", lambda _: None)
+
+    assert claude_binary() == binary.resolve()
+
+
 def test_pretool_gate_binds_recipient_and_full_message() -> None:
     key = bytes.fromhex("11" * 32)
     message = "one exact body"
@@ -370,7 +382,7 @@ def test_claude_alias_is_validated_before_sendmessage(
     )
     agent = {
         "session_id": route.session_id,
-        "name": "a" * 70,
+        "name": "a" * 70 + "\x01",
         "kind": "interactive",
         "cwd": route.cwd,
     }
@@ -387,3 +399,57 @@ def test_claude_alias_is_validated_before_sendmessage(
 
     assert response["status"] == "PRE_EFFECT_REJECTED"
     assert response["provider"] == "claude"
+
+
+@pytest.mark.parametrize("kind", ["interactive", "background"])
+def test_supported_claude_kind_preserves_exact_native_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    from cross_agent_chat import claude_runtime
+
+    session_id = str(uuid4())
+    agent = {"session_id": session_id, "name": "Exact target", "kind": kind, "cwd": str(tmp_path)}
+    monkeypatch.setattr(claude_runtime, "claude_agents", lambda: [agent])
+    assert claude_runtime.exact_agent(session_id, str(tmp_path)) == agent
+    with pytest.raises(ChatError):
+        claude_runtime.exact_agent(str(uuid4()), str(tmp_path))
+    listing_kind = "bg" if kind == "background" else kind
+    listing = f"  Exact target [ABC123]  ·  {listing_kind}  ·  idle"
+    record = json.dumps({"tool_use_result": {"listing": listing}})
+    monkeypatch.setattr(claude_runtime, "claude_binary", lambda: Path("/opt/claude"))
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, record, ""),
+    )
+    assert claude_runtime.discover_target_ref("Exact target") == "Exact target [ABC123]"
+    with pytest.raises(ChatError):
+        claude_runtime.discover_target_ref("Wrong target")
+
+
+def test_long_claude_alias_retains_exact_session_disambiguation() -> None:
+    from cross_agent_chat.claude_runtime import ClaudeAgent, claude_alias
+
+    a: ClaudeAgent = {
+        "session_id": str(uuid4()),
+        "name": "이름" * 50,
+        "kind": "interactive",
+        "cwd": "/tmp",
+    }
+    b: ClaudeAgent = {**a, "session_id": str(uuid4())}
+    first = claude_alias("device", "p" * 110, a)
+    second = claude_alias("device", "p" * 110, b)
+    assert len(first) <= 128 and len(second) <= 128
+    assert first != second
+
+
+def test_claude_helper_keeps_selected_endpoint_and_backend_context() -> None:
+    selected = {
+        "CLAUDE_CONFIG_DIR": "/profiles/a",
+        "ANTHROPIC_BASE_URL": "https://gateway.example.invalid",
+        "ANTHROPIC_AUTH_TOKEN": "synthetic-helper-token",
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "AWS_PROFILE": "selected-profile",
+        "AWS_SESSION_TOKEN": "synthetic-session-token",
+    }
+    assert courier_environment({**selected, "UNRELATED_SECRET": "do-not-inherit"}) == selected

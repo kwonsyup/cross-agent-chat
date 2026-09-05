@@ -27,6 +27,7 @@ from cross_agent_chat.runtime import (
     send,
 )
 from cross_agent_chat.tailnet import (
+    local_tailnet_address,
     parse_ifconfig_tailnet_address,
     parse_known_tailnet_address,
     parse_local_tailnet_address,
@@ -115,6 +116,31 @@ utun4: flags=8051<UP>
     assert parse_ifconfig_tailnet_address(second_interface) is None
 
 
+def test_unverified_cgnat_interface_never_becomes_a_tailnet_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cross_agent_chat.tailnet._status_output", lambda: None)
+    monkeypatch.setattr(
+        "cross_agent_chat.tailnet._ifconfig_tailnet_address", lambda: "100.90.10.11"
+    )
+
+    assert local_tailnet_address() is None
+
+
+def test_running_tailscale_identity_requires_the_current_interface_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cross_agent_chat.tailnet._status_output",
+        lambda: json.dumps({"BackendState": "Running", "Self": {"TailscaleIPs": ["100.64.0.13"]}}),
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.tailnet._ifconfig_output", lambda: "utun4:\n inet 100.64.0.13"
+    )
+
+    assert local_tailnet_address() == "100.64.0.13"
+
+
 def test_tailnet_broker_exposes_only_local_live_peers(tmp_path: Path) -> None:
     assert handle_broker_request(
         tmp_path,
@@ -123,16 +149,13 @@ def test_tailnet_broker_exposes_only_local_live_peers(tmp_path: Path) -> None:
     ) == {"schema_version": 1, "peers": []}
 
 
-def test_broker_binds_localhost_and_installer_discovered_tailnet_address(
+def test_broker_keeps_only_localhost_when_tailscale_identity_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CROSS_AGENT_CHAT_TAILNET_ADDRESS", "100.64.0.13")
     monkeypatch.setattr("cross_agent_chat.tailnet_broker.local_tailnet_address", lambda: None)
 
-    assert broker_bindings() == [
-        ("127.0.0.1", 47072),
-        ("100.64.0.13", 47071),
-    ]
+    assert broker_bindings() == [("127.0.0.1", 47072)]
 
 
 def test_broker_prefers_current_tailnet_address_over_persisted_identity(
@@ -494,8 +517,9 @@ def test_remote_receive_requires_source_authorization_before_provider_effect(
 
     monkeypatch.setattr("cross_agent_chat.runtime.request_socket", provider_boundary)
 
-    with pytest.raises(ChatError, match="not authorized"):
-        receive_remote(tmp_path, envelope, "100.64.0.11")
+    response = receive_remote(tmp_path, envelope, "100.64.0.11")
+    assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["provider"] == "codex"
 
 
 def test_tailnet_client_keeps_write_side_open_for_serve_proxy() -> None:
@@ -538,7 +562,7 @@ def test_remote_targets_are_discovered_without_peer_configuration(
     def request(address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         assert address == "100.64.0.11"
         assert payload == {"schema_version": 1, "operation": "peers"}
-        assert timeout == REMOTE_DISCOVERY_TIMEOUT_SECONDS
+        assert 0 < timeout <= REMOTE_DISCOVERY_TIMEOUT_SECONDS
         return {
             "schema_version": 1,
             "peers": [
@@ -798,3 +822,149 @@ def test_cli_has_private_tailnet_broker_entrypoint(tmp_path: Path) -> None:
 
     assert arguments.command == "_broker"
     assert arguments.state_root == str(tmp_path)
+
+
+def test_launchd_path_prefers_installed_standalone_tailscale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import tailnet
+
+    standalone, gui = tmp_path / "standalone", tmp_path / "gui"
+    for binary in (standalone, gui):
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o700)
+    monkeypatch.setattr("cross_agent_chat.tailnet.shutil.which", lambda _: None)
+    monkeypatch.setattr(tailnet, "TAILSCALE_STANDALONE_BINARIES", (standalone,))
+    monkeypatch.setattr(tailnet, "TAILSCALE_APP_BINARY", gui)
+    assert tailnet.tailscale_binary() == standalone
+
+
+def test_unavailable_status_uses_only_exact_previously_validated_interface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cross_agent_chat import tailnet
+
+    monkeypatch.setattr(tailnet, "_status_output", lambda: None)
+    monkeypatch.setenv("CROSS_AGENT_CHAT_TAILNET_ADDRESS", "100.64.0.13")
+    monkeypatch.setattr(
+        tailnet, "_ifconfig_output", lambda: "utun8: flags\n  inet 100.64.0.14 netmask 0xffffffff\n"
+    )
+    assert tailnet.local_tailnet_address() is None
+    monkeypatch.setattr(
+        tailnet, "_ifconfig_output", lambda: "utun8: flags\n  inet 100.64.0.13 netmask 0xffffffff\n"
+    )
+    assert tailnet.local_tailnet_address() == "100.64.0.13"
+    monkeypatch.setattr(tailnet, "_status_output", lambda: json.dumps({"BackendState": "Stopped"}))
+    assert tailnet.local_tailnet_address() is None
+
+
+def test_broker_revokes_listener_when_verified_identity_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local, private = mock.Mock(), mock.Mock()
+    listeners = iter((local, private))
+    bindings = iter(([("127.0.0.1", 47072), ("100.64.0.13", 47071)], [("127.0.0.1", 47072)]))
+    observed: list[list[object]] = []
+    monkeypatch.setattr(
+        tailnet_broker_module, "bind_broker_listener", lambda *args, **kwargs: next(listeners)
+    )
+    monkeypatch.setattr(tailnet_broker_module, "broker_bindings", lambda: next(bindings))
+
+    def ready(
+        servers: list[object], *_args: object
+    ) -> tuple[list[object], list[object], list[object]]:
+        observed.append(list(servers))
+        if len(observed) == 2:
+            private.close.assert_called_once_with()
+            raise RuntimeError("stop fixture")
+        return [], [], []
+
+    monkeypatch.setattr(select, "select", ready)
+    with pytest.raises(RuntimeError, match="stop fixture"):
+        broker_server(str(tmp_path))
+    assert observed == [[local, private], [local]]
+    private.close.assert_called_once_with()
+    local.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "stage", ["authorize_pre", "accept_pre", "authorize_unknown", "accept_unknown"]
+)
+def test_broker_receive_preserves_proven_rejection_and_post_write_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from cross_agent_chat.core import UnknownDeliveryError
+
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(target)
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:project:sender",
+        source_generation=str(uuid4()),
+        target_alias=target.alias,
+        generation=target.generation,
+        message="controlled body",
+    )
+    effects: list[str] = []
+
+    def authorize(
+        _address: str, payload: dict[str, object], **_kwargs: object
+    ) -> dict[str, object]:
+        if stage == "authorize_pre":
+            raise ChatError("authorization connection unavailable")
+        if stage == "authorize_unknown":
+            raise UnknownDeliveryError("authorization receipt missing")
+        return {**{k: v for k, v in payload.items() if k != "operation"}, "status": "AUTHORIZED"}
+
+    def courier(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        if payload["operation"] == "health":
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "alias": target.alias,
+                "generation": target.generation,
+            }
+        if stage == "accept_pre":
+            raise ChatError("destination disappeared before connect")
+        effects.append("possible provider write")
+        raise UnknownDeliveryError("destination receipt missing")
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", authorize)
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", courier)
+    monkeypatch.setattr(
+        tailnet_broker_module,
+        "read_frame",
+        lambda _: json.dumps(
+            {"schema_version": 1, "operation": "receive", "envelope": envelope}
+        ).encode(),
+    )
+    emitted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        tailnet_broker_module,
+        "emit_frame_safely",
+        lambda _connection, response: emitted.append(response),
+    )
+    connection = mock.Mock()
+    if stage.endswith("unknown"):
+        with pytest.raises(UnknownDeliveryError):
+            tailnet_broker_module.serve_broker_connection(tmp_path, connection, "100.64.0.11")
+        assert emitted == []
+    else:
+        tailnet_broker_module.serve_broker_connection(tmp_path, connection, "100.64.0.11")
+        assert emitted == [
+            {
+                "schema_version": 1,
+                "event_id": event_id,
+                "status": "PRE_EFFECT_REJECTED",
+                "provider": "codex",
+                "error": "remote destination rejected before provider effect",
+            }
+        ]
+        assert effects == []

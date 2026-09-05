@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import stat
 import subprocess
@@ -19,6 +22,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
@@ -30,6 +34,7 @@ from cross_agent_chat.claude_runtime import (
     DISCOVERY_TIMEOUT_SECONDS,
     SEND_TIMEOUT_SECONDS,
     claude_alias,
+    claude_binary,
     courier_environment,
     discover_target_ref,
     exact_agent,
@@ -49,6 +54,7 @@ from cross_agent_chat.core import (
     canonical_cwd,
     ensure_private_dir,
     session_key,
+    state_lock,
     valid_device,
     valid_name,
     valid_uuid,
@@ -59,6 +65,8 @@ from cross_agent_chat.transport import remote_envelope
 
 MAX_FRAME_BYTES: Final = 64 * 1024
 SOCKET_TIMEOUT_SECONDS: Final = 5.0
+MCP_TOOL_TIMEOUT_SECONDS: Final = 270.0
+OPERATION_TIMEOUT_SECONDS: Final = 260.0
 HEALTH_TIMEOUT_SECONDS: Final = AGENTS_TIMEOUT_SECONDS + 2.0
 REMOTE_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS + 5.0
 ACCEPT_TIMEOUT_SECONDS: Final = (
@@ -72,6 +80,36 @@ REMOTE_TIMEOUT_SECONDS: Final = (
 LOCAL_DISCOVERY_WORKERS: Final = 32
 LOCAL_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS
 PRESENCE_ENV_VAR: Final = "CROSS_AGENT_CHAT_PRESENCE"
+PROC_PIDTBSDINFO: Final = 3
+PROC_BSDINFO_SIZE: Final = 136
+
+
+def recipient_profile_root(provider: str) -> str:
+    value = os.environ.get("CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR")
+    root = Path(value) if value else Path.home() / (".codex" if provider == "codex" else ".claude")
+    return str(root.expanduser().resolve(strict=False))
+
+
+def recipient_owner_identity(
+    provider: str, pid: int, profile_root: str | None = None
+) -> tuple[str, Path]:
+    """Bind a route to the provider executable, process birth, uid, and selected root."""
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+    path_buffer = ctypes.create_string_buffer(4096)
+    if libproc.proc_pidpath(pid, path_buffer, len(path_buffer)) <= 0:
+        raise ChatError("provider process identity is unavailable")
+    info = ctypes.create_string_buffer(PROC_BSDINFO_SIZE)
+    if libproc.proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, info, len(info)) != PROC_BSDINFO_SIZE:
+        raise ChatError("provider process identity is unavailable")
+    uid = int.from_bytes(info.raw[20:24], sys.byteorder)
+    if uid != os.getuid():
+        raise ChatError("provider process identity is unavailable")
+    start_seconds = int.from_bytes(info.raw[120:128], sys.byteorder)
+    start_microseconds = int.from_bytes(info.raw[128:136], sys.byteorder)
+    binary = Path(path_buffer.value.decode()).resolve(strict=True)
+    root = Path(profile_root or recipient_profile_root(provider)).expanduser().resolve(strict=False)
+    payload = f"{provider}\0{binary}\0{uid}\0{start_seconds}\0{start_microseconds}\0{root}".encode()
+    return hashlib.sha256(payload).hexdigest(), binary
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +193,8 @@ def read_frame(connection: socket.socket, limit: int = MAX_FRAME_BYTES) -> bytes
 
 
 def emit_frame(connection: socket.socket, payload: dict[str, object]) -> None:
-    connection.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+    frame = json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n"
+    connection.sendall(frame.encode())
 
 
 def emit_frame_safely(connection: socket.socket, payload: dict[str, object]) -> None:
@@ -170,13 +209,16 @@ def request_socket(
 ) -> dict[str, object]:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(timeout)
+    attempted_write = False
     try:
         require_socket(path)
         client.connect(str(path))
+        attempted_write = True
         emit_frame(client, payload)
-        client.shutdown(socket.SHUT_WR)
         raw = json.loads(read_frame(client))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError) as error:
+        if not attempted_write:
+            raise ChatError("session courier is unavailable before delivery") from error
         raise UnknownDeliveryError("delivery state is unknown") from error
     finally:
         client.close()
@@ -193,13 +235,17 @@ def request_tailnet(
     timeout: float = 2.0,
 ) -> dict[str, object]:
     """Exchange one bounded frame with a Tailnet broker."""
+    attempted_write = False
     try:
         client = socket.create_connection((address, port), timeout=timeout)
         client.settimeout(timeout)
         with client:
+            attempted_write = True
             emit_frame(client, payload)
             raw: object = json.loads(read_frame(client))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError) as error:
+        if not attempted_write:
+            raise ChatError("Tailnet peer is unavailable before delivery") from error
         raise UnknownDeliveryError("Tailnet delivery state is unknown") from error
     if not isinstance(raw, dict):
         raise UnknownDeliveryError("Tailnet delivery state is unknown")
@@ -235,6 +281,7 @@ def executable() -> Path:
 
 def _spawn_courier(root: Path, route: Route) -> None:
     path = socket_path(root, route)
+    owner_binary = recipient_owner_identity(route.provider, route.pid, route.profile_root)[1]
     if path.exists() or path.is_symlink():
         raise ChatError("session courier socket already exists")
     command = [
@@ -253,11 +300,20 @@ def _spawn_courier(root: Path, route: Route) -> None:
         "--pid",
         str(route.pid),
     ]
-    environment = (
-        courier_environment()
-        if route.provider == "claude"
-        else {key: os.environ[key] for key in COURIER_ENV_KEYS if key in os.environ}
-    )
+    if route.provider == "claude":
+        environment = courier_environment()
+        environment["CROSS_AGENT_CHAT_CLAUDE_BINARY"] = str(owner_binary or claude_binary())
+    else:
+        environment = {
+            key: os.environ[key]
+            for key in (*COURIER_ENV_KEYS, "CODEX_HOME", "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE")
+            if key in os.environ
+        }
+        environment["CODEX_HOME"] = route.profile_root or recipient_profile_root("codex")
+        codex = str(owner_binary) if owner_binary is not None else shutil.which("codex")
+        if codex is not None:
+            with suppress(OSError):
+                environment["CROSS_AGENT_CHAT_CODEX_BINARY"] = str(Path(codex).resolve(strict=True))
     try:
         process = subprocess.Popen(
             command,
@@ -288,7 +344,7 @@ def _spawn_courier(root: Path, route: Route) -> None:
             if response.get("status") == "READY":
                 return
             time.sleep(0.02)
-        except UnknownDeliveryError:
+        except ChatError:
             time.sleep(0.02)
     process.terminate()
     raise ChatError("session courier did not become ready")
@@ -302,23 +358,56 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
     if isinstance(pid, bool) or pid <= 0:
         raise ChatError("provider process is invalid")
     raw = hook_input("SessionStart")
+    owner_identity, _owner_binary = recipient_owner_identity(provider, pid)
     route = Route.create(
         provider=provider,
         session_id=cast(str, raw["session_id"]),
         device=valid_device(device),
         cwd=cast(str, raw["cwd"]),
         pid=pid,
+        owner_identity=owner_identity,
+        profile_root=recipient_profile_root(provider),
     )
     root = state_root(state_root_value)
-    registry = Registry(root)
-    registry.compact_dead()
-    registry.upsert(route)
-    try:
-        _spawn_courier(root, route)
-    except ChatError:
-        Registry(root).remove(route.provider, route.session_id, route.pid)
-        raise
-    return route
+    with state_lock(root, "register-" + session_key(route.provider, route.session_id)):
+        registry = Registry(root)
+        registry.compact_dead()
+        registered = registry.upsert_or_reuse_live_owner(route)
+        if registered != route:
+            try:
+                health = request_socket(
+                    socket_path(root, registered),
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "operation": "health",
+                        "generation": registered.generation,
+                    },
+                    timeout=0.5,
+                )
+            except ChatError as error:
+                cause = error.__cause__
+                missing = not socket_path(root, registered).exists()
+                refused = isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
+                if not missing and not refused:
+                    # A busy courier may still own an accepted provider effect. A
+                    # health timeout is not evidence authorizing queue replacement.
+                    return registered
+                registry.upsert(route)
+            else:
+                if (
+                    health.get("status") == "READY"
+                    and health.get("generation") == registered.generation
+                ):
+                    return registered
+                raise ChatError("existing courier ownership could not be verified")
+        try:
+            _spawn_courier(root, route)
+        except ChatError:
+            Registry(root).remove(
+                route.provider, route.session_id, route.pid, generation=route.generation
+            )
+            raise
+        return route
 
 
 def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
@@ -337,7 +426,7 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
     if len(routes) != 1:
         raise ChatError("exact session route is unavailable")
     route = routes[0]
-    Registry(root).remove(route.provider, route.session_id, route.pid)
+    Registry(root).remove(route.provider, route.session_id, route.pid, generation=route.generation)
     try:
         request_socket(
             socket_path(root, route),
@@ -347,12 +436,28 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
                 "generation": route.generation,
             },
         )
-    except UnknownDeliveryError:
+    except ChatError:
         return
 
 
 def _route_current(root: Path, expected: Route) -> bool:
-    return Registry(root).current(expected) and expected.process_is_live()
+    if expected.owner_identity is not None:
+        profile = expected.profile_root or str(
+            Path.home() / (".codex" if expected.provider == "codex" else ".claude")
+        )
+        try:
+            if (
+                recipient_owner_identity(expected.provider, expected.pid, profile)[0]
+                != expected.owner_identity
+            ):
+                return False
+        except (ChatError, OSError):
+            return False
+    return (
+        Registry(root).current(expected)
+        and expected.process_is_live()
+        and expected.cwd_is_available()
+    )
 
 
 def courier_accept(
@@ -473,8 +578,27 @@ def courier_server(
         server.bind(str(path))
     finally:
         os.umask(old_umask)
+    native_queue: tuple[Path, dict[str, str], str] | None = None
+    native_enabled = os.environ.get("CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE") == "experimental"
+    if provider == "codex" and native_enabled:
+        bound_binary = os.environ.get("CROSS_AGENT_CHAT_CODEX_BINARY")
+        if bound_binary is not None:
+            candidate = Path(bound_binary)
+            try:
+                binary = candidate.resolve(strict=True)
+            except OSError as error:
+                raise ChatError("Codex native queue is unavailable") from error
+            native_queue = (
+                binary,
+                {
+                    key: os.environ[key]
+                    for key in (*COURIER_ENV_KEYS, "CODEX_HOME")
+                    if key in os.environ
+                },
+                route.session_id,
+            )
     courier = (
-        CodexCourier(alias=route.alias, generation=route.generation)
+        CodexCourier(alias=route.alias, generation=route.generation, native_queue=native_queue)
         if provider == "codex"
         else None
     )
@@ -580,13 +704,15 @@ def shutdown_couriers(root: Path) -> None:
 def _local_target(
     root: Path, route: Route, *, timeout: float = HEALTH_TIMEOUT_SECONDS
 ) -> Target | None:
+    if not route.cwd_is_available():
+        return None
     try:
         response = request_socket(
             socket_path(root, route),
             {"schema_version": 1, "operation": "health", "generation": route.generation},
             timeout=timeout,
         )
-    except UnknownDeliveryError:
+    except ChatError:
         return None
     alias = response.get("alias")
     if (
@@ -600,8 +726,11 @@ def _local_target(
     if route.provider == "codex":
         if alias != route.alias:
             return None
-    elif not alias.startswith(f"claude@{route.device}:{route.project}:"):
-        return None
+    else:
+        prefix = f"claude@{route.device}:{route.project}:"
+        shortened = prefix[:115] + "~" + session_key("claude", route.session_id)[:12]
+        if not alias.startswith(prefix) and not (len(prefix) > 115 and alias == shortened):
+            return None
     try:
         return Target(
             alias=valid_name(alias, "route alias"),
@@ -627,7 +756,11 @@ def _local_target_before_deadline(root: Path, route: Route, deadline: float) -> 
 
 
 def local_targets(root: Path) -> list[Target]:
-    routes = [route for route in Registry(root).routes() if route.process_is_live()]
+    routes = [
+        route
+        for route in Registry(root).routes()
+        if route.process_is_live() and route.cwd_is_available()
+    ]
     if not routes:
         return []
     deadline = time.monotonic() + LOCAL_DISCOVERY_TIMEOUT_SECONDS
@@ -707,13 +840,18 @@ def _targets_from_tailnet(address: str, raw: object) -> list[Target]:
     return targets
 
 
-def _remote_node_targets(address: str) -> list[Target]:
+def _remote_node_targets(address: str, deadline: float | None = None) -> list[Target]:
+    remaining = (
+        REMOTE_DISCOVERY_TIMEOUT_SECONDS if deadline is None else deadline - time.monotonic()
+    )
+    if remaining <= 0:
+        return []
     try:
         raw = request_tailnet(
             address,
             {"schema_version": SCHEMA_VERSION, "operation": "peers"},
             # The remote broker may spend HEALTH_TIMEOUT_SECONDS validating local routes.
-            timeout=REMOTE_DISCOVERY_TIMEOUT_SECONDS,
+            timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining),
         )
         return _targets_from_tailnet(address, raw)
     except (ChatError, UnknownDeliveryError):
@@ -725,10 +863,18 @@ def remote_targets(_root: Path) -> list[Target]:
     if not addresses:
         return []
     targets: list[Target] = []
-    with ThreadPoolExecutor(max_workers=min(16, len(addresses))) as workers:
-        results = workers.map(_remote_node_targets, addresses)
-        for result in results:
-            targets.extend(result)
+    deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
+    workers = ThreadPoolExecutor(max_workers=min(16, len(addresses)))
+    futures = [workers.submit(_remote_node_targets, address, deadline) for address in addresses]
+    try:
+        for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
+            targets.extend(future.result())
+    except FuturesTimeoutError:
+        pass
+    finally:
+        for future in futures:
+            future.cancel()
+        workers.shutdown(wait=False, cancel_futures=True)
     return targets
 
 
@@ -749,8 +895,8 @@ def all_targets(root: Path, *, include_remote: bool = True) -> list[Target]:
 def _target_matches(target: Target, query: str) -> bool:
     if target.alias.casefold() == query.casefold():
         return True
-    wanted = [token for token in re.split(r"[^A-Za-z0-9]+", query.casefold()) if token]
-    available = {token for token in re.split(r"[^A-Za-z0-9]+", target.alias.casefold()) if token}
+    wanted = re.findall(r"[^\W_]+", query.casefold())
+    available = set(re.findall(r"[^\W_]+", target.alias.casefold()))
     return bool(wanted) and all(token in available for token in wanted)
 
 
@@ -776,7 +922,7 @@ def wrapped_message(source_alias: str, message: str, event_id: str) -> str:
 
 def canonical_source_alias(root: Path, source: Route) -> str:
     """Return the exact currently live public alias for an authenticated sender."""
-    if not Registry(root).current(source) or not source.process_is_live():
+    if not _route_current(root, source):
         raise ChatError("sender route changed before transport acceptance")
     if source.provider == "codex":
         return source.alias
@@ -784,9 +930,21 @@ def canonical_source_alias(root: Path, source: Route) -> str:
     return claude_alias(source.device, source.project, agent)
 
 
-def send_local(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
-    targets = local_targets(root)
-    target = resolve_target(targets, target_query)
+def _remaining_operation_timeout(deadline: float, maximum: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ChatError("delivery timed out before provider acceptance")
+    return min(maximum, remaining)
+
+
+def _send_local_target(
+    root: Path,
+    source: Route,
+    target: Target,
+    message: str,
+    *,
+    deadline: float,
+) -> dict[str, object]:
     if target.session_id is None or target.pid is None or target.cwd is None:
         raise ChatError("target route is incomplete")
     current_routes = Registry(root).routes()
@@ -804,6 +962,7 @@ def send_local(root: Path, source: Route, target_query: str, message: str) -> di
     source_alias = canonical_source_alias(root, source)
     event_id = str(uuid4())
     body = wrapped_message(source_alias, bounded_message(message), event_id)
+    timeout = _remaining_operation_timeout(deadline, ACCEPT_TIMEOUT_SECONDS)
     store = IntentStore(root)
     store.begin(
         source,
@@ -822,13 +981,16 @@ def send_local(root: Path, source: Route, target_query: str, message: str) -> di
                 "event_id": event_id,
                 "message": body,
             },
-            timeout=ACCEPT_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except UnknownDeliveryError:
         store.mark(event_id, "UNKNOWN_DELIVERY")
         raise UnknownDeliveryError(
             f"delivery state is unknown for event {event_id}; do not retry automatically"
         ) from None
+    except ChatError:
+        store.mark(event_id, "PRE_EFFECT_REJECTED")
+        raise
     expected = {
         "schema_version": 1,
         "event_id": event_id,
@@ -848,15 +1010,27 @@ def send_local(root: Path, source: Route, target_query: str, message: str) -> di
     return expected
 
 
+def send_local(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
+    deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
+    target = resolve_target(local_targets(root), target_query)
+    return _send_local_target(root, source, target, message, deadline=deadline)
+
+
 def send(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
-    target = resolve_target(all_targets(root), target_query)
-    if not target.remote:
-        return send_local(root, source, target.alias, message)
+    deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
+    local_matches = [
+        target for target in local_targets(root) if _target_matches(target, target_query)
+    ]
+    if local_matches:
+        target = resolve_target(local_matches, target_query)
+        return _send_local_target(root, source, target, message, deadline=deadline)
+    target = resolve_target(remote_targets(root), target_query)
     if target.tailnet_address is None:
         raise ChatError("remote target route is incomplete")
     source_alias = canonical_source_alias(root, source)
     event_id = str(uuid4())
     body = wrapped_message(source_alias, bounded_message(message), event_id)
+    timeout = _remaining_operation_timeout(deadline, REMOTE_TIMEOUT_SECONDS)
     store = IntentStore(root)
     store.begin_identity(
         source_key=session_key(source.provider, source.session_id),
@@ -890,13 +1064,16 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
                 "operation": "receive",
                 "envelope": envelope,
             },
-            timeout=REMOTE_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except UnknownDeliveryError as error:
         store.mark(event_id, "UNKNOWN_DELIVERY")
         raise UnknownDeliveryError(
             f"remote delivery state is unknown for event {event_id}; do not retry automatically"
         ) from error
+    except ChatError:
+        store.mark(event_id, "PRE_EFFECT_REJECTED")
+        raise
     rejection = pre_effect_error(response, event_id, target.provider)
     if rejection is not None:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
@@ -949,78 +1126,92 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
     event_id, source_alias, source_generation, target_alias, generation, message = (
         parse_remote_envelope(text)
     )
-    matches = [
-        target
-        for target in local_targets(root)
-        if target.alias == target_alias and target.generation == generation
-    ]
-    if len(matches) != 1:
-        raise ChatError("remote target changed before transport acceptance")
-    target = matches[0]
-    if target.session_id is None or target.pid is None or target.cwd is None:
-        raise ChatError("remote target route is incomplete")
-    target_key = session_key(target.provider, target.session_id)
-    payload_digest = hashlib.sha256(message.encode()).hexdigest()
-    authorization_request: dict[str, object] = {
-        "schema_version": SCHEMA_VERSION,
-        "operation": "authorize",
-        "event_id": event_id,
-        "source_alias": source_alias,
-        "source_generation": source_generation,
-        "target_key": target_key,
-        "target_generation": generation,
-        "payload_digest": payload_digest,
-    }
-    authorization = request_tailnet(
-        source_address,
-        authorization_request,
-        timeout=AUTHORIZE_TIMEOUT_SECONDS,
-    )
-    expected_authorization = {
-        key: value for key, value in authorization_request.items() if key != "operation"
-    }
-    expected_authorization["status"] = "AUTHORIZED"
-    if authorization != expected_authorization:
-        raise ChatError("remote envelope is not authorized")
-    routes = [
-        route
-        for route in Registry(root).routes()
-        if route.session_id == target.session_id
-        and route.pid == target.pid
-        and route.generation == target.generation
-        and route.cwd == target.cwd
-    ]
-    if len(routes) != 1:
-        raise ChatError("remote target changed before transport acceptance")
-    response = request_socket(
-        socket_path(root, routes[0]),
-        {
+    target_provider = target_alias.split("@", 1)[0]
+    if target_provider not in {"claude", "codex"}:
+        raise ChatError("remote target provider is invalid")
+    try:
+        matches = [
+            target
+            for target in local_targets(root)
+            if target.alias == target_alias and target.generation == generation
+        ]
+        if len(matches) != 1:
+            raise ChatError("remote target changed before transport acceptance")
+        target = matches[0]
+        if target.session_id is None or target.pid is None or target.cwd is None:
+            raise ChatError("remote target route is incomplete")
+        target_key = session_key(target.provider, target.session_id)
+        payload_digest = hashlib.sha256(message.encode()).hexdigest()
+        authorization_request: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
-            "operation": "accept",
-            "generation": generation,
+            "operation": "authorize",
             "event_id": event_id,
-            "message": message,
-        },
-        timeout=ACCEPT_TIMEOUT_SECONDS,
-    )
-    expected: dict[str, object] = {
-        "schema_version": SCHEMA_VERSION,
-        "event_id": event_id,
-        "status": "TRANSPORT_ACCEPTED",
-        "to": target.alias,
-        "provider": target.provider,
-    }
-    if pre_effect_error(response, event_id, target.provider) is not None:
+            "source_alias": source_alias,
+            "source_generation": source_generation,
+            "target_key": target_key,
+            "target_generation": generation,
+            "payload_digest": payload_digest,
+        }
+        authorization = request_tailnet(
+            source_address,
+            authorization_request,
+            timeout=AUTHORIZE_TIMEOUT_SECONDS,
+        )
+        expected_authorization = {
+            key: value for key, value in authorization_request.items() if key != "operation"
+        }
+        expected_authorization["status"] = "AUTHORIZED"
+        if authorization != expected_authorization:
+            raise ChatError("remote envelope is not authorized")
+        routes = [
+            route
+            for route in Registry(root).routes()
+            if route.session_id == target.session_id
+            and route.pid == target.pid
+            and route.generation == target.generation
+            and route.cwd == target.cwd
+        ]
+        if len(routes) != 1:
+            raise ChatError("remote target changed before transport acceptance")
+        response = request_socket(
+            socket_path(root, routes[0]),
+            {
+                "schema_version": SCHEMA_VERSION,
+                "operation": "accept",
+                "generation": generation,
+                "event_id": event_id,
+                "message": message,
+            },
+            timeout=ACCEPT_TIMEOUT_SECONDS,
+        )
+        expected: dict[str, object] = {
+            "schema_version": SCHEMA_VERSION,
+            "event_id": event_id,
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": target.provider,
+        }
+        if pre_effect_error(response, event_id, target.provider) is not None:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "event_id": event_id,
+                "status": "PRE_EFFECT_REJECTED",
+                "provider": target.provider,
+                "error": "remote destination rejected before provider effect",
+            }
+        if response != expected:
+            raise UnknownDeliveryError("remote delivery state is unknown")
+        return expected
+    except UnknownDeliveryError:
+        raise
+    except ChatError:
         return {
             "schema_version": SCHEMA_VERSION,
             "event_id": event_id,
             "status": "PRE_EFFECT_REJECTED",
-            "provider": target.provider,
+            "provider": target_provider,
             "error": "remote destination rejected before provider effect",
         }
-    if response != expected:
-        raise UnknownDeliveryError("remote delivery state is unknown")
-    return expected
 
 
 def peers(root: Path, *, include_remote: bool = True, internal: bool = False) -> dict[str, object]:
@@ -1080,7 +1271,7 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
         snapshot.accept(item["event_id"], item["message"])
 
     def emit(payload: dict[str, object]) -> None:
-        print(json.dumps(payload, separators=(",", ":")), flush=True)
+        print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
 
     deliver_at_stop(snapshot, stop_hook_active=False, emit=emit)
     try:
@@ -1093,7 +1284,7 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
                 "event_ids": [item["event_id"] for item in messages],
             },
         )
-    except UnknownDeliveryError:
+    except ChatError:
         return
 
 

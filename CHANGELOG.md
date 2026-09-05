@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.4 - 2026-09-04
+
+- Bind Claude setup to the active `CLAUDE_CONFIG_DIR` and Codex setup to the active `CODEX_HOME`,
+  with profile-scoped installer state and recoverable backups for explicit roots.
+- Add an explicit `setup --enable-experimental-codex-native-queue` opt-in that persists only in
+  the selected Codex profile's owned hooks. Ordinary setups remain natural-Stop-bound; doctor
+  reports the selected profile's queue mode.
+- Keep stale workspace metadata structurally readable while excluding unavailable routes from live
+  discovery and delivery.
+- Fix a fast-reply socket close race that intermittently hid healthy peers during discovery.
+- Support Claude's native background session inventory and ListAgents display format.
+- Accept ordinary Unicode project names and bound rendered peer labels without using display text as
+  route authority.
+- Preserve a live courier generation and its in-memory queue when a provider repeats SessionStart
+  for the same verified process birth, executable, profile, session, and working directory. A busy
+  courier is preserved; a missing courier can recover with a fresh generation.
+- Drain Codex courier queues in whole bounded frame batches, preserving ordered remainder for a
+  later natural provider boundary.
+- Align the Codex MCP tool timeout with the bounded remote delivery operation.
+- Bind private listeners only to Tailscale-verified identities with an exact live interface match.
+  Canonical launches find the standalone Tailscale CLI, and identity loss revokes the listener; a
+  generic CGNAT tunnel or persisted address without a matching interface is insufficient.
+
 ## 0.1.3 - 2026-09-02
 
 - Let disposable provider workers opt out with `CROSS_AGENT_CHAT_PRESENCE=off` without

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from cross_agent_chat.core import UnknownDeliveryError
+from cross_agent_chat.core import ChatError, UnknownDeliveryError
 from cross_agent_chat.runtime import request_socket
 from cross_agent_chat.transport import remote_envelope
 
@@ -26,6 +26,7 @@ def test_remote_envelope_binds_target_generation_without_body_persistence() -> N
     assert payload.endswith("\n")
 
 
-def test_absent_courier_socket_is_a_retryable_unknown_state(tmp_path: Path) -> None:
-    with pytest.raises(UnknownDeliveryError, match="unknown"):
+def test_absent_courier_socket_is_pre_effect(tmp_path: Path) -> None:
+    with pytest.raises(ChatError, match="before delivery") as error:
         request_socket(tmp_path / "not-bound.sock", {"operation": "health"})
+    assert not isinstance(error.value, UnknownDeliveryError)

@@ -32,6 +32,7 @@ from tomlkit.exceptions import TOMLKitError
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import ChatError, atomic_json, ensure_private_dir, valid_device
+from cross_agent_chat.runtime import MCP_TOOL_TIMEOUT_SECONDS
 from cross_agent_chat.tailnet import LOCAL_BROKER_HOST, LOCAL_BROKER_PORT, valid_tailnet_address
 
 SERVER_NAME: Final = "cross-agent-chat"
@@ -331,17 +332,30 @@ def _process_identity_digest(pid: int) -> str | None:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _hook_command(executable: Path, provider: str, device: str, event: str) -> str:
+def _hook_command(
+    executable: Path,
+    provider: str,
+    device: str,
+    event: str,
+    *,
+    codex_native_queue: bool = False,
+) -> str:
     binary = shlex.quote(str(executable))
+    native_queue = (
+        "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE=experimental "
+        if provider == "codex" and codex_native_queue
+        else ""
+    )
     if event == "SessionStart":
         return (
-            f"{binary} _register --provider {provider} --device {shlex.quote(device)} "
+            f"{native_queue}{binary} _register --provider {provider} "
+            f"--device {shlex.quote(device)} "
             '--pid "$PPID" >/dev/null'
         )
     if event == "SessionEnd":
-        return f'{binary} _unregister --provider {provider} --pid "$PPID" >/dev/null'
+        return f'{native_queue}{binary} _unregister --provider {provider} --pid "$PPID" >/dev/null'
     if provider == "codex" and event == "Stop":
-        return f'{binary} _codex-stop --pid "$PPID"'
+        return f'{native_queue}{binary} _codex-stop --pid "$PPID"'
     raise SettingsError("unsupported provider hook")
 
 
@@ -358,6 +372,8 @@ def _owned_hook(value: object) -> bool:
         tokens = shlex.split(command)
     except ValueError:
         return False
+    if tokens and tokens[0] == "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE=experimental":
+        tokens = tokens[1:]
     return (
         len(tokens) >= 2
         and Path(tokens[0]).name == SERVER_NAME
@@ -365,7 +381,32 @@ def _owned_hook(value: object) -> bool:
     )
 
 
-def _hook_group(executable: Path, provider: str, device: str, event: str) -> dict[str, object]:
+def _owned_hook_native_queue(value: object) -> bool:
+    if not _owned_hook(value):
+        return False
+    if not isinstance(value, dict):
+        return False
+    hooks = value.get("hooks")
+    if not isinstance(hooks, list) or not hooks or not isinstance(hooks[0], dict):
+        return False
+    command = hooks[0].get("command")
+    if not isinstance(command, str):
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    return bool(tokens) and tokens[0] == "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE=experimental"
+
+
+def _hook_group(
+    executable: Path,
+    provider: str,
+    device: str,
+    event: str,
+    *,
+    codex_native_queue: bool = False,
+) -> dict[str, object]:
     timeout = 10 if (provider, event) == ("claude", "SessionStart") else 5
     if event in {"SessionEnd", "Stop"}:
         timeout = 3
@@ -373,7 +414,13 @@ def _hook_group(executable: Path, provider: str, device: str, event: str) -> dic
         "hooks": [
             {
                 "type": "command",
-                "command": _hook_command(executable, provider, device, event),
+                "command": _hook_command(
+                    executable,
+                    provider,
+                    device,
+                    event,
+                    codex_native_queue=codex_native_queue,
+                ),
                 "timeout": timeout,
             }
         ]
@@ -597,6 +644,8 @@ def _codex_owned_toml(
     device: str,
     hooks_path: Path,
     hook_indices: dict[str, int],
+    *,
+    codex_native_queue: bool = False,
 ) -> str:
     command = _toml_string(str(executable))
     args = (
@@ -608,10 +657,17 @@ def _codex_owned_toml(
     )
     text = (
         f'{OWNED_TOML_START}\n[mcp_servers."{SERVER_NAME}"]\ncommand = {command}\n'
-        f'args = {args}\ntool_timeout_sec = 120\ndefault_tools_approval_mode = "approve"\n'
+        f"args = {args}\ntool_timeout_sec = {int(MCP_TOOL_TIMEOUT_SECONDS)}\n"
+        'default_tools_approval_mode = "approve"\n'
     )
     for event, timeout in (("SessionStart", 5), ("SessionEnd", 3), ("Stop", 3)):
-        hook_command = _hook_command(executable, "codex", device, event)
+        hook_command = _hook_command(
+            executable,
+            "codex",
+            device,
+            event,
+            codex_native_queue=codex_native_queue,
+        )
         key = f"{hooks_path}:{_hook_event_name(event)}:{hook_indices[event]}:0"
         text += (
             f"\n[hooks.state.{_toml_string(key)}]\n"
@@ -673,21 +729,58 @@ class Installer:
         executable: Path,
         device: str,
         tailnet_address: str | None = None,
+        codex_home: Path | None = None,
+        claude_config_dir: Path | None = None,
+        codex_native_queue: bool | None = None,
     ) -> None:
         self.home = home.resolve()
         self.executable = executable if executable.is_absolute() else executable.absolute()
         self.device = valid_device(device)
+        if claude_config_dir is not None:
+            configured_claude_root = claude_config_dir.expanduser()
+            if not configured_claude_root.is_absolute() or configured_claude_root == Path("/"):
+                raise SettingsError("CLAUDE_CONFIG_DIR must be an absolute configuration directory")
+            self.claude_config_dir: Path | None = configured_claude_root.resolve(strict=False)
+        else:
+            self.claude_config_dir = None
+        configured_codex_home = (
+            self.home / ".codex" if codex_home is None else codex_home.expanduser()
+        )
+        if not configured_codex_home.is_absolute() or configured_codex_home == Path("/"):
+            raise SettingsError("CODEX_HOME must be an absolute configuration directory")
+        self.codex_home = configured_codex_home.resolve(strict=False)
         self.tailnet_address = (
             None if tailnet_address is None else valid_tailnet_address(tailnet_address)
         )
+        self.codex_native_queue = codex_native_queue
         self.state = self.home / ".local" / "state" / SERVER_NAME
-        self.install_state = self.home / ".config" / SERVER_NAME / "install.json"
+        profile_identity = json.dumps(
+            {
+                "claude_config_dir": None
+                if self.claude_config_dir is None
+                else str(self.claude_config_dir),
+                "codex_home": str(self.codex_home),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        default_profile = self.claude_config_dir is None and self.codex_home == self.home / ".codex"
+        install_name = (
+            "install.json"
+            if default_profile
+            else f"install-{hashlib.sha256(profile_identity).hexdigest()[:16]}.json"
+        )
+        self.install_state = self.home / ".config" / SERVER_NAME / install_name
         self.cache = self.home / ".cache" / SERVER_NAME
         self.legacy_peers = self.state / "peers.json"
-        self.claude_settings = self.home / ".claude" / "settings.json"
-        self.claude_config = self.home / ".claude.json"
-        self.codex_config = self.home / ".codex" / "config.toml"
-        self.codex_hooks = self.home / ".codex" / "hooks.json"
+        if self.claude_config_dir is None:
+            self.claude_settings = self.home / ".claude" / "settings.json"
+            self.claude_config = self.home / ".claude.json"
+        else:
+            self.claude_settings = self.claude_config_dir / "settings.json"
+            self.claude_config = self.claude_config_dir / ".claude.json"
+        self.codex_config = self.codex_home / "config.toml"
+        self.codex_hooks = self.codex_home / "hooks.json"
         self.launch_agent = self.home / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
         self.runtime_root = self.home / ".local" / "share" / f"{SERVER_NAME}-runtime"
         self.releases = self.runtime_root / "releases"
@@ -714,14 +807,41 @@ class Installer:
             if root.exists() and not root.resolve(strict=True).is_relative_to(self.home):
                 raise SettingsError("runtime ownership is invalid")
 
+    def _managed_root(self, path: Path) -> Path | None:
+        resolved = path.resolve(strict=False)
+        roots: tuple[Path, ...] = (self.codex_home, self.home)
+        if self.claude_config_dir is not None:
+            roots = (*roots, self.claude_config_dir)
+        for root in sorted(roots, key=lambda item: len(item.parts), reverse=True):
+            if resolved.is_relative_to(root):
+                return root
+        return None
+
+    def _codex_native_queue_enabled(self) -> bool:
+        if self.codex_native_queue is not None:
+            return self.codex_native_queue
+        try:
+            hooks = _json_object(self.codex_hooks)
+        except SettingsError:
+            return False
+        raw_hooks = hooks.get("hooks")
+        if not isinstance(raw_hooks, dict):
+            return False
+        session_start = raw_hooks.get("SessionStart")
+        if not isinstance(session_start, list):
+            return False
+        owned = [item for item in session_start if _owned_hook(item)]
+        return len(owned) == 1 and _owned_hook_native_queue(owned[0])
+
     def _ensure_durable_parent(self, parent: Path) -> None:
-        if not self.home.exists():
-            self.home.mkdir(mode=0o700, exist_ok=True)
         resolved = parent.resolve(strict=False)
-        if not resolved.is_relative_to(self.home):
-            raise SettingsError("managed path parent escapes home")
-        current = self.home
-        for part in resolved.relative_to(self.home).parts:
+        root = self._managed_root(resolved)
+        if root is None:
+            raise SettingsError("managed path parent escapes home and active configuration roots")
+        if not root.exists():
+            root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        current = root
+        for part in resolved.relative_to(root).parts:
             current /= part
             if current.exists():
                 if not current.is_dir():
@@ -734,7 +854,7 @@ class Installer:
         current = resolved
         while True:
             _fsync_directory(current)
-            if current == self.home:
+            if current == root:
                 return
             current = current.parent
 
@@ -912,11 +1032,18 @@ class Installer:
         servers[SERVER_NAME] = _mcp_route(self.executable, "claude", self.device)
 
         codex_hooks = _json_object(self.codex_hooks)
+        codex_native_queue = self._codex_native_queue_enabled()
         for event in ("SessionStart", "SessionEnd", "Stop"):
             _merge_hook(
                 codex_hooks,
                 event,
-                _hook_group(self.executable, "codex", self.device, event),
+                _hook_group(
+                    self.executable,
+                    "codex",
+                    self.device,
+                    event,
+                    codex_native_queue=codex_native_queue,
+                ),
             )
         raw_hook_map = codex_hooks.get("hooks")
         if not isinstance(raw_hook_map, dict):
@@ -945,6 +1072,7 @@ class Installer:
             self.device,
             self.codex_hooks,
             hook_indices,
+            codex_native_queue=codex_native_queue,
         )
 
         return {
@@ -963,8 +1091,7 @@ class Installer:
         destination = root / f"{stamp}-{uuid4().hex[:8]}"
         ensure_private_dir(destination)
         manifest: dict[str, object] = {
-            str(path.relative_to(self.home)): _snapshot_json(snapshot)
-            for path, snapshot in originals.items()
+            self._backup_key(path): _snapshot_json(snapshot) for path, snapshot in originals.items()
         }
         _atomic_write(destination / "manifest.json", _json_bytes(manifest))
         _fsync_directory(root)
@@ -973,6 +1100,15 @@ class Installer:
         _fsync_directory(self.home)
         return destination
 
+    def _backup_key(self, path: Path) -> str:
+        if self.claude_config_dir is not None and path.is_relative_to(self.claude_config_dir):
+            return f"CLAUDE_CONFIG_DIR/{path.relative_to(self.claude_config_dir)}"
+        if path.is_relative_to(self.home):
+            return str(path.relative_to(self.home))
+        if path.is_relative_to(self.codex_home):
+            return f"CODEX_HOME/{path.relative_to(self.codex_home)}"
+        raise SettingsError("backup path is outside active configuration roots")
+
     def _configuration_destinations(self) -> dict[Path, Path]:
         destinations: dict[Path, Path] = {}
         for path in self.config_paths:
@@ -980,8 +1116,10 @@ class Installer:
                 destination = path.resolve(strict=False)
             except (OSError, RuntimeError) as error:
                 raise SettingsError(f"managed configuration path is invalid: {path}") from error
-            if not destination.is_relative_to(self.home):
-                raise SettingsError(f"managed configuration path escapes home: {path}")
+            if self._managed_root(destination) is None:
+                raise SettingsError(
+                    f"managed configuration path escapes home and active roots: {path}"
+                )
             destinations[path] = destination
         return destinations
 
@@ -1081,12 +1219,21 @@ class Installer:
         for relative, encoded in manifest.items():
             if not isinstance(relative, str):
                 raise SettingsError("backup manifest is invalid")
-            relative_path = Path(relative)
-            destination = self.home / relative_path
+            if relative.startswith("CODEX_HOME/"):
+                relative_path = Path(relative.removeprefix("CODEX_HOME/"))
+                destination = self.codex_home / relative_path
+            elif relative.startswith("CLAUDE_CONFIG_DIR/"):
+                if self.claude_config_dir is None:
+                    raise SettingsError("backup manifest is invalid")
+                relative_path = Path(relative.removeprefix("CLAUDE_CONFIG_DIR/"))
+                destination = self.claude_config_dir / relative_path
+            else:
+                relative_path = Path(relative)
+                destination = self.home / relative_path
             if (
                 relative_path.is_absolute()
                 or ".." in relative_path.parts
-                or not destination.parent.resolve(strict=False).is_relative_to(self.home)
+                or self._managed_root(destination.parent) is None
             ):
                 raise SettingsError("backup manifest is invalid")
             if isinstance(encoded, dict):
@@ -1751,9 +1898,14 @@ class Installer:
             if launch_agent != plistlib.loads(self._launch_agent_payload()):
                 return False
             self._install_metadata(settings)
-            for config, events in (
-                (settings, ("SessionStart", "SessionEnd")),
-                (codex_hooks, ("SessionStart", "SessionEnd", "Stop")),
+            for config, provider, events, native_queue in (
+                (settings, "claude", ("SessionStart", "SessionEnd"), False),
+                (
+                    codex_hooks,
+                    "codex",
+                    ("SessionStart", "SessionEnd", "Stop"),
+                    self._codex_native_queue_enabled(),
+                ),
             ):
                 raw_hooks = config.get("hooks")
                 if not isinstance(raw_hooks, dict):
@@ -1762,7 +1914,16 @@ class Installer:
                     groups = raw_hooks.get(event)
                     if not isinstance(groups, list):
                         return False
-                    if len([item for item in groups if _owned_hook(item)]) != 1:
+                    owned = [item for item in groups if _owned_hook(item)]
+                    if owned != [
+                        _hook_group(
+                            self.executable,
+                            provider,
+                            self.device,
+                            event,
+                            codex_native_queue=native_queue,
+                        )
+                    ]:
                         return False
             return True
         except (
@@ -2198,9 +2359,34 @@ class Installer:
 
         shutdown_couriers(self.state)
 
-    def _remove_runtime_state(self) -> None:
-        if self.state.exists():
-            shutil.rmtree(self.state)
+    def _remove_runtime_state(self) -> bool:
+        """Retire transient routes without erasing durable delivery intent evidence.
+
+        Returns whether durable intent state remains for the owner to inspect.
+        """
+        if not self.state.exists():
+            return False
+        if self.state.is_symlink() or not self.state.is_dir():
+            raise SettingsError("runtime state ownership is invalid")
+        routes = self.state / "routes.json"
+        if routes.is_symlink() or routes.is_file():
+            routes.unlink()
+        elif routes.exists():
+            raise SettingsError("transient route state is invalid")
+        intents = self.state / "intents.json"
+        if intents.exists() or intents.is_symlink():
+            return True
+        shutil.rmtree(self.state)
+        return False
+
+    def _other_profile_install_states(self) -> bool:
+        if not self.install_state.parent.exists():
+            return False
+        return any(
+            candidate != self.install_state
+            for candidate in self.install_state.parent.glob("install*.json")
+            if candidate.is_file() and not candidate.is_symlink()
+        )
 
     def _prepare_runtime_removal(
         self,
@@ -2335,11 +2521,11 @@ class Installer:
         with suppress(OSError):
             self.runtime_root.rmdir()
 
-    def uninstall(self) -> None:
+    def uninstall(self) -> bool:
         with self._exclusive_lock():
-            self._uninstall()
+            return self._uninstall()
 
-    def _uninstall(self) -> None:
+    def _uninstall(self) -> bool:
         self._codex_config_text()
         self._recover_unfinished_transaction()
         destinations = self._configuration_destinations()
@@ -2349,11 +2535,18 @@ class Installer:
             self.home / cast(str, item)
             for item in cast(list[object], metadata["managed_entrypoints"])
         )
-        runtime_removal = self._prepare_runtime_removal(stable_entrypoint, managed_entrypoints)
-        broker_was_loaded = self.broker_is_loaded()
-        self._stop_broker()
-        self._stop_couriers()
-        self._remove_runtime_state()
+        other_profile_installs = self._other_profile_install_states()
+        runtime_removal = (
+            None
+            if other_profile_installs
+            else self._prepare_runtime_removal(stable_entrypoint, managed_entrypoints)
+        )
+        broker_was_loaded = False if other_profile_installs else self.broker_is_loaded()
+        durable_intents_preserved = (self.state / "intents.json").exists()
+        if not other_profile_installs:
+            self._stop_broker()
+            self._stop_couriers()
+            durable_intents_preserved = self._remove_runtime_state()
         for attempt in range(5):
             destinations = self._configuration_destinations()
             codex_hooks = _json_object(destinations[self.codex_hooks])
@@ -2419,14 +2612,17 @@ class Installer:
             _json_bytes(codex_hooks),
             mode=_shared_path_mode(codex_hooks_destination),
         )
-        destinations[self.launch_agent].unlink(missing_ok=True)
-        self.legacy_peers.unlink(missing_ok=True)
-        if self.cache.exists():
+        if not other_profile_installs:
+            destinations[self.launch_agent].unlink(missing_ok=True)
+            self.legacy_peers.unlink(missing_ok=True)
+        if self.cache.exists() and not other_profile_installs:
             shutil.rmtree(self.cache)
-        self._remove_installed_runtime(runtime_removal)
+        if not other_profile_installs:
+            self._remove_installed_runtime(runtime_removal)
         destinations[self.install_state].unlink(missing_ok=True)
         with suppress(OSError):
             self.install_state.parent.rmdir()
+        return durable_intents_preserved
 
 
 def discover_executable(invoked_as: Path | None = None) -> Path:
