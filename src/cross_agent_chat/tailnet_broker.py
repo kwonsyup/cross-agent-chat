@@ -237,13 +237,15 @@ def broker_server(state_root_value: str | None) -> None:
             while True:
                 current_bindings = broker_bindings()
                 desired_tailnet = current_bindings[1] if len(current_bindings) == 2 else None
+                if tailnet_server is not None and desired_tailnet != tailnet_binding:
+                    servers.remove(tailnet_server)
+                    tailnet_server.close()
+                    tailnet_server = None
+                    tailnet_binding = None
                 if desired_tailnet is not None and desired_tailnet != tailnet_binding:
                     replacement = bind_broker_listener(desired_tailnet, allow_unavailable=True)
                     if replacement is not None:
                         servers.append(replacement)
-                        if tailnet_server is not None:
-                            servers.remove(tailnet_server)
-                            tailnet_server.close()
                         tailnet_server = replacement
                         tailnet_binding = desired_tailnet
                 readable, _, _ = select.select(servers, [], [], TAILNET_BIND_RETRY_SECONDS)

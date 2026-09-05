@@ -17,6 +17,10 @@ TAILNET_PORT: Final = 47071
 LOCAL_BROKER_HOST: Final = "127.0.0.1"
 LOCAL_BROKER_PORT: Final = 47072
 TAILSCALE_APP_BINARY: Final = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+TAILSCALE_STANDALONE_BINARIES: Final = (
+    Path("/opt/homebrew/bin/tailscale"),
+    Path("/usr/local/bin/tailscale"),
+)
 IFCONFIG_BINARY: Final = Path("/sbin/ifconfig")
 
 
@@ -134,6 +138,9 @@ def tailscale_binary() -> Path | None:
     """Find an executable Tailscale CLI without modifying the user's PATH."""
     candidate = shutil.which("tailscale")
     paths = [Path(candidate)] if candidate is not None else []
+    # launchd does not inherit the shell's Homebrew PATH. Prefer the installed
+    # standalone CLI before the GUI binary, which may not answer from launchd.
+    paths.extend(TAILSCALE_STANDALONE_BINARIES)
     paths.append(TAILSCALE_APP_BINARY)
     for path in paths:
         try:
@@ -218,12 +225,23 @@ def tailnet_nodes() -> list[str]:
 def local_tailnet_address() -> str | None:
     """Return this Mac's Tailnet IPv4 address without changing Tailscale state."""
     output = _status_output()
+    address: str | None
     if output is None:
-        return None
-    try:
-        address = parse_local_tailnet_address(output)
-    except ChatError:
-        return None
+        # Setup captured this exact address from Tailscale's own Self identity.
+        # Its continued presence is sufficient when the status CLI is unavailable;
+        # an arbitrary CGNAT tunnel must never replace the captured identity.
+        configured = os.environ.get("CROSS_AGENT_CHAT_TAILNET_ADDRESS")
+        if configured is None:
+            return None
+        try:
+            address = valid_tailnet_address(configured)
+        except ChatError:
+            return None
+    else:
+        try:
+            address = parse_local_tailnet_address(output)
+        except ChatError:
+            return None
     if address is None:
         return None
     interfaces = _ifconfig_output()

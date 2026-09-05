@@ -821,3 +821,66 @@ def test_cli_has_private_tailnet_broker_entrypoint(tmp_path: Path) -> None:
 
     assert arguments.command == "_broker"
     assert arguments.state_root == str(tmp_path)
+
+
+def test_launchd_path_prefers_installed_standalone_tailscale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import tailnet
+
+    standalone, gui = tmp_path / "standalone", tmp_path / "gui"
+    for binary in (standalone, gui):
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o700)
+    monkeypatch.setattr("cross_agent_chat.tailnet.shutil.which", lambda _: None)
+    monkeypatch.setattr(tailnet, "TAILSCALE_STANDALONE_BINARIES", (standalone,))
+    monkeypatch.setattr(tailnet, "TAILSCALE_APP_BINARY", gui)
+    assert tailnet.tailscale_binary() == standalone
+
+
+def test_unavailable_status_uses_only_exact_previously_validated_interface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cross_agent_chat import tailnet
+
+    monkeypatch.setattr(tailnet, "_status_output", lambda: None)
+    monkeypatch.setenv("CROSS_AGENT_CHAT_TAILNET_ADDRESS", "100.64.0.13")
+    monkeypatch.setattr(
+        tailnet, "_ifconfig_output", lambda: "utun8: flags\n  inet 100.64.0.14 netmask 0xffffffff\n"
+    )
+    assert tailnet.local_tailnet_address() is None
+    monkeypatch.setattr(
+        tailnet, "_ifconfig_output", lambda: "utun8: flags\n  inet 100.64.0.13 netmask 0xffffffff\n"
+    )
+    assert tailnet.local_tailnet_address() == "100.64.0.13"
+    monkeypatch.setattr(tailnet, "_status_output", lambda: json.dumps({"BackendState": "Stopped"}))
+    assert tailnet.local_tailnet_address() is None
+
+
+def test_broker_revokes_listener_when_verified_identity_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local, private = mock.Mock(), mock.Mock()
+    listeners = iter((local, private))
+    bindings = iter(([("127.0.0.1", 47072), ("100.64.0.13", 47071)], [("127.0.0.1", 47072)]))
+    observed: list[list[object]] = []
+    monkeypatch.setattr(
+        tailnet_broker_module, "bind_broker_listener", lambda *args, **kwargs: next(listeners)
+    )
+    monkeypatch.setattr(tailnet_broker_module, "broker_bindings", lambda: next(bindings))
+
+    def ready(
+        servers: list[object], *_args: object
+    ) -> tuple[list[object], list[object], list[object]]:
+        observed.append(list(servers))
+        if len(observed) == 2:
+            private.close.assert_called_once_with()
+            raise RuntimeError("stop fixture")
+        return [], [], []
+
+    monkeypatch.setattr(select, "select", ready)
+    with pytest.raises(RuntimeError, match="stop fixture"):
+        broker_server(str(tmp_path))
+    assert observed == [[local, private], [local]]
+    private.close.assert_called_once_with()
+    local.close.assert_called_once_with()

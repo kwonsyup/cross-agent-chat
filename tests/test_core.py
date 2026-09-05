@@ -25,6 +25,7 @@ from cross_agent_chat.core import (
     authenticate_sender,
     bounded_message,
     resolve_target,
+    session_key,
 )
 from cross_agent_chat.runtime import (
     HEALTH_TIMEOUT_SECONDS,
@@ -963,3 +964,78 @@ def test_remote_discovery_uses_one_deadline_for_queued_workers(
         assert len(started) <= 16
     finally:
         release.set()
+
+
+def test_stale_generation_cleanup_never_removes_new_owner(tmp_path: Path) -> None:
+    old = route(tmp_path, pid=os.getpid())
+    newer = replace(old, generation=str(uuid4()))
+    registry = Registry(tmp_path / "state")
+    registry.upsert(newer)
+    registry.remove(old.provider, old.session_id, old.pid, generation=old.generation)
+    assert registry.routes() == [newer]
+
+
+def test_concurrent_registration_failure_preserves_successful_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    hook = {"hook_event_name": "SessionStart", "session_id": str(uuid4()), "cwd": str(tmp_path)}
+    root = tmp_path / "state"
+    entered, release = threading.Event(), threading.Event()
+    spawned: list[Route] = []
+
+    def spawn(_root: Path, owned: Route) -> None:
+        spawned.append(owned)
+        if len(spawned) == 1:
+            entered.set()
+            assert release.wait(2)
+            raise ChatError("first launch failed")
+
+    monkeypatch.setattr(runtime, "hook_input", lambda _: hook)
+    monkeypatch.setattr(runtime, "_spawn_courier", spawn)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        first = workers.submit(runtime.register, "codex", "studio", os.getpid(), str(root))
+        assert entered.wait(2)
+        second = workers.submit(runtime.register, "codex", "studio", os.getpid(), str(root))
+        try:
+            time.sleep(0.05)
+            assert len(spawned) == 1
+        finally:
+            release.set()
+        with pytest.raises(ChatError, match="first launch failed"):
+            first.result(timeout=2)
+        replacement = second.result(timeout=2)
+    assert replacement is not None
+    assert Registry(root).routes() == [replacement]
+
+
+def test_disappeared_courier_closes_intent_as_pre_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    root = tmp_path / "state"
+    source = route(tmp_path, project="source", pid=os.getpid())
+    destination = route(tmp_path, project="target", pid=os.getpid())
+    for owned in (source, destination):
+        Registry(root).upsert(owned)
+    target = Target(
+        alias=destination.alias,
+        provider=destination.provider,
+        device=destination.device,
+        project=destination.project,
+        generation=destination.generation,
+        session_key=session_key(destination.provider, destination.session_id),
+        remote=False,
+        session_id=destination.session_id,
+        cwd=destination.cwd,
+        pid=destination.pid,
+    )
+    monkeypatch.setattr(runtime, "local_targets", lambda _: [target])
+    with pytest.raises(ChatError) as error:
+        runtime.send(root, source, target.alias, "never sent")
+    assert not isinstance(error.value, UnknownDeliveryError)
+    store = IntentStore(root)
+    assert [item.status for item in store.intents()] == ["PRE_EFFECT_REJECTED"]
+    assert store.begin(source, destination, source_alias=source.alias, payload_digest="b" * 64)

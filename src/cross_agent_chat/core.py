@@ -448,13 +448,16 @@ class Registry:
             atomic_json(self.path, [item.to_dict() for item in [*retained, route]])
             return route
 
-    def remove(self, provider: Provider, session_id: str, pid: int) -> None:
+    def remove(
+        self, provider: Provider, session_id: str, pid: int, *, generation: str | None = None
+    ) -> None:
         with state_lock(self.root, "routes"):
             existing = self.routes()
             retained = [
                 item
                 for item in existing
                 if (item.provider, item.session_id, item.pid) != (provider, session_id, pid)
+                or (generation is not None and item.generation != generation)
             ]
             atomic_json(self.path, [item.to_dict() for item in retained])
 

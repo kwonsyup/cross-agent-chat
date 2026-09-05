@@ -54,6 +54,7 @@ from cross_agent_chat.core import (
     canonical_cwd,
     ensure_private_dir,
     session_key,
+    state_lock,
     valid_device,
     valid_name,
     valid_uuid,
@@ -208,12 +209,16 @@ def request_socket(
 ) -> dict[str, object]:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(timeout)
+    attempted_write = False
     try:
         require_socket(path)
         client.connect(str(path))
+        attempted_write = True
         emit_frame(client, payload)
         raw = json.loads(read_frame(client))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError) as error:
+        if not attempted_write:
+            raise ChatError("session courier is unavailable before delivery") from error
         raise UnknownDeliveryError("delivery state is unknown") from error
     finally:
         client.close()
@@ -230,13 +235,17 @@ def request_tailnet(
     timeout: float = 2.0,
 ) -> dict[str, object]:
     """Exchange one bounded frame with a Tailnet broker."""
+    attempted_write = False
     try:
         client = socket.create_connection((address, port), timeout=timeout)
         client.settimeout(timeout)
         with client:
+            attempted_write = True
             emit_frame(client, payload)
             raw: object = json.loads(read_frame(client))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError) as error:
+        if not attempted_write:
+            raise ChatError("Tailnet peer is unavailable before delivery") from error
         raise UnknownDeliveryError("Tailnet delivery state is unknown") from error
     if not isinstance(raw, dict):
         raise UnknownDeliveryError("Tailnet delivery state is unknown")
@@ -335,7 +344,7 @@ def _spawn_courier(root: Path, route: Route) -> None:
             if response.get("status") == "READY":
                 return
             time.sleep(0.02)
-        except UnknownDeliveryError:
+        except ChatError:
             time.sleep(0.02)
     process.terminate()
     raise ChatError("session courier did not become ready")
@@ -360,42 +369,45 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
         profile_root=recipient_profile_root(provider),
     )
     root = state_root(state_root_value)
-    registry = Registry(root)
-    registry.compact_dead()
-    registered = registry.upsert_or_reuse_live_owner(route)
-    if registered != route:
+    with state_lock(root, "register-" + session_key(route.provider, route.session_id)):
+        registry = Registry(root)
+        registry.compact_dead()
+        registered = registry.upsert_or_reuse_live_owner(route)
+        if registered != route:
+            try:
+                health = request_socket(
+                    socket_path(root, registered),
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "operation": "health",
+                        "generation": registered.generation,
+                    },
+                    timeout=0.5,
+                )
+            except ChatError as error:
+                cause = error.__cause__
+                missing = not socket_path(root, registered).exists()
+                refused = isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
+                if not missing and not refused:
+                    # A busy courier may still own an accepted provider effect. A
+                    # health timeout is not evidence authorizing queue replacement.
+                    return registered
+                registry.upsert(route)
+            else:
+                if (
+                    health.get("status") == "READY"
+                    and health.get("generation") == registered.generation
+                ):
+                    return registered
+                raise ChatError("existing courier ownership could not be verified")
         try:
-            health = request_socket(
-                socket_path(root, registered),
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "operation": "health",
-                    "generation": registered.generation,
-                },
-                timeout=0.5,
+            _spawn_courier(root, route)
+        except ChatError:
+            Registry(root).remove(
+                route.provider, route.session_id, route.pid, generation=route.generation
             )
-        except UnknownDeliveryError as error:
-            cause = error.__cause__
-            missing = not socket_path(root, registered).exists()
-            refused = isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
-            if not missing and not refused:
-                # A busy courier may still own an accepted provider effect. A
-                # health timeout is not evidence authorizing queue replacement.
-                return registered
-            registry.upsert(route)
-        else:
-            if (
-                health.get("status") == "READY"
-                and health.get("generation") == registered.generation
-            ):
-                return registered
-            raise ChatError("existing courier ownership could not be verified")
-    try:
-        _spawn_courier(root, route)
-    except ChatError:
-        Registry(root).remove(route.provider, route.session_id, route.pid)
-        raise
-    return route
+            raise
+        return route
 
 
 def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
@@ -414,7 +426,7 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
     if len(routes) != 1:
         raise ChatError("exact session route is unavailable")
     route = routes[0]
-    Registry(root).remove(route.provider, route.session_id, route.pid)
+    Registry(root).remove(route.provider, route.session_id, route.pid, generation=route.generation)
     try:
         request_socket(
             socket_path(root, route),
@@ -424,7 +436,7 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
                 "generation": route.generation,
             },
         )
-    except UnknownDeliveryError:
+    except ChatError:
         return
 
 
@@ -700,7 +712,7 @@ def _local_target(
             {"schema_version": 1, "operation": "health", "generation": route.generation},
             timeout=timeout,
         )
-    except UnknownDeliveryError:
+    except ChatError:
         return None
     alias = response.get("alias")
     if (
@@ -976,6 +988,9 @@ def _send_local_target(
         raise UnknownDeliveryError(
             f"delivery state is unknown for event {event_id}; do not retry automatically"
         ) from None
+    except ChatError:
+        store.mark(event_id, "PRE_EFFECT_REJECTED")
+        raise
     expected = {
         "schema_version": 1,
         "event_id": event_id,
@@ -1056,6 +1071,9 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
         raise UnknownDeliveryError(
             f"remote delivery state is unknown for event {event_id}; do not retry automatically"
         ) from error
+    except ChatError:
+        store.mark(event_id, "PRE_EFFECT_REJECTED")
+        raise
     rejection = pre_effect_error(response, event_id, target.provider)
     if rejection is not None:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
@@ -1252,7 +1270,7 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
                 "event_ids": [item["event_id"] for item in messages],
             },
         )
-    except UnknownDeliveryError:
+    except ChatError:
         return
 
 

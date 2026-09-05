@@ -19,8 +19,9 @@
 - Drain Codex courier queues in whole bounded frame batches, preserving ordered remainder for a
   later natural provider boundary.
 - Align the Codex MCP tool timeout with the bounded remote delivery operation.
-- Bind private broker listeners only after a running Tailscale status establishes the active address;
-  a generic CGNAT tunnel or persisted address alone is insufficient.
+- Bind private listeners only to Tailscale-verified identities with an exact live interface match.
+  Canonical launches find the standalone Tailscale CLI, and identity loss revokes the listener; a
+  generic CGNAT tunnel or persisted address without a matching interface is insufficient.
 
 ## 0.1.3 - 2026-09-02
 
