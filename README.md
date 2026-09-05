@@ -14,6 +14,8 @@ not already have a compatible one. Start fresh Claude or Codex sessions, then as
 Cross Agent Chat follows the provider processes you already use. There are no peer files,
 copied provider credentials, Cross Agent Chat accounts, or terminal-specific extensions.
 Local sessions work without Tailscale; permitted online Tailnet Macs appear automatically.
+Use the exact recipient returned by `chat_peers`. Fuzzy names are checked across devices;
+multiple matches or incomplete remote discovery require a more precise recipient.
 
 Disposable worker launchers can set `CROSS_AGENT_CHAT_PRESENCE=off`. That worker remains out
 of Cross Agent Chat's peer roster and creates no route or courier; ordinary sessions remain
@@ -45,6 +47,10 @@ perimeter. Messages are still delivered as untrusted peer/user input, not system
 - A deterministic pre-effect error means no message effect occurred; correct it and send
   fresh.
 
+`chat_peers` also reports each recipient's observed delivery mode: Claude native messaging,
+Codex Stop-bound delivery, or the experimental Codex queue. Older couriers report `unknown`.
+The mode identifies the active adapter; it does not establish consumption or a reply.
+
 Codex uses natural Stop delivery by default. An explicit, profile-local experimental queue can
 be enabled for fresh Codex sessions; it uses Codex's version-bound stdio app-server
 `thread/queue/add` interface, whose provider owns queued message bodies. The Cross Agent Chat
@@ -65,12 +71,19 @@ cross-agent-chat peers --json
 cross-agent-chat uninstall
 ```
 
-Running the installer again upgrades and repairs the owned configuration. `uninstall`
+Running the installer again upgrades and repairs the owned configuration. An upgrade or
+uninstall transitions the shared broker and couriers; schedule it when sessions using that
+installation can safely stop. A temporary profile does not isolate that shared service.
+`uninstall`
 removes only Cross Agent Chat-owned runtime, hooks, MCP routes, service, and transient route
 state, and restores the prior shared Claude inbound setting. Durable content-free delivery intents
 remain intact, including unresolved delivery records; uninstall never resolves or replays them.
-When another configured profile remains, uninstall keeps the shared runtime and broker for that
-profile while removing only the selected profile's hooks and MCP routes.
+When another configured profile remains, uninstall keeps the shared runtime and broker.
+Shared provider files, including symlinked files, retain their integration until their last
+recorded owner is removed. The last owner restores the recorded original Claude inbound and
+Codex hooks settings while retaining unrelated settings. Older install records that lack file
+ownership information are handled conservatively; unavailable original values are not invented.
+Sharing a Codex config file while using different hook files is rejected before setup writes.
 
 `setup` uses the active provider roots: by default Claude reads `~/.claude/settings.json` and
 `~/.claude.json`, while an explicit `CLAUDE_CONFIG_DIR=/path/to/profile` reads

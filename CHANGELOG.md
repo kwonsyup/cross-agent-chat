@@ -1,7 +1,16 @@
 # Changelog
 
-## 0.1.4 - 2026-09-04
+## 0.1.4 - 2026-09-05
 
+- Resolve fuzzy destinations across local and remote peers before creating a delivery intent.
+  Exact local recipients retain the fast path; incomplete discovery does not silently choose
+  a fuzzy local recipient.
+- Preserve provider integration files shared by profile pairs or symlink aliases until their
+  last recorded owner is removed, including original inbound and hooks-setting restoration.
+- Report observed per-recipient delivery modes automatically through `chat_peers`, with
+  negotiated compatibility and `unknown` for older couriers.
+- Isolate lifecycle tests from real services, provider settings, processes, and courier sockets.
+- Preserve accepted, rejected, and unknown durable delivery records through lifecycle changes.
 - Bind Claude setup to the active `CLAUDE_CONFIG_DIR` and Codex setup to the active `CODEX_HOME`,
   with profile-scoped installer state and recoverable backups for explicit roots.
 - Add an explicit `setup --enable-experimental-codex-native-queue` opt-in that persists only in

@@ -948,11 +948,11 @@ def test_remote_discovery_uses_one_deadline_for_queued_workers(
     release = threading.Event()
     started: list[str] = []
 
-    def wait_for_peer(address: str, deadline: float | None = None) -> list[Target]:
+    def wait_for_peer(address: str, deadline: float | None = None) -> tuple[list[Target], bool]:
         assert deadline is not None
         started.append(address)
         release.wait(1)
-        return []
+        return [], True
 
     monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [str(i) for i in range(48)])
     monkeypatch.setattr(runtime, "_remote_node_targets", wait_for_peer)

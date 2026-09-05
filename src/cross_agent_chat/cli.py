@@ -110,7 +110,15 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                             {
                                 "name": "chat_peers",
                                 "description": (
-                                    "List exact live Claude and Codex peers before addressing one."
+                                    "Discover exact live Claude and "
+                                    "Codex recipients for requested "
+                                    "communication. Resolve across "
+                                    "devices and ask for clarification "
+                                    "when multiple peers match. Do not "
+                                    "choose a local peer merely because "
+                                    "it is local. Delivery mode reports "
+                                    "capability, not a receipt. Do not "
+                                    "call for unrelated work."
                                 ),
                                 "inputSchema": {
                                     "type": "object",
@@ -121,7 +129,19 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                             {
                                 "name": "chat_send",
                                 "description": (
-                                    "Send one asynchronous message. A reply is a separate send."
+                                    "Send one requested asynchronous "
+                                    "message to an exact verified peer. "
+                                    "A reply is a separate send. "
+                                    "TRANSPORT_ACCEPTED means custody, "
+                                    "not consumption; UNKNOWN_DELIVERY "
+                                    "must not be retried through any "
+                                    "transport. Stop-bound recipients "
+                                    "wait for a normal turn; "
+                                    "experimental queues are not "
+                                    "universal support. Do not "
+                                    "broadcast, route around permission "
+                                    "denial, change configuration, or "
+                                    "send for unrelated work."
                                 ),
                                 "inputSchema": {
                                     "type": "object",
@@ -149,7 +169,7 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                 typed_arguments = cast(dict[str, object], arguments)
                 if name == "chat_peers" and not typed_arguments:
                     assert root is not None
-                    result = peers(root)
+                    result = peers(root, include_delivery_mode=True)
                 elif name == "chat_send":
                     target, message = normalize_send_arguments(typed_arguments)
                     metadata = typed_params.get("_meta")

@@ -25,7 +25,7 @@ from concurrent.futures import (
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, cast
+from typing import Final, Literal, cast
 from uuid import uuid4
 
 from cross_agent_chat.claude_runtime import (
@@ -82,6 +82,11 @@ LOCAL_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS
 PRESENCE_ENV_VAR: Final = "CROSS_AGENT_CHAT_PRESENCE"
 PROC_PIDTBSDINFO: Final = 3
 PROC_BSDINFO_SIZE: Final = 136
+DeliveryMode = Literal[
+    "claude_native_cross_session",
+    "codex_stop_bound",
+    "codex_experimental_queue",
+]
 
 
 def recipient_profile_root(provider: str) -> str:
@@ -125,15 +130,21 @@ class Target:
     cwd: str | None = None
     pid: int | None = None
     tailnet_address: str | None = None
+    delivery_mode: DeliveryMode | None = None
 
-    def public(self) -> dict[str, str]:
-        return {
+    def public(self, *, include_delivery_mode: bool = False) -> dict[str, str]:
+        result = {
             "alias": self.alias,
             "provider": self.provider,
             "device": self.device,
             "project": self.project,
             "status": "available",
         }
+        if include_delivery_mode:
+            result["delivery_mode"] = (
+                "unknown" if self.delivery_mode is None else self.delivery_mode
+            )
+        return result
 
 
 def state_root(value: str | None = None) -> Path:
@@ -526,7 +537,19 @@ def pre_effect_error(response: dict[str, object], event_id: str, provider: Provi
     return error
 
 
-def courier_health(route: Route) -> dict[str, object]:
+def _delivery_mode(route: Route, courier: CodexCourier | None) -> DeliveryMode:
+    if route.provider == "claude":
+        return "claude_native_cross_session"
+    return (
+        "codex_experimental_queue"
+        if courier is not None and courier.native_queue
+        else "codex_stop_bound"
+    )
+
+
+def courier_health(
+    route: Route, courier: CodexCourier | None = None, *, include_delivery_mode: bool = False
+) -> dict[str, object]:
     alias = route.alias
     if route.provider == "claude":
         try:
@@ -541,12 +564,15 @@ def courier_health(route: Route) -> dict[str, object]:
                 "status": "UNAVAILABLE",
                 "generation": route.generation,
             }
-    return {
+    response: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "status": "READY",
         "generation": route.generation,
         "alias": alias,
     }
+    if include_delivery_mode:
+        response["delivery_mode"] = _delivery_mode(route, courier)
+    return response
 
 
 def courier_server(
@@ -629,7 +655,14 @@ def courier_server(
                     continue
                 operation = request.get("operation")
                 if operation == "health":
-                    emit_frame_safely(connection, courier_health(route))
+                    emit_frame_safely(
+                        connection,
+                        courier_health(
+                            route,
+                            courier,
+                            include_delivery_mode=request.get("include_delivery_mode") is True,
+                        ),
+                    )
                 elif operation == "shutdown":
                     emit_frame_safely(connection, {"schema_version": 1, "status": "STOPPED"})
                     stopping = True
@@ -709,18 +742,30 @@ def _local_target(
     try:
         response = request_socket(
             socket_path(root, route),
-            {"schema_version": 1, "operation": "health", "generation": route.generation},
+            {
+                "schema_version": 1,
+                "operation": "health",
+                "generation": route.generation,
+                "include_delivery_mode": True,
+            },
             timeout=timeout,
         )
     except ChatError:
         return None
     alias = response.get("alias")
+    expected = {"schema_version", "status", "generation", "alias"}
+    observed_mode = response.get("delivery_mode")
     if (
-        set(response) != {"schema_version", "status", "generation", "alias"}
+        set(response) not in (expected, expected | {"delivery_mode"})
         or response.get("schema_version") != SCHEMA_VERSION
         or response.get("status") != "READY"
         or response.get("generation") != route.generation
         or not isinstance(alias, str)
+        or (
+            observed_mode is not None
+            and observed_mode
+            not in {"claude_native_cross_session", "codex_stop_bound", "codex_experimental_queue"}
+        )
     ):
         return None
     if route.provider == "codex":
@@ -743,6 +788,7 @@ def _local_target(
             session_id=route.session_id,
             cwd=route.cwd,
             pid=route.pid,
+            delivery_mode=observed_mode if observed_mode is not None else None,
         )
     except ChatError:
         return None
@@ -789,7 +835,9 @@ def local_targets(root: Path) -> list[Target]:
     return [target for target in results if target is not None]
 
 
-def _targets_from_tailnet(address: str, raw: object) -> list[Target]:
+def _targets_from_tailnet(
+    address: str, raw: object, *, include_delivery_mode: bool = False
+) -> list[Target]:
     if not isinstance(raw, dict) or set(raw) != {"schema_version", "peers"}:
         raise ChatError("Tailnet peer returned invalid discovery")
     response = cast(dict[object, object], raw)
@@ -807,7 +855,8 @@ def _targets_from_tailnet(address: str, raw: object) -> list[Target]:
             "generation",
             "session_key",
         }
-        if not isinstance(raw_item, dict) or set(raw_item) != required:
+        allowed = required | ({"delivery_mode"} if include_delivery_mode else set())
+        if not isinstance(raw_item, dict) or set(raw_item) not in (required, allowed):
             raise ChatError("Tailnet peer returned invalid discovery")
         item = cast(dict[object, object], raw_item)
         provider = item.get("provider")
@@ -823,8 +872,19 @@ def _targets_from_tailnet(address: str, raw: object) -> list[Target]:
             or not all(isinstance(value, str) for value in values)
             or item.get("status") != "available"
             or not re.fullmatch(r"[0-9a-f]{64}", cast(str, item.get("session_key")))
+            or (
+                "delivery_mode" in item
+                and item["delivery_mode"]
+                not in {
+                    "claude_native_cross_session",
+                    "codex_stop_bound",
+                    "codex_experimental_queue",
+                    "unknown",
+                }
+            )
         ):
             raise ChatError("Tailnet peer returned invalid discovery")
+        observed_mode = item.get("delivery_mode")
         targets.append(
             Target(
                 alias=valid_name(cast(str, item["alias"]), "remote alias"),
@@ -835,54 +895,104 @@ def _targets_from_tailnet(address: str, raw: object) -> list[Target]:
                 session_key=cast(str, item["session_key"]),
                 remote=True,
                 tailnet_address=address,
+                delivery_mode=(
+                    cast(DeliveryMode, observed_mode)
+                    if isinstance(observed_mode, str) and observed_mode != "unknown"
+                    else None
+                ),
             )
         )
     return targets
 
 
-def _remote_node_targets(address: str, deadline: float | None = None) -> list[Target]:
+def _remote_node_targets(
+    address: str, deadline: float | None = None, *, include_delivery_mode: bool = False
+) -> tuple[list[Target], bool]:
     remaining = (
         REMOTE_DISCOVERY_TIMEOUT_SECONDS if deadline is None else deadline - time.monotonic()
     )
     if remaining <= 0:
-        return []
+        return [], False
+    request: dict[str, object] = {"schema_version": SCHEMA_VERSION, "operation": "peers"}
+    if include_delivery_mode:
+        request["include_delivery_mode"] = True
     try:
         raw = request_tailnet(
             address,
-            {"schema_version": SCHEMA_VERSION, "operation": "peers"},
+            request,
             # The remote broker may spend HEALTH_TIMEOUT_SECONDS validating local routes.
             timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining),
         )
-        return _targets_from_tailnet(address, raw)
+        return (
+            _targets_from_tailnet(address, raw, include_delivery_mode=include_delivery_mode),
+            True,
+        )
     except (ChatError, UnknownDeliveryError):
-        return []
+        if not include_delivery_mode:
+            return [], False
+        remaining = deadline - time.monotonic() if deadline is not None else 0.0
+        if remaining <= 0:
+            return [], False
+        try:
+            raw = request_tailnet(
+                address,
+                {"schema_version": SCHEMA_VERSION, "operation": "peers"},
+                timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining),
+            )
+            return _targets_from_tailnet(address, raw), True
+        except (ChatError, UnknownDeliveryError):
+            return [], False
 
 
-def remote_targets(_root: Path) -> list[Target]:
+def _remote_discovery(*, include_delivery_mode: bool = False) -> tuple[list[Target], bool]:
     addresses = tailnet_nodes()
     if not addresses:
-        return []
+        return [], False
     targets: list[Target] = []
+    complete = True
     deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
     workers = ThreadPoolExecutor(max_workers=min(16, len(addresses)))
-    futures = [workers.submit(_remote_node_targets, address, deadline) for address in addresses]
+    futures = [
+        (
+            workers.submit(
+                _remote_node_targets,
+                address,
+                deadline,
+                include_delivery_mode=True,
+            )
+            if include_delivery_mode
+            else workers.submit(_remote_node_targets, address, deadline)
+        )
+        for address in addresses
+    ]
     try:
         for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
-            targets.extend(future.result())
+            outcome = future.result()
+            discovered, node_complete = outcome
+            targets.extend(discovered)
+            complete = complete and node_complete
     except FuturesTimeoutError:
-        pass
+        complete = False
     finally:
         for future in futures:
             future.cancel()
         workers.shutdown(wait=False, cancel_futures=True)
-    return targets
+    return targets, complete
 
 
-def all_targets(root: Path, *, include_remote: bool = True) -> list[Target]:
+def remote_targets(_root: Path, *, include_delivery_mode: bool = False) -> list[Target]:
+    return _remote_discovery(include_delivery_mode=include_delivery_mode)[0]
+
+
+def all_targets(
+    root: Path, *, include_remote: bool = True, include_delivery_mode: bool = False
+) -> list[Target]:
     if include_remote:
         with ThreadPoolExecutor(max_workers=2) as workers:
             local = workers.submit(local_targets, root)
-            remote = workers.submit(remote_targets, root)
+            remote = workers.submit(
+                remote_targets, root, include_delivery_mode=include_delivery_mode
+            )
             targets = [*local.result(), *remote.result()]
     else:
         targets = local_targets(root)
@@ -903,6 +1013,12 @@ def _target_matches(target: Target, query: str) -> bool:
 def resolve_target(targets: list[Target], query: str) -> Target:
     if not query.strip() or len(query) > 160:
         raise ChatError("target query is invalid")
+    exact_matches = [target for target in targets if target.alias.casefold() == query.casefold()]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        candidates = ", ".join(target.alias for target in exact_matches)
+        raise ChatError(f"target is ambiguous or unavailable: {candidates}")
     matches = [target for target in targets if _target_matches(target, query)]
     if len(matches) != 1:
         candidates = ", ".join(target.alias for target in matches)
@@ -1018,13 +1134,25 @@ def send_local(root: Path, source: Route, target_query: str, message: str) -> di
 
 def send(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
     deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
-    local_matches = [
-        target for target in local_targets(root) if _target_matches(target, target_query)
+    local = local_targets(root)
+    exact_local_matches = [
+        target for target in local if target.alias.casefold() == target_query.casefold()
     ]
-    if local_matches:
-        target = resolve_target(local_matches, target_query)
+    if len(exact_local_matches) == 1:
+        target = exact_local_matches[0]
         return _send_local_target(root, source, target, message, deadline=deadline)
-    target = resolve_target(remote_targets(root), target_query)
+    remote, remote_complete = _remote_discovery()
+    exact_remote_matches = [
+        target for target in remote if target.alias.casefold() == target_query.casefold()
+    ]
+    if len(exact_remote_matches) == 1:
+        target = exact_remote_matches[0]
+    else:
+        if not remote_complete:
+            raise ChatError("remote peer discovery is incomplete; use an exact available recipient")
+        target = resolve_target([*local, *remote], target_query)
+    if not target.remote:
+        return _send_local_target(root, source, target, message, deadline=deadline)
     if target.tailnet_address is None:
         raise ChatError("remote target route is incomplete")
     source_alias = canonical_source_alias(root, source)
@@ -1214,11 +1342,21 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         }
 
 
-def peers(root: Path, *, include_remote: bool = True, internal: bool = False) -> dict[str, object]:
-    targets = all_targets(root, include_remote=include_remote)
+def peers(
+    root: Path,
+    *,
+    include_remote: bool = True,
+    internal: bool = False,
+    include_delivery_mode: bool = False,
+) -> dict[str, object]:
+    targets = all_targets(
+        root,
+        include_remote=include_remote,
+        include_delivery_mode=include_delivery_mode,
+    )
     items: list[dict[str, str]] = []
     for target in targets:
-        item = target.public()
+        item = target.public(include_delivery_mode=include_delivery_mode)
         if internal:
             item["generation"] = target.generation
             item["session_key"] = target.session_key

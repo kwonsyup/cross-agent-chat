@@ -73,6 +73,18 @@ def _seed_durable_intents(installer: Installer) -> bytes:
                     "status": "TRANSPORT_ACCEPTED",
                     "timestamp": "2026-09-04T00:00:01+00:00",
                 },
+                {
+                    "schema_version": 1,
+                    "event_id": "00000000-0000-4000-8000-000000000007",
+                    "source_key": "1" * 64,
+                    "source_generation": "00000000-0000-4000-8000-000000000008",
+                    "source_alias": "claude@studio:rejected:00000000",
+                    "target_key": "2" * 64,
+                    "target_generation": "00000000-0000-4000-8000-000000000009",
+                    "payload_digest": "3" * 64,
+                    "status": "PRE_EFFECT_REJECTED",
+                    "timestamp": "2026-09-04T00:00:02+00:00",
+                },
             ],
             indent=2,
         ).encode()
@@ -2447,7 +2459,7 @@ def test_staged_upgrade_persists_entrypoint_selected_for_transition(
     installer.install_staged(stage, selected_stable)
 
     metadata = json.loads(installer.install_state.read_text())
-    assert metadata["schema_version"] == 3
+    assert metadata["schema_version"] == 4
     assert metadata["stable_entrypoint"] == str(selected_stable.relative_to(home))
     assert set(metadata["managed_entrypoints"]) == {
         str(previous_stable.relative_to(home)),
@@ -4250,7 +4262,7 @@ def test_uninstall_preserves_durable_intents_without_resolving_them(
     assert (installer.state / "intents.json").read_bytes() == original
     assert (installer.state / ".intents.lock").exists()
     statuses = {item["status"] for item in json.loads(original)}
-    assert statuses == {"UNKNOWN_DELIVERY", "TRANSPORT_ACCEPTED"}
+    assert statuses == {"PRE_EFFECT_REJECTED", "UNKNOWN_DELIVERY", "TRANSPORT_ACCEPTED"}
     assert not installer.launch_agent.exists()
 
 

@@ -115,6 +115,18 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
             raise ChatError("Tailnet broker request is invalid")
         valid_tailnet_address(peer_address)
         return peers(root, include_remote=False, internal=True)
+    if operation == "peers" and set(request) == {
+        "schema_version",
+        "operation",
+        "include_delivery_mode",
+    }:
+        if (
+            request.get("schema_version") != SCHEMA_VERSION
+            or request.get("include_delivery_mode") is not True
+        ):
+            raise ChatError("Tailnet broker request is invalid")
+        valid_tailnet_address(peer_address)
+        return peers(root, include_remote=False, internal=True, include_delivery_mode=True)
     authorization_fields = {
         "schema_version",
         "operation",
