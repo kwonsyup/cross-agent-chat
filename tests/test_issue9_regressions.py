@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+import cross_agent_chat.install as install_module
 from cross_agent_chat import runtime
 from cross_agent_chat.core import ChatError, Route
 from cross_agent_chat.install import Installer, SettingsError
@@ -318,11 +319,79 @@ def test_shared_codex_config_with_distinct_hooks_fails_before_second_setup(
     first.setup()
     before = shared_config.read_bytes()
 
-    with pytest.raises(SettingsError, match=r"distinct hooks\.json"):
+    with pytest.raises(SettingsError, match="same profile ownership"):
         second.setup()
 
     assert shared_config.read_bytes() == before
     assert first.verify_configuration()
+
+
+def test_shared_codex_hooks_with_distinct_configs_fails_before_second_setup(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    first_root = tmp_path / "codex-one"
+    second_root = tmp_path / "codex-two"
+    first_root.mkdir()
+    second_root.mkdir()
+    shared_hooks = first_root / "shared-hooks.json"
+    shared_hooks.write_text("{}")
+    (first_root / "hooks.json").symlink_to(shared_hooks)
+    (second_root / "hooks.json").symlink_to(shared_hooks)
+    first = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        codex_home=first_root,
+        codex_native_queue=False,
+    )
+    second = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        codex_home=second_root,
+        codex_native_queue=True,
+    )
+    first.setup()
+    before = shared_hooks.read_bytes()
+
+    with pytest.raises(SettingsError, match="same profile ownership"):
+        second.setup()
+
+    assert shared_hooks.read_bytes() == before
+    assert first.verify_configuration()
+
+
+@pytest.mark.parametrize("path_name", ("claude_settings", "claude_config", "codex_hooks"))
+def test_uninstall_retries_json_cleanup_without_losing_concurrent_user_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path_name: str
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    installer.setup()
+    selected = getattr(installer, path_name)
+    original_json_object = install_module._json_object
+    calls = 0
+    inject_on_read = 1 if path_name == "claude_config" else 2
+
+    def read_then_user_writes(path: Path) -> dict[str, object]:
+        nonlocal calls
+        value = original_json_object(path)
+        if path == selected:
+            calls += 1
+            if calls == inject_on_read:
+                concurrent = original_json_object(path)
+                concurrent["concurrent_user_key"] = "keep"
+                path.write_text(json.dumps(concurrent))
+        return value
+
+    monkeypatch.setattr(install_module, "_json_object", read_then_user_writes)
+    _safe_uninstall(installer, monkeypatch)
+
+    installer.uninstall()
+
+    assert original_json_object(selected)["concurrent_user_key"] == "keep"
 
 
 def test_optional_delivery_mode_preserves_legacy_local_health_shape(
@@ -403,3 +472,132 @@ def test_last_codex_config_owner_restores_prior_hooks_feature(
     installer.uninstall()
 
     assert tomllib.loads((codex_home / "config.toml").read_text())["features"]["hooks"] is False
+
+
+@pytest.mark.parametrize(
+    "path_name",
+    ("claude_settings", "claude_config", "codex_config", "codex_hooks"),
+)
+def test_uninstall_rejects_retargeted_recorded_provider_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path_name: str
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    selected = getattr(installer, path_name)
+    selected.parent.mkdir(parents=True)
+    original = selected.parent / f"{path_name}-original"
+    replacement = selected.parent / f"{path_name}-replacement"
+    payload = "" if path_name == "codex_config" else "{}"
+    original.write_text(payload)
+    replacement.write_text(payload)
+    selected.symlink_to(original.name)
+    installer.setup()
+    before = replacement.read_bytes()
+    selected.unlink()
+    selected.symlink_to(replacement.name)
+    _safe_uninstall(installer, monkeypatch)
+
+    with pytest.raises(SettingsError, match="ownership changed"):
+        installer.uninstall()
+
+    assert replacement.read_bytes() == before
+
+
+def test_uninstall_rechecks_recorded_paths_after_broker_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    selected = installer.claude_settings
+    selected.parent.mkdir(parents=True)
+    original = selected.parent / "settings-original.json"
+    replacement = selected.parent / "settings-replacement.json"
+    original.write_text(json.dumps({"crossSessionInbound": "hold"}))
+    replacement.write_text(json.dumps({"crossSessionInbound": "accept", "user_owned": True}))
+    selected.symlink_to(original.name)
+    installer.setup()
+    before = replacement.read_bytes()
+
+    def retarget_during_stop() -> None:
+        selected.unlink()
+        selected.symlink_to(replacement.name)
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_stop_broker", retarget_during_stop)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+
+    with pytest.raises(SettingsError, match="ownership changed"):
+        installer.uninstall()
+
+    assert replacement.read_bytes() == before
+
+
+def test_uninstall_rejects_malformed_sibling_state_before_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    installer.setup()
+    malformed = installer.install_state.parent / "install-malformed.json"
+    malformed.write_text("{}")
+    monkeypatch.setattr(installer, "_stop_broker", lambda: pytest.fail("broker stop ran"))
+
+    with pytest.raises(SettingsError, match="install state is invalid"):
+        installer.uninstall()
+
+
+@pytest.mark.parametrize("path_name", ("claude_config", "codex_hooks"))
+def test_uninstall_preflights_malformed_json_before_broker_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path_name: str
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    installer.setup()
+    malformed = getattr(installer, path_name)
+    malformed.write_text("{")
+    monkeypatch.setattr(installer, "_stop_broker", lambda: pytest.fail("broker stop ran"))
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: pytest.fail("courier stop ran"))
+
+    with pytest.raises(SettingsError, match="invalid JSON"):
+        installer.uninstall()
+
+    assert malformed.read_text() == "{"
+    assert installer.install_state.exists()
+
+
+def test_uninstall_rolls_back_owned_writes_after_later_json_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    installer.setup()
+    surfaces = (
+        installer.claude_settings,
+        installer.claude_config,
+        installer.codex_config,
+        installer.codex_hooks,
+    )
+    before = {path: path.read_bytes() for path in surfaces}
+    original_atomic_write = install_module._atomic_write
+    reactivated: list[bool] = []
+
+    def fail_claude_settings(path: Path, payload: bytes, mode: int = 0o600) -> None:
+        if path == installer.claude_settings:
+            raise OSError("injected Claude settings write failure")
+        original_atomic_write(path, payload, mode)
+
+    monkeypatch.setattr(install_module, "_atomic_write", fail_claude_settings)
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "activate", lambda: reactivated.append(True))
+
+    with pytest.raises(OSError, match="injected Claude settings"):
+        installer.uninstall()
+
+    assert {path: path.read_bytes() for path in surfaces} == before
+    assert installer.install_state.exists()
+    assert reactivated == [True]

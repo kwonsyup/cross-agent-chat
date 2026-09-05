@@ -83,7 +83,8 @@ Shared provider files, including symlinked files, retain their integration until
 recorded owner is removed. The last owner restores the recorded original Claude inbound and
 Codex hooks settings while retaining unrelated settings. Older install records that lack file
 ownership information are handled conservatively; unavailable original values are not invented.
-Sharing a Codex config file while using different hook files is rejected before setup writes.
+Sharing only one of a Codex config file and its hook file across profiles is rejected before
+setup writes.
 
 `setup` uses the active provider roots: by default Claude reads `~/.claude/settings.json` and
 `~/.claude.json`, while an explicit `CLAUDE_CONFIG_DIR=/path/to/profile` reads

@@ -88,7 +88,7 @@ def _guard_subprocess_run(
 def _fixture_socket_root(request: pytest.FixtureRequest) -> Path:
     configured = os.environ.get(_SOCKET_ROOT_ENV)
     if configured is None:
-        root = Path(tempfile.mkdtemp(prefix="cac-tests-"))
+        root = Path(tempfile.mkdtemp(prefix="cac-tests-", dir="/tmp"))
         root.chmod(0o700)
         request.addfinalizer(lambda: root.rmdir())
     else:

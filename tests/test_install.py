@@ -1245,6 +1245,7 @@ def test_uninstall_re_resolves_codex_config_symlink_after_broker_stop(
     second = home / ".codex/second.toml"
     first.write_text(owned)
     second.write_text(owned + '\n[mcp_servers."user"]\ncommand = "user"\n')
+    second_before = second.read_bytes()
     installer.codex_config.unlink()
     installer.codex_config.symlink_to(first.name)
 
@@ -1255,10 +1256,11 @@ def test_uninstall_re_resolves_codex_config_symlink_after_broker_stop(
     monkeypatch.setattr(installer, "_stop_broker", stop_broker)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
 
-    installer.uninstall()
+    with pytest.raises(SettingsError, match="ownership changed"):
+        installer.uninstall()
 
     assert first.read_text() == owned
-    assert tomllib.loads(second.read_text())["mcp_servers"] == {"user": {"command": "user"}}
+    assert second.read_bytes() == second_before
 
 
 def test_uninstall_re_resolves_all_provider_symlinks_after_broker_stop(
@@ -1274,6 +1276,7 @@ def test_uninstall_re_resolves_all_provider_symlinks_after_broker_stop(
     second_payload = json.loads(owned)
     second_payload["unrelated"] = True
     second.write_text(json.dumps(second_payload))
+    second_before = second.read_bytes()
     installer.claude_settings.unlink()
     installer.claude_settings.symlink_to(first.name)
 
@@ -1284,12 +1287,11 @@ def test_uninstall_re_resolves_all_provider_symlinks_after_broker_stop(
     monkeypatch.setattr(installer, "_stop_broker", stop_broker)
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
 
-    installer.uninstall()
+    with pytest.raises(SettingsError, match="ownership changed"):
+        installer.uninstall()
 
     assert first.read_bytes() == owned
-    updated = json.loads(second.read_text())
-    assert updated["unrelated"] is True
-    assert "crossSessionInbound" not in updated
+    assert second.read_bytes() == second_before
 
 
 def test_uninstall_retries_latest_codex_config_before_owned_write(

@@ -1023,6 +1023,55 @@ class Installer:
             "codex_hooks": str(self.codex_hooks.resolve(strict=False)),
         }
 
+    def _require_recorded_provider_paths(self, recorded: dict[str, str]) -> None:
+        if self._provider_paths() != recorded:
+            raise SettingsError("provider configuration ownership changed during uninstall")
+
+    def _update_json_for_uninstall(
+        self,
+        path: Path,
+        transform: Callable[[dict[str, object]], None],
+        *,
+        recorded_paths: dict[str, str] | None,
+        writes: dict[Path, tuple[PathSnapshot, bytes]],
+    ) -> bytes:
+        for attempt in range(5):
+            if recorded_paths is not None:
+                self._require_recorded_provider_paths(recorded_paths)
+            before = path.read_bytes() if path.exists() else None
+            value = _json_object(path)
+            transform(value)
+            if recorded_paths is not None:
+                self._require_recorded_provider_paths(recorded_paths)
+            current = path.read_bytes() if path.exists() else None
+            if current != before:
+                if attempt < 4:
+                    time.sleep(0.05)
+                    continue
+                break
+            payload = _json_bytes(value)
+            writes[path] = (_snapshot_path(path), payload)
+            _atomic_write(path, payload, mode=_shared_path_mode(path))
+            return payload
+        raise SettingsError(f"provider configuration kept changing during uninstall: {path}")
+
+    def _rollback_uninstall_writes(
+        self,
+        writes: dict[Path, tuple[PathSnapshot, bytes]],
+        *,
+        broker_was_loaded: bool,
+    ) -> None:
+        for path, (snapshot, payload) in reversed(tuple(writes.items())):
+            try:
+                current = path.read_bytes() if path.exists() else None
+                if current == payload:
+                    _restore_path(snapshot)
+            except OSError:
+                continue
+        if broker_was_loaded:
+            with suppress(OSError, SettingsError):
+                self.activate()
+
     def _metadata_provider_paths(self, metadata: dict[str, object]) -> dict[str, str] | None:
         schema_version = metadata.get("schema_version")
         if schema_version in {1, 2, 3}:
@@ -1036,15 +1085,13 @@ class Installer:
         paths = cast(dict[str, object], raw_paths)
         if not all(isinstance(paths[name], str) for name in names):
             raise SettingsError("Cross Agent Chat install state is invalid")
-        canonical = {
-            name: str(Path(cast(str, paths[name])).resolve(strict=False)) for name in names
-        }
         if any(
-            not Path(value).is_absolute() or paths[name] != value
-            for name, value in canonical.items()
+            not Path(cast(str, paths[name])).is_absolute()
+            or os.path.normpath(cast(str, paths[name])) != paths[name]
+            for name in names
         ):
             raise SettingsError("Cross Agent Chat install state is invalid")
-        return canonical
+        return {name: cast(str, paths[name]) for name in names}
 
     def _remaining_profile_metadata(self) -> list[dict[str, object]]:
         if not self.install_state.parent.exists():
@@ -1092,12 +1139,11 @@ class Installer:
             paths = self._metadata_provider_paths(metadata)
             if paths is None:
                 continue
-            if (
-                paths["codex_config"] == current["codex_config"]
-                and paths["codex_hooks"] != current["codex_hooks"]
-            ):
+            shares_config = paths["codex_config"] == current["codex_config"]
+            shares_hooks = paths["codex_hooks"] == current["codex_hooks"]
+            if shares_config != shares_hooks:
                 raise SettingsError(
-                    "Codex config.toml is shared by profiles with distinct hooks.json files"
+                    "Codex config.toml and hooks.json must share the same profile ownership"
                 )
 
     def _prior_claude_cross_session_inbound(self, settings: dict[str, object]) -> dict[str, object]:
@@ -2700,9 +2746,18 @@ class Installer:
     def _uninstall(self) -> bool:
         self._codex_config_text()
         self._recover_unfinished_transaction()
+        recorded_metadata = _json_object(self.install_state)
+        recorded_schema = recorded_metadata.get("schema_version")
+        self._install_metadata(_json_object(self.claude_settings))
+        metadata = recorded_metadata
+        recorded_paths = self._metadata_provider_paths(metadata)
+        if recorded_paths is not None:
+            self._require_recorded_provider_paths(recorded_paths)
         destinations = self._configuration_destinations()
-        recorded_schema = _json_object(self.install_state).get("schema_version")
-        metadata = self._install_metadata(_json_object(self.claude_settings))
+        _json_object(destinations[self.claude_settings])
+        _json_object(destinations[self.claude_config])
+        _json_object(destinations[self.codex_hooks])
+        uninstall_writes: dict[Path, tuple[PathSnapshot, bytes]] = {}
         stable_entrypoint = self.home / cast(str, metadata["stable_entrypoint"])
         managed_entrypoints = tuple(
             self.home / cast(str, item)
@@ -2733,8 +2788,12 @@ class Installer:
             self._stop_broker()
             self._stop_couriers()
             durable_intents_preserved = self._remove_runtime_state()
+        if recorded_paths is not None:
+            self._require_recorded_provider_paths(recorded_paths)
         if not codex_config_has_remaining_owner:
             for attempt in range(5):
+                if recorded_paths is not None:
+                    self._require_recorded_provider_paths(recorded_paths)
                 destinations = self._configuration_destinations()
                 codex_hooks = _json_object(destinations[self.codex_hooks])
                 owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
@@ -2757,11 +2816,20 @@ class Installer:
                         time.sleep(0.05)
                     continue
                 codex_destination = destinations[self.codex_config]
-                _atomic_write(
-                    codex_destination,
-                    stripped.lstrip("\n").encode(),
-                    mode=_shared_path_mode(codex_destination),
-                )
+                payload = stripped.lstrip("\n").encode()
+                uninstall_writes[codex_destination] = (_snapshot_path(codex_destination), payload)
+                try:
+                    _atomic_write(
+                        codex_destination,
+                        payload,
+                        mode=_shared_path_mode(codex_destination),
+                    )
+                except (OSError, SettingsError):
+                    self._rollback_uninstall_writes(
+                        uninstall_writes,
+                        broker_was_loaded=broker_was_loaded,
+                    )
+                    raise
                 break
             else:
                 if broker_was_loaded:
@@ -2771,41 +2839,67 @@ class Installer:
                     "re-run uninstall"
                 )
         if not codex_hooks_has_remaining_owner:
-            codex_hooks = _json_object(destinations[self.codex_hooks])
-            _remove_hooks(codex_hooks)
             codex_hooks_destination = destinations[self.codex_hooks]
-            _atomic_write(
-                codex_hooks_destination,
-                _json_bytes(codex_hooks),
-                mode=_shared_path_mode(codex_hooks_destination),
-            )
+            try:
+                self._update_json_for_uninstall(
+                    codex_hooks_destination,
+                    _remove_hooks,
+                    recorded_paths=recorded_paths,
+                    writes=uninstall_writes,
+                )
+            except (OSError, SettingsError):
+                self._rollback_uninstall_writes(
+                    uninstall_writes,
+                    broker_was_loaded=broker_was_loaded,
+                )
+                raise
         if not claude_settings_has_remaining_owner:
-            claude_settings = _json_object(destinations[self.claude_settings])
-            _remove_hooks(claude_settings)
             previous = cast(dict[str, object], metadata["claude_cross_session_inbound"])
-            if claude_settings.get("crossSessionInbound") == "accept":
-                if cast(bool, previous["present"]):
-                    claude_settings["crossSessionInbound"] = previous["value"]
-                else:
-                    claude_settings.pop("crossSessionInbound", None)
             claude_settings_destination = destinations[self.claude_settings]
-            _atomic_write(
-                claude_settings_destination,
-                _json_bytes(claude_settings),
-                mode=_shared_path_mode(claude_settings_destination),
-            )
+
+            def remove_claude_settings(value: dict[str, object]) -> None:
+                _remove_hooks(value)
+                if value.get("crossSessionInbound") == "accept":
+                    if cast(bool, previous["present"]):
+                        value["crossSessionInbound"] = previous["value"]
+                    else:
+                        value.pop("crossSessionInbound", None)
+
+            try:
+                self._update_json_for_uninstall(
+                    claude_settings_destination,
+                    remove_claude_settings,
+                    recorded_paths=recorded_paths,
+                    writes=uninstall_writes,
+                )
+            except (OSError, SettingsError):
+                self._rollback_uninstall_writes(
+                    uninstall_writes,
+                    broker_was_loaded=broker_was_loaded,
+                )
+                raise
 
         if not claude_config_has_remaining_owner:
-            claude = _json_object(destinations[self.claude_config])
-            servers = claude.get("mcpServers")
-            if isinstance(servers, dict):
-                cast(dict[str, object], servers).pop(SERVER_NAME, None)
             claude_destination = destinations[self.claude_config]
-            _atomic_write(
-                claude_destination,
-                _json_bytes(claude),
-                mode=_shared_path_mode(claude_destination),
-            )
+
+            def remove_claude_server(value: dict[str, object]) -> None:
+                servers = value.get("mcpServers")
+                if isinstance(servers, dict):
+                    cast(dict[str, object], servers).pop(SERVER_NAME, None)
+
+            try:
+                self._update_json_for_uninstall(
+                    claude_destination,
+                    remove_claude_server,
+                    recorded_paths=recorded_paths,
+                    writes=uninstall_writes,
+                )
+            except (OSError, SettingsError):
+                self._rollback_uninstall_writes(
+                    uninstall_writes,
+                    broker_was_loaded=broker_was_loaded,
+                )
+                raise
         if not other_profile_installs:
             destinations[self.launch_agent].unlink(missing_ok=True)
             self.legacy_peers.unlink(missing_ok=True)
