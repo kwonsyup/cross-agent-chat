@@ -43,6 +43,8 @@ CLAUDE_AUTH_ENV_KEYS: Final = (
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
 )
+CLAUDE_CONTEXT_ENV_KEYS: Final = ("CLAUDE_CONFIG_DIR",)
+BOUND_CLAUDE_BINARY_ENV: Final = "CROSS_AGENT_CHAT_CLAUDE_BINARY"
 TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z")
 
 
@@ -58,7 +60,7 @@ def courier_environment(source: Mapping[str, str] | None = None) -> dict[str, st
     environment = os.environ if source is None else source
     return {
         key: environment[key]
-        for key in (*COURIER_ENV_KEYS, *CLAUDE_AUTH_ENV_KEYS)
+        for key in (*COURIER_ENV_KEYS, *CLAUDE_AUTH_ENV_KEYS, *CLAUDE_CONTEXT_ENV_KEYS)
         if key in environment
     }
 
@@ -68,7 +70,8 @@ def _environment() -> dict[str, str]:
 
 
 def claude_binary() -> Path:
-    candidate = shutil.which("claude")
+    configured = os.environ.get(BOUND_CLAUDE_BINARY_ENV)
+    candidate = configured if configured else shutil.which("claude")
     if candidate is None:
         fallback = Path.home() / ".local" / "bin" / "claude"
         candidate = str(fallback) if fallback.exists() else None

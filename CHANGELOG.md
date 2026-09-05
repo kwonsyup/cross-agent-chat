@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.4 - 2026-09-04
+
+- Keep stale workspace metadata structurally readable while excluding unavailable routes from live
+  discovery and delivery.
+- Accept ordinary Unicode project names and bound rendered peer labels without using display text as
+  route authority.
+- Preserve a live courier generation and its in-memory queue when a provider repeats SessionStart
+  for the same process, session, device, and working directory.
+- Drain Codex courier queues in whole bounded frame batches, preserving ordered remainder for a
+  later natural provider boundary.
+- Align the Codex MCP tool timeout with the bounded remote delivery operation.
+- Bind private broker listeners only after a running Tailscale status establishes the active address;
+  a generic CGNAT tunnel or persisted address alone is insufficient.
+
 ## 0.1.3 - 2026-09-02
 
 - Let disposable provider workers opt out with `CROSS_AGENT_CHAT_PRESENCE=off` without

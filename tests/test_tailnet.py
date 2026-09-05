@@ -27,6 +27,7 @@ from cross_agent_chat.runtime import (
     send,
 )
 from cross_agent_chat.tailnet import (
+    local_tailnet_address,
     parse_ifconfig_tailnet_address,
     parse_known_tailnet_address,
     parse_local_tailnet_address,
@@ -115,6 +116,33 @@ utun4: flags=8051<UP>
     assert parse_ifconfig_tailnet_address(second_interface) is None
 
 
+def test_unverified_cgnat_interface_never_becomes_a_tailnet_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cross_agent_chat.tailnet._status_output", lambda: None)
+    monkeypatch.setattr(
+        "cross_agent_chat.tailnet._ifconfig_tailnet_address", lambda: "100.90.10.11"
+    )
+
+    assert local_tailnet_address() is None
+
+
+def test_running_tailscale_identity_requires_the_current_interface_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cross_agent_chat.tailnet._status_output",
+        lambda: json.dumps(
+            {"BackendState": "Running", "Self": {"TailscaleIPs": ["100.64.0.13"]}}
+        ),
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.tailnet._ifconfig_output", lambda: "utun4:\n inet 100.64.0.13"
+    )
+
+    assert local_tailnet_address() == "100.64.0.13"
+
+
 def test_tailnet_broker_exposes_only_local_live_peers(tmp_path: Path) -> None:
     assert handle_broker_request(
         tmp_path,
@@ -123,16 +151,13 @@ def test_tailnet_broker_exposes_only_local_live_peers(tmp_path: Path) -> None:
     ) == {"schema_version": 1, "peers": []}
 
 
-def test_broker_binds_localhost_and_installer_discovered_tailnet_address(
+def test_broker_keeps_only_localhost_when_tailscale_identity_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CROSS_AGENT_CHAT_TAILNET_ADDRESS", "100.64.0.13")
     monkeypatch.setattr("cross_agent_chat.tailnet_broker.local_tailnet_address", lambda: None)
 
-    assert broker_bindings() == [
-        ("127.0.0.1", 47072),
-        ("100.64.0.13", 47071),
-    ]
+    assert broker_bindings() == [("127.0.0.1", 47072)]
 
 
 def test_broker_prefers_current_tailnet_address_over_persisted_identity(

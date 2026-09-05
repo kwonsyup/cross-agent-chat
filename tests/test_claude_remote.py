@@ -93,6 +93,18 @@ def test_claude_binary_uses_fixed_user_local_fallback(
     assert claude_binary() == binary.resolve()
 
 
+def test_claude_binary_keeps_the_recipient_bound_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = tmp_path / "profile-a-claude"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o700)
+    monkeypatch.setenv("CROSS_AGENT_CHAT_CLAUDE_BINARY", str(binary))
+    monkeypatch.setattr("cross_agent_chat.claude_runtime.shutil.which", lambda _: None)
+
+    assert claude_binary() == binary.resolve()
+
+
 def test_pretool_gate_binds_recipient_and_full_message() -> None:
     key = bytes.fromhex("11" * 32)
     message = "one exact body"

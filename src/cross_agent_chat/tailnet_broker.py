@@ -70,9 +70,7 @@ class BrokerAdmission:
 def broker_bindings() -> list[tuple[str, int]]:
     """Return the exact interfaces owned by this broker process."""
     bindings = [(LOCAL_BROKER_HOST, LOCAL_BROKER_PORT)]
-    configured = os.environ.get("CROSS_AGENT_CHAT_TAILNET_ADDRESS")
-    configured_address = valid_tailnet_address(configured) if configured is not None else None
-    tailnet_address = local_tailnet_address() or configured_address
+    tailnet_address = local_tailnet_address()
     if tailnet_address is not None:
         bindings.append((tailnet_address, TAILNET_PORT))
     return bindings

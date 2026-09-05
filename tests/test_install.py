@@ -429,6 +429,23 @@ def test_setup_passes_known_tailnet_address_to_broker(tmp_path: Path) -> None:
     assert payload["EnvironmentVariables"] == {"CROSS_AGENT_CHAT_TAILNET_ADDRESS": "100.64.0.10"}
 
 
+def test_setup_uses_the_explicit_codex_profile_root(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    profile = tmp_path / "codex-profile"
+    installer = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        codex_home=profile,
+    )
+
+    installer.setup()
+
+    assert (profile / "config.toml").is_file()
+    assert (profile / "hooks.json").is_file()
+    assert not (home / ".codex" / "config.toml").exists()
+
+
 def test_setup_trusts_each_owned_codex_hook(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
@@ -437,7 +454,7 @@ def test_setup_trusts_each_owned_codex_hook(tmp_path: Path) -> None:
 
     config = tomllib.loads((home / ".codex" / "config.toml").read_text())
     trusted = config["hooks"]["state"]
-    assert config["mcp_servers"]["cross-agent-chat"]["tool_timeout_sec"] == 120
+    assert config["mcp_servers"]["cross-agent-chat"]["tool_timeout_sec"] == 240
     assert config["mcp_servers"]["cross-agent-chat"]["default_tools_approval_mode"] == "approve"
     assert len(trusted) == 3
     assert all(
@@ -2195,7 +2212,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.1.3')\n"
+            "    print('cross-agent-chat 0.1.4')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -2221,7 +2238,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.1.3"
+    assert completed.stdout.strip() == "cross-agent-chat 0.1.4"
     assert stage.exists()
 
 
@@ -3625,7 +3642,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.1.3",
+            "version": "0.1.4",
             "module_path": str(module),
         },
     )
@@ -3803,7 +3820,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.1.3",
+                "version": "0.1.4",
             "module_path": str(module),
         }
 

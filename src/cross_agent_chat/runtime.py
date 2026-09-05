@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import stat
 import subprocess
@@ -19,6 +20,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
@@ -30,6 +32,7 @@ from cross_agent_chat.claude_runtime import (
     DISCOVERY_TIMEOUT_SECONDS,
     SEND_TIMEOUT_SECONDS,
     claude_alias,
+    claude_binary,
     courier_environment,
     discover_target_ref,
     exact_agent,
@@ -59,6 +62,7 @@ from cross_agent_chat.transport import remote_envelope
 
 MAX_FRAME_BYTES: Final = 64 * 1024
 SOCKET_TIMEOUT_SECONDS: Final = 5.0
+MCP_TOOL_TIMEOUT_SECONDS: Final = 240.0
 HEALTH_TIMEOUT_SECONDS: Final = AGENTS_TIMEOUT_SECONDS + 2.0
 REMOTE_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS + 5.0
 ACCEPT_TIMEOUT_SECONDS: Final = (
@@ -155,7 +159,8 @@ def read_frame(connection: socket.socket, limit: int = MAX_FRAME_BYTES) -> bytes
 
 
 def emit_frame(connection: socket.socket, payload: dict[str, object]) -> None:
-    connection.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+    frame = json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n"
+    connection.sendall(frame.encode())
 
 
 def emit_frame_safely(connection: socket.socket, payload: dict[str, object]) -> None:
@@ -253,11 +258,19 @@ def _spawn_courier(root: Path, route: Route) -> None:
         "--pid",
         str(route.pid),
     ]
-    environment = (
-        courier_environment()
-        if route.provider == "claude"
-        else {key: os.environ[key] for key in COURIER_ENV_KEYS if key in os.environ}
-    )
+    if route.provider == "claude":
+        environment = courier_environment()
+        environment["CROSS_AGENT_CHAT_CLAUDE_BINARY"] = str(claude_binary())
+    else:
+        environment = {
+            key: os.environ[key]
+            for key in (*COURIER_ENV_KEYS, "CODEX_HOME", "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE")
+            if key in os.environ
+        }
+        codex = shutil.which("codex")
+        if codex is not None:
+            with suppress(OSError):
+                environment["CROSS_AGENT_CHAT_CODEX_BINARY"] = str(Path(codex).resolve(strict=True))
     try:
         process = subprocess.Popen(
             command,
@@ -312,7 +325,9 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
     root = state_root(state_root_value)
     registry = Registry(root)
     registry.compact_dead()
-    registry.upsert(route)
+    registered = registry.upsert_or_reuse_live_owner(route)
+    if registered != route:
+        return registered
     try:
         _spawn_courier(root, route)
     except ChatError:
@@ -352,7 +367,11 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
 
 
 def _route_current(root: Path, expected: Route) -> bool:
-    return Registry(root).current(expected) and expected.process_is_live()
+    return (
+        Registry(root).current(expected)
+        and expected.process_is_live()
+        and expected.cwd_is_available()
+    )
 
 
 def courier_accept(
@@ -473,8 +492,27 @@ def courier_server(
         server.bind(str(path))
     finally:
         os.umask(old_umask)
+    native_queue: tuple[Path, dict[str, str], str] | None = None
+    native_enabled = os.environ.get("CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE") == "experimental"
+    if provider == "codex" and native_enabled:
+        bound_binary = os.environ.get("CROSS_AGENT_CHAT_CODEX_BINARY")
+        if bound_binary is not None:
+            candidate = Path(bound_binary)
+            try:
+                binary = candidate.resolve(strict=True)
+            except OSError as error:
+                raise ChatError("Codex native queue is unavailable") from error
+            native_queue = (
+                binary,
+                {
+                    key: os.environ[key]
+                    for key in (*COURIER_ENV_KEYS, "CODEX_HOME")
+                    if key in os.environ
+                },
+                route.session_id,
+            )
     courier = (
-        CodexCourier(alias=route.alias, generation=route.generation)
+        CodexCourier(alias=route.alias, generation=route.generation, native_queue=native_queue)
         if provider == "codex"
         else None
     )
@@ -580,6 +618,8 @@ def shutdown_couriers(root: Path) -> None:
 def _local_target(
     root: Path, route: Route, *, timeout: float = HEALTH_TIMEOUT_SECONDS
 ) -> Target | None:
+    if not route.cwd_is_available():
+        return None
     try:
         response = request_socket(
             socket_path(root, route),
@@ -627,7 +667,11 @@ def _local_target_before_deadline(root: Path, route: Route, deadline: float) -> 
 
 
 def local_targets(root: Path) -> list[Target]:
-    routes = [route for route in Registry(root).routes() if route.process_is_live()]
+    routes = [
+        route
+        for route in Registry(root).routes()
+        if route.process_is_live() and route.cwd_is_available()
+    ]
     if not routes:
         return []
     deadline = time.monotonic() + LOCAL_DISCOVERY_TIMEOUT_SECONDS
@@ -749,8 +793,8 @@ def all_targets(root: Path, *, include_remote: bool = True) -> list[Target]:
 def _target_matches(target: Target, query: str) -> bool:
     if target.alias.casefold() == query.casefold():
         return True
-    wanted = [token for token in re.split(r"[^A-Za-z0-9]+", query.casefold()) if token]
-    available = {token for token in re.split(r"[^A-Za-z0-9]+", target.alias.casefold()) if token}
+    wanted = re.findall(r"[^\W_]+", query.casefold())
+    available = set(re.findall(r"[^\W_]+", target.alias.casefold()))
     return bool(wanted) and all(token in available for token in wanted)
 
 
@@ -776,7 +820,7 @@ def wrapped_message(source_alias: str, message: str, event_id: str) -> str:
 
 def canonical_source_alias(root: Path, source: Route) -> str:
     """Return the exact currently live public alias for an authenticated sender."""
-    if not Registry(root).current(source) or not source.process_is_live():
+    if not _route_current(root, source):
         raise ChatError("sender route changed before transport acceptance")
     if source.provider == "codex":
         return source.alias
@@ -784,9 +828,21 @@ def canonical_source_alias(root: Path, source: Route) -> str:
     return claude_alias(source.device, source.project, agent)
 
 
-def send_local(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
-    targets = local_targets(root)
-    target = resolve_target(targets, target_query)
+def _remaining_operation_timeout(deadline: float, maximum: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ChatError("delivery timed out before provider acceptance")
+    return min(maximum, remaining)
+
+
+def _send_local_target(
+    root: Path,
+    source: Route,
+    target: Target,
+    message: str,
+    *,
+    deadline: float,
+) -> dict[str, object]:
     if target.session_id is None or target.pid is None or target.cwd is None:
         raise ChatError("target route is incomplete")
     current_routes = Registry(root).routes()
@@ -804,6 +860,7 @@ def send_local(root: Path, source: Route, target_query: str, message: str) -> di
     source_alias = canonical_source_alias(root, source)
     event_id = str(uuid4())
     body = wrapped_message(source_alias, bounded_message(message), event_id)
+    timeout = _remaining_operation_timeout(deadline, ACCEPT_TIMEOUT_SECONDS)
     store = IntentStore(root)
     store.begin(
         source,
@@ -822,7 +879,7 @@ def send_local(root: Path, source: Route, target_query: str, message: str) -> di
                 "event_id": event_id,
                 "message": body,
             },
-            timeout=ACCEPT_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except UnknownDeliveryError:
         store.mark(event_id, "UNKNOWN_DELIVERY")
@@ -848,15 +905,27 @@ def send_local(root: Path, source: Route, target_query: str, message: str) -> di
     return expected
 
 
+def send_local(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
+    deadline = time.monotonic() + MCP_TOOL_TIMEOUT_SECONDS
+    target = resolve_target(local_targets(root), target_query)
+    return _send_local_target(root, source, target, message, deadline=deadline)
+
+
 def send(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
-    target = resolve_target(all_targets(root), target_query)
-    if not target.remote:
-        return send_local(root, source, target.alias, message)
+    deadline = time.monotonic() + MCP_TOOL_TIMEOUT_SECONDS
+    local_matches = [
+        target for target in local_targets(root) if _target_matches(target, target_query)
+    ]
+    if local_matches:
+        target = resolve_target(local_matches, target_query)
+        return _send_local_target(root, source, target, message, deadline=deadline)
+    target = resolve_target(remote_targets(root), target_query)
     if target.tailnet_address is None:
         raise ChatError("remote target route is incomplete")
     source_alias = canonical_source_alias(root, source)
     event_id = str(uuid4())
     body = wrapped_message(source_alias, bounded_message(message), event_id)
+    timeout = _remaining_operation_timeout(deadline, REMOTE_TIMEOUT_SECONDS)
     store = IntentStore(root)
     store.begin_identity(
         source_key=session_key(source.provider, source.session_id),
@@ -890,7 +959,7 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
                 "operation": "receive",
                 "envelope": envelope,
             },
-            timeout=REMOTE_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except UnknownDeliveryError as error:
         store.mark(event_id, "UNKNOWN_DELIVERY")

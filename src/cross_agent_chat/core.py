@@ -9,6 +9,7 @@ import os
 import re
 import stat
 import tempfile
+import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -30,8 +31,9 @@ IntentStatus = Literal[
 SCHEMA_VERSION: Final = 1
 MAX_MESSAGE_BYTES: Final = 16 * 1024
 CODEX_ALIAS_DIGEST_LENGTH: Final = 12
+MAX_NAME_CODEPOINTS: Final = 128
+MAX_ALIAS_CODEPOINTS: Final = 128
 SAFE_DEVICE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}\Z")
-SAFE_NAME_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._@:-]{0,127}\Z")
 UUID_RE: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 
 
@@ -70,7 +72,13 @@ def valid_device(value: str) -> str:
 
 
 def valid_name(value: str, field: str) -> str:
-    if SAFE_NAME_RE.fullmatch(value) is None:
+    if not value or len(value) > MAX_NAME_CODEPOINTS:
+        fail(f"{field} is invalid")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        fail(f"{field} is invalid")
+    if any(unicodedata.category(character).startswith("C") for character in value):
         fail(f"{field} is invalid")
     return value
 
@@ -88,16 +96,43 @@ def canonical_cwd(value: str) -> str:
     return str(resolved)
 
 
+def stored_cwd(value: str) -> str:
+    """Validate a persisted route path without requiring its workspace to survive."""
+    path = Path(value)
+    if (
+        not path.is_absolute()
+        or len(value) > 512
+        or "\x00" in value
+        or os.path.normpath(value) != value
+    ):
+        fail("working directory is invalid")
+    return value
+
+
 def session_key(provider: Provider, session_id: str) -> str:
     valid_uuid(session_id, "session id")
     return hashlib.sha256(f"{provider}:{session_id}".encode()).hexdigest()
 
 
 def friendly_alias(provider: Provider, device: str, project: str, session_id: str) -> str:
-    prefix = f"{provider}@{valid_device(device)}:{valid_name(project, 'project')}"
-    if provider == "codex":
-        return f"{prefix}:{session_key(provider, session_id)[:CODEX_ALIAS_DIGEST_LENGTH]}"
-    return prefix
+    prefix = f"{provider}@{valid_device(device)}:"
+    suffix = (
+        f":{session_key(provider, session_id)[:CODEX_ALIAS_DIGEST_LENGTH]}"
+        if provider == "codex"
+        else ""
+    )
+    exact_project = valid_name(project, "project")
+    available = MAX_ALIAS_CODEPOINTS - len(prefix) - len(suffix)
+    if available <= 0:
+        fail("route alias is invalid")
+    if len(exact_project) > available:
+        digest = hashlib.sha256(exact_project.encode()).hexdigest()[:CODEX_ALIAS_DIGEST_LENGTH]
+        marker = f"~{digest}"
+        exact_project = exact_project[: available - len(marker)] + marker
+    alias = f"{prefix}{exact_project}{suffix}"
+    if len(alias) > MAX_ALIAS_CODEPOINTS:
+        fail("route alias is invalid")
+    return alias
 
 
 def bounded_message(message: str) -> str:
@@ -145,7 +180,7 @@ class Route:
         valid_uuid(self.session_id, "session id")
         valid_uuid(self.generation, "route generation")
         valid_device(self.device)
-        if canonical_cwd(self.cwd) != self.cwd:
+        if stored_cwd(self.cwd) != self.cwd:
             fail("route working directory is not canonical")
         valid_name(self.project, "project")
         expected = friendly_alias(self.provider, self.device, self.project, self.session_id)
@@ -259,6 +294,12 @@ class Route:
             return True
         return True
 
+    def cwd_is_available(self) -> bool:
+        try:
+            return canonical_cwd(self.cwd) == self.cwd
+        except ChatError:
+            return False
+
 
 def ensure_private_dir(path: Path) -> None:
     path.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -346,6 +387,29 @@ class Registry:
                 if (item.provider, item.session_id) != (route.provider, route.session_id)
             ]
             atomic_json(self.path, [item.to_dict() for item in [*existing, route]])
+
+    def upsert_or_reuse_live_owner(self, route: Route) -> Route:
+        """Preserve a live generation when an identical provider hook repeats."""
+        with state_lock(self.root, "routes"):
+            existing = self.routes()
+            matching = [
+                item
+                for item in existing
+                if item.provider == route.provider
+                and item.session_id == route.session_id
+                and item.device == route.device
+                and item.cwd == route.cwd
+                and item.pid == route.pid
+            ]
+            if len(matching) == 1:
+                return matching[0]
+            retained = [
+                item
+                for item in existing
+                if (item.provider, item.session_id) != (route.provider, route.session_id)
+            ]
+            atomic_json(self.path, [item.to_dict() for item in [*retained, route]])
+            return route
 
     def remove(self, provider: Provider, session_id: str, pid: int) -> None:
         with state_lock(self.root, "routes"):
@@ -667,8 +731,8 @@ def authenticate_sender(
 def _query_matches(route: Route, query: str) -> bool:
     if query.casefold() == route.alias.casefold():
         return True
-    query_tokens = [token for token in re.split(r"[^A-Za-z0-9]+", query.casefold()) if token]
-    route_tokens = {token for token in re.split(r"[^A-Za-z0-9]+", route.alias.casefold()) if token}
+    query_tokens = re.findall(r"[^\W_]+", query.casefold())
+    route_tokens = set(re.findall(r"[^\W_]+", route.alias.casefold()))
     return bool(query_tokens) and all(token in route_tokens for token in query_tokens)
 
 

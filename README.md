@@ -3,7 +3,7 @@
 Chat between live Claude Code and Codex sessions on your Mac or Tailnet.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.1.3/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.1.4/install.sh | sh
 ```
 
 That is the whole setup. The installer supplies its own Python runtime when the Mac does

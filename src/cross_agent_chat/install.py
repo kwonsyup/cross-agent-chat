@@ -32,6 +32,7 @@ from tomlkit.exceptions import TOMLKitError
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import ChatError, atomic_json, ensure_private_dir, valid_device
+from cross_agent_chat.runtime import MCP_TOOL_TIMEOUT_SECONDS
 from cross_agent_chat.tailnet import LOCAL_BROKER_HOST, LOCAL_BROKER_PORT, valid_tailnet_address
 
 SERVER_NAME: Final = "cross-agent-chat"
@@ -608,7 +609,8 @@ def _codex_owned_toml(
     )
     text = (
         f'{OWNED_TOML_START}\n[mcp_servers."{SERVER_NAME}"]\ncommand = {command}\n'
-        f'args = {args}\ntool_timeout_sec = 120\ndefault_tools_approval_mode = "approve"\n'
+        f'args = {args}\ntool_timeout_sec = {int(MCP_TOOL_TIMEOUT_SECONDS)}\n'
+        'default_tools_approval_mode = "approve"\n'
     )
     for event, timeout in (("SessionStart", 5), ("SessionEnd", 3), ("Stop", 3)):
         hook_command = _hook_command(executable, "codex", device, event)
@@ -673,10 +675,17 @@ class Installer:
         executable: Path,
         device: str,
         tailnet_address: str | None = None,
+        codex_home: Path | None = None,
     ) -> None:
         self.home = home.resolve()
         self.executable = executable if executable.is_absolute() else executable.absolute()
         self.device = valid_device(device)
+        configured_codex_home = (
+            self.home / ".codex" if codex_home is None else codex_home.expanduser()
+        )
+        if not configured_codex_home.is_absolute() or configured_codex_home == Path("/"):
+            raise SettingsError("CODEX_HOME must be an absolute configuration directory")
+        self.codex_home = configured_codex_home.resolve(strict=False)
         self.tailnet_address = (
             None if tailnet_address is None else valid_tailnet_address(tailnet_address)
         )
@@ -686,8 +695,8 @@ class Installer:
         self.legacy_peers = self.state / "peers.json"
         self.claude_settings = self.home / ".claude" / "settings.json"
         self.claude_config = self.home / ".claude.json"
-        self.codex_config = self.home / ".codex" / "config.toml"
-        self.codex_hooks = self.home / ".codex" / "hooks.json"
+        self.codex_config = self.codex_home / "config.toml"
+        self.codex_hooks = self.codex_home / "hooks.json"
         self.launch_agent = self.home / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
         self.runtime_root = self.home / ".local" / "share" / f"{SERVER_NAME}-runtime"
         self.releases = self.runtime_root / "releases"
@@ -714,14 +723,23 @@ class Installer:
             if root.exists() and not root.resolve(strict=True).is_relative_to(self.home):
                 raise SettingsError("runtime ownership is invalid")
 
+    def _managed_root(self, path: Path) -> Path | None:
+        resolved = path.resolve(strict=False)
+        roots = (self.codex_home, self.home)
+        for root in sorted(roots, key=lambda item: len(item.parts), reverse=True):
+            if resolved.is_relative_to(root):
+                return root
+        return None
+
     def _ensure_durable_parent(self, parent: Path) -> None:
-        if not self.home.exists():
-            self.home.mkdir(mode=0o700, exist_ok=True)
         resolved = parent.resolve(strict=False)
-        if not resolved.is_relative_to(self.home):
-            raise SettingsError("managed path parent escapes home")
-        current = self.home
-        for part in resolved.relative_to(self.home).parts:
+        root = self._managed_root(resolved)
+        if root is None:
+            raise SettingsError("managed path parent escapes home and active configuration roots")
+        if not root.exists():
+            root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        current = root
+        for part in resolved.relative_to(root).parts:
             current /= part
             if current.exists():
                 if not current.is_dir():
@@ -734,7 +752,7 @@ class Installer:
         current = resolved
         while True:
             _fsync_directory(current)
-            if current == self.home:
+            if current == root:
                 return
             current = current.parent
 
@@ -963,8 +981,7 @@ class Installer:
         destination = root / f"{stamp}-{uuid4().hex[:8]}"
         ensure_private_dir(destination)
         manifest: dict[str, object] = {
-            str(path.relative_to(self.home)): _snapshot_json(snapshot)
-            for path, snapshot in originals.items()
+            self._backup_key(path): _snapshot_json(snapshot) for path, snapshot in originals.items()
         }
         _atomic_write(destination / "manifest.json", _json_bytes(manifest))
         _fsync_directory(root)
@@ -973,6 +990,13 @@ class Installer:
         _fsync_directory(self.home)
         return destination
 
+    def _backup_key(self, path: Path) -> str:
+        if path.is_relative_to(self.home):
+            return str(path.relative_to(self.home))
+        if path.is_relative_to(self.codex_home):
+            return f"CODEX_HOME/{path.relative_to(self.codex_home)}"
+        raise SettingsError("backup path is outside active configuration roots")
+
     def _configuration_destinations(self) -> dict[Path, Path]:
         destinations: dict[Path, Path] = {}
         for path in self.config_paths:
@@ -980,8 +1004,10 @@ class Installer:
                 destination = path.resolve(strict=False)
             except (OSError, RuntimeError) as error:
                 raise SettingsError(f"managed configuration path is invalid: {path}") from error
-            if not destination.is_relative_to(self.home):
-                raise SettingsError(f"managed configuration path escapes home: {path}")
+            if self._managed_root(destination) is None:
+                raise SettingsError(
+                    f"managed configuration path escapes home and active roots: {path}"
+                )
             destinations[path] = destination
         return destinations
 
@@ -1081,12 +1107,16 @@ class Installer:
         for relative, encoded in manifest.items():
             if not isinstance(relative, str):
                 raise SettingsError("backup manifest is invalid")
-            relative_path = Path(relative)
-            destination = self.home / relative_path
+            if relative.startswith("CODEX_HOME/"):
+                relative_path = Path(relative.removeprefix("CODEX_HOME/"))
+                destination = self.codex_home / relative_path
+            else:
+                relative_path = Path(relative)
+                destination = self.home / relative_path
             if (
                 relative_path.is_absolute()
                 or ".." in relative_path.parts
-                or not destination.parent.resolve(strict=False).is_relative_to(self.home)
+                or self._managed_root(destination.parent) is None
             ):
                 raise SettingsError("backup manifest is invalid")
             if isinstance(encoded, dict):

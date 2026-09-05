@@ -38,11 +38,14 @@ def _fail(message: str) -> NoReturn:
 
 
 def _installer(device: str | None) -> Installer:
+    raw_codex_home = os.environ.get("CODEX_HOME")
+    codex_home = None if raw_codex_home in {None, ""} else Path(raw_codex_home).expanduser()
     return Installer(
         home=Path.home(),
         executable=discover_executable(Path(sys.argv[0])),
         device=default_device() if device is None else device,
         tailnet_address=known_tailnet_address(),
+        codex_home=codex_home,
     )
 
 
@@ -298,6 +301,11 @@ def run(arguments: argparse.Namespace) -> int:
             executable=arguments.stable_entrypoint,
             device=device,
             tailnet_address=known_tailnet_address(),
+            codex_home=(
+                None
+                if os.environ.get("CODEX_HOME") in {None, ""}
+                else Path(os.environ["CODEX_HOME"]).expanduser()
+            ),
         )
         installer.install_staged(arguments.staged_runtime, arguments.stable_entrypoint)
         print(f"Cross Agent Chat is ready on {device}. Start fresh Claude/Codex sessions.")

@@ -166,6 +166,11 @@ def _status_output() -> str | None:
 
 
 def _ifconfig_tailnet_address() -> str | None:
+    output = _ifconfig_output()
+    return None if output is None else parse_ifconfig_tailnet_address(output)
+
+
+def _ifconfig_output() -> str | None:
     try:
         completed = subprocess.run(
             [str(IFCONFIG_BINARY)],
@@ -177,9 +182,26 @@ def _ifconfig_tailnet_address() -> str | None:
         )
         if completed.returncode != 0:
             return None
-        return parse_ifconfig_tailnet_address(completed.stdout)
+        return completed.stdout
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def _interface_has_address(text: str, expected_address: str) -> bool:
+    interface = ""
+    for line in text.splitlines():
+        if line and not line[0].isspace() and ":" in line:
+            interface = line.split(":", maxsplit=1)[0]
+            continue
+        fields = line.split()
+        if (
+            interface.startswith("utun")
+            and len(fields) >= 2
+            and fields[0] == "inet"
+            and fields[1] == expected_address
+        ):
+            return True
+    return False
 
 
 def tailnet_nodes() -> list[str]:
@@ -196,14 +218,18 @@ def tailnet_nodes() -> list[str]:
 def local_tailnet_address() -> str | None:
     """Return this Mac's Tailnet IPv4 address without changing Tailscale state."""
     output = _status_output()
-    if output is not None:
-        try:
-            address = parse_local_tailnet_address(output)
-        except ChatError:
-            address = None
-        if address is not None:
-            return address
-    return _ifconfig_tailnet_address()
+    if output is None:
+        return None
+    try:
+        address = parse_local_tailnet_address(output)
+    except ChatError:
+        return None
+    if address is None:
+        return None
+    interfaces = _ifconfig_output()
+    if interfaces is None or not _interface_has_address(interfaces, address):
+        return None
+    return address
 
 
 def known_tailnet_address() -> str | None:

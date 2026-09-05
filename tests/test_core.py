@@ -27,7 +27,9 @@ from cross_agent_chat.core import (
 from cross_agent_chat.runtime import (
     HEALTH_TIMEOUT_SECONDS,
     LOCAL_DISCOVERY_TIMEOUT_SECONDS,
+    MCP_TOOL_TIMEOUT_SECONDS,
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
+    REMOTE_TIMEOUT_SECONDS,
     Target,
     _local_target,
     canonical_source_alias,
@@ -35,6 +37,7 @@ from cross_agent_chat.runtime import (
     local_targets,
     pre_effect_error,
     presence_is_enabled,
+    send,
     send_local,
 )
 
@@ -152,6 +155,29 @@ def test_route_liveness_compacts_only_definitively_missing_processes(
     assert not item.process_is_live()
 
 
+def test_removed_live_workspace_is_excluded_without_poisoning_a_healthy_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    removed = route(tmp_path, pid=os.getpid(), project="removed")
+    healthy = route(tmp_path, pid=os.getpid(), project="healthy")
+    Registry(root).upsert(removed)
+    Registry(root).upsert(healthy)
+    Path(removed.cwd).rmdir()
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda *_args, **_kwargs: {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": healthy.generation,
+            "alias": healthy.alias,
+        },
+    )
+
+    assert Registry(root).routes() == [removed, healthy]
+    assert [target.alias for target in local_targets(root)] == [healthy.alias]
+
+
 def test_authenticate_claude_sender_requires_unique_parent_pid(tmp_path: Path) -> None:
     first = route(tmp_path, provider="claude", pid=1400, project="one")
     second = route(tmp_path, provider="claude", pid=1400, project="two")
@@ -188,6 +214,23 @@ def test_target_resolution_accepts_exact_alias(tmp_path: Path) -> None:
     second = route(tmp_path, project="web")
 
     assert resolve_target([first, second], second.alias) == second
+
+
+def test_unicode_project_aliases_preserve_identity_without_ascii_filtering(tmp_path: Path) -> None:
+    first = route(tmp_path, project="클루로")
+    second = route(tmp_path, project="클루로\u0301")
+
+    assert first.project != second.project
+    assert first.alias != second.alias
+    assert resolve_target([first], "클루로") == first
+
+
+def test_long_project_label_is_bounded_without_changing_route_identity(tmp_path: Path) -> None:
+    item = route(tmp_path, project="p" * 110, device="device-with-a-long-name")
+
+    assert item.project == "p" * 110
+    assert len(item.alias) <= 128
+    assert "~" in item.alias
 
 
 def test_bounded_message_rejects_empty_and_oversized() -> None:
@@ -246,6 +289,51 @@ def test_pre_effect_rejection_does_not_block_fresh_intent(tmp_path: Path) -> Non
     store.mark(event_id, "PRE_EFFECT_REJECTED")
 
     assert store.begin(source, target, source_alias=source.alias, payload_digest="b" * 64)
+
+
+def test_configured_tool_deadline_covers_one_remote_discovery_and_delivery() -> None:
+    assert MCP_TOOL_TIMEOUT_SECONDS >= (
+        LOCAL_DISCOVERY_TIMEOUT_SECONDS + REMOTE_DISCOVERY_TIMEOUT_SECONDS + REMOTE_TIMEOUT_SECONDS
+    )
+
+
+def test_local_send_does_not_wait_for_remote_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = route(tmp_path, project="source", pid=os.getpid())
+    target = route(tmp_path, project="target", pid=os.getpid())
+    Registry(root).upsert(source)
+    Registry(root).upsert(target)
+    local = Target(
+        alias=target.alias,
+        provider=target.provider,
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key="b" * 64,
+        remote=False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [local])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.remote_targets",
+        lambda _: pytest.fail("local delivery must not wait for Tailnet discovery"),
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda _path, payload, **_: {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": "codex",
+        },
+    )
+
+    assert send(root, source, target.alias, "hello")["status"] == "TRANSPORT_ACCEPTED"
 
 
 def test_live_route_discovery_does_not_apply_an_age_ttl(
