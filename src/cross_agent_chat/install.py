@@ -24,7 +24,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final, Literal, cast
+from typing import Final, Literal, NoReturn, cast
 from uuid import uuid4
 
 import tomlkit
@@ -32,6 +32,7 @@ from tomlkit.exceptions import TOMLKitError
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import ChatError, atomic_json, ensure_private_dir, valid_device
+from cross_agent_chat.runtime import MCP_TOOL_TIMEOUT_SECONDS
 from cross_agent_chat.tailnet import LOCAL_BROKER_HOST, LOCAL_BROKER_PORT, valid_tailnet_address
 
 SERVER_NAME: Final = "cross-agent-chat"
@@ -331,17 +332,30 @@ def _process_identity_digest(pid: int) -> str | None:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _hook_command(executable: Path, provider: str, device: str, event: str) -> str:
+def _hook_command(
+    executable: Path,
+    provider: str,
+    device: str,
+    event: str,
+    *,
+    codex_native_queue: bool = False,
+) -> str:
     binary = shlex.quote(str(executable))
+    native_queue = (
+        "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE=experimental "
+        if provider == "codex" and codex_native_queue
+        else ""
+    )
     if event == "SessionStart":
         return (
-            f"{binary} _register --provider {provider} --device {shlex.quote(device)} "
+            f"{native_queue}{binary} _register --provider {provider} "
+            f"--device {shlex.quote(device)} "
             '--pid "$PPID" >/dev/null'
         )
     if event == "SessionEnd":
-        return f'{binary} _unregister --provider {provider} --pid "$PPID" >/dev/null'
+        return f'{native_queue}{binary} _unregister --provider {provider} --pid "$PPID" >/dev/null'
     if provider == "codex" and event == "Stop":
-        return f'{binary} _codex-stop --pid "$PPID"'
+        return f'{native_queue}{binary} _codex-stop --pid "$PPID"'
     raise SettingsError("unsupported provider hook")
 
 
@@ -358,6 +372,8 @@ def _owned_hook(value: object) -> bool:
         tokens = shlex.split(command)
     except ValueError:
         return False
+    if tokens and tokens[0] == "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE=experimental":
+        tokens = tokens[1:]
     return (
         len(tokens) >= 2
         and Path(tokens[0]).name == SERVER_NAME
@@ -365,7 +381,32 @@ def _owned_hook(value: object) -> bool:
     )
 
 
-def _hook_group(executable: Path, provider: str, device: str, event: str) -> dict[str, object]:
+def _owned_hook_native_queue(value: object) -> bool:
+    if not _owned_hook(value):
+        return False
+    if not isinstance(value, dict):
+        return False
+    hooks = value.get("hooks")
+    if not isinstance(hooks, list) or not hooks or not isinstance(hooks[0], dict):
+        return False
+    command = hooks[0].get("command")
+    if not isinstance(command, str):
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    return bool(tokens) and tokens[0] == "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE=experimental"
+
+
+def _hook_group(
+    executable: Path,
+    provider: str,
+    device: str,
+    event: str,
+    *,
+    codex_native_queue: bool = False,
+) -> dict[str, object]:
     timeout = 10 if (provider, event) == ("claude", "SessionStart") else 5
     if event in {"SessionEnd", "Stop"}:
         timeout = 3
@@ -373,7 +414,13 @@ def _hook_group(executable: Path, provider: str, device: str, event: str) -> dic
         "hooks": [
             {
                 "type": "command",
-                "command": _hook_command(executable, provider, device, event),
+                "command": _hook_command(
+                    executable,
+                    provider,
+                    device,
+                    event,
+                    codex_native_queue=codex_native_queue,
+                ),
                 "timeout": timeout,
             }
         ]
@@ -472,6 +519,23 @@ def _enable_hooks_feature(text: str) -> str:
         features = tomlkit.table()
         document["features"] = features
     features["hooks"] = True
+    return tomlkit.dumps(document)
+
+
+def _restore_hooks_feature(text: str, snapshot: dict[str, object]) -> str:
+    try:
+        document = tomlkit.parse(text)
+    except TOMLKitError as error:
+        raise SettingsError("Codex config.toml is invalid") from error
+    features = document.get("features")
+    if not isinstance(features, MutableMapping) or features.get("hooks") is not True:
+        return tomlkit.dumps(document)
+    if cast(bool, snapshot["present"]):
+        features["hooks"] = snapshot["value"]
+    else:
+        features.pop("hooks", None)
+        if not features:
+            document.pop("features", None)
     return tomlkit.dumps(document)
 
 
@@ -597,6 +661,8 @@ def _codex_owned_toml(
     device: str,
     hooks_path: Path,
     hook_indices: dict[str, int],
+    *,
+    codex_native_queue: bool = False,
 ) -> str:
     command = _toml_string(str(executable))
     args = (
@@ -608,10 +674,17 @@ def _codex_owned_toml(
     )
     text = (
         f'{OWNED_TOML_START}\n[mcp_servers."{SERVER_NAME}"]\ncommand = {command}\n'
-        f'args = {args}\ntool_timeout_sec = 120\ndefault_tools_approval_mode = "approve"\n'
+        f"args = {args}\ntool_timeout_sec = {int(MCP_TOOL_TIMEOUT_SECONDS)}\n"
+        'default_tools_approval_mode = "approve"\n'
     )
     for event, timeout in (("SessionStart", 5), ("SessionEnd", 3), ("Stop", 3)):
-        hook_command = _hook_command(executable, "codex", device, event)
+        hook_command = _hook_command(
+            executable,
+            "codex",
+            device,
+            event,
+            codex_native_queue=codex_native_queue,
+        )
         key = f"{hooks_path}:{_hook_event_name(event)}:{hook_indices[event]}:0"
         text += (
             f"\n[hooks.state.{_toml_string(key)}]\n"
@@ -673,21 +746,58 @@ class Installer:
         executable: Path,
         device: str,
         tailnet_address: str | None = None,
+        codex_home: Path | None = None,
+        claude_config_dir: Path | None = None,
+        codex_native_queue: bool | None = None,
     ) -> None:
         self.home = home.resolve()
         self.executable = executable if executable.is_absolute() else executable.absolute()
         self.device = valid_device(device)
+        if claude_config_dir is not None:
+            configured_claude_root = claude_config_dir.expanduser()
+            if not configured_claude_root.is_absolute() or configured_claude_root == Path("/"):
+                raise SettingsError("CLAUDE_CONFIG_DIR must be an absolute configuration directory")
+            self.claude_config_dir: Path | None = configured_claude_root.resolve(strict=False)
+        else:
+            self.claude_config_dir = None
+        configured_codex_home = (
+            self.home / ".codex" if codex_home is None else codex_home.expanduser()
+        )
+        if not configured_codex_home.is_absolute() or configured_codex_home == Path("/"):
+            raise SettingsError("CODEX_HOME must be an absolute configuration directory")
+        self.codex_home = configured_codex_home.resolve(strict=False)
         self.tailnet_address = (
             None if tailnet_address is None else valid_tailnet_address(tailnet_address)
         )
+        self.codex_native_queue = codex_native_queue
         self.state = self.home / ".local" / "state" / SERVER_NAME
-        self.install_state = self.home / ".config" / SERVER_NAME / "install.json"
+        profile_identity = json.dumps(
+            {
+                "claude_config_dir": None
+                if self.claude_config_dir is None
+                else str(self.claude_config_dir),
+                "codex_home": str(self.codex_home),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        default_profile = self.claude_config_dir is None and self.codex_home == self.home / ".codex"
+        install_name = (
+            "install.json"
+            if default_profile
+            else f"install-{hashlib.sha256(profile_identity).hexdigest()[:16]}.json"
+        )
+        self.install_state = self.home / ".config" / SERVER_NAME / install_name
         self.cache = self.home / ".cache" / SERVER_NAME
         self.legacy_peers = self.state / "peers.json"
-        self.claude_settings = self.home / ".claude" / "settings.json"
-        self.claude_config = self.home / ".claude.json"
-        self.codex_config = self.home / ".codex" / "config.toml"
-        self.codex_hooks = self.home / ".codex" / "hooks.json"
+        if self.claude_config_dir is None:
+            self.claude_settings = self.home / ".claude" / "settings.json"
+            self.claude_config = self.home / ".claude.json"
+        else:
+            self.claude_settings = self.claude_config_dir / "settings.json"
+            self.claude_config = self.claude_config_dir / ".claude.json"
+        self.codex_config = self.codex_home / "config.toml"
+        self.codex_hooks = self.codex_home / "hooks.json"
         self.launch_agent = self.home / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
         self.runtime_root = self.home / ".local" / "share" / f"{SERVER_NAME}-runtime"
         self.releases = self.runtime_root / "releases"
@@ -714,14 +824,41 @@ class Installer:
             if root.exists() and not root.resolve(strict=True).is_relative_to(self.home):
                 raise SettingsError("runtime ownership is invalid")
 
+    def _managed_root(self, path: Path) -> Path | None:
+        resolved = path.resolve(strict=False)
+        roots: tuple[Path, ...] = (self.codex_home, self.home)
+        if self.claude_config_dir is not None:
+            roots = (*roots, self.claude_config_dir)
+        for root in sorted(roots, key=lambda item: len(item.parts), reverse=True):
+            if resolved.is_relative_to(root):
+                return root
+        return None
+
+    def _codex_native_queue_enabled(self) -> bool:
+        if self.codex_native_queue is not None:
+            return self.codex_native_queue
+        try:
+            hooks = _json_object(self.codex_hooks)
+        except SettingsError:
+            return False
+        raw_hooks = hooks.get("hooks")
+        if not isinstance(raw_hooks, dict):
+            return False
+        session_start = raw_hooks.get("SessionStart")
+        if not isinstance(session_start, list):
+            return False
+        owned = [item for item in session_start if _owned_hook(item)]
+        return len(owned) == 1 and _owned_hook_native_queue(owned[0])
+
     def _ensure_durable_parent(self, parent: Path) -> None:
-        if not self.home.exists():
-            self.home.mkdir(mode=0o700, exist_ok=True)
         resolved = parent.resolve(strict=False)
-        if not resolved.is_relative_to(self.home):
-            raise SettingsError("managed path parent escapes home")
-        current = self.home
-        for part in resolved.relative_to(self.home).parts:
+        root = self._managed_root(resolved)
+        if root is None:
+            raise SettingsError("managed path parent escapes home and active configuration roots")
+        if not root.exists():
+            root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        current = root
+        for part in resolved.relative_to(root).parts:
             current /= part
             if current.exists():
                 if not current.is_dir():
@@ -734,7 +871,7 @@ class Installer:
         current = resolved
         while True:
             _fsync_directory(current)
-            if current == self.home:
+            if current == root:
                 return
             current = current.parent
 
@@ -779,15 +916,18 @@ class Installer:
         if self.install_state.exists():
             metadata = _json_object(self.install_state)
             previous = metadata.get("claude_cross_session_inbound")
+            hooks_feature = metadata.get("codex_hooks_feature")
             stable_relative = metadata.get("stable_entrypoint")
             if (
-                metadata.get("schema_version") not in {1, 2, 3}
+                metadata.get("schema_version") not in {1, 2, 3, 4}
                 or not isinstance(previous, dict)
                 or set(previous) != {"present", "value"}
                 or not isinstance(previous.get("present"), bool)
                 or (previous.get("present") is False and previous.get("value") is not None)
             ):
                 raise SettingsError("Cross Agent Chat install state is invalid")
+            if metadata.get("schema_version") == 4:
+                self._validate_hooks_feature_snapshot(hooks_feature)
             managed: list[Path]
             if metadata["schema_version"] == 1:
                 if set(metadata) != {"schema_version", "claude_cross_session_inbound"}:
@@ -816,14 +956,17 @@ class Installer:
                 managed = [stable]
             else:
                 raw_managed = metadata.get("managed_entrypoints")
+                expected_fields = {
+                    "schema_version",
+                    "claude_cross_session_inbound",
+                    "stable_entrypoint",
+                    "managed_entrypoints",
+                }
+                if metadata["schema_version"] == 4:
+                    expected_fields.add("provider_paths")
+                    expected_fields.add("codex_hooks_feature")
                 if (
-                    set(metadata)
-                    != {
-                        "schema_version",
-                        "claude_cross_session_inbound",
-                        "stable_entrypoint",
-                        "managed_entrypoints",
-                    }
+                    set(metadata) != expected_fields
                     or not isinstance(stable_relative, str)
                     or not isinstance(raw_managed, list)
                     or not raw_managed
@@ -840,32 +983,247 @@ class Installer:
                     raise SettingsError("Cross Agent Chat install state is invalid") from error
                 if stable not in managed:
                     raise SettingsError("Cross Agent Chat install state is invalid")
+                if metadata["schema_version"] == 4:
+                    recorded_paths = self._metadata_provider_paths(metadata)
+                    assert recorded_paths is not None
+                    self._require_recorded_provider_paths(recorded_paths)
             if stable_entrypoint is not None:
                 stable = self._validate_stable_entrypoint(stable_entrypoint)
             if stable not in managed:
                 managed.append(stable)
             return {
-                "schema_version": 3,
+                "schema_version": 4,
                 "claude_cross_session_inbound": previous,
                 "stable_entrypoint": str(stable.relative_to(self.home)),
                 "managed_entrypoints": [
                     str(path.relative_to(self.home)) for path in dict.fromkeys(managed)
                 ],
+                "provider_paths": self._provider_paths(),
+                "codex_hooks_feature": (
+                    self._validate_hooks_feature_snapshot(hooks_feature)
+                    if metadata["schema_version"] == 4
+                    else self._prior_codex_hooks_feature()
+                ),
             }
-        present = "crossSessionInbound" in settings
+        previous = self._prior_claude_cross_session_inbound(settings)
         try:
             stable = self._validate_stable_entrypoint(self.executable)
         except SettingsError:
             stable = self._validate_stable_entrypoint(self.home / ".local" / "bin" / SERVER_NAME)
         return {
-            "schema_version": 3,
-            "claude_cross_session_inbound": {
-                "present": present,
-                "value": settings.get("crossSessionInbound") if present else None,
-            },
+            "schema_version": 4,
+            "claude_cross_session_inbound": previous,
             "stable_entrypoint": str(stable.relative_to(self.home)),
             "managed_entrypoints": [str(stable.relative_to(self.home))],
+            "provider_paths": self._provider_paths(),
+            "codex_hooks_feature": self._prior_codex_hooks_feature(),
         }
+
+    def _provider_paths(self) -> dict[str, str]:
+        return {
+            "claude_settings": str(self.claude_settings.resolve(strict=False)),
+            "claude_config": str(self.claude_config.resolve(strict=False)),
+            "codex_config": str(self.codex_config.resolve(strict=False)),
+            "codex_hooks": str(self.codex_hooks.resolve(strict=False)),
+        }
+
+    def _require_recorded_provider_paths(self, recorded: dict[str, str]) -> None:
+        if self._provider_paths() != recorded:
+            raise SettingsError("provider configuration ownership changed")
+
+    def _update_json_for_uninstall(
+        self,
+        path: Path,
+        transform: Callable[[dict[str, object]], None],
+        *,
+        recorded_paths: dict[str, str] | None,
+        writes: dict[Path, tuple[PathSnapshot, bytes]],
+    ) -> bytes:
+        for attempt in range(5):
+            if recorded_paths is not None:
+                self._require_recorded_provider_paths(recorded_paths)
+            before = path.read_bytes() if path.exists() else None
+            value = _json_object(path)
+            transform(value)
+            if recorded_paths is not None:
+                self._require_recorded_provider_paths(recorded_paths)
+            current = path.read_bytes() if path.exists() else None
+            if current != before:
+                if attempt < 4:
+                    time.sleep(0.05)
+                    continue
+                break
+            payload = _json_bytes(value)
+            writes[path] = (_snapshot_path(path), payload)
+            _atomic_write(path, payload, mode=_shared_path_mode(path))
+            return payload
+        raise SettingsError(f"provider configuration kept changing during uninstall: {path}")
+
+    def _rollback_uninstall_writes(
+        self,
+        writes: dict[Path, tuple[PathSnapshot, bytes]],
+        *,
+        broker_was_loaded: bool,
+    ) -> tuple[Exception, ...]:
+        failures: list[Exception] = []
+        for path, (snapshot, payload) in reversed(tuple(writes.items())):
+            try:
+                current = path.read_bytes() if path.exists() else None
+                if current == payload:
+                    _restore_path(snapshot)
+            except (OSError, SettingsError) as error:
+                failures.append(error)
+        if broker_was_loaded:
+            try:
+                self.activate()
+            except (OSError, SettingsError, ChatError, subprocess.SubprocessError) as error:
+                failures.append(error)
+        return tuple(failures)
+
+    def _raise_uninstall_failure(
+        self,
+        failure: Exception,
+        writes: dict[Path, tuple[PathSnapshot, bytes]],
+        *,
+        broker_was_loaded: bool,
+    ) -> NoReturn:
+        rollback_failures = self._rollback_uninstall_writes(
+            writes,
+            broker_was_loaded=broker_was_loaded,
+        )
+        if rollback_failures:
+            raise SettingsError(
+                f"uninstall failed: {failure}; rollback failed: {rollback_failures[0]}"
+            ) from failure
+        raise failure
+
+    def _metadata_provider_paths(self, metadata: dict[str, object]) -> dict[str, str] | None:
+        schema_version = metadata.get("schema_version")
+        if schema_version in {1, 2, 3}:
+            return None
+        if schema_version != 4:
+            raise SettingsError("Cross Agent Chat install state is invalid")
+        names = {"claude_settings", "claude_config", "codex_config", "codex_hooks"}
+        raw_paths = metadata.get("provider_paths")
+        if not isinstance(raw_paths, dict) or set(raw_paths) != names:
+            raise SettingsError("Cross Agent Chat install state is invalid")
+        paths = cast(dict[str, object], raw_paths)
+        if not all(isinstance(paths[name], str) for name in names):
+            raise SettingsError("Cross Agent Chat install state is invalid")
+        if any(
+            not Path(cast(str, paths[name])).is_absolute()
+            or os.path.normpath(cast(str, paths[name])) != paths[name]
+            for name in names
+        ):
+            raise SettingsError("Cross Agent Chat install state is invalid")
+        return {name: cast(str, paths[name]) for name in names}
+
+    def _remaining_profile_metadata(self) -> list[dict[str, object]]:
+        if not self.install_state.parent.exists():
+            return []
+        records: list[dict[str, object]] = []
+        for candidate in self.install_state.parent.glob("install*.json"):
+            if candidate == self.install_state:
+                continue
+            if candidate.is_symlink() or not candidate.is_file():
+                raise SettingsError("remaining Cross Agent Chat install state is invalid")
+            metadata = _json_object(candidate)
+            paths = self._metadata_provider_paths(metadata)
+            if paths is not None:
+                managed_entrypoints = metadata.get("managed_entrypoints")
+                expected = {
+                    "schema_version",
+                    "claude_cross_session_inbound",
+                    "stable_entrypoint",
+                    "managed_entrypoints",
+                    "provider_paths",
+                    "codex_hooks_feature",
+                }
+                if (
+                    set(metadata) != expected
+                    or not isinstance(metadata.get("stable_entrypoint"), str)
+                    or not isinstance(managed_entrypoints, list)
+                    or not all(isinstance(item, str) for item in managed_entrypoints)
+                ):
+                    raise SettingsError("remaining Cross Agent Chat install state is invalid")
+                previous = metadata.get("claude_cross_session_inbound")
+                if (
+                    not isinstance(previous, dict)
+                    or set(previous) != {"present", "value"}
+                    or not isinstance(previous.get("present"), bool)
+                    or (previous.get("present") is False and previous.get("value") is not None)
+                ):
+                    raise SettingsError("remaining Cross Agent Chat install state is invalid")
+                self._validate_hooks_feature_snapshot(metadata.get("codex_hooks_feature"))
+            records.append(metadata)
+        return records
+
+    def _reject_incompatible_shared_codex_config(self) -> None:
+        current = self._provider_paths()
+        for metadata in self._remaining_profile_metadata():
+            paths = self._metadata_provider_paths(metadata)
+            if paths is None:
+                continue
+            shares_config = paths["codex_config"] == current["codex_config"]
+            shares_hooks = paths["codex_hooks"] == current["codex_hooks"]
+            if shares_config != shares_hooks:
+                raise SettingsError(
+                    "Codex config.toml and hooks.json must share the same profile ownership"
+                )
+
+    def _prior_claude_cross_session_inbound(self, settings: dict[str, object]) -> dict[str, object]:
+        claude_settings = self._provider_paths()["claude_settings"]
+        for metadata in self._remaining_profile_metadata():
+            paths = self._metadata_provider_paths(metadata)
+            if paths is None or paths["claude_settings"] != claude_settings:
+                continue
+            previous = metadata.get("claude_cross_session_inbound")
+            if (
+                not isinstance(previous, dict)
+                or set(previous) != {"present", "value"}
+                or not isinstance(previous.get("present"), bool)
+                or (previous.get("present") is False and previous.get("value") is not None)
+            ):
+                raise SettingsError("Cross Agent Chat install state is invalid")
+            return cast(dict[str, object], previous)
+        present = "crossSessionInbound" in settings
+        return {
+            "present": present,
+            "value": settings.get("crossSessionInbound") if present else None,
+        }
+
+    def _validate_hooks_feature_snapshot(self, value: object) -> dict[str, object]:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"present", "value"}
+            or not isinstance(value.get("present"), bool)
+            or (value.get("present") is False and value.get("value") is not None)
+            or (value.get("present") is True and not isinstance(value.get("value"), bool))
+        ):
+            raise SettingsError("Cross Agent Chat install state is invalid")
+        return cast(dict[str, object], value)
+
+    def _prior_codex_hooks_feature(self) -> dict[str, object]:
+        codex_config = self._provider_paths()["codex_config"]
+        for metadata in self._remaining_profile_metadata():
+            paths = self._metadata_provider_paths(metadata)
+            if paths is None or paths["codex_config"] != codex_config:
+                continue
+            return self._validate_hooks_feature_snapshot(metadata.get("codex_hooks_feature"))
+        text = self._codex_config_text()
+        if text is None:
+            return {"present": False, "value": None}
+        try:
+            document = tomlkit.parse(text)
+        except TOMLKitError as error:
+            raise SettingsError("Codex config.toml is invalid") from error
+        features = document.get("features")
+        if not isinstance(features, MutableMapping) or "hooks" not in features:
+            return {"present": False, "value": None}
+        value = features["hooks"]
+        if not isinstance(value, bool):
+            return {"present": False, "value": None}
+        return {"present": True, "value": value}
 
     def _launch_agent_payload(self) -> bytes:
         payload: dict[str, object] = {
@@ -912,11 +1270,18 @@ class Installer:
         servers[SERVER_NAME] = _mcp_route(self.executable, "claude", self.device)
 
         codex_hooks = _json_object(self.codex_hooks)
+        codex_native_queue = self._codex_native_queue_enabled()
         for event in ("SessionStart", "SessionEnd", "Stop"):
             _merge_hook(
                 codex_hooks,
                 event,
-                _hook_group(self.executable, "codex", self.device, event),
+                _hook_group(
+                    self.executable,
+                    "codex",
+                    self.device,
+                    event,
+                    codex_native_queue=codex_native_queue,
+                ),
             )
         raw_hook_map = codex_hooks.get("hooks")
         if not isinstance(raw_hook_map, dict):
@@ -945,6 +1310,7 @@ class Installer:
             self.device,
             self.codex_hooks,
             hook_indices,
+            codex_native_queue=codex_native_queue,
         )
 
         return {
@@ -963,8 +1329,7 @@ class Installer:
         destination = root / f"{stamp}-{uuid4().hex[:8]}"
         ensure_private_dir(destination)
         manifest: dict[str, object] = {
-            str(path.relative_to(self.home)): _snapshot_json(snapshot)
-            for path, snapshot in originals.items()
+            self._backup_key(path): _snapshot_json(snapshot) for path, snapshot in originals.items()
         }
         _atomic_write(destination / "manifest.json", _json_bytes(manifest))
         _fsync_directory(root)
@@ -973,6 +1338,15 @@ class Installer:
         _fsync_directory(self.home)
         return destination
 
+    def _backup_key(self, path: Path) -> str:
+        if self.claude_config_dir is not None and path.is_relative_to(self.claude_config_dir):
+            return f"CLAUDE_CONFIG_DIR/{path.relative_to(self.claude_config_dir)}"
+        if path.is_relative_to(self.home):
+            return str(path.relative_to(self.home))
+        if path.is_relative_to(self.codex_home):
+            return f"CODEX_HOME/{path.relative_to(self.codex_home)}"
+        raise SettingsError("backup path is outside active configuration roots")
+
     def _configuration_destinations(self) -> dict[Path, Path]:
         destinations: dict[Path, Path] = {}
         for path in self.config_paths:
@@ -980,12 +1354,15 @@ class Installer:
                 destination = path.resolve(strict=False)
             except (OSError, RuntimeError) as error:
                 raise SettingsError(f"managed configuration path is invalid: {path}") from error
-            if not destination.is_relative_to(self.home):
-                raise SettingsError(f"managed configuration path escapes home: {path}")
+            if self._managed_root(destination) is None:
+                raise SettingsError(
+                    f"managed configuration path escapes home and active roots: {path}"
+                )
             destinations[path] = destination
         return destinations
 
     def _prepare_setup(self, stable_entrypoint: Path | None = None) -> PreparedSetup:
+        self._reject_incompatible_shared_codex_config()
         last_error: OSError | None = None
         for attempt in range(5):
             try:
@@ -1081,12 +1458,21 @@ class Installer:
         for relative, encoded in manifest.items():
             if not isinstance(relative, str):
                 raise SettingsError("backup manifest is invalid")
-            relative_path = Path(relative)
-            destination = self.home / relative_path
+            if relative.startswith("CODEX_HOME/"):
+                relative_path = Path(relative.removeprefix("CODEX_HOME/"))
+                destination = self.codex_home / relative_path
+            elif relative.startswith("CLAUDE_CONFIG_DIR/"):
+                if self.claude_config_dir is None:
+                    raise SettingsError("backup manifest is invalid")
+                relative_path = Path(relative.removeprefix("CLAUDE_CONFIG_DIR/"))
+                destination = self.claude_config_dir / relative_path
+            else:
+                relative_path = Path(relative)
+                destination = self.home / relative_path
             if (
                 relative_path.is_absolute()
                 or ".." in relative_path.parts
-                or not destination.parent.resolve(strict=False).is_relative_to(self.home)
+                or self._managed_root(destination.parent) is None
             ):
                 raise SettingsError("backup manifest is invalid")
             if isinstance(encoded, dict):
@@ -1751,9 +2137,14 @@ class Installer:
             if launch_agent != plistlib.loads(self._launch_agent_payload()):
                 return False
             self._install_metadata(settings)
-            for config, events in (
-                (settings, ("SessionStart", "SessionEnd")),
-                (codex_hooks, ("SessionStart", "SessionEnd", "Stop")),
+            for config, provider, events, native_queue in (
+                (settings, "claude", ("SessionStart", "SessionEnd"), False),
+                (
+                    codex_hooks,
+                    "codex",
+                    ("SessionStart", "SessionEnd", "Stop"),
+                    self._codex_native_queue_enabled(),
+                ),
             ):
                 raw_hooks = config.get("hooks")
                 if not isinstance(raw_hooks, dict):
@@ -1762,7 +2153,16 @@ class Installer:
                     groups = raw_hooks.get(event)
                     if not isinstance(groups, list):
                         return False
-                    if len([item for item in groups if _owned_hook(item)]) != 1:
+                    owned = [item for item in groups if _owned_hook(item)]
+                    if owned != [
+                        _hook_group(
+                            self.executable,
+                            provider,
+                            self.device,
+                            event,
+                            codex_native_queue=native_queue,
+                        )
+                    ]:
                         return False
             return True
         except (
@@ -2198,9 +2598,38 @@ class Installer:
 
         shutdown_couriers(self.state)
 
-    def _remove_runtime_state(self) -> None:
-        if self.state.exists():
-            shutil.rmtree(self.state)
+    def _remove_runtime_state(self) -> bool:
+        """Retire transient routes without erasing durable delivery intent evidence.
+
+        Returns whether durable intent state remains for the owner to inspect.
+        """
+        if not self.state.exists():
+            return False
+        if self.state.is_symlink() or not self.state.is_dir():
+            raise SettingsError("runtime state ownership is invalid")
+        routes = self.state / "routes.json"
+        if routes.is_symlink() or routes.is_file():
+            routes.unlink()
+        elif routes.exists():
+            raise SettingsError("transient route state is invalid")
+        intents = self.state / "intents.json"
+        if intents.exists() or intents.is_symlink():
+            return True
+        shutil.rmtree(self.state)
+        return False
+
+    def _other_profile_install_states(self) -> bool:
+        return bool(self._remaining_profile_metadata())
+
+    def _provider_path_has_remaining_owner(
+        self, provider_path: str, remaining: list[dict[str, object]]
+    ) -> bool:
+        current_path = self._provider_paths()[provider_path]
+        for metadata in remaining:
+            paths = self._metadata_provider_paths(metadata)
+            if paths is None or paths[provider_path] == current_path:
+                return True
+        return False
 
     def _prepare_runtime_removal(
         self,
@@ -2335,98 +2764,162 @@ class Installer:
         with suppress(OSError):
             self.runtime_root.rmdir()
 
-    def uninstall(self) -> None:
+    def uninstall(self) -> bool:
         with self._exclusive_lock():
-            self._uninstall()
+            return self._uninstall()
 
-    def _uninstall(self) -> None:
+    def _uninstall(self) -> bool:
         self._codex_config_text()
         self._recover_unfinished_transaction()
+        recorded_metadata = _json_object(self.install_state)
+        recorded_schema = recorded_metadata.get("schema_version")
+        normalized_metadata = self._install_metadata(_json_object(self.claude_settings))
+        metadata = recorded_metadata if recorded_schema == 4 else normalized_metadata
+        recorded_paths = self._metadata_provider_paths(metadata)
+        if recorded_paths is not None:
+            self._require_recorded_provider_paths(recorded_paths)
         destinations = self._configuration_destinations()
-        metadata = self._install_metadata(_json_object(self.claude_settings))
+        _json_object(destinations[self.claude_settings])
+        _json_object(destinations[self.claude_config])
+        _json_object(destinations[self.codex_hooks])
+        codex_preflight = self._codex_config_text()
+        if codex_preflight is not None:
+            _remove_owned_codex_server(_strip_owned_toml_block(codex_preflight))
+        uninstall_writes: dict[Path, tuple[PathSnapshot, bytes]] = {}
         stable_entrypoint = self.home / cast(str, metadata["stable_entrypoint"])
         managed_entrypoints = tuple(
             self.home / cast(str, item)
             for item in cast(list[object], metadata["managed_entrypoints"])
         )
-        runtime_removal = self._prepare_runtime_removal(stable_entrypoint, managed_entrypoints)
-        broker_was_loaded = self.broker_is_loaded()
-        self._stop_broker()
-        self._stop_couriers()
-        self._remove_runtime_state()
-        for attempt in range(5):
-            destinations = self._configuration_destinations()
-            codex_hooks = _json_object(destinations[self.codex_hooks])
-            owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
-            codex_text = self._codex_config_text()
-            if codex_text is None:
-                break
-            stripped = _strip_owned_toml_block(codex_text)
-            stripped = _remove_owned_codex_server(stripped)
-            stripped = _remove_owned_hook_trust(stripped, owned_trust_keys)
-            if stripped == codex_text:
-                break
-            if self._codex_config_text() != codex_text:
-                destinations = self._configuration_destinations()
-                if attempt < 4:
-                    time.sleep(0.05)
-                continue
-            codex_destination = destinations[self.codex_config]
-            _atomic_write(
-                codex_destination,
-                stripped.lstrip("\n").encode(),
-                mode=_shared_path_mode(codex_destination),
-            )
-            break
-        else:
-            if broker_was_loaded:
-                self.activate()
-            raise SettingsError(
-                f"Codex config.toml kept changing during uninstall: {self.codex_config}; "
-                "re-run uninstall"
-            )
-        claude_settings = _json_object(destinations[self.claude_settings])
-        _remove_hooks(claude_settings)
-        previous = cast(dict[str, object], metadata["claude_cross_session_inbound"])
-        if claude_settings.get("crossSessionInbound") == "accept":
-            if cast(bool, previous["present"]):
-                claude_settings["crossSessionInbound"] = previous["value"]
-            else:
-                claude_settings.pop("crossSessionInbound", None)
-        claude_settings_destination = destinations[self.claude_settings]
-        _atomic_write(
-            claude_settings_destination,
-            _json_bytes(claude_settings),
-            mode=_shared_path_mode(claude_settings_destination),
+        remaining_profiles = self._remaining_profile_metadata()
+        other_profile_installs = bool(remaining_profiles)
+        claude_settings_has_remaining_owner = self._provider_path_has_remaining_owner(
+            "claude_settings", remaining_profiles
         )
+        claude_config_has_remaining_owner = self._provider_path_has_remaining_owner(
+            "claude_config", remaining_profiles
+        )
+        codex_config_has_remaining_owner = self._provider_path_has_remaining_owner(
+            "codex_config", remaining_profiles
+        )
+        codex_hooks_has_remaining_owner = self._provider_path_has_remaining_owner(
+            "codex_hooks", remaining_profiles
+        )
+        runtime_removal = (
+            None
+            if other_profile_installs
+            else self._prepare_runtime_removal(stable_entrypoint, managed_entrypoints)
+        )
+        broker_was_loaded = False if other_profile_installs else self.broker_is_loaded()
+        if not other_profile_installs:
+            self._stop_broker()
 
-        claude = _json_object(destinations[self.claude_config])
-        servers = claude.get("mcpServers")
-        if isinstance(servers, dict):
-            cast(dict[str, object], servers).pop(SERVER_NAME, None)
-        claude_destination = destinations[self.claude_config]
-        _atomic_write(
-            claude_destination,
-            _json_bytes(claude),
-            mode=_shared_path_mode(claude_destination),
-        )
+        def remove_owned_configuration() -> bool:
+            current_destinations = destinations
+            durable_intents_preserved = (self.state / "intents.json").exists()
+            if not other_profile_installs:
+                self._stop_couriers()
+                durable_intents_preserved = self._remove_runtime_state()
+            if recorded_paths is not None:
+                self._require_recorded_provider_paths(recorded_paths)
+            if not codex_config_has_remaining_owner:
+                for attempt in range(5):
+                    if recorded_paths is not None:
+                        self._require_recorded_provider_paths(recorded_paths)
+                    current_destinations = self._configuration_destinations()
+                    codex_hooks = _json_object(current_destinations[self.codex_hooks])
+                    owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
+                    codex_text = self._codex_config_text()
+                    if codex_text is None:
+                        break
+                    stripped = _strip_owned_toml_block(codex_text)
+                    stripped = _remove_owned_codex_server(stripped)
+                    stripped = _remove_owned_hook_trust(stripped, owned_trust_keys)
+                    if recorded_schema == 4:
+                        stripped = _restore_hooks_feature(
+                            stripped,
+                            cast(dict[str, object], metadata["codex_hooks_feature"]),
+                        )
+                    if stripped == codex_text:
+                        break
+                    if self._codex_config_text() != codex_text:
+                        current_destinations = self._configuration_destinations()
+                        if attempt < 4:
+                            time.sleep(0.05)
+                        continue
+                    codex_destination = current_destinations[self.codex_config]
+                    payload = stripped.lstrip("\n").encode()
+                    uninstall_writes[codex_destination] = (
+                        _snapshot_path(codex_destination),
+                        payload,
+                    )
+                    _atomic_write(
+                        codex_destination,
+                        payload,
+                        mode=_shared_path_mode(codex_destination),
+                    )
+                    break
+                else:
+                    raise SettingsError(
+                        f"Codex config.toml kept changing during uninstall: {self.codex_config}; "
+                        "re-run uninstall"
+                    )
+            if not codex_hooks_has_remaining_owner:
+                self._update_json_for_uninstall(
+                    current_destinations[self.codex_hooks],
+                    _remove_hooks,
+                    recorded_paths=recorded_paths,
+                    writes=uninstall_writes,
+                )
+            if not claude_settings_has_remaining_owner:
+                previous = cast(dict[str, object], metadata["claude_cross_session_inbound"])
 
-        codex_hooks = _json_object(destinations[self.codex_hooks])
-        _remove_hooks(codex_hooks)
-        codex_hooks_destination = destinations[self.codex_hooks]
-        _atomic_write(
-            codex_hooks_destination,
-            _json_bytes(codex_hooks),
-            mode=_shared_path_mode(codex_hooks_destination),
-        )
-        destinations[self.launch_agent].unlink(missing_ok=True)
-        self.legacy_peers.unlink(missing_ok=True)
-        if self.cache.exists():
-            shutil.rmtree(self.cache)
-        self._remove_installed_runtime(runtime_removal)
-        destinations[self.install_state].unlink(missing_ok=True)
-        with suppress(OSError):
-            self.install_state.parent.rmdir()
+                def remove_claude_settings(value: dict[str, object]) -> None:
+                    _remove_hooks(value)
+                    if value.get("crossSessionInbound") == "accept":
+                        if cast(bool, previous["present"]):
+                            value["crossSessionInbound"] = previous["value"]
+                        else:
+                            value.pop("crossSessionInbound", None)
+
+                self._update_json_for_uninstall(
+                    current_destinations[self.claude_settings],
+                    remove_claude_settings,
+                    recorded_paths=recorded_paths,
+                    writes=uninstall_writes,
+                )
+
+            if not claude_config_has_remaining_owner:
+
+                def remove_claude_server(value: dict[str, object]) -> None:
+                    servers = value.get("mcpServers")
+                    if isinstance(servers, dict):
+                        cast(dict[str, object], servers).pop(SERVER_NAME, None)
+
+                self._update_json_for_uninstall(
+                    current_destinations[self.claude_config],
+                    remove_claude_server,
+                    recorded_paths=recorded_paths,
+                    writes=uninstall_writes,
+                )
+            if not other_profile_installs:
+                current_destinations[self.launch_agent].unlink(missing_ok=True)
+                self.legacy_peers.unlink(missing_ok=True)
+            if self.cache.exists() and not other_profile_installs:
+                shutil.rmtree(self.cache)
+            if not other_profile_installs:
+                self._remove_installed_runtime(runtime_removal)
+            current_destinations[self.install_state].unlink(missing_ok=True)
+            with suppress(OSError):
+                self.install_state.parent.rmdir()
+            return durable_intents_preserved
+
+        try:
+            return remove_owned_configuration()
+        except (OSError, SettingsError, ChatError, subprocess.SubprocessError) as failure:
+            self._raise_uninstall_failure(
+                failure, uninstall_writes, broker_was_loaded=broker_was_loaded
+            )
 
 
 def discover_executable(invoked_as: Path | None = None) -> Path:

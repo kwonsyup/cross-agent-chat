@@ -22,6 +22,7 @@ from cross_agent_chat.core import (
     UnknownDeliveryError,
     bounded_message,
     canonical_cwd,
+    session_key,
     valid_name,
     valid_uuid,
 )
@@ -42,7 +43,29 @@ COURIER_ENV_KEYS: Final = (
 CLAUDE_AUTH_ENV_KEYS: Final = (
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
 )
+CLAUDE_CONTEXT_ENV_KEYS: Final = (
+    "CLAUDE_CONFIG_DIR",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLOUD_ML_REGION",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
+BOUND_CLAUDE_BINARY_ENV: Final = "CROSS_AGENT_CHAT_CLAUDE_BINARY"
 TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z")
 
 
@@ -58,7 +81,7 @@ def courier_environment(source: Mapping[str, str] | None = None) -> dict[str, st
     environment = os.environ if source is None else source
     return {
         key: environment[key]
-        for key in (*COURIER_ENV_KEYS, *CLAUDE_AUTH_ENV_KEYS)
+        for key in (*COURIER_ENV_KEYS, *CLAUDE_AUTH_ENV_KEYS, *CLAUDE_CONTEXT_ENV_KEYS)
         if key in environment
     }
 
@@ -68,7 +91,8 @@ def _environment() -> dict[str, str]:
 
 
 def claude_binary() -> Path:
-    candidate = shutil.which("claude")
+    configured = os.environ.get(BOUND_CLAUDE_BINARY_ENV)
+    candidate = configured if configured else shutil.which("claude")
     if candidate is None:
         fallback = Path.home() / ".local" / "bin" / "claude"
         candidate = str(fallback) if fallback.exists() else None
@@ -135,16 +159,21 @@ def exact_agent(session_id: str, cwd: str) -> ClaudeAgent:
         agent
         for agent in claude_agents()
         if agent["session_id"] == session_id
-        and agent["kind"] == "interactive"
+        and agent["kind"] in {"interactive", "background"}
         and agent["cwd"] == cwd
     ]
     if len(matches) != 1:
-        raise ChatError("Claude target is not one exact live interactive session")
+        raise ChatError("Claude target is not one exact live supported session")
     return matches[0]
 
 
 def claude_alias(device: str, project: str, agent: ClaudeAgent) -> str:
-    return valid_name(f"claude@{device}:{project}:{agent['name']}", "Claude alias")
+    valid_name(project, "project")
+    valid_name(agent["name"], "Claude session name")
+    rendered = f"claude@{device}:{project}:{agent['name']}"
+    if len(rendered) > 128:
+        rendered = rendered[:115] + "~" + session_key("claude", agent["session_id"])[:12]
+    return valid_name(rendered, "Claude alias")
 
 
 def discover_target_ref(session_name: str) -> str:
@@ -188,7 +217,8 @@ def discover_target_ref(session_name: str) -> str:
     if completed.returncode != 0 or len(listings) != 1:
         raise ChatError("Claude ListAgents discovery failed")
     pattern = re.compile(
-        r"^  (?P<name>.+?) \[(?P<token>[A-Za-z0-9]{6})\]  ·  interactive(?:  ·  [^\r\n]+)*$"
+        r"^  (?P<name>.+?) \[(?P<token>[A-Za-z0-9]{6})\]  ·  "
+        r"(?:interactive|bg)(?:  ·  [^\r\n]+)*$"
     )
     refs = [
         f"{match.group('name')} [{match.group('token')}]"
@@ -196,7 +226,7 @@ def discover_target_ref(session_name: str) -> str:
         if (match := pattern.fullmatch(line)) and match.group("name") == session_name
     ]
     if len(refs) != 1 or TARGET_REF_RE.fullmatch(refs[0]) is None:
-        raise ChatError("Claude target discovery is not one exact interactive match")
+        raise ChatError("Claude target discovery is not one exact supported match")
     return refs[0]
 
 

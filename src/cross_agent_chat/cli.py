@@ -37,12 +37,21 @@ def _fail(message: str) -> NoReturn:
     raise ChatError(message)
 
 
-def _installer(device: str | None) -> Installer:
+def _installer(device: str | None, *, codex_native_queue: bool | None = None) -> Installer:
+    raw_codex_home = os.environ.get("CODEX_HOME")
+    codex_home = None if raw_codex_home in {None, ""} else Path(raw_codex_home).expanduser()
+    raw_claude_config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    claude_config_dir = (
+        None if raw_claude_config_dir in {None, ""} else Path(raw_claude_config_dir).expanduser()
+    )
     return Installer(
         home=Path.home(),
         executable=discover_executable(Path(sys.argv[0])),
         device=default_device() if device is None else device,
         tailnet_address=known_tailnet_address(),
+        codex_home=codex_home,
+        claude_config_dir=claude_config_dir,
+        codex_native_queue=codex_native_queue,
     )
 
 
@@ -101,7 +110,15 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                             {
                                 "name": "chat_peers",
                                 "description": (
-                                    "List exact live Claude and Codex peers before addressing one."
+                                    "Discover exact live Claude and "
+                                    "Codex recipients for requested "
+                                    "communication. Resolve across "
+                                    "devices and ask for clarification "
+                                    "when multiple peers match. Do not "
+                                    "choose a local peer merely because "
+                                    "it is local. Delivery mode reports "
+                                    "capability, not a receipt. Do not "
+                                    "call for unrelated work."
                                 ),
                                 "inputSchema": {
                                     "type": "object",
@@ -112,7 +129,19 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                             {
                                 "name": "chat_send",
                                 "description": (
-                                    "Send one asynchronous message. A reply is a separate send."
+                                    "Send one requested asynchronous "
+                                    "message to an exact verified peer. "
+                                    "A reply is a separate send. "
+                                    "TRANSPORT_ACCEPTED means custody, "
+                                    "not consumption; UNKNOWN_DELIVERY "
+                                    "must not be retried through any "
+                                    "transport. Stop-bound recipients "
+                                    "wait for a normal turn; "
+                                    "experimental queues are not "
+                                    "universal support. Do not "
+                                    "broadcast, route around permission "
+                                    "denial, change configuration, or "
+                                    "send for unrelated work."
                                 ),
                                 "inputSchema": {
                                     "type": "object",
@@ -140,7 +169,7 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                 typed_arguments = cast(dict[str, object], arguments)
                 if name == "chat_peers" and not typed_arguments:
                     assert root is not None
-                    result = peers(root)
+                    result = peers(root, include_delivery_mode=True)
                 elif name == "chat_send":
                     target, message = normalize_send_arguments(typed_arguments)
                     metadata = typed_params.get("_meta")
@@ -180,6 +209,17 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     setup = commands.add_parser("setup", help="install and verify native provider integrations")
     setup.add_argument("--device")
+    setup_native_queue = setup.add_mutually_exclusive_group()
+    setup_native_queue.add_argument(
+        "--enable-experimental-codex-native-queue",
+        action="store_true",
+        help="persist the version-bound experimental Codex queue for this active profile",
+    )
+    setup_native_queue.add_argument(
+        "--disable-experimental-codex-native-queue",
+        action="store_true",
+        help="return this active Codex profile to natural Stop delivery",
+    )
     doctor = commands.add_parser("doctor", help="verify installed integrations")
     doctor.add_argument("--device")
     doctor.add_argument("--json", action="store_true")
@@ -232,7 +272,14 @@ def parser() -> argparse.ArgumentParser:
 def run(arguments: argparse.Namespace) -> int:
     command = cast(str, arguments.command)
     if command == "setup":
-        _installer(arguments.device).install()
+        codex_native_queue = (
+            True
+            if arguments.enable_experimental_codex_native_queue
+            else False
+            if arguments.disable_experimental_codex_native_queue
+            else None
+        )
+        _installer(arguments.device, codex_native_queue=codex_native_queue).install()
         print(
             f"Cross Agent Chat is ready on {arguments.device or default_device()}. "
             "Start fresh Claude/Codex sessions."
@@ -245,6 +292,9 @@ def run(arguments: argparse.Namespace) -> int:
         doctor_result = {
             "version": __version__,
             "integration": "healthy" if integration_healthy else "needs setup",
+            "codex_native_queue": (
+                "experimental" if installer._codex_native_queue_enabled() else "stop-bound"
+            ),
             "local_broker": "healthy" if broker_healthy else "unavailable",
             "remote_trust": "tailscale_acl",
             "next": "start fresh Claude/Codex sessions" if healthy else "cross-agent-chat setup",
@@ -256,8 +306,10 @@ def run(arguments: argparse.Namespace) -> int:
         )
         return 0 if healthy else 1
     elif command == "uninstall":
-        _installer(arguments.device).uninstall()
+        retained = _installer(arguments.device).uninstall()
         print("Removed Cross Agent Chat-owned provider and background configuration.")
+        if retained:
+            print("Delivery intent records remain available for owner inspection.")
     elif command == "peers":
         peer_result = peers(state_root(), include_remote=not arguments.local_only)
         if arguments.json:
@@ -298,6 +350,16 @@ def run(arguments: argparse.Namespace) -> int:
             executable=arguments.stable_entrypoint,
             device=device,
             tailnet_address=known_tailnet_address(),
+            codex_home=(
+                None
+                if os.environ.get("CODEX_HOME") in {None, ""}
+                else Path(os.environ["CODEX_HOME"]).expanduser()
+            ),
+            claude_config_dir=(
+                None
+                if os.environ.get("CLAUDE_CONFIG_DIR") in {None, ""}
+                else Path(os.environ["CLAUDE_CONFIG_DIR"]).expanduser()
+            ),
         )
         installer.install_staged(arguments.staged_runtime, arguments.stable_entrypoint)
         print(f"Cross Agent Chat is ready on {device}. Start fresh Claude/Codex sessions.")
