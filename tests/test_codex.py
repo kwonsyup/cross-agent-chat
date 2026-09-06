@@ -149,7 +149,11 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as log:
 """
     )
     binary.chmod(0o700)
-    monkeypatch.setattr(codex, "NATIVE_QUEUE_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(
+        codex,
+        "NATIVE_QUEUE_TIMEOUT_SECONDS",
+        1.0 if mode in {"init_timeout", "queue_timeout"} else 5.0,
+    )
     monkeypatch.setattr(codex, "MAX_NATIVE_STDOUT_BYTES", 4096)
     body = "peer body only on stdin"
     environment = {"CODEX_HOME": str(tmp_path), "TEST_MODE": mode, "TEST_TRACE": str(trace)}

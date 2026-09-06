@@ -1076,7 +1076,7 @@ class Installer:
         if broker_was_loaded:
             try:
                 self.activate()
-            except (OSError, SettingsError) as error:
+            except (OSError, SettingsError, ChatError, subprocess.SubprocessError) as error:
                 failures.append(error)
         return tuple(failures)
 
@@ -2773,8 +2773,8 @@ class Installer:
         self._recover_unfinished_transaction()
         recorded_metadata = _json_object(self.install_state)
         recorded_schema = recorded_metadata.get("schema_version")
-        self._install_metadata(_json_object(self.claude_settings))
-        metadata = recorded_metadata
+        normalized_metadata = self._install_metadata(_json_object(self.claude_settings))
+        metadata = recorded_metadata if recorded_schema == 4 else normalized_metadata
         recorded_paths = self._metadata_provider_paths(metadata)
         if recorded_paths is not None:
             self._require_recorded_provider_paths(recorded_paths)
@@ -2811,135 +2811,115 @@ class Installer:
             else self._prepare_runtime_removal(stable_entrypoint, managed_entrypoints)
         )
         broker_was_loaded = False if other_profile_installs else self.broker_is_loaded()
-        durable_intents_preserved = (self.state / "intents.json").exists()
         if not other_profile_installs:
             self._stop_broker()
-            self._stop_couriers()
-            durable_intents_preserved = self._remove_runtime_state()
-        if recorded_paths is not None:
-            try:
+
+        def remove_owned_configuration() -> bool:
+            current_destinations = destinations
+            durable_intents_preserved = (self.state / "intents.json").exists()
+            if not other_profile_installs:
+                self._stop_couriers()
+                durable_intents_preserved = self._remove_runtime_state()
+            if recorded_paths is not None:
                 self._require_recorded_provider_paths(recorded_paths)
-            except SettingsError as failure:
-                self._raise_uninstall_failure(
-                    failure,
-                    uninstall_writes,
-                    broker_was_loaded=broker_was_loaded,
-                )
-        if not codex_config_has_remaining_owner:
-            for attempt in range(5):
-                if recorded_paths is not None:
-                    self._require_recorded_provider_paths(recorded_paths)
-                destinations = self._configuration_destinations()
-                codex_hooks = _json_object(destinations[self.codex_hooks])
-                owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
-                codex_text = self._codex_config_text()
-                if codex_text is None:
-                    break
-                stripped = _strip_owned_toml_block(codex_text)
-                stripped = _remove_owned_codex_server(stripped)
-                stripped = _remove_owned_hook_trust(stripped, owned_trust_keys)
-                if recorded_schema == 4:
-                    stripped = _restore_hooks_feature(
-                        stripped,
-                        cast(dict[str, object], metadata["codex_hooks_feature"]),
+            if not codex_config_has_remaining_owner:
+                for attempt in range(5):
+                    if recorded_paths is not None:
+                        self._require_recorded_provider_paths(recorded_paths)
+                    current_destinations = self._configuration_destinations()
+                    codex_hooks = _json_object(current_destinations[self.codex_hooks])
+                    owned_trust_keys = _owned_hook_trust_keys(codex_hooks, self.codex_hooks)
+                    codex_text = self._codex_config_text()
+                    if codex_text is None:
+                        break
+                    stripped = _strip_owned_toml_block(codex_text)
+                    stripped = _remove_owned_codex_server(stripped)
+                    stripped = _remove_owned_hook_trust(stripped, owned_trust_keys)
+                    if recorded_schema == 4:
+                        stripped = _restore_hooks_feature(
+                            stripped,
+                            cast(dict[str, object], metadata["codex_hooks_feature"]),
+                        )
+                    if stripped == codex_text:
+                        break
+                    if self._codex_config_text() != codex_text:
+                        current_destinations = self._configuration_destinations()
+                        if attempt < 4:
+                            time.sleep(0.05)
+                        continue
+                    codex_destination = current_destinations[self.codex_config]
+                    payload = stripped.lstrip("\n").encode()
+                    uninstall_writes[codex_destination] = (
+                        _snapshot_path(codex_destination),
+                        payload,
                     )
-                if stripped == codex_text:
-                    break
-                if self._codex_config_text() != codex_text:
-                    destinations = self._configuration_destinations()
-                    if attempt < 4:
-                        time.sleep(0.05)
-                    continue
-                codex_destination = destinations[self.codex_config]
-                payload = stripped.lstrip("\n").encode()
-                uninstall_writes[codex_destination] = (_snapshot_path(codex_destination), payload)
-                try:
                     _atomic_write(
                         codex_destination,
                         payload,
                         mode=_shared_path_mode(codex_destination),
                     )
-                except (OSError, SettingsError) as failure:
-                    self._raise_uninstall_failure(
-                        failure, uninstall_writes, broker_was_loaded=broker_was_loaded
-                    )
-                break
-            else:
-                self._raise_uninstall_failure(
-                    SettingsError(
+                    break
+                else:
+                    raise SettingsError(
                         f"Codex config.toml kept changing during uninstall: {self.codex_config}; "
                         "re-run uninstall"
-                    ),
-                    uninstall_writes,
-                    broker_was_loaded=broker_was_loaded,
-                )
-        if not codex_hooks_has_remaining_owner:
-            codex_hooks_destination = destinations[self.codex_hooks]
-            try:
+                    )
+            if not codex_hooks_has_remaining_owner:
                 self._update_json_for_uninstall(
-                    codex_hooks_destination,
+                    current_destinations[self.codex_hooks],
                     _remove_hooks,
                     recorded_paths=recorded_paths,
                     writes=uninstall_writes,
                 )
-            except (OSError, SettingsError) as failure:
-                self._raise_uninstall_failure(
-                    failure, uninstall_writes, broker_was_loaded=broker_was_loaded
-                )
-        if not claude_settings_has_remaining_owner:
-            previous = cast(dict[str, object], metadata["claude_cross_session_inbound"])
-            claude_settings_destination = destinations[self.claude_settings]
+            if not claude_settings_has_remaining_owner:
+                previous = cast(dict[str, object], metadata["claude_cross_session_inbound"])
 
-            def remove_claude_settings(value: dict[str, object]) -> None:
-                _remove_hooks(value)
-                if value.get("crossSessionInbound") == "accept":
-                    if cast(bool, previous["present"]):
-                        value["crossSessionInbound"] = previous["value"]
-                    else:
-                        value.pop("crossSessionInbound", None)
+                def remove_claude_settings(value: dict[str, object]) -> None:
+                    _remove_hooks(value)
+                    if value.get("crossSessionInbound") == "accept":
+                        if cast(bool, previous["present"]):
+                            value["crossSessionInbound"] = previous["value"]
+                        else:
+                            value.pop("crossSessionInbound", None)
 
-            try:
                 self._update_json_for_uninstall(
-                    claude_settings_destination,
+                    current_destinations[self.claude_settings],
                     remove_claude_settings,
                     recorded_paths=recorded_paths,
                     writes=uninstall_writes,
                 )
-            except (OSError, SettingsError) as failure:
-                self._raise_uninstall_failure(
-                    failure, uninstall_writes, broker_was_loaded=broker_was_loaded
-                )
 
-        if not claude_config_has_remaining_owner:
-            claude_destination = destinations[self.claude_config]
+            if not claude_config_has_remaining_owner:
 
-            def remove_claude_server(value: dict[str, object]) -> None:
-                servers = value.get("mcpServers")
-                if isinstance(servers, dict):
-                    cast(dict[str, object], servers).pop(SERVER_NAME, None)
+                def remove_claude_server(value: dict[str, object]) -> None:
+                    servers = value.get("mcpServers")
+                    if isinstance(servers, dict):
+                        cast(dict[str, object], servers).pop(SERVER_NAME, None)
 
-            try:
                 self._update_json_for_uninstall(
-                    claude_destination,
+                    current_destinations[self.claude_config],
                     remove_claude_server,
                     recorded_paths=recorded_paths,
                     writes=uninstall_writes,
                 )
-            except (OSError, SettingsError) as failure:
-                self._raise_uninstall_failure(
-                    failure, uninstall_writes, broker_was_loaded=broker_was_loaded
-                )
-        if not other_profile_installs:
-            destinations[self.launch_agent].unlink(missing_ok=True)
-            self.legacy_peers.unlink(missing_ok=True)
-        if self.cache.exists() and not other_profile_installs:
-            shutil.rmtree(self.cache)
-        if not other_profile_installs:
-            self._remove_installed_runtime(runtime_removal)
-        destinations[self.install_state].unlink(missing_ok=True)
-        with suppress(OSError):
-            self.install_state.parent.rmdir()
-        return durable_intents_preserved
+            if not other_profile_installs:
+                current_destinations[self.launch_agent].unlink(missing_ok=True)
+                self.legacy_peers.unlink(missing_ok=True)
+            if self.cache.exists() and not other_profile_installs:
+                shutil.rmtree(self.cache)
+            if not other_profile_installs:
+                self._remove_installed_runtime(runtime_removal)
+            current_destinations[self.install_state].unlink(missing_ok=True)
+            with suppress(OSError):
+                self.install_state.parent.rmdir()
+            return durable_intents_preserved
+
+        try:
+            return remove_owned_configuration()
+        except (OSError, SettingsError, ChatError, subprocess.SubprocessError) as failure:
+            self._raise_uninstall_failure(
+                failure, uninstall_writes, broker_was_loaded=broker_was_loaded
+            )
 
 
 def discover_executable(invoked_as: Path | None = None) -> Path:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tomllib
 from pathlib import Path
 from uuid import uuid4
@@ -645,6 +646,89 @@ def test_uninstall_reactivates_after_post_stop_retarget(
     assert reactivated == [True]
 
 
+def test_uninstall_reactivates_after_retarget_during_codex_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    selected = installer.codex_config
+    selected.parent.mkdir(parents=True)
+    original = selected.parent / "original.toml"
+    replacement = selected.parent / "replacement.toml"
+    original.write_text("")
+    replacement.write_text('[mcp_servers.user]\ncommand = "keep"\n')
+    selected.symlink_to(original.name)
+    installer.setup()
+    replacement_before = replacement.read_bytes()
+    state_before = installer.install_state.read_bytes()
+    require_paths = installer._require_recorded_provider_paths
+    events: list[str] = []
+    post_stop_checks = 0
+
+    def require(recorded: dict[str, str]) -> None:
+        nonlocal post_stop_checks
+        if "stop" in events:
+            post_stop_checks += 1
+            if post_stop_checks == 2:
+                selected.unlink()
+                selected.symlink_to(replacement.name)
+        require_paths(recorded)
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: events.append("stop"))
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: events.append("couriers"))
+    monkeypatch.setattr(installer, "activate", lambda: events.append("activate"))
+    monkeypatch.setattr(installer, "_require_recorded_provider_paths", require)
+
+    with pytest.raises(SettingsError, match="ownership changed"):
+        installer.uninstall()
+
+    assert replacement.read_bytes() == replacement_before
+    assert installer.install_state.read_bytes() == state_before
+    assert events == ["stop", "couriers", "activate"]
+
+
+@pytest.mark.parametrize("failure_point", ("couriers", "toml", "transform"))
+def test_uninstall_reactivates_for_post_stop_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    installer.setup()
+    settings_before = installer.claude_settings.read_bytes()
+    events: list[str] = []
+
+    def stop() -> None:
+        events.append("stop")
+        if failure_point == "toml":
+            installer.codex_config.write_text("[")
+
+    def stop_couriers() -> None:
+        if failure_point == "couriers":
+            raise SettingsError("injected courier failure")
+
+    def fail_transform(text: str, keys: set[str]) -> str:
+        raise SettingsError("injected transform failure")
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
+    monkeypatch.setattr(installer, "_stop_broker", stop)
+    monkeypatch.setattr(installer, "_stop_couriers", stop_couriers)
+    monkeypatch.setattr(installer, "activate", lambda: events.append("activate"))
+    if failure_point == "transform":
+        monkeypatch.setattr(install_module, "_remove_owned_hook_trust", fail_transform)
+
+    with pytest.raises(SettingsError):
+        installer.uninstall()
+
+    assert events == ["stop", "activate"]
+    assert installer.claude_settings.read_bytes() == settings_before
+    assert installer.install_state.exists()
+    if failure_point == "toml":
+        assert installer.codex_config.read_text() == "["
+
+
 def test_uninstall_rolls_back_owned_writes_after_later_json_write_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -679,3 +763,54 @@ def test_uninstall_rolls_back_owned_writes_after_later_json_write_failure(
     assert {path: path.read_bytes() for path in surfaces} == before
     assert installer.install_state.exists()
     assert reactivated == [True]
+
+
+def test_uninstall_reports_reactivation_timeout_after_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    installer.setup()
+
+    def fail_couriers() -> None:
+        raise SettingsError("injected courier failure")
+
+    def fail_activation() -> None:
+        raise subprocess.TimeoutExpired(["launchctl", "bootstrap"], 10)
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+    monkeypatch.setattr(installer, "_stop_couriers", fail_couriers)
+    monkeypatch.setattr(installer, "activate", fail_activation)
+
+    with pytest.raises(SettingsError, match=r"uninstall failed: injected.*rollback failed"):
+        installer.uninstall()
+
+    assert installer.install_state.exists()
+
+
+@pytest.mark.parametrize("schema", (1, 2, 3))
+def test_uninstall_preserves_legacy_install_metadata_migration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schema: int
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    installer.setup()
+    current = json.loads(installer.install_state.read_text())
+    legacy = {
+        "schema_version": schema,
+        "claude_cross_session_inbound": current["claude_cross_session_inbound"],
+    }
+    if schema >= 2:
+        legacy["stable_entrypoint"] = current["stable_entrypoint"]
+    if schema == 3:
+        legacy["managed_entrypoints"] = current["managed_entrypoints"]
+    installer.install_state.write_text(json.dumps(legacy))
+    _safe_uninstall(installer, monkeypatch)
+
+    installer.uninstall()
+
+    assert not installer.install_state.exists()
+    assert "crossSessionInbound" not in json.loads(installer.claude_settings.read_text())

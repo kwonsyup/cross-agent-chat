@@ -383,9 +383,21 @@ def test_healthy_duplicate_registration_keeps_generation_and_pending_courier_eve
     worker.start()
     path = socket_path(root, first)
     deadline = time.monotonic() + 2
-    while not path.exists() and time.monotonic() < deadline:
+    ready = False
+    while time.monotonic() < deadline:
+        try:
+            health = request_socket(
+                path,
+                {"schema_version": 1, "operation": "health", "generation": first.generation},
+                timeout=0.1,
+            )
+            ready = health.get("status") == "READY"
+        except ChatError:
+            pass
+        if ready:
+            break
         time.sleep(0.01)
-    assert path.exists()
+    assert ready
     event_id = str(uuid4())
     request_socket(
         path,
