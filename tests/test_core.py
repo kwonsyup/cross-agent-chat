@@ -34,6 +34,7 @@ from cross_agent_chat.core import (
 from cross_agent_chat.runtime import (
     HEALTH_TIMEOUT_SECONDS,
     LOCAL_DISCOVERY_TIMEOUT_SECONDS,
+    MAX_FRAME_BYTES,
     MCP_TOOL_TIMEOUT_SECONDS,
     OPERATION_TIMEOUT_SECONDS,
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
@@ -390,6 +391,16 @@ def test_healthy_duplicate_registration_keeps_generation_and_pending_courier_eve
     ready = False
     while time.monotonic() < deadline:
         try:
+            bootstrap = request_socket(
+                path,
+                {"schema_version": 1, "operation": "bootstrap", "generation": first.generation},
+                timeout=0.1,
+            )
+            assert bootstrap == {
+                "schema_version": 1,
+                "status": "BOOTSTRAPPED",
+                "generation": first.generation,
+            }
             health = request_socket(
                 path,
                 {"schema_version": 1, "operation": "health", "generation": first.generation},
@@ -911,6 +922,160 @@ def test_claude_bootstrap_survives_delayed_native_health_without_claiming_a_peer
             == bootstrap
         )
     finally:
+        request_socket(
+            path,
+            {"schema_version": 1, "operation": "shutdown", "generation": item.generation},
+        )
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+
+
+def test_initial_bootstrap_follows_prebootstrap_health_without_native_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+    root = tmp_path / "state"
+    Registry(root).upsert(item)
+    health_done = threading.Event()
+    native_started = threading.Event()
+    release_native = threading.Event()
+    health_responses: list[dict[str, object]] = []
+
+    def slow_native(*_args: object) -> dict[str, str]:
+        native_started.set()
+        assert release_native.wait(2)
+        raise ChatError("native listing is unavailable")
+
+    def health_before_bootstrap() -> None:
+        health_responses.append(
+            request_socket(
+                socket_path(root, item),
+                {"schema_version": 1, "operation": "health", "generation": item.generation},
+                timeout=1.0,
+            )
+        )
+        health_done.set()
+
+    monkeypatch.setattr("cross_agent_chat.runtime.exact_agent", slow_native)
+    worker = threading.Thread(
+        target=courier_server,
+        kwargs={
+            "provider": "claude",
+            "state_root_value": str(root),
+            "session_id": item.session_id,
+            "cwd": item.cwd,
+            "generation": item.generation,
+            "pid": os.getpid(),
+        },
+        daemon=True,
+    )
+    worker.start()
+    path = socket_path(root, item)
+    deadline = time.monotonic() + 2.0
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.exists()
+    health = threading.Thread(target=health_before_bootstrap, daemon=True)
+    health.start()
+    try:
+        assert health_done.wait(1.0)
+        assert health_responses == [
+            {
+                "schema_version": 1,
+                "status": "UNAVAILABLE",
+                "generation": item.generation,
+            }
+        ]
+        assert not native_started.is_set()
+        event_id = str(uuid4())
+        assert request_socket(
+            path,
+            {
+                "schema_version": 1,
+                "operation": "accept",
+                "generation": item.generation,
+                "event_id": event_id,
+                "message": "must not invoke native delivery",
+            },
+            timeout=1.0,
+        ) == {
+            "schema_version": 1,
+            "event_id": event_id,
+            "status": "PRE_EFFECT_REJECTED",
+            "provider": "claude",
+            "error": "session courier is still bootstrapping",
+        }
+        assert not native_started.is_set()
+        assert request_socket(
+            path,
+            {"schema_version": 1, "operation": "bootstrap", "generation": item.generation},
+            timeout=1.0,
+        ) == {
+            "schema_version": 1,
+            "status": "BOOTSTRAPPED",
+            "generation": item.generation,
+        }
+    finally:
+        release_native.set()
+        health.join(timeout=2)
+        request_socket(
+            path,
+            {"schema_version": 1, "operation": "shutdown", "generation": item.generation},
+        )
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+
+
+def test_incomplete_prebootstrap_frame_cannot_delay_initial_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = route(tmp_path, pid=os.getpid())
+    root = tmp_path / "state"
+    Registry(root).upsert(item)
+    frame_started = threading.Event()
+    from cross_agent_chat import runtime
+
+    original_read_frame = runtime.read_frame
+
+    def tracked_read_frame(connection: socket.socket, limit: int = MAX_FRAME_BYTES) -> bytes:
+        frame_started.set()
+        return original_read_frame(connection, limit)
+
+    monkeypatch.setattr(runtime, "read_frame", tracked_read_frame)
+    worker = threading.Thread(
+        target=courier_server,
+        kwargs={
+            "provider": "codex",
+            "state_root_value": str(root),
+            "session_id": item.session_id,
+            "cwd": item.cwd,
+            "generation": item.generation,
+            "pid": os.getpid(),
+        },
+        daemon=True,
+    )
+    worker.start()
+    path = socket_path(root, item)
+    deadline = time.monotonic() + 2.0
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.exists()
+    partial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    partial.connect(str(path))
+    partial.sendall(b'{"schema_version":1')
+    assert frame_started.wait(1.0)
+    try:
+        assert request_socket(
+            path,
+            {"schema_version": 1, "operation": "bootstrap", "generation": item.generation},
+            timeout=1.0,
+        ) == {
+            "schema_version": 1,
+            "status": "BOOTSTRAPPED",
+            "generation": item.generation,
+        }
+    finally:
+        partial.close()
         request_socket(
             path,
             {"schema_version": 1, "operation": "shutdown", "generation": item.generation},

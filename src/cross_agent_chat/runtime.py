@@ -79,6 +79,7 @@ ACCEPT_TIMEOUT_SECONDS: Final = (
 AUTHORIZE_TIMEOUT_SECONDS: Final = 20.0
 COURIER_READY_SECONDS: Final = 3.0
 MAX_COURIER_DIAGNOSTIC_BYTES: Final = 1024
+BOOTSTRAP_FRAME_TIMEOUT_SECONDS: Final = 0.1
 REMOTE_TIMEOUT_SECONDS: Final = (
     HEALTH_TIMEOUT_SECONDS + AUTHORIZE_TIMEOUT_SECONDS + ACCEPT_TIMEOUT_SECONDS + 5.0
 )
@@ -775,6 +776,7 @@ def courier_server(
     server.listen(4)
     server.settimeout(1.0)
     stopping = False
+    bootstrapped = False
     try:
         while not stopping and _route_current(root, route):
             try:
@@ -782,7 +784,9 @@ def courier_server(
             except TimeoutError:
                 continue
             with connection:
-                connection.settimeout(SOCKET_TIMEOUT_SECONDS)
+                connection.settimeout(
+                    SOCKET_TIMEOUT_SECONDS if bootstrapped else BOOTSTRAP_FRAME_TIMEOUT_SECONDS
+                )
                 try:
                     raw = json.loads(read_frame(connection))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError):
@@ -797,23 +801,37 @@ def courier_server(
                     continue
                 operation = request.get("operation")
                 if operation == "bootstrap":
-                    emit_frame_safely(
-                        connection,
-                        {
-                            "schema_version": SCHEMA_VERSION,
-                            "status": "BOOTSTRAPPED",
-                            "generation": route.generation,
-                        },
-                    )
+                    try:
+                        emit_frame(
+                            connection,
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "status": "BOOTSTRAPPED",
+                                "generation": route.generation,
+                            },
+                        )
+                    except OSError:
+                        continue
+                    bootstrapped = True
                 elif operation == "health":
-                    emit_frame_safely(
-                        connection,
-                        courier_health(
-                            route,
-                            courier,
-                            include_delivery_mode=request.get("include_delivery_mode") is True,
-                        ),
-                    )
+                    if not bootstrapped:
+                        emit_frame_safely(
+                            connection,
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "status": "UNAVAILABLE",
+                                "generation": route.generation,
+                            },
+                        )
+                    else:
+                        emit_frame_safely(
+                            connection,
+                            courier_health(
+                                route,
+                                courier,
+                                include_delivery_mode=request.get("include_delivery_mode") is True,
+                            ),
+                        )
                 elif operation == "shutdown":
                     emit_frame_safely(connection, {"schema_version": 1, "status": "STOPPED"})
                     stopping = True
@@ -822,7 +840,25 @@ def courier_server(
                     message = request.get("message")
                     if not isinstance(event_id, str) or not isinstance(message, str):
                         continue
-                    emit_frame_safely(connection, courier_accept(route, courier, event_id, message))
+                    if not bootstrapped:
+                        try:
+                            identifier = valid_uuid(event_id, "event id")
+                        except ChatError:
+                            continue
+                        emit_frame_safely(
+                            connection,
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "event_id": identifier,
+                                "status": "PRE_EFFECT_REJECTED",
+                                "provider": route.provider,
+                                "error": "session courier is still bootstrapping",
+                            },
+                        )
+                    else:
+                        emit_frame_safely(
+                            connection, courier_accept(route, courier, event_id, message)
+                        )
                 elif operation == "peek":
                     if courier is None:
                         continue

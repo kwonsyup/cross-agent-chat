@@ -4,6 +4,8 @@
 
 - Complete local courier bootstrap without waiting for Claude's native session listing. Routes
   become available only after the existing native health and pre-delivery identity checks pass.
+- Keep initial bootstrap ahead of native health and delivery work; pre-bootstrap health remains
+  unavailable and delivery is rejected before effect.
 - Reuse an exact bootstrapped courier on duplicate SessionStart events, preserving its generation
   and accepted in-memory queue while native routing is temporarily unavailable.
 - Reap a failed registration's exact child and private socket before removing its route.
