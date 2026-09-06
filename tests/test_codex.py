@@ -4,6 +4,7 @@ import io
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -102,12 +103,15 @@ def test_native_queue_effect_boundary(
 
     event_id, thread_id = str(uuid4()), str(uuid4())
     trace = tmp_path / "trace.jsonl"
+    ready = tmp_path / "ready"
     binary = tmp_path / "fake-codex"
     binary.write_text(
         f"#!{sys.executable}\n"
         + r"""
 import json, os, sys, time
+from pathlib import Path
 mode = os.environ["TEST_MODE"]
+Path(os.environ["TEST_READY"]).touch()
 with open(os.environ["TEST_TRACE"], "a", buffering=1) as log:
     log.write(json.dumps({"argv": sys.argv[1:]}) + "\n")
     for line in sys.stdin:
@@ -156,7 +160,24 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as log:
     )
     monkeypatch.setattr(codex, "MAX_NATIVE_STDOUT_BYTES", 4096)
     body = "peer body only on stdin"
-    environment = {"CODEX_HOME": str(tmp_path), "TEST_MODE": mode, "TEST_TRACE": str(trace)}
+    environment = {
+        "CODEX_HOME": str(tmp_path),
+        "TEST_MODE": mode,
+        "TEST_READY": str(ready),
+        "TEST_TRACE": str(trace),
+    }
+    real_monotonic = time.monotonic
+    real_sleep = time.sleep
+
+    def monotonic_after_fake_server_starts() -> float:
+        deadline = real_monotonic() + 5.0
+        while not ready.exists():
+            if real_monotonic() >= deadline:
+                pytest.fail("fake Codex app-server did not become ready")
+            real_sleep(0.01)
+        return real_monotonic()
+
+    monkeypatch.setattr("cross_agent_chat.codex.time.monotonic", monotonic_after_fake_server_starts)
     if expected_error is None:
         queue_native_input(
             binary=binary,

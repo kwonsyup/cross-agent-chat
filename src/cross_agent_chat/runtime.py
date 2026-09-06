@@ -9,11 +9,14 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
@@ -22,9 +25,10 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from types import FrameType
 from typing import BinaryIO, Final, Literal, cast
 from uuid import uuid4
 
@@ -88,6 +92,13 @@ DeliveryMode = Literal[
     "codex_stop_bound",
     "codex_experimental_queue",
 ]
+
+
+class RegistrationInterrupted(SystemExit):
+    """Interrupt one in-flight courier registration without retrying its health probe."""
+
+    def __init__(self) -> None:
+        super().__init__(143)
 
 
 def recipient_profile_root(provider: str) -> str:
@@ -346,7 +357,12 @@ def _courier_failure_phase(captured: bytearray) -> str:
 
 
 def _reap_owned_courier(
-    process: subprocess.Popen[bytes], path: Path, stderr: BinaryIO, captured: bytearray
+    process: subprocess.Popen[bytes],
+    root: Path,
+    route: Route,
+    path: Path,
+    stderr: BinaryIO,
+    captured: bytearray,
 ) -> None:
     """Stop and reap only the child and socket created for one failed registration."""
     socket_identity = _owned_socket_identity(path)
@@ -360,11 +376,34 @@ def _reap_owned_courier(
             with suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=0.5)
     _drain_courier_stderr(stderr, captured)
-    if socket_identity is not None and _owned_socket_identity(path) == socket_identity:
+    current_socket = _owned_socket_identity(path)
+    if socket_identity is not None and current_socket == socket_identity:
+        with suppress(FileNotFoundError):
+            path.unlink()
+    elif socket_identity is None and current_socket is not None and Registry(root).current(route):
+        # The per-session registration lock still owns this exact route generation,
+        # so a child that bound while termination began cannot leave a stale socket.
         with suppress(FileNotFoundError):
             path.unlink()
     with suppress(OSError):
         stderr.close()
+
+
+def _registration_sigterm(_signum: int, _frame: FrameType | None) -> None:
+    raise RegistrationInterrupted()
+
+
+@contextmanager
+def _registration_sigterm_scope() -> Iterator[None]:
+    """Convert SIGTERM to exact registration cleanup for one main-thread transaction."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGTERM, _registration_sigterm)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def _spawn_courier(root: Path, route: Route) -> None:
@@ -457,7 +496,7 @@ def _spawn_courier(root: Path, route: Route) -> None:
                 time.sleep(0.02)
         raise ChatError("session courier did not complete local bootstrap")
     except BaseException:
-        _reap_owned_courier(process, path, stderr, captured)
+        _reap_owned_courier(process, root, route, path, stderr, captured)
         raise
     finally:
         with suppress(OSError):
@@ -483,42 +522,45 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
         profile_root=recipient_profile_root(provider),
     )
     root = state_root(state_root_value)
-    with state_lock(root, "register-" + session_key(route.provider, route.session_id)):
-        registry = Registry(root)
-        registry.compact_dead()
-        registered = registry.upsert_or_reuse_live_owner(route)
-        if registered != route:
-            try:
-                bootstrap = request_socket(
-                    socket_path(root, registered),
-                    {
-                        "schema_version": SCHEMA_VERSION,
-                        "operation": "bootstrap",
-                        "generation": registered.generation,
-                    },
-                    timeout=0.5,
-                )
-            except ChatError as error:
-                cause = error.__cause__
-                missing = not socket_path(root, registered).exists()
-                refused = isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
-                if not missing and not refused:
-                    # A busy courier may still own an accepted provider effect. A
-                    # health timeout is not evidence authorizing queue replacement.
-                    return registered
-                registry.upsert(route)
-            else:
-                if _bootstrap_response(bootstrap, registered):
-                    return registered
-                raise ChatError("existing courier ownership could not be verified")
-        try:
+    try:
+        with (
+            _registration_sigterm_scope(),
+            state_lock(root, "register-" + session_key(route.provider, route.session_id)),
+        ):
+            registry = Registry(root)
+            registry.compact_dead()
+            registered = registry.upsert_or_reuse_live_owner(route)
+            if registered != route:
+                try:
+                    bootstrap = request_socket(
+                        socket_path(root, registered),
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            "operation": "bootstrap",
+                            "generation": registered.generation,
+                        },
+                        timeout=0.5,
+                    )
+                except ChatError as error:
+                    cause = error.__cause__
+                    missing = not socket_path(root, registered).exists()
+                    refused = isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
+                    if not missing and not refused:
+                        # A busy courier may still own an accepted provider effect. A
+                        # health timeout is not evidence authorizing queue replacement.
+                        return registered
+                    registry.upsert(route)
+                else:
+                    if _bootstrap_response(bootstrap, registered):
+                        return registered
+                    raise ChatError("existing courier ownership could not be verified")
             _spawn_courier(root, route)
-        except BaseException:
-            Registry(root).remove(
-                route.provider, route.session_id, route.pid, generation=route.generation
-            )
-            raise
-        return route
+            return route
+    except BaseException:
+        Registry(root).remove(
+            route.provider, route.session_id, route.pid, generation=route.generation
+        )
+        raise
 
 
 def unregister(provider: str, pid: int, state_root_value: str | None) -> None:

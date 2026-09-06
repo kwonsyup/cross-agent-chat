@@ -3,6 +3,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
+import socket
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterable, Iterator
@@ -540,6 +544,62 @@ def test_failed_courier_bootstrap_reaps_the_exact_owned_child(
     assert process.waited
 
 
+def test_failed_bootstrap_reaps_a_socket_bound_during_exact_child_termination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    root = tmp_path / "state"
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+    Registry(root).upsert(item)
+    path = socket_path(root, item)
+    sockets: list[socket.socket] = []
+
+    class OwnedProcess:
+        terminated = False
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(path))
+            server.listen()
+            sockets.append(server)
+
+        def kill(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float) -> int:
+            return 0
+
+    process = OwnedProcess()
+
+    def spawn(*_args: object, **_kwargs: object) -> OwnedProcess:
+        return process
+
+    def unavailable(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise ChatError("local listener is unavailable")
+
+    monkeypatch.setattr(runtime, "executable", lambda: Path("/bin/echo"))
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_: ("a" * 64, Path("/bin/echo"))
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.subprocess.Popen", spawn)
+    monkeypatch.setattr(runtime, "request_socket", unavailable)
+    monkeypatch.setattr(runtime, "COURIER_READY_SECONDS", 0.0)
+
+    try:
+        with pytest.raises(ChatError, match="local bootstrap"):
+            runtime._spawn_courier(root, item)
+        assert process.terminated
+        assert not path.exists()
+    finally:
+        for server in sockets:
+            server.close()
+
+
 def test_cancelled_courier_bootstrap_reaps_the_exact_owned_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -608,6 +668,134 @@ def test_cancelled_registration_removes_its_exact_generation(
         runtime.register("claude", "studio", os.getpid(), str(root))
 
     assert Registry(root).routes() == []
+
+
+def test_sigterm_registration_cleanup_removes_the_exact_generation_in_an_owned_process(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    project = tmp_path / "project"
+    project.mkdir()
+    session_id = str(uuid4())
+    code = f"""
+import os
+import time
+from pathlib import Path
+from cross_agent_chat import runtime
+from cross_agent_chat.core import ChatError, Registry
+
+root = Path({str(root)!r})
+project = Path({str(project)!r})
+session_id = {session_id!r}
+runtime.hook_input = lambda _event: {{
+    "hook_event_name": "SessionStart", "session_id": session_id, "cwd": str(project)
+}}
+runtime.recipient_owner_identity = lambda *_args: ("a" * 64, Path("/bin/echo"))
+runtime.recipient_profile_root = lambda _provider: str(root / "profile")
+runtime.executable = lambda: Path("/bin/echo")
+class Process:
+    terminated = False
+    def poll(self):
+        return None
+    def terminate(self):
+        self.terminated = True
+        (root / "terminated").write_text("yes")
+    def kill(self):
+        self.terminated = True
+    def wait(self, timeout):
+        return 0
+process = Process()
+runtime.subprocess.Popen = lambda *_args, **_kwargs: process
+def wait_for_bootstrap(*_args, **_kwargs):
+    print("WAITING", flush=True)
+    while True:
+        time.sleep(1)
+runtime.request_socket = wait_for_bootstrap
+runtime.register("claude", "studio", os.getpid(), str(root))
+"""
+    environment = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "src")}
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    assert process.stdout is not None
+    try:
+        assert process.stdout.readline() == "WAITING\n"
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=2)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=2)
+    assert process.returncode == 143
+    assert stdout == ""
+    assert stderr == ""
+    assert Registry(root).routes() == []
+    assert (root / "terminated").read_text() == "yes"
+
+
+def test_sigterm_scope_begins_before_route_publication_in_an_owned_process(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    project = tmp_path / "project"
+    project.mkdir()
+    session_id = str(uuid4())
+    code = f"""
+import os
+import time
+from pathlib import Path
+from cross_agent_chat import runtime
+
+root = Path({str(root)!r})
+project = Path({str(project)!r})
+runtime.hook_input = lambda _event: {{
+    "hook_event_name": "SessionStart", "session_id": {session_id!r}, "cwd": str(project)
+}}
+runtime.recipient_owner_identity = lambda *_args: ("a" * 64, Path("/bin/echo"))
+runtime.recipient_profile_root = lambda _provider: str(root / "profile")
+def wait_before_publish(self, _route):
+    print("BEFORE_PUBLISH", flush=True)
+    while True:
+        time.sleep(1)
+runtime.Registry.upsert_or_reuse_live_owner = wait_before_publish
+runtime.register("claude", "studio", os.getpid(), str(root))
+"""
+    environment = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "src")}
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    assert process.stdout is not None
+    try:
+        assert process.stdout.readline() == "BEFORE_PUBLISH\n"
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=2)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=2)
+    assert process.returncode == 143
+    assert stdout == ""
+    assert stderr == ""
+    assert Registry(root).routes() == []
+
+
+def test_registration_sigterm_scope_restores_the_previous_handler() -> None:
+    from cross_agent_chat import runtime
+
+    previous = signal.getsignal(signal.SIGTERM)
+
+    with runtime._registration_sigterm_scope():
+        assert signal.getsignal(signal.SIGTERM) is runtime._registration_sigterm
+
+    assert signal.getsignal(signal.SIGTERM) is previous
 
 
 def test_duplicate_claude_start_reuses_bootstrapped_courier_before_native_routing(

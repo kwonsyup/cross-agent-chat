@@ -302,8 +302,21 @@ def test_install_script_does_not_delete_committed_runtime_after_late_failure(
 ) -> None:
     home = tmp_path / "home"
     fake_bin = tmp_path / "fake-bin"
+    fake_cross_agent = tmp_path / "fake-cross-agent"
     home.mkdir()
     fake_bin.mkdir()
+    fake_cross_agent.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = --version ]; then\n'
+        "  echo cross-agent-chat 0.1.3\n"
+        "  exit 0\n"
+        "fi\n"
+        'stage="$3"\n'
+        "printf 'cross-agent-chat-runtime-v1:committed\\n' > "
+        '"$stage/.cross-agent-chat-release"\n'
+        "exit 9\n"
+    )
+    fake_cross_agent.chmod(0o700)
     fake_uv = fake_bin / "uv"
     fake_uv.write_text(
         "#!/bin/sh\n"
@@ -311,11 +324,7 @@ def test_install_script_does_not_delete_committed_runtime_after_late_failure(
         '  stage="$4"\n'
         '  mkdir -p "$stage/bin"\n'
         '  printf "#!/bin/sh\\nexit 0\\n" > "$stage/bin/python"\n'
-        "  printf '%s\\n' '#!/bin/sh' 'if [ \"$1\" = --version ]; then' "
-        "'  echo cross-agent-chat 0.1.3' '  exit 0' 'fi' 'stage=\"$3\"' "
-        "'printf '\"'\"'cross-agent-chat-runtime-v1:committed\\n'\"'\"' "
-        "'> \"$stage/.cross-agent-chat-release\"' "
-        "'exit 9' > \"$stage/bin/cross-agent-chat\"\n"
+        '  cp "$FAKE_CROSS_AGENT" "$stage/bin/cross-agent-chat"\n'
         '  chmod +x "$stage/bin/python" "$stage/bin/cross-agent-chat"\n'
         "  exit 0\n"
         "fi\n"
@@ -330,6 +339,7 @@ def test_install_script_does_not_delete_committed_runtime_after_late_failure(
             **os.environ,
             "HOME": str(home),
             "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "FAKE_CROSS_AGENT": str(fake_cross_agent),
             "CROSS_AGENT_CHAT_SOURCE": "candidate-wheel",
         },
         capture_output=True,
@@ -351,8 +361,18 @@ def test_install_script_preserves_transaction_owned_runtime_after_child_failure(
 ) -> None:
     home = tmp_path / "home"
     fake_bin = tmp_path / "fake-bin"
+    fake_cross_agent = tmp_path / "fake-cross-agent"
     home.mkdir()
     fake_bin.mkdir()
+    fake_cross_agent.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = --version ]; then exit 0; fi\n'
+        'stage="$3"\n'
+        "printf 'cross-agent-chat-runtime-v1:transaction:"
+        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n\' > "$stage/.cross-agent-chat-release"\n'
+        "exit 9\n"
+    )
+    fake_cross_agent.chmod(0o700)
     fake_uv = fake_bin / "uv"
     fake_uv.write_text(
         "#!/bin/sh\n"
@@ -360,10 +380,7 @@ def test_install_script_preserves_transaction_owned_runtime_after_child_failure(
         '  stage="$4"\n'
         '  mkdir -p "$stage/bin"\n'
         '  printf "#!/bin/sh\\nexit 0\\n" > "$stage/bin/python"\n'
-        "  printf '%s\\n' '#!/bin/sh' 'if [ \"$1\" = --version ]; then exit 0; fi' "
-        "'stage=\"$3\"' 'printf '\"'\"'cross-agent-chat-runtime-v1:transaction:"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\"'\"' > \"$stage/.cross-agent-chat-release\"' "
-        "'exit 9' > \"$stage/bin/cross-agent-chat\"\n"
+        '  cp "$FAKE_CROSS_AGENT" "$stage/bin/cross-agent-chat"\n'
         '  chmod +x "$stage/bin/python" "$stage/bin/cross-agent-chat"\n'
         "  exit 0\n"
         "fi\n"
@@ -378,6 +395,7 @@ def test_install_script_preserves_transaction_owned_runtime_after_child_failure(
             **os.environ,
             "HOME": str(home),
             "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "FAKE_CROSS_AGENT": str(fake_cross_agent),
             "CROSS_AGENT_CHAT_SOURCE": "candidate-wheel",
         },
         capture_output=True,
@@ -399,12 +417,21 @@ def test_install_script_preserves_transaction_owned_runtime_after_child_failure(
 def test_install_script_falls_back_from_runtime_internal_entrypoint(tmp_path: Path) -> None:
     home = tmp_path / "home"
     fake_bin = tmp_path / "fake-bin"
+    fake_cross_agent = tmp_path / "fake-cross-agent"
     runtime_bin = home / ".local/share/cross-agent-chat-runtime/current/bin"
     fake_bin.mkdir()
     runtime_bin.mkdir(parents=True)
     predecessor = runtime_bin / "cross-agent-chat"
     predecessor.write_text("#!/bin/sh\nexit 0\n")
     predecessor.chmod(0o755)
+    fake_cross_agent.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = --version ]; then exit 0; fi\n'
+        'printf "%s" "$5" > "$HOME/stable-captured"\n'
+        'printf "cross-agent-chat-runtime-v1:committed\\n" > "$3/.cross-agent-chat-release"\n'
+        "exit 0\n"
+    )
+    fake_cross_agent.chmod(0o700)
     fake_uv = fake_bin / "uv"
     fake_uv.write_text(
         "#!/bin/sh\n"
@@ -412,10 +439,7 @@ def test_install_script_falls_back_from_runtime_internal_entrypoint(tmp_path: Pa
         '  stage="$4"\n'
         '  mkdir -p "$stage/bin"\n'
         '  printf "#!/bin/sh\\nexit 0\\n" > "$stage/bin/python"\n'
-        "  printf '%s\\n' '#!/bin/sh' 'if [ \"$1\" = --version ]; then exit 0; fi' "
-        '\'printf "%s" "$5" > "$HOME/stable-captured"\' '
-        '\'printf "cross-agent-chat-runtime-v1:committed\\n" > "$3/.cross-agent-chat-release"\' '
-        "'exit 0' > \"$stage/bin/cross-agent-chat\"\n"
+        '  cp "$FAKE_CROSS_AGENT" "$stage/bin/cross-agent-chat"\n'
         '  chmod +x "$stage/bin/python" "$stage/bin/cross-agent-chat"\n'
         "  exit 0\n"
         "fi\n"
@@ -430,6 +454,7 @@ def test_install_script_falls_back_from_runtime_internal_entrypoint(tmp_path: Pa
             **os.environ,
             "HOME": str(home),
             "PATH": f"{fake_bin}:{runtime_bin}:/usr/bin:/bin",
+            "FAKE_CROSS_AGENT": str(fake_cross_agent),
             "CROSS_AGENT_CHAT_SOURCE": "candidate-wheel",
         },
         capture_output=True,
