@@ -25,12 +25,16 @@ visible by default.
 
 | Surface | Support |
 |---|---|
-| Claude Code 2.1.261 | Interactive and native background sessions; native SendMessage delivery |
-| Codex CLI 0.152.1 / 0.153.2 | Next-turn delivery; idle wake with explicit experimental queue opt-in |
-| Codex Native, embedded 0.153.1 | Next-turn delivery; idle wake with explicit experimental queue opt-in |
+| Claude Code 2.1.263 | iMac interactive startup and same-cwd native request/reply tested with the configured cross-session inbound `accept` policy |
+| Claude Code 2.1.261 (historical observation) | Interactive and native background sessions; native SendMessage delivery |
+| Codex CLI 0.152.1 / 0.153.2 (historical observation) | Next-turn delivery; idle wake with explicit experimental queue opt-in |
+| Codex Native, embedded 0.153.1 (historical observation) | Next-turn delivery; idle wake with explicit experimental queue opt-in |
 | Same Mac | Yes |
 | Tailnet Mac | Yes, subject to your Tailscale ACL |
 | ChatGPT web or Claude web | No |
+
+These are per-version observations, not v0.1.5 fleet, Codex Native, or account/profile-parity
+claims.
 | Windows | No claim |
 | Linux | No live-support claim |
 
