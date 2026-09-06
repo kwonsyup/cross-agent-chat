@@ -182,7 +182,7 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "local_broker": "healthy",
         "next": "start fresh Claude/Codex sessions",
         "remote_trust": "tailscale_acl",
-        "version": "0.1.4",
+        "version": "0.1.5",
     }
 
 
@@ -311,17 +311,11 @@ def test_install_script_does_not_delete_committed_runtime_after_late_failure(
         '  stage="$4"\n'
         '  mkdir -p "$stage/bin"\n'
         '  printf "#!/bin/sh\\nexit 0\\n" > "$stage/bin/python"\n'
-        "  cat > \"$stage/bin/cross-agent-chat\" <<'SCRIPT'\n"
-        "#!/bin/sh\n"
-        'if [ "$1" = --version ]; then\n'
-        "  echo cross-agent-chat 0.1.3\n"
-        "  exit 0\n"
-        "fi\n"
-        'stage="$3"\n'
-        "printf 'cross-agent-chat-runtime-v1:committed\\n' > "
-        '"$stage/.cross-agent-chat-release"\n'
-        "exit 9\n"
-        "SCRIPT\n"
+        "  printf '%s\\n' '#!/bin/sh' 'if [ \"$1\" = --version ]; then' "
+        "'  echo cross-agent-chat 0.1.3' '  exit 0' 'fi' 'stage=\"$3\"' "
+        "'printf '\"'\"'cross-agent-chat-runtime-v1:committed\\n'\"'\"' "
+        "'> \"$stage/.cross-agent-chat-release\"' "
+        "'exit 9' > \"$stage/bin/cross-agent-chat\"\n"
         '  chmod +x "$stage/bin/python" "$stage/bin/cross-agent-chat"\n'
         "  exit 0\n"
         "fi\n"
@@ -366,14 +360,10 @@ def test_install_script_preserves_transaction_owned_runtime_after_child_failure(
         '  stage="$4"\n'
         '  mkdir -p "$stage/bin"\n'
         '  printf "#!/bin/sh\\nexit 0\\n" > "$stage/bin/python"\n'
-        "  cat > \"$stage/bin/cross-agent-chat\" <<'SCRIPT'\n"
-        "#!/bin/sh\n"
-        'if [ "$1" = --version ]; then exit 0; fi\n'
-        'stage="$3"\n'
-        "printf 'cross-agent-chat-runtime-v1:transaction:"
-        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n\' > "$stage/.cross-agent-chat-release"\n'
-        "exit 9\n"
-        "SCRIPT\n"
+        "  printf '%s\\n' '#!/bin/sh' 'if [ \"$1\" = --version ]; then exit 0; fi' "
+        "'stage=\"$3\"' 'printf '\"'\"'cross-agent-chat-runtime-v1:transaction:"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\"'\"' > \"$stage/.cross-agent-chat-release\"' "
+        "'exit 9' > \"$stage/bin/cross-agent-chat\"\n"
         '  chmod +x "$stage/bin/python" "$stage/bin/cross-agent-chat"\n'
         "  exit 0\n"
         "fi\n"
@@ -422,13 +412,10 @@ def test_install_script_falls_back_from_runtime_internal_entrypoint(tmp_path: Pa
         '  stage="$4"\n'
         '  mkdir -p "$stage/bin"\n'
         '  printf "#!/bin/sh\\nexit 0\\n" > "$stage/bin/python"\n'
-        "  cat > \"$stage/bin/cross-agent-chat\" <<'SCRIPT'\n"
-        "#!/bin/sh\n"
-        'if [ "$1" = --version ]; then exit 0; fi\n'
-        'printf "%s" "$5" > "$HOME/stable-captured"\n'
-        'printf "cross-agent-chat-runtime-v1:committed\\n" > "$3/.cross-agent-chat-release"\n'
-        "exit 0\n"
-        "SCRIPT\n"
+        "  printf '%s\\n' '#!/bin/sh' 'if [ \"$1\" = --version ]; then exit 0; fi' "
+        '\'printf "%s" "$5" > "$HOME/stable-captured"\' '
+        '\'printf "cross-agent-chat-runtime-v1:committed\\n" > "$3/.cross-agent-chat-release"\' '
+        "'exit 0' > \"$stage/bin/cross-agent-chat\"\n"
         '  chmod +x "$stage/bin/python" "$stage/bin/cross-agent-chat"\n'
         "  exit 0\n"
         "fi\n"
@@ -2530,7 +2517,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.1.4')\n"
+        "    print('cross-agent-chat 0.1.5')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -2556,7 +2543,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.1.4"
+    assert completed.stdout.strip() == "cross-agent-chat 0.1.5"
     assert stage.exists()
 
 
@@ -3960,7 +3947,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.1.4",
+            "version": "0.1.5",
             "module_path": str(module),
         },
     )
@@ -4138,7 +4125,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.1.4",
+            "version": "0.1.5",
             "module_path": str(module),
         }
 

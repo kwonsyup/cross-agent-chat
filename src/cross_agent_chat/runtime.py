@@ -25,7 +25,7 @@ from concurrent.futures import (
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal, cast
+from typing import BinaryIO, Final, Literal, cast
 from uuid import uuid4
 
 from cross_agent_chat.claude_runtime import (
@@ -74,6 +74,7 @@ ACCEPT_TIMEOUT_SECONDS: Final = (
 )
 AUTHORIZE_TIMEOUT_SECONDS: Final = 20.0
 COURIER_READY_SECONDS: Final = 3.0
+MAX_COURIER_DIAGNOSTIC_BYTES: Final = 1024
 REMOTE_TIMEOUT_SECONDS: Final = (
     HEALTH_TIMEOUT_SECONDS + AUTHORIZE_TIMEOUT_SECONDS + ACCEPT_TIMEOUT_SECONDS + 5.0
 )
@@ -290,6 +291,82 @@ def executable() -> Path:
         raise ChatError("runtime executable is unavailable") from error
 
 
+def _bootstrap_response(response: dict[str, object], route: Route) -> bool:
+    """Accept only the exact local listener bound to this route generation."""
+    return response == {
+        "schema_version": SCHEMA_VERSION,
+        "status": "BOOTSTRAPPED",
+        "generation": route.generation,
+    }
+
+
+def _owned_socket_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.getuid():
+        return None
+    return metadata.st_dev, metadata.st_ino
+
+
+def _drain_courier_stderr(stream: BinaryIO, captured: bytearray) -> None:
+    try:
+        descriptor = stream.fileno()
+        os.set_blocking(descriptor, False)
+    except OSError:
+        return
+    drained = 0
+    while drained < MAX_COURIER_DIAGNOSTIC_BYTES:
+        try:
+            chunk = os.read(descriptor, min(4096, MAX_COURIER_DIAGNOSTIC_BYTES - drained))
+        except BlockingIOError:
+            return
+        except OSError:
+            return
+        if not chunk:
+            return
+        drained += len(chunk)
+        remaining = MAX_COURIER_DIAGNOSTIC_BYTES - len(captured)
+        if remaining > 0:
+            captured.extend(chunk[:remaining])
+
+
+def _courier_failure_phase(captured: bytearray) -> str:
+    detail = bytes(captured).decode("utf-8", errors="replace").lower()
+    if "courier route is not current" in detail:
+        return "route"
+    if "address already in use" in detail:
+        return "socket-bind"
+    if "native queue is unavailable" in detail:
+        return "context"
+    if "modulenotfounderror" in detail or "importerror" in detail:
+        return "runtime"
+    return "child"
+
+
+def _reap_owned_courier(
+    process: subprocess.Popen[bytes], path: Path, stderr: BinaryIO, captured: bytearray
+) -> None:
+    """Stop and reap only the child and socket created for one failed registration."""
+    socket_identity = _owned_socket_identity(path)
+    _drain_courier_stderr(stderr, captured)
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=0.5)
+    _drain_courier_stderr(stderr, captured)
+    if socket_identity is not None and _owned_socket_identity(path) == socket_identity:
+        with suppress(FileNotFoundError):
+            path.unlink()
+    with suppress(OSError):
+        stderr.close()
+
+
 def _spawn_courier(root: Path, route: Route) -> None:
     path = socket_path(root, route)
     owner_binary = recipient_owner_identity(route.provider, route.pid, route.profile_root)[1]
@@ -326,39 +403,65 @@ def _spawn_courier(root: Path, route: Route) -> None:
             with suppress(OSError):
                 environment["CROSS_AGENT_CHAT_CODEX_BINARY"] = str(Path(codex).resolve(strict=True))
     try:
+        read_descriptor, write_descriptor = os.pipe()
+    except OSError as error:
+        raise ChatError("session courier diagnostics could not start") from error
+    try:
+        os.set_blocking(write_descriptor, False)
+    except OSError as error:
+        os.close(read_descriptor)
+        os.close(write_descriptor)
+        raise ChatError("session courier diagnostics could not start") from error
+    stderr = os.fdopen(read_descriptor, "rb", buffering=0)
+    try:
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=write_descriptor,
             env=environment,
             close_fds=True,
             start_new_session=True,
         )
     except OSError as error:
+        stderr.close()
         raise ChatError("session courier could not start") from error
-    deadline = time.monotonic() + COURIER_READY_SECONDS
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise ChatError("session courier exited before becoming ready")
-        try:
-            remaining = max(0.1, deadline - time.monotonic())
-            response = request_socket(
-                path,
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "operation": "health",
-                    "generation": route.generation,
-                },
-                timeout=remaining,
-            )
-            if response.get("status") == "READY":
-                return
-            time.sleep(0.02)
-        except ChatError:
-            time.sleep(0.02)
-    process.terminate()
-    raise ChatError("session courier did not become ready")
+    finally:
+        with suppress(OSError):
+            os.close(write_descriptor)
+    captured = bytearray()
+    try:
+        deadline = time.monotonic() + COURIER_READY_SECONDS
+        while time.monotonic() < deadline:
+            _drain_courier_stderr(stderr, captured)
+            if process.poll() is not None:
+                raise ChatError(
+                    "session courier exited before local bootstrap"
+                    f" ({_courier_failure_phase(captured)})"
+                )
+            try:
+                remaining = max(0.1, deadline - time.monotonic())
+                response = request_socket(
+                    path,
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "operation": "bootstrap",
+                        "generation": route.generation,
+                    },
+                    timeout=remaining,
+                )
+                if _bootstrap_response(response, route):
+                    return
+                time.sleep(0.02)
+            except ChatError:
+                time.sleep(0.02)
+        raise ChatError("session courier did not complete local bootstrap")
+    except BaseException:
+        _reap_owned_courier(process, path, stderr, captured)
+        raise
+    finally:
+        with suppress(OSError):
+            stderr.close()
 
 
 def register(provider: str, device: str, pid: int, state_root_value: str | None) -> Route | None:
@@ -386,11 +489,11 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
         registered = registry.upsert_or_reuse_live_owner(route)
         if registered != route:
             try:
-                health = request_socket(
+                bootstrap = request_socket(
                     socket_path(root, registered),
                     {
                         "schema_version": SCHEMA_VERSION,
-                        "operation": "health",
+                        "operation": "bootstrap",
                         "generation": registered.generation,
                     },
                     timeout=0.5,
@@ -405,15 +508,12 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
                     return registered
                 registry.upsert(route)
             else:
-                if (
-                    health.get("status") == "READY"
-                    and health.get("generation") == registered.generation
-                ):
+                if _bootstrap_response(bootstrap, registered):
                     return registered
                 raise ChatError("existing courier ownership could not be verified")
         try:
             _spawn_courier(root, route)
-        except ChatError:
+        except BaseException:
             Registry(root).remove(
                 route.provider, route.session_id, route.pid, generation=route.generation
             )
@@ -654,7 +754,16 @@ def courier_server(
                 ):
                     continue
                 operation = request.get("operation")
-                if operation == "health":
+                if operation == "bootstrap":
+                    emit_frame_safely(
+                        connection,
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            "status": "BOOTSTRAPPED",
+                            "generation": route.generation,
+                        },
+                    )
+                elif operation == "health":
                     emit_frame_safely(
                         connection,
                         courier_health(

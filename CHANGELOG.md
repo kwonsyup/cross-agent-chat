@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.5 - 2026-09-06
+
+- Complete local courier bootstrap without waiting for Claude's native session listing. Routes
+  become available only after the existing native health and pre-delivery identity checks pass.
+- Reuse an exact bootstrapped courier on duplicate SessionStart events, preserving its generation
+  and accepted in-memory queue while native routing is temporarily unavailable.
+- Reap a failed registration's exact child and private socket before removing its route.
+- Ignore unrelated stale Claude agent rows whose workspace no longer exists; an invalid selected
+  target remains unavailable.
+
 ## 0.1.4 - 2026-09-05
 
 - Resolve fuzzy destinations across local and remote peers before creating a delivery intent.

@@ -45,18 +45,45 @@ def _command_is_safe(command: Command, test_root: Path) -> bool:
     if binary.name in _BLOCKED_COMMANDS:
         return False
     if binary.name in {"sh", "bash"}:
-        return len(parts) >= 2 and Path(parts[1]).resolve() == (
-            Path(__file__).parents[1] / "install.sh"
+        if len(parts) < 2:
+            return False
+        script = Path(parts[1]).resolve()
+        return script == (Path(__file__).parents[1] / "install.sh") or (
+            script.parent == test_root.resolve() and script.name == "install-fixture.sh"
         )
     if binary == Path(sys.executable):
         return True
     return binary.is_absolute() and binary.is_relative_to(test_root)
 
 
+def _fixture_install_script(test_root: Path) -> Path:
+    source = Path(__file__).parents[1] / "install.sh"
+    fixture = test_root / "install-fixture.sh"
+    fake_ps = test_root / "fixture-ps"
+    fake_ps.write_text("#!/bin/sh\nprintf '%s\\n' 'fixture process identity'\n")
+    fake_ps.chmod(0o700)
+    command = '/bin/ps -ww -p "$$" -o lstart= -o command='
+    content = source.read_text(encoding="utf-8")
+    if content.count(command) != 1:
+        raise AssertionError("production installer identity command changed")
+    fixture.write_text(content.replace(command, f'{fake_ps} -ww -p "$$" -o lstart= -o command='))
+    fixture.chmod(0o700)
+    return fixture
+
+
 def _guard_process_call(
     call: Callable[Concatenate[Command, P], R], test_root: Path
 ) -> Callable[Concatenate[Command, P], R]:
     def guarded(command: Command, /, *args: P.args, **kwargs: P.kwargs) -> R:
+        parts = _command_parts(command)
+        if (
+            len(parts) >= 2
+            and Path(parts[0]).name in {"sh", "bash"}
+            and Path(parts[1]).resolve() == (Path(__file__).parents[1] / "install.sh")
+        ):
+            fixture = _fixture_install_script(test_root)
+            rewritten = [parts[0], str(fixture), *parts[2:]]
+            return call(cast(Command, rewritten), *args, **kwargs)
         if not _command_is_safe(command, test_root):
             raise AssertionError("test attempted a non-fixture subprocess")
         return call(command, *args, **kwargs)
@@ -78,6 +105,14 @@ def _guard_subprocess_run(
             if str(os.getpid()) in parts:
                 return cast(R, subprocess.CompletedProcess(parts, 0, "fixture process\n", ""))
             return cast(R, subprocess.CompletedProcess(parts, 1, "", "fixture process unavailable"))
+        if (
+            len(parts) >= 2
+            and Path(parts[0]).name in {"sh", "bash"}
+            and Path(parts[1]).resolve() == (Path(__file__).parents[1] / "install.sh")
+        ):
+            fixture = _fixture_install_script(test_root)
+            rewritten = [parts[0], str(fixture), *parts[2:]]
+            return call(cast(Command, rewritten), *args, **kwargs)
         if not _command_is_safe(command, test_root):
             raise AssertionError("test attempted a non-fixture subprocess")
         return call(command, *args, **kwargs)

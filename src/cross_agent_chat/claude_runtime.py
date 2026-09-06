@@ -124,12 +124,20 @@ def parse_claude_agents(text: str) -> list[ClaudeAgent]:
         cwd = item.get("cwd")
         if not all(isinstance(value, str) for value in (session_id, name, kind, cwd)):
             raise ChatError("Claude agents response is invalid")
+        agent_session_id = valid_uuid(cast(str, session_id), "Claude session id")
+        agent_name = valid_name(cast(str, name), "Claude session name")
+        try:
+            canonical = canonical_cwd(cast(str, cwd))
+        except ChatError:
+            # Claude can retain an unrelated row after its workspace disappears.
+            # It cannot be an exact live target, but it must not hide healthy rows.
+            continue
         agents.append(
             {
-                "session_id": valid_uuid(cast(str, session_id), "Claude session id"),
-                "name": valid_name(cast(str, name), "Claude session name"),
+                "session_id": agent_session_id,
+                "name": agent_name,
                 "kind": cast(str, kind),
-                "cwd": canonical_cwd(cast(str, cwd)),
+                "cwd": canonical,
             }
         )
     return agents

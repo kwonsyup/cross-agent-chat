@@ -80,6 +80,46 @@ def test_claude_agents_requires_exact_interactive_identity(tmp_path: Path) -> No
     ]
 
 
+def test_claude_agents_skip_an_unrelated_disappeared_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import claude_runtime
+
+    healthy_session = str(uuid4())
+    stale_session = str(uuid4())
+    stale_workspace = tmp_path / "disappeared"
+    payload = json.dumps(
+        [
+            {
+                "sessionId": healthy_session,
+                "name": "Healthy session",
+                "kind": "interactive",
+                "cwd": str(tmp_path),
+            },
+            {
+                "sessionId": stale_session,
+                "name": "Stale session",
+                "kind": "interactive",
+                "cwd": str(stale_workspace),
+            },
+        ]
+    )
+
+    agents = parse_claude_agents(payload)
+
+    assert agents == [
+        {
+            "session_id": healthy_session,
+            "name": "Healthy session",
+            "kind": "interactive",
+            "cwd": str(tmp_path.resolve()),
+        }
+    ]
+    monkeypatch.setattr(claude_runtime, "claude_agents", lambda: agents)
+    with pytest.raises(ChatError, match="exact live supported"):
+        claude_runtime.exact_agent(stale_session, str(stale_workspace))
+
+
 def test_claude_binary_uses_fixed_user_local_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

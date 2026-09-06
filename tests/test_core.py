@@ -436,6 +436,301 @@ def test_healthy_duplicate_registration_keeps_generation_and_pending_courier_eve
     assert not worker.is_alive()
 
 
+def test_courier_bootstrap_does_not_wait_for_claude_native_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+
+    class OwnedProcess:
+        stderr: None = None
+        terminated = False
+        waited = False
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float) -> int:
+            self.waited = True
+            return 0
+
+    process = OwnedProcess()
+
+    def spawn(*_args: object, **_kwargs: object) -> OwnedProcess:
+        return process
+
+    def bootstrap(_path: Path, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        assert timeout > 0
+        assert payload == {
+            "schema_version": 1,
+            "operation": "bootstrap",
+            "generation": item.generation,
+        }
+        return {
+            "schema_version": 1,
+            "status": "BOOTSTRAPPED",
+            "generation": item.generation,
+        }
+
+    monkeypatch.setattr(runtime, "executable", lambda: Path("/bin/echo"))
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_: ("a" * 64, Path("/bin/echo"))
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.subprocess.Popen", spawn)
+    monkeypatch.setattr(runtime, "request_socket", bootstrap)
+
+    runtime._spawn_courier(tmp_path / "state", item)
+
+    assert not process.terminated
+    assert not process.waited
+
+
+def test_failed_courier_bootstrap_reaps_the_exact_owned_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+
+    class OwnedProcess:
+        stderr: None = None
+        terminated = False
+        waited = False
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float) -> int:
+            self.waited = True
+            return 0
+
+    process = OwnedProcess()
+
+    def spawn(*_args: object, **_kwargs: object) -> OwnedProcess:
+        return process
+
+    def unavailable(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise ChatError("local listener is unavailable")
+
+    monkeypatch.setattr(runtime, "executable", lambda: Path("/bin/echo"))
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_: ("a" * 64, Path("/bin/echo"))
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.subprocess.Popen", spawn)
+    monkeypatch.setattr(runtime, "request_socket", unavailable)
+    monkeypatch.setattr(runtime, "COURIER_READY_SECONDS", 0.0)
+
+    with pytest.raises(ChatError, match="local bootstrap"):
+        runtime._spawn_courier(tmp_path / "state", item)
+
+    assert process.terminated
+    assert process.waited
+
+
+def test_cancelled_courier_bootstrap_reaps_the_exact_owned_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+
+    class OwnedProcess:
+        terminated = False
+        waited = False
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float) -> int:
+            self.waited = True
+            return 0
+
+    process = OwnedProcess()
+
+    def spawn(*_args: object, **_kwargs: object) -> OwnedProcess:
+        return process
+
+    def cancelled(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runtime, "executable", lambda: Path("/bin/echo"))
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_: ("a" * 64, Path("/bin/echo"))
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.subprocess.Popen", spawn)
+    monkeypatch.setattr(runtime, "request_socket", cancelled)
+
+    with pytest.raises(KeyboardInterrupt):
+        runtime._spawn_courier(tmp_path / "state", item)
+
+    assert process.terminated
+    assert process.waited
+
+
+def test_cancelled_registration_removes_its_exact_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    project = tmp_path / "project"
+    project.mkdir()
+    root = tmp_path / "state"
+    session_id = str(uuid4())
+    hook = {"hook_event_name": "SessionStart", "session_id": session_id, "cwd": str(project)}
+    monkeypatch.setattr(runtime, "hook_input", lambda _: hook)
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_: ("a" * 64, Path("/bin/echo"))
+    )
+    monkeypatch.setattr(
+        runtime, "_spawn_courier", lambda *_: (_ for _ in ()).throw(KeyboardInterrupt)
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        runtime.register("claude", "studio", os.getpid(), str(root))
+
+    assert Registry(root).routes() == []
+
+
+def test_duplicate_claude_start_reuses_bootstrapped_courier_before_native_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    project = tmp_path / "project"
+    project.mkdir()
+    root = tmp_path / "state"
+    session_id = str(uuid4())
+    profile = str(tmp_path / "claude-profile")
+    first = Route.create(
+        provider="claude",
+        session_id=session_id,
+        device="studio",
+        cwd=str(project),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+        profile_root=profile,
+    )
+    Registry(root).upsert(first)
+    hook = {"hook_event_name": "SessionStart", "session_id": session_id, "cwd": str(project)}
+    monkeypatch.setattr(runtime, "hook_input", lambda _: hook)
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_: ("a" * 64, Path("/bin/echo"))
+    )
+    monkeypatch.setattr(runtime, "recipient_profile_root", lambda _: profile)
+    monkeypatch.setattr(
+        runtime, "_spawn_courier", lambda *_: pytest.fail("duplicate spawned a courier")
+    )
+
+    def bootstrap(_path: Path, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        assert timeout == 0.5
+        assert payload == {
+            "schema_version": 1,
+            "operation": "bootstrap",
+            "generation": first.generation,
+        }
+        return {
+            "schema_version": 1,
+            "status": "BOOTSTRAPPED",
+            "generation": first.generation,
+        }
+
+    monkeypatch.setattr(runtime, "request_socket", bootstrap)
+
+    assert runtime.register("claude", "studio", os.getpid(), str(root)) == first
+
+
+def test_claude_bootstrap_survives_delayed_native_health_without_claiming_a_peer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+    root = tmp_path / "state"
+    Registry(root).upsert(item)
+    native_lookups = 0
+
+    def unavailable_native(*_args: object) -> dict[str, str]:
+        nonlocal native_lookups
+        native_lookups += 1
+        time.sleep(0.15)
+        raise ChatError("native listing is unavailable")
+
+    monkeypatch.setattr("cross_agent_chat.runtime.exact_agent", unavailable_native)
+    worker = threading.Thread(
+        target=courier_server,
+        kwargs={
+            "provider": "claude",
+            "state_root_value": str(root),
+            "session_id": item.session_id,
+            "cwd": item.cwd,
+            "generation": item.generation,
+            "pid": os.getpid(),
+        },
+        daemon=True,
+    )
+    worker.start()
+    path = socket_path(root, item)
+    deadline = time.monotonic() + 2.0
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.exists()
+    try:
+        bootstrap = request_socket(
+            path,
+            {"schema_version": 1, "operation": "bootstrap", "generation": item.generation},
+            timeout=0.1,
+        )
+        assert bootstrap == {
+            "schema_version": 1,
+            "status": "BOOTSTRAPPED",
+            "generation": item.generation,
+        }
+        assert native_lookups == 0
+        health = request_socket(
+            path,
+            {"schema_version": 1, "operation": "health", "generation": item.generation},
+            timeout=0.5,
+        )
+        assert health == {
+            "schema_version": 1,
+            "status": "UNAVAILABLE",
+            "generation": item.generation,
+        }
+        assert native_lookups == 1
+        assert (
+            request_socket(
+                path,
+                {"schema_version": 1, "operation": "bootstrap", "generation": item.generation},
+                timeout=0.1,
+            )
+            == bootstrap
+        )
+    finally:
+        request_socket(
+            path,
+            {"schema_version": 1, "operation": "shutdown", "generation": item.generation},
+        )
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+
+
 def test_missing_courier_duplicate_registration_replaces_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

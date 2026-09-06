@@ -32,7 +32,7 @@ def queue_native_input(
         "id": 0,
         "method": "initialize",
         "params": {
-            "clientInfo": {"name": "cross-agent-chat", "version": "0.1.4"},
+            "clientInfo": {"name": "cross-agent-chat", "version": "0.1.5"},
             "capabilities": {"experimentalApi": True},
         },
     }
