@@ -74,7 +74,7 @@ def test_native_thread_titles_are_metadata_only_and_bounded(tmp_path: Path) -> N
     binary = tmp_path / "fake-codex"
     binary.write_text(
         f"#!{sys.executable}\n"
-        + r'''
+        + r"""
 import json, os, sys
 with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
     for line in sys.stdin:
@@ -87,7 +87,7 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
             thread_id = request["params"]["threadId"]
             thread = {"id": thread_id, "name": "Canary " + thread_id[:8], "turns": []}
             print(json.dumps({"id": request["id"], "result": {"thread": thread}}), flush=True)
-'''
+"""
     )
     binary.chmod(0o700)
 
@@ -105,6 +105,137 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
         {"threadId": first, "includeTurns": False},
         {"threadId": second, "includeTurns": False},
     ]
+
+
+def test_native_thread_titles_rejects_a_different_profile(tmp_path: Path) -> None:
+    thread_id = str(uuid4())
+    trace = tmp_path / "trace.jsonl"
+    binary = tmp_path / "fake-codex"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        + r"""
+import json, os, sys
+with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
+    for line in sys.stdin:
+        request = json.loads(line)
+        trace.write(json.dumps(request) + "\n")
+        if request.get("id") == 0:
+            print(json.dumps({"id": 0, "result": {"codexHome": "/wrong-profile"}}), flush=True)
+"""
+    )
+    binary.chmod(0o700)
+
+    titles = native_thread_titles(
+        binary=binary,
+        environment={"CODEX_HOME": str(tmp_path), "TEST_TRACE": str(trace)},
+        thread_ids=[thread_id],
+        deadline=time.monotonic() + 1,
+    )
+
+    assert titles == {}
+    assert [json.loads(line) for line in trace.read_text().splitlines()] == [
+        {
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "cross-agent-chat", "version": "0.1.5"},
+                "capabilities": {"experimentalApi": True},
+            },
+        }
+    ]
+
+
+def test_native_thread_titles_stops_at_the_metadata_deadline(tmp_path: Path) -> None:
+    binary = tmp_path / "fake-codex"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        + r"""
+import time
+for _line in __import__("sys").stdin:
+    time.sleep(5)
+"""
+    )
+    binary.chmod(0o700)
+    started = time.monotonic()
+
+    titles = native_thread_titles(
+        binary=binary,
+        environment={"CODEX_HOME": str(tmp_path)},
+        thread_ids=[str(uuid4())],
+        deadline=started + 0.05,
+    )
+
+    assert titles == {}
+    assert time.monotonic() - started < 1.5
+
+
+def test_native_thread_titles_rejects_a_title_for_another_thread(tmp_path: Path) -> None:
+    requested, wrong = str(uuid4()), str(uuid4())
+    binary = tmp_path / "fake-codex"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        + r"""
+import json, os, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("id") == 0:
+        print(json.dumps({"id": 0, "result": {"codexHome": os.environ["CODEX_HOME"]}}), flush=True)
+    elif request.get("method") == "thread/read":
+        response = {
+            "id": request["id"],
+            "result": {"thread": {"id": os.environ["WRONG_THREAD"], "name": "Wrong title"}},
+        }
+        print(json.dumps(response), flush=True)
+"""
+    )
+    binary.chmod(0o700)
+
+    assert (
+        native_thread_titles(
+            binary=binary,
+            environment={"CODEX_HOME": str(tmp_path), "WRONG_THREAD": wrong},
+            thread_ids=[requested],
+            deadline=time.monotonic() + 1,
+        )
+        == {}
+    )
+
+
+def test_native_thread_titles_kills_a_stubborn_metadata_process(tmp_path: Path) -> None:
+    pid_file = tmp_path / "stubborn.pid"
+    binary = tmp_path / "fake-codex"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        + r"""
+import json, os, signal, sys, time
+from pathlib import Path
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(os.environ["PID_FILE"]).write_text(str(os.getpid()))
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("id") == 0:
+        print(json.dumps({"id": 0, "result": {"codexHome": os.environ["CODEX_HOME"]}}), flush=True)
+    elif request.get("method") == "thread/read":
+        while True:
+            time.sleep(1)
+"""
+    )
+    binary.chmod(0o700)
+    started = time.monotonic()
+
+    assert (
+        native_thread_titles(
+            binary=binary,
+            environment={"CODEX_HOME": str(tmp_path), "PID_FILE": str(pid_file)},
+            thread_ids=[str(uuid4())],
+            deadline=started + 1,
+        )
+        == {}
+    )
+    assert time.monotonic() - started < 3
+    assert pid_file.exists()
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
 
 
 def test_queue_is_idempotent_for_exact_repeats_and_rejects_conflicts() -> None:

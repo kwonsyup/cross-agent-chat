@@ -1037,32 +1037,33 @@ def local_targets(root: Path) -> list[Target]:
         for future in futures:
             future.cancel()
         workers.shutdown(wait=False, cancel_futures=True)
-    targets = [target for target in results if target is not None]
-    return _with_codex_titles(root, targets, deadline)
+    return [target for target in results if target is not None]
 
 
 def _with_codex_titles(root: Path, targets: list[Target], deadline: float) -> list[Target]:
     """Add optional title hints after courier health, never as route authority."""
     groups: dict[tuple[Path, str], list[Target]] = {}
+    routes = Registry(root).routes()
     for target in targets:
         if target.provider != "codex" or target.pid is None or target.session_id is None:
             continue
-        try:
-            identity, binary = recipient_owner_identity("codex", target.pid)
-        except (ChatError, OSError):
-            continue
         route_matches = [
             route
-            for route in Registry(root).routes()
+            for route in routes
             if route.provider == "codex"
             and route.pid == target.pid
             and route.session_id == target.session_id
             and route.generation == target.generation
-            and route.owner_identity == identity
         ]
         if len(route_matches) != 1:
             continue
         profile = route_matches[0].profile_root or recipient_profile_root("codex")
+        try:
+            identity, binary = recipient_owner_identity("codex", target.pid, profile)
+        except (ChatError, OSError):
+            continue
+        if route_matches[0].owner_identity != identity:
+            continue
         groups.setdefault((binary, profile), []).append(target)
     titles: dict[str, str] = {}
     for (binary, profile), group in groups.items():
@@ -1077,7 +1078,10 @@ def _with_codex_titles(root: Path, targets: list[Target], deadline: float) -> li
                 deadline=time.monotonic() + min(remaining, NATIVE_TITLE_TIMEOUT_SECONDS),
             )
         )
-    return [replace(target, title=titles.get(target.session_id or "")) for target in targets]
+    return [
+        target if target.remote else replace(target, title=titles.get(target.session_id or ""))
+        for target in targets
+    ]
 
 
 def _targets_from_tailnet(
@@ -1100,10 +1104,12 @@ def _targets_from_tailnet(
             "generation",
             "session_key",
         }
-        allowed = required | ({"delivery_mode"} if include_delivery_mode else set()) | (
-            {"title"} if include_title else set()
+        allowed = (
+            required
+            | ({"delivery_mode"} if include_delivery_mode else set())
+            | ({"title"} if include_title else set())
         )
-        if not isinstance(raw_item, dict) or set(raw_item) not in (required, allowed):
+        if not isinstance(raw_item, dict) or not required <= set(raw_item) <= allowed:
             raise ChatError("Tailnet peer returned invalid discovery")
         item = cast(dict[object, object], raw_item)
         provider = item.get("provider")
@@ -1163,9 +1169,9 @@ def _remote_node_targets(
     include_delivery_mode: bool = False,
     include_title: bool = False,
 ) -> tuple[list[Target], bool]:
-    remaining = (
-        REMOTE_DISCOVERY_TIMEOUT_SECONDS if deadline is None else deadline - time.monotonic()
-    )
+    if deadline is None:
+        deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
+    remaining = deadline - time.monotonic()
     if remaining <= 0:
         return [], False
     request: dict[str, object] = {"schema_version": SCHEMA_VERSION, "operation": "peers"}
@@ -1173,40 +1179,41 @@ def _remote_node_targets(
         request["include_delivery_mode"] = True
     if include_title:
         request["include_title"] = True
-    try:
-        raw = request_tailnet(
-            address,
-            request,
-            # The remote broker may spend HEALTH_TIMEOUT_SECONDS validating local routes.
-            timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining),
-        )
-        return (
-            _targets_from_tailnet(
-                address,
-                raw,
-                include_delivery_mode=include_delivery_mode,
-                include_title=include_title,
-            ),
-            True,
-        )
-    except (ChatError, UnknownDeliveryError):
-        if not include_delivery_mode and not include_title:
-            return [], False
-        remaining = deadline - time.monotonic() if deadline is not None else 0.0
+    variants: list[tuple[dict[str, object], bool, bool]] = [
+        (request, include_delivery_mode, include_title)
+    ]
+    legacy: dict[str, object] = {"schema_version": SCHEMA_VERSION, "operation": "peers"}
+    if include_title and include_delivery_mode:
+        variants.append(({**legacy, "include_delivery_mode": True}, True, False))
+    if include_delivery_mode or include_title:
+        variants.append((legacy, False, False))
+    for payload, mode_requested, title_requested in variants:
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             return [], False
         try:
             raw = request_tailnet(
                 address,
-                {"schema_version": SCHEMA_VERSION, "operation": "peers"},
+                payload,
                 timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining),
             )
-            return _targets_from_tailnet(address, raw), True
+            return (
+                _targets_from_tailnet(
+                    address,
+                    raw,
+                    include_delivery_mode=mode_requested,
+                    include_title=title_requested,
+                ),
+                True,
+            )
         except (ChatError, UnknownDeliveryError):
-            return [], False
+            continue
+    return [], False
 
 
-def _remote_discovery(*, include_delivery_mode: bool = False) -> tuple[list[Target], bool]:
+def _remote_discovery(
+    *, include_delivery_mode: bool = False, include_title: bool = False
+) -> tuple[list[Target], bool]:
     addresses = tailnet_nodes()
     if not addresses:
         return [], False
@@ -1220,10 +1227,10 @@ def _remote_discovery(*, include_delivery_mode: bool = False) -> tuple[list[Targ
                 _remote_node_targets,
                 address,
                 deadline,
-                include_delivery_mode=True,
-                include_title=True,
+                include_delivery_mode=include_delivery_mode,
+                include_title=include_title,
             )
-            if include_delivery_mode
+            if include_delivery_mode or include_title
             else workers.submit(_remote_node_targets, address, deadline)
         )
         for address in addresses
@@ -1243,18 +1250,29 @@ def _remote_discovery(*, include_delivery_mode: bool = False) -> tuple[list[Targ
     return targets, complete
 
 
-def remote_targets(_root: Path, *, include_delivery_mode: bool = False) -> list[Target]:
-    return _remote_discovery(include_delivery_mode=include_delivery_mode)[0]
+def remote_targets(
+    _root: Path, *, include_delivery_mode: bool = False, include_title: bool = False
+) -> list[Target]:
+    return _remote_discovery(
+        include_delivery_mode=include_delivery_mode, include_title=include_title
+    )[0]
 
 
 def all_targets(
-    root: Path, *, include_remote: bool = True, include_delivery_mode: bool = False
+    root: Path,
+    *,
+    include_remote: bool = True,
+    include_delivery_mode: bool = False,
+    include_title: bool = False,
 ) -> list[Target]:
     if include_remote:
         with ThreadPoolExecutor(max_workers=2) as workers:
             local = workers.submit(local_targets, root)
             remote = workers.submit(
-                remote_targets, root, include_delivery_mode=include_delivery_mode
+                remote_targets,
+                root,
+                include_delivery_mode=include_delivery_mode,
+                include_title=include_title,
             )
             targets = [*local.result(), *remote.result()]
     else:
@@ -1273,10 +1291,6 @@ def _target_matches(target: Target, query: str) -> bool:
     return bool(wanted) and all(token in available for token in wanted)
 
 
-def _exact_target_matches(target: Target, query: str) -> bool:
-    return target.alias.casefold() == query.casefold() or target.session_key == query
-
-
 def resolve_target(targets: list[Target], query: str) -> Target:
     if not query.strip() or len(query) > 160:
         raise ChatError("target query is invalid")
@@ -1284,6 +1298,8 @@ def resolve_target(targets: list[Target], query: str) -> Target:
     if len(handle_matches) == 1:
         return handle_matches[0]
     if len(handle_matches) > 1:
+        raise ChatError("target handle is unavailable")
+    if re.fullmatch(r"[0-9a-f]{64}", query):
         raise ChatError("target handle is unavailable")
     exact_matches = [target for target in targets if target.alias.casefold() == query.casefold()]
     if len(exact_matches) == 1:
@@ -1411,19 +1427,15 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
     if len(exact_local_handles) == 1:
         target = exact_local_handles[0]
         return _send_local_target(root, source, target, message, deadline=deadline)
-    exact_local_codex_aliases = [
-        target
-        for target in local
-        if target.provider == "codex" and target.alias.casefold() == target_query.casefold()
-    ]
-    if len(exact_local_codex_aliases) == 1:
-        target = exact_local_codex_aliases[0]
-        return _send_local_target(root, source, target, message, deadline=deadline)
     remote, remote_complete = _remote_discovery()
     exact_remote_handles = [target for target in remote if target.session_key == target_query]
     if len(exact_remote_handles) == 1:
         target = exact_remote_handles[0]
     else:
+        if not remote_complete:
+            raise ChatError(
+                "remote peer discovery is incomplete; use an exact available recipient handle"
+            )
         exact_aliases = [
             target
             for target in [*local, *remote]
@@ -1434,10 +1446,6 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
         elif len(exact_aliases) > 1:
             raise ChatError("target is ambiguous or unavailable")
         else:
-            if not remote_complete:
-                raise ChatError(
-                    "remote peer discovery is incomplete; use an exact available recipient"
-                )
             target = resolve_target([*local, *remote], target_query)
     if not target.remote:
         return _send_local_target(root, source, target, message, deadline=deadline)
@@ -1638,11 +1646,18 @@ def peers(
     include_delivery_mode: bool = False,
     include_title: bool = False,
 ) -> dict[str, object]:
+    display_titles = not internal or include_title
+    deadline = time.monotonic() + (
+        REMOTE_DISCOVERY_TIMEOUT_SECONDS if include_remote else LOCAL_DISCOVERY_TIMEOUT_SECONDS
+    )
     targets = all_targets(
         root,
         include_remote=include_remote,
         include_delivery_mode=include_delivery_mode,
+        include_title=display_titles,
     )
+    if display_titles:
+        targets = _with_codex_titles(root, targets, deadline)
     items: list[dict[str, str]] = []
     for target in targets:
         item = target.public(

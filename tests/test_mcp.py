@@ -3,11 +3,12 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
 from cross_agent_chat.cli import mcp
-from cross_agent_chat.core import ChatError
+from cross_agent_chat.core import ChatError, IntentStore, Registry, Route
 from cross_agent_chat.mcp_server import normalize_send_arguments
 
 
@@ -66,3 +67,90 @@ def test_presence_off_mcp_initializes_without_tools_or_state(
         "error": {"code": -32602, "message": "Cross Agent Chat presence is disabled"},
     }
     assert not root.exists()
+
+
+def test_mcp_status_requires_the_trusted_codex_thread_and_current_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    parent_pid = 4242
+    session_id = str(uuid4())
+    source = Route.create(
+        provider="codex",
+        session_id=session_id,
+        device="studio",
+        cwd=str(tmp_path),
+        pid=parent_pid,
+    )
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=parent_pid + 1,
+    )
+    Registry(root).upsert(source)
+    event_id = IntentStore(root).begin(
+        source, target, source_alias=source.alias, payload_digest="a" * 64
+    )
+    monkeypatch.delenv("CROSS_AGENT_CHAT_PRESENCE", raising=False)
+    monkeypatch.setattr("cross_agent_chat.cli.os.getppid", lambda: parent_pid)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "chat_status",
+                "arguments": {"event_id": event_id},
+                "_meta": {"threadId": session_id},
+            },
+        },
+    ]
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO("".join(f"{json.dumps(request)}\n" for request in requests))
+    )
+
+    mcp("codex", "studio", str(root))
+
+    responses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert {tool["name"] for tool in responses[0]["result"]["tools"]} == {
+        "chat_peers",
+        "chat_send",
+        "chat_status",
+    }
+    assert json.loads(responses[1]["result"]["content"][0]["text"])["event_id"] == event_id
+
+    replacement = Route.create(
+        provider="codex",
+        session_id=session_id,
+        device="studio",
+        cwd=str(tmp_path),
+        pid=parent_pid,
+    )
+    Registry(root).upsert(replacement)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "chat_status",
+                        "arguments": {"event_id": event_id},
+                        "_meta": {"threadId": session_id},
+                    },
+                }
+            )
+            + "\n"
+        ),
+    )
+
+    mcp("codex", "studio", str(root))
+
+    denied = json.loads(capsys.readouterr().out)
+    assert denied["error"] == {"code": -32602, "message": "event is unavailable"}

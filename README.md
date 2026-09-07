@@ -17,9 +17,10 @@ The installer supplies a Python runtime when the Mac lacks a compatible one. Its
 command is `~/.local/bin/cross-agent-chat`; it stages releases under
 `~/.local/share/cross-agent-chat-runtime`, then writes the selected Claude `settings.json` and
 `.claude.json`, selected Codex `config.toml` and `hooks.json`, per-profile install metadata, and
-the owner-local LaunchAgent broker. Setup can stop and replace the shared broker and transient
-couriers, so inspect active consumers and selected roots before an install, upgrade, or uninstall.
-Existing provider sessions keep their loaded hooks; open fresh Claude or Codex sessions afterward.
+the owner-local LaunchAgent broker. Setup can replace the shared broker, so inspect active
+consumers and selected roots before an install, upgrade, or uninstall. Upgrades preserve existing
+couriers and their route generations. Existing sessions keep their loaded integration; fresh
+Claude or Codex sessions use the updated tools and hooks.
 
 Start a fresh session, then ask naturally:
 
@@ -28,8 +29,8 @@ Start a fresh session, then ask naturally:
 Cross Agent Chat follows the provider processes you already use. There are no peer files,
 Cross Agent Chat accounts, or terminal-specific extensions. Permitted online Tailnet Macs appear
 automatically.
-Use the opaque exact `handle` returned by `chat_peers` when display labels repeat. Fuzzy names are checked across devices;
-multiple matches or incomplete remote discovery require a more precise recipient.
+Use the opaque exact `handle` returned by `chat_peers` to select a recipient. Display names are
+checked across devices; multiple matches or incomplete discovery require an exact handle.
 `chat_peers` reports the invoking sender's readiness separately from each recipient's delivery mode.
 
 Disposable worker launchers can set `CROSS_AGENT_CHAT_PRESENCE=off`. That worker remains out
@@ -101,10 +102,12 @@ cross-agent-chat peers --json
 cross-agent-chat uninstall
 ```
 
-Running the installer again upgrades and repairs the owned configuration. An upgrade or
-uninstall pauses Cross Agent Chat messaging and stops its couriers, not Claude or Codex coding
-processes. Let pending Stop-bound deliveries consume before that pause; new sessions after an
-upgrade load the updated integration. A temporary profile does not isolate that shared service.
+Running the installer again upgrades and repairs the owned configuration. Upgrades briefly
+restart the shared broker while preserving existing couriers, pending input, and route identity.
+Older runtimes are retained while route registrations remain, so repeated upgrades do not remove
+a live courier's executable. Fresh sessions load the updated integration. Uninstall stops
+couriers; let pending Stop-bound deliveries consume before uninstalling. A temporary profile
+does not isolate the shared service. Neither operation restarts Claude or Codex coding processes.
 If a failed setup or upgrade finds newer provider settings during rollback, it retains those
 settings and recovery custody for diagnosis before retrying.
 `uninstall`

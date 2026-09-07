@@ -151,6 +151,24 @@ def queue_native_input(
         raise UnknownDeliveryError("Codex native queue outcome is unknown")
 
 
+def _reap_metadata_process(process: subprocess.Popen[bytes]) -> None:
+    if process.stdin is not None:
+        with suppress(OSError):
+            process.stdin.close()
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=0.5)
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+
+
 def native_thread_titles(
     *, binary: Path, environment: dict[str, str], thread_ids: list[str], deadline: float
 ) -> dict[str, str]:
@@ -170,7 +188,7 @@ def native_thread_titles(
     except OSError:
         return {}
     if process.stdin is None or process.stdout is None:
-        process.terminate()
+        _reap_metadata_process(process)
         return {}
     stdin, stdout = process.stdin, process.stdout
     selector = selectors.DefaultSelector()
@@ -230,7 +248,9 @@ def native_thread_titles(
             response = read(index)
             result = response.get("result") if response is not None else None
             thread = result.get("thread") if isinstance(result, dict) else None
-            name = thread.get("name") if isinstance(thread, dict) else None
+            if not isinstance(thread, dict) or thread.get("id") != thread_id:
+                continue
+            name = thread.get("name")
             if isinstance(name, str):
                 try:
                     titles[thread_id] = valid_name(name, "Codex thread title")
@@ -240,15 +260,7 @@ def native_thread_titles(
         return {}
     finally:
         selector.close()
-        with suppress(OSError):
-            stdin.close()
-        try:
-            process.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            with suppress(subprocess.TimeoutExpired):
-                process.wait(timeout=0.5)
-        stdout.close()
+        _reap_metadata_process(process)
     return titles
 
 

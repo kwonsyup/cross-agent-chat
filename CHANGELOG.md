@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.5 - 2026-09-06
+## 0.1.5 - Unreleased
 
 - Complete local courier bootstrap without waiting for Claude's native session listing. Routes
   become available only after the existing native health and pre-delivery identity checks pass.
@@ -13,6 +13,10 @@
   target remains unavailable.
 - Preserve concurrent provider-setting edits when failed setup or upgrade rollback conflicts, and
   retain recovery custody for diagnosis instead of restoring stale settings.
+- Expose exact peer handles, optional native task titles, and caller readiness separately from
+  recipient delivery modes. Resolve display aliases globally before sending.
+- Add authenticated, read-only MCP event status without changing stored intents or replaying work.
+- Preserve live couriers, route generations, and retained runtimes through compatible upgrades.
 
 ## 0.1.4 - 2026-09-05
 

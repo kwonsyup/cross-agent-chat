@@ -422,7 +422,7 @@ def test_configured_tool_deadline_covers_one_remote_discovery_and_delivery() -> 
     assert MCP_TOOL_TIMEOUT_SECONDS >= OPERATION_TIMEOUT_SECONDS + 10
 
 
-def test_local_send_does_not_wait_for_remote_discovery(
+def test_local_send_by_exact_handle_skips_remote_discovery_and_title_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "state"
@@ -448,6 +448,10 @@ def test_local_send_does_not_wait_for_remote_discovery(
         lambda _: pytest.fail("local delivery must not wait for Tailnet discovery"),
     )
     monkeypatch.setattr(
+        "cross_agent_chat.runtime._with_codex_titles",
+        lambda *_args: pytest.fail("delivery must not invoke optional title metadata"),
+    )
+    monkeypatch.setattr(
         "cross_agent_chat.runtime.request_socket",
         lambda _path, payload, **_: {
             "schema_version": 1,
@@ -458,7 +462,169 @@ def test_local_send_does_not_wait_for_remote_discovery(
         },
     )
 
-    assert send(root, source, target.alias, "hello")["status"] == "TRANSPORT_ACCEPTED"
+    assert send(root, source, local.session_key, "hello")["status"] == "TRANSPORT_ACCEPTED"
+
+
+def test_alias_send_rejects_incomplete_global_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    source = route(tmp_path, project="source", pid=os.getpid())
+    target = route(tmp_path, project="target", pid=os.getpid())
+    local = Target(
+        alias=target.alias,
+        provider=target.provider,
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=session_key(target.provider, target.session_id),
+        remote=False,
+    )
+    monkeypatch.setattr(runtime, "local_targets", lambda _: [local])
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([], False))
+
+    with pytest.raises(ChatError, match="discovery is incomplete"):
+        send(tmp_path / "state", source, target.alias, "hello")
+
+
+def test_duplicate_codex_aliases_are_ambiguous_after_complete_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    source = route(tmp_path, project="source", pid=os.getpid())
+    aliases = [
+        Target(
+            alias="codex@studio:api:shared",
+            provider="codex",
+            device="studio",
+            project="api",
+            generation=str(uuid4()),
+            session_key=session_key("codex", str(uuid4())),
+            remote=False,
+        )
+        for _ in range(2)
+    ]
+    monkeypatch.setattr(runtime, "local_targets", lambda _: aliases)
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([], True))
+
+    with pytest.raises(ChatError, match="ambiguous"):
+        send(tmp_path / "state", source, aliases[0].alias, "hello")
+
+
+def test_unknown_opaque_handle_cannot_fall_back_to_fuzzy_target_matching() -> None:
+    target = Target(
+        alias="codex@studio:api:known",
+        provider="codex",
+        device="studio",
+        project="api",
+        generation=str(uuid4()),
+        session_key="b" * 64,
+        remote=False,
+    )
+
+    with pytest.raises(ChatError, match="target handle is unavailable"):
+        resolve_live_target([target], "a" * 64)
+
+
+def test_local_titles_use_the_registered_codex_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    root = tmp_path / "state"
+    profile = tmp_path / "registered-profile"
+    binary = tmp_path / "registered-profile" / "bin" / "codex"
+    item = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+        profile_root=str(profile),
+    )
+    Registry(root).upsert(item)
+    target = Target(
+        alias=item.alias,
+        provider="codex",
+        device=item.device,
+        project=item.project,
+        generation=item.generation,
+        session_key=session_key(item.provider, item.session_id),
+        remote=False,
+        session_id=item.session_id,
+        cwd=item.cwd,
+        pid=item.pid,
+    )
+    observed: dict[str, object] = {}
+
+    def owner_identity(
+        provider: str, pid: int, profile_root: str | None = None
+    ) -> tuple[str, Path]:
+        observed["owner"] = (provider, pid, profile_root)
+        return "a" * 64, binary
+
+    def titles(**kwargs: object) -> dict[str, str]:
+        observed["titles"] = kwargs
+        return {item.session_id: "Registered profile title"}
+
+    monkeypatch.setattr(runtime, "recipient_owner_identity", owner_identity)
+    monkeypatch.setattr(runtime, "native_thread_titles", titles)
+
+    enriched = runtime._with_codex_titles(root, [target], time.monotonic() + 1)
+
+    assert enriched[0].title == "Registered profile title"
+    assert observed["owner"] == ("codex", os.getpid(), str(profile))
+    title_call = observed["titles"]
+    assert isinstance(title_call, dict)
+    assert title_call["binary"] == binary
+    assert title_call["environment"] == {"CODEX_HOME": str(profile)}
+    assert title_call["thread_ids"] == [item.session_id]
+    assert isinstance(title_call["deadline"], float)
+
+
+def test_local_titles_reject_an_owner_identity_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    root = tmp_path / "state"
+    item = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+        profile_root=str(tmp_path / "registered-profile"),
+    )
+    Registry(root).upsert(item)
+    target = Target(
+        alias=item.alias,
+        provider="codex",
+        device=item.device,
+        project=item.project,
+        generation=item.generation,
+        session_key=session_key(item.provider, item.session_id),
+        remote=False,
+        session_id=item.session_id,
+        cwd=item.cwd,
+        pid=item.pid,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "recipient_owner_identity",
+        lambda *_args: ("b" * 64, tmp_path / "wrong-codex"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "native_thread_titles",
+        lambda **_kwargs: pytest.fail("unverified owner must not receive title metadata"),
+    )
+
+    assert runtime._with_codex_titles(root, [target], time.monotonic() + 1) == [target]
 
 
 @pytest.mark.parametrize("health_timeout", [False, True])
@@ -1882,7 +2048,7 @@ def test_disappeared_courier_closes_intent_as_pre_effect(
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _: [target])
     with pytest.raises(ChatError) as error:
-        runtime.send(root, source, target.alias, "never sent")
+        runtime.send(root, source, target.session_key, "never sent")
     assert not isinstance(error.value, UnknownDeliveryError)
     store = IntentStore(root)
     assert [item.status for item in store.intents()] == ["PRE_EFFECT_REJECTED"]

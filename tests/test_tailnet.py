@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 
 import cross_agent_chat.tailnet_broker as tailnet_broker_module
-from cross_agent_chat import __version__
+from cross_agent_chat import __version__, runtime
 from cross_agent_chat.cli import parser
 from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, session_key
 from cross_agent_chat.runtime import (
@@ -67,6 +67,133 @@ def test_tailnet_discovery_returns_only_online_ipv4_nodes() -> None:
     )
 
     assert parse_tailnet_nodes(payload) == ["100.64.0.11"]
+
+
+def _remote_peer(*, provider: str = "codex", title: str | None = None) -> dict[str, object]:
+    session = str(uuid4())
+    peer: dict[str, object] = {
+        "alias": f"{provider}@remote:api:123456789abc",
+        "provider": provider,
+        "device": "remote",
+        "project": "api",
+        "status": "available",
+        "generation": str(uuid4()),
+        "session_key": session_key("codex", session),
+    }
+    if title is not None:
+        peer["title"] = title
+    return peer
+
+
+def test_new_remote_title_negotiation_returns_title(monkeypatch: pytest.MonkeyPatch) -> None:
+    peer = _remote_peer(title="Remote Canary")
+    calls: list[dict[str, object]] = []
+
+    def request(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        calls.append(payload)
+        return {"schema_version": 1, "peers": [peer]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1", include_delivery_mode=True, include_title=True
+    )
+
+    assert complete is True
+    assert targets[0].title == "Remote Canary"
+    assert calls == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
+            "include_title": True,
+        }
+    ]
+
+
+def test_new_remote_title_negotiation_retries_legacy_peer(monkeypatch: pytest.MonkeyPatch) -> None:
+    peer = _remote_peer()
+    calls: list[dict[str, object]] = []
+
+    def request(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        calls.append(payload)
+        if "include_title" in payload or "include_delivery_mode" in payload:
+            raise ChatError("old peer")
+        return {"schema_version": 1, "peers": [peer]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1", include_delivery_mode=True, include_title=True
+    )
+
+    assert complete is True
+    assert targets[0].title is None
+    assert calls == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
+            "include_title": True,
+        },
+        {"schema_version": 1, "operation": "peers", "include_delivery_mode": True},
+        {"schema_version": 1, "operation": "peers"},
+    ]
+
+
+def test_new_remote_title_negotiation_preserves_mode_from_an_older_mode_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer = _remote_peer()
+    peer["delivery_mode"] = "codex_stop_bound"
+    calls: list[dict[str, object]] = []
+
+    def request(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        calls.append(payload)
+        if "include_title" in payload:
+            raise ChatError("peer does not support titles")
+        return {"schema_version": 1, "peers": [peer]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1", include_delivery_mode=True, include_title=True
+    )
+
+    assert complete is True
+    assert targets[0].delivery_mode == "codex_stop_bound"
+    assert targets[0].title is None
+    assert calls == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
+            "include_title": True,
+        },
+        {"schema_version": 1, "operation": "peers", "include_delivery_mode": True},
+    ]
+
+
+def test_remote_title_must_be_a_valid_name() -> None:
+    payload = {"schema_version": 1, "peers": [_remote_peer(title="bad\nname")]}
+
+    with pytest.raises(ChatError, match="remote title"):
+        runtime._targets_from_tailnet("100.64.0.1", payload, include_title=True)
+
+
+def test_remote_title_and_delivery_mode_are_independent_negotiated_fields() -> None:
+    claude = _remote_peer(provider="claude", title="Claude plan")
+    codex = _remote_peer(title="Codex plan")
+    codex["delivery_mode"] = "codex_stop_bound"
+
+    targets = runtime._targets_from_tailnet(
+        "100.64.0.1",
+        {"schema_version": 1, "peers": [claude, codex]},
+        include_delivery_mode=True,
+        include_title=True,
+    )
+
+    assert [(target.provider, target.title, target.delivery_mode) for target in targets] == [
+        ("claude", "Claude plan", None),
+        ("codex", "Codex plan", "codex_stop_bound"),
+    ]
 
 
 def test_tailnet_discovery_rejects_malformed_status() -> None:

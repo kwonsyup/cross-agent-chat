@@ -16,6 +16,7 @@ import tomllib
 from collections.abc import MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import tomlkit
@@ -23,6 +24,8 @@ from tomlkit.exceptions import TOMLKitError
 
 from cross_agent_chat import cli
 from cross_agent_chat.cli import parser
+from cross_agent_chat.codex import CodexCourier
+from cross_agent_chat.core import Registry, Route
 from cross_agent_chat.install import (
     BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
     BROKER_HEALTH_WAIT_SECONDS,
@@ -2246,41 +2249,35 @@ def test_install_restores_provider_files_if_activation_fails(
     assert not installer.launch_agent.exists()
 
 
-def test_install_preserves_healthy_broker_when_courier_shutdown_fails(
+def test_install_keeps_live_couriers_during_healthy_broker_transition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
     settings = home / ".claude" / "settings.json"
     settings.parent.mkdir(parents=True)
     settings.write_text(json.dumps({"theme": "light"}))
-    original = settings.read_bytes()
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
     health_checks = 0
-    bootouts = 0
 
     def healthy() -> bool:
         nonlocal health_checks
         health_checks += 1
         return True
 
-    def fail_shutdown() -> None:
-        raise SettingsError("courier shutdown failed")
-
-    def bootout() -> None:
-        nonlocal bootouts
-        bootouts += 1
-
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
     monkeypatch.setattr(installer, "_wait_for_previous_broker_health", healthy)
-    monkeypatch.setattr(installer, "_stop_couriers", fail_shutdown)
-    monkeypatch.setattr(installer, "_bootout", bootout)
+    monkeypatch.setattr(
+        installer,
+        "_stop_couriers",
+        lambda: pytest.fail("ordinary installation must not stop a live courier"),
+    )
+    monkeypatch.setattr(installer, "activate", lambda: None)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: True)
 
-    with pytest.raises(SettingsError, match="courier shutdown failed"):
-        installer.install()
+    installer.install()
 
-    assert settings.read_bytes() == original
-    assert bootouts == 0
-    assert health_checks == 2
+    assert json.loads(settings.read_text())["theme"] == "light"
+    assert health_checks == 1
 
 
 def test_install_aborts_before_setup_when_previous_broker_state_is_unknown(
@@ -2403,8 +2400,8 @@ def test_install_reports_primary_and_rollback_restart_failures(
     assert (backups[0] / "manifest.json").exists()
 
 
-def _staged_runtime(installer: Installer, marker: str = "candidate") -> Path:
-    stage = installer.releases / "release-test"
+def _staged_runtime(installer: Installer, marker: str = "candidate", *, name: str = "test") -> Path:
+    stage = installer.releases / f"release-{name}"
     executable = stage / "bin" / "cross-agent-chat"
     executable.parent.mkdir(parents=True)
     executable.write_text(marker)
@@ -2511,6 +2508,77 @@ def test_failed_staged_upgrade_rollback_preserves_unknown_intent_bytes(
 
     assert (installer.state / "intents.json").read_bytes() == original
     assert (installer.state / ".intents.lock").exists()
+
+
+def test_successive_staged_upgrades_and_rollback_preserve_live_courier_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    stable = home / "bin" / "cross-agent-chat"
+    installer = Installer(home=home, executable=stable, device="studio")
+    original = installer.releases / "release-original"
+    original_executable = original / "bin" / "cross-agent-chat"
+    original_executable.parent.mkdir(parents=True)
+    original_executable.write_text("original live courier executable")
+    (original / ".cross-agent-chat-release").write_text("cross-agent-chat-runtime-v1:committed\n")
+    installer.current_runtime.symlink_to("releases/release-original")
+    stable.parent.mkdir(parents=True)
+    stable.symlink_to(original_executable)
+    cwd = tmp_path / "live-session"
+    cwd.mkdir()
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(cwd),
+        pid=os.getpid(),
+    )
+    Registry(installer.state).upsert(route)
+    courier = CodexCourier(alias=route.alias, generation=route.generation)
+    event_id = str(uuid4())
+    courier.accept(event_id, "accepted before upgrades")
+    route_bytes = (installer.state / "routes.json").read_bytes()
+    monkeypatch.setattr(installer, "_validate_staged_runtime", lambda stage: stage.resolve())
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
+    monkeypatch.setattr(
+        installer,
+        "_stop_couriers",
+        lambda: pytest.fail("a staged upgrade must not stop a live courier"),
+    )
+    monkeypatch.setattr(installer, "activate", lambda: None)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: True)
+
+    first = _staged_runtime(installer, "upgrade one", name="one")
+    installer.install_staged(first, stable)
+    second = _staged_runtime(installer, "upgrade two", name="two")
+    installer.install_staged(second, stable)
+
+    assert original_executable.read_text() == "original live courier executable"
+    assert (installer.state / "routes.json").read_bytes() == route_bytes
+    assert Registry(installer.state).routes() == [route]
+    assert courier.pending_ids() == [event_id]
+    assert stable.resolve() == second / "bin" / "cross-agent-chat"
+    assert {release.name for release in installer.releases.iterdir()} == {
+        "release-original",
+        "release-one",
+        "release-two",
+    }
+
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: False)
+    monkeypatch.setattr(installer, "_wait_for_broker_health", lambda _check: False)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+    failed = _staged_runtime(installer, "failed upgrade", name="failed")
+
+    with pytest.raises(SettingsError, match="background broker did not become healthy"):
+        installer.install_staged(failed, stable)
+
+    assert original_executable.read_text() == "original live courier executable"
+    assert (installer.state / "routes.json").read_bytes() == route_bytes
+    assert Registry(installer.state).routes() == [route]
+    assert courier.pending_ids() == [event_id]
+    assert stable.resolve() == second / "bin" / "cross-agent-chat"
+    assert not failed.exists()
 
 
 def test_failed_staged_upgrade_retains_concurrent_provider_edit_and_transaction(
@@ -2719,6 +2787,8 @@ def test_staged_upgrade_persists_entrypoint_selected_for_transition(
 def test_staged_install_fsyncs_backup_and_journal_parents_before_first_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from cross_agent_chat import install as install_module
+
     home = tmp_path / "home"
     stable = home / ".local/bin/cross-agent-chat"
     installer = Installer(home=home, executable=stable, device="studio")
@@ -2731,8 +2801,18 @@ def test_staged_install_fsyncs_backup_and_journal_parents_before_first_effect(
         "cross_agent_chat.install._fsync_directory",
         lambda path: events.append(f"fsync:{path}"),
     )
-    monkeypatch.setattr(installer, "_stop_couriers", lambda: events.append("first-effect"))
-    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+    original_symlink = install_module._atomic_symlink
+
+    def runtime_switch(target: str, destination: Path) -> None:
+        events.append("first-effect")
+        original_symlink(target, destination)
+
+    monkeypatch.setattr(install_module, "_atomic_symlink", runtime_switch)
+    monkeypatch.setattr(
+        installer,
+        "_stop_couriers",
+        lambda: pytest.fail("staged install must not stop a live courier"),
+    )
     monkeypatch.setattr(installer, "activate", lambda: None)
     monkeypatch.setattr(installer, "verify", lambda **_kwargs: True)
 
@@ -3716,22 +3796,37 @@ def test_setup_retains_backup_and_reports_compound_rollback_failure(
     assert prepared.backup.exists()
 
 
-def test_staged_install_courier_failure_preserves_healthy_predecessor(
+def test_staged_install_health_rollback_keeps_live_courier_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
     stable = home / "configured-bin" / "cross-agent-chat"
-    predecessor = home / "legacy-root" / "bin" / "cross-agent-chat"
+    installer = Installer(home=home, executable=stable, device="studio")
+    predecessor = installer.releases / "release-original" / "bin" / "cross-agent-chat"
     predecessor.parent.mkdir(parents=True)
-    predecessor.write_text("predecessor")
+    predecessor.write_text("original live courier executable")
+    (predecessor.parents[1] / ".cross-agent-chat-release").write_text(
+        "cross-agent-chat-runtime-v1:committed\n"
+    )
+    installer.current_runtime.symlink_to("releases/release-original")
     stable.parent.mkdir(parents=True)
     stable.symlink_to(predecessor)
-    installer = Installer(home=home, executable=stable, device="studio")
     stage = _staged_runtime(installer)
+    cwd = tmp_path / "live-session"
+    cwd.mkdir()
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(cwd),
+        pid=os.getpid(),
+    )
+    Registry(installer.state).upsert(route)
+    courier = CodexCourier(alias=route.alias, generation=route.generation)
+    event_id = str(uuid4())
+    courier.accept(event_id, "accepted before failed upgrade")
+    route_bytes = (installer.state / "routes.json").read_bytes()
     activations = 0
-
-    def fail_shutdown() -> None:
-        raise SettingsError("courier shutdown failed")
 
     def activate() -> None:
         nonlocal activations
@@ -3740,24 +3835,34 @@ def test_staged_install_courier_failure_preserves_healthy_predecessor(
     monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: True)
     monkeypatch.setattr(installer, "_wait_for_previous_broker_health", lambda: True)
-    monkeypatch.setattr(installer, "_stop_couriers", fail_shutdown)
+    monkeypatch.setattr(
+        installer,
+        "_stop_couriers",
+        lambda: pytest.fail("staged installation must not stop a live courier"),
+    )
     monkeypatch.setattr(installer, "activate", activate)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: False)
+    monkeypatch.setattr(installer, "_wait_for_broker_health", lambda _check: False)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
 
-    with pytest.raises(
-        SettingsError,
-        match="transition failed but rollback succeeded: courier shutdown failed",
-    ):
+    with pytest.raises(SettingsError, match="background broker did not become healthy"):
         installer.install_staged(stage, stable)
 
+    assert activations == 2
+    assert installer.current_runtime.resolve() == predecessor.parents[1]
     assert stable.resolve() == predecessor
-    assert predecessor.read_text() == "predecessor"
+    assert predecessor.read_text() == "original live courier executable"
+    assert (installer.state / "routes.json").read_bytes() == route_bytes
+    assert Registry(installer.state).routes() == [route]
+    assert courier.pending_ids() == [event_id]
     assert not stage.exists()
-    assert activations == 0
 
 
 def test_staged_install_does_not_restore_config_before_config_phase(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from cross_agent_chat import install as install_module
+
     home = tmp_path / "home"
     stable = home / "bin/cross-agent-chat"
     stable.parent.mkdir(parents=True)
@@ -3768,16 +3873,21 @@ def test_staged_install_does_not_restore_config_before_config_phase(
     installer = Installer(home=home, executable=stable, device="studio")
     stage = _staged_runtime(installer)
 
-    def fail_shutdown() -> None:
+    def fail_runtime_switch(_target: str, _destination: Path) -> None:
         settings.write_text(json.dumps({"generation": "newer"}))
-        raise SettingsError("courier shutdown failed")
+        raise SettingsError("runtime transition failed")
 
     monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
     monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
-    monkeypatch.setattr(installer, "_stop_couriers", fail_shutdown)
+    monkeypatch.setattr(install_module, "_atomic_symlink", fail_runtime_switch)
+    monkeypatch.setattr(
+        installer,
+        "_stop_couriers",
+        lambda: pytest.fail("staged installation must not stop a live courier"),
+    )
 
-    with pytest.raises(SettingsError, match="transition failed but rollback succeeded"):
+    with pytest.raises(SettingsError, match="runtime transition failed"):
         installer.install_staged(stage, stable)
 
     assert json.loads(settings.read_text()) == {"generation": "newer"}
