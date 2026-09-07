@@ -10,7 +10,12 @@ from uuid import uuid4
 
 import pytest
 
-from cross_agent_chat.codex import CodexCourier, deliver_at_stop, queue_native_input
+from cross_agent_chat.codex import (
+    CodexCourier,
+    deliver_at_stop,
+    native_thread_titles,
+    queue_native_input,
+)
 from cross_agent_chat.core import ChatError, UnknownDeliveryError
 from cross_agent_chat.runtime import MAX_FRAME_BYTES, codex_stop, register, unregister
 
@@ -61,6 +66,45 @@ def test_queue_has_no_age_expiration() -> None:
     courier.accept(event_id, "old but live")
 
     assert courier.peek()[0]["event_id"] == event_id
+
+
+def test_native_thread_titles_are_metadata_only_and_bounded(tmp_path: Path) -> None:
+    first, second = str(uuid4()), str(uuid4())
+    trace = tmp_path / "trace.jsonl"
+    binary = tmp_path / "fake-codex"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        + r'''
+import json, os, sys
+with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
+    for line in sys.stdin:
+        request = json.loads(line)
+        trace.write(json.dumps(request) + "\n")
+        if request.get("id") == 0:
+            response = {"id": 0, "result": {"codexHome": os.environ["CODEX_HOME"]}}
+            print(json.dumps(response), flush=True)
+        elif request.get("method") == "thread/read":
+            thread_id = request["params"]["threadId"]
+            thread = {"id": thread_id, "name": "Canary " + thread_id[:8], "turns": []}
+            print(json.dumps({"id": request["id"], "result": {"thread": thread}}), flush=True)
+'''
+    )
+    binary.chmod(0o700)
+
+    titles = native_thread_titles(
+        binary=binary,
+        environment={"CODEX_HOME": str(tmp_path), "TEST_TRACE": str(trace)},
+        thread_ids=[first, second],
+        deadline=time.monotonic() + 2,
+    )
+
+    assert titles == {first: f"Canary {first[:8]}", second: f"Canary {second[:8]}"}
+    requests = [json.loads(line) for line in trace.read_text().splitlines()]
+    reads = [request for request in requests if request.get("method") == "thread/read"]
+    assert [request["params"] for request in reads] == [
+        {"threadId": first, "includeTurns": False},
+        {"threadId": second, "includeTurns": False},
+    ]
 
 
 def test_queue_is_idempotent_for_exact_repeats_and_rejects_conflicts() -> None:

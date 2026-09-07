@@ -22,10 +22,12 @@ from cross_agent_chat.runtime import (
     authenticate_mcp_sender,
     codex_stop,
     courier_server,
+    event_status,
     peers,
     presence_is_enabled,
     register,
     send,
+    sender_readiness,
     state_root,
     unregister,
 )
@@ -118,11 +120,29 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                                     "choose a local peer merely because "
                                     "it is local. Delivery mode reports "
                                     "capability, not a receipt. Do not "
-                                    "call for unrelated work."
+                                    "call for unrelated work. The opaque "
+                                    "handle selects one discovered peer; "
+                                    "sender readiness is separate from "
+                                    "recipient availability."
                                 ),
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {},
+                                    "additionalProperties": False,
+                                },
+                            },
+                            {
+                                "name": "chat_status",
+                                "description": (
+                                    "Read body-free custody state for one "
+                                    "event created by this exact sender. "
+                                    "It does not contact a provider, replay "
+                                    "a message, or prove consumption."
+                                ),
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {"event_id": {"type": "string"}},
+                                    "required": ["event_id"],
                                     "additionalProperties": False,
                                 },
                             },
@@ -167,13 +187,18 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                 if not isinstance(name, str) or not isinstance(arguments, dict):
                     _fail("MCP tool call is invalid")
                 typed_arguments = cast(dict[str, object], arguments)
+                metadata = typed_params.get("_meta")
+                thread_id: str | None = None
+                if provider == "codex" and isinstance(metadata, dict):
+                    raw_thread = metadata.get("threadId")
+                    if isinstance(raw_thread, str):
+                        thread_id = raw_thread
                 if name == "chat_peers" and not typed_arguments:
                     assert root is not None
                     result = peers(root, include_delivery_mode=True)
+                    result["sender"] = sender_readiness(root, provider, os.getppid(), thread_id)
                 elif name == "chat_send":
                     target, message = normalize_send_arguments(typed_arguments)
-                    metadata = typed_params.get("_meta")
-                    thread_id: str | None = None
                     if provider == "codex":
                         if not isinstance(metadata, dict):
                             _fail("Codex host thread identity is required")
@@ -184,6 +209,16 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                     assert root is not None
                     source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
                     result = send(root, source, target, message)
+                elif name == "chat_status":
+                    if set(typed_arguments) != {"event_id"} or not isinstance(
+                        typed_arguments["event_id"], str
+                    ):
+                        _fail("event id is invalid")
+                    if provider == "codex" and thread_id is None:
+                        _fail("Codex host thread identity is required")
+                    assert root is not None
+                    source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+                    result = event_status(root, source, typed_arguments["event_id"])
                 else:
                     _fail("MCP tool call is invalid")
                 _mcp_response(

@@ -44,13 +44,19 @@ from cross_agent_chat.runtime import (
     canonical_source_alias,
     courier_health,
     courier_server,
+    event_status,
     local_targets,
     pre_effect_error,
     presence_is_enabled,
     request_socket,
     send,
     send_local,
+    sender_readiness,
     socket_path,
+    unregister,
+)
+from cross_agent_chat.runtime import (
+    resolve_target as resolve_live_target,
 )
 
 
@@ -235,6 +241,108 @@ def test_unicode_project_aliases_preserve_identity_without_ascii_filtering(tmp_p
     assert first.project != second.project
     assert first.alias != second.alias
     assert resolve_target([first], "클루로") == first
+
+
+def test_target_handle_selects_one_duplicate_display_alias(tmp_path: Path) -> None:
+    first_route = route(tmp_path, provider="claude", project="api", session_id=str(uuid4()))
+    second_route = route(tmp_path, provider="claude", project="api", session_id=str(uuid4()))
+    first = Target(
+        alias=first_route.alias,
+        provider=first_route.provider,
+        device=first_route.device,
+        project=first_route.project,
+        generation=first_route.generation,
+        session_key=session_key(first_route.provider, first_route.session_id),
+        remote=False,
+    )
+    second = Target(
+        alias=second_route.alias,
+        provider=second_route.provider,
+        device=second_route.device,
+        project=second_route.project,
+        generation=second_route.generation,
+        session_key=session_key(second_route.provider, second_route.session_id),
+        remote=False,
+    )
+
+    assert first.alias == second.alias
+    assert first.public()["handle"] == first.session_key
+    assert resolve_live_target([first, second], second.session_key) == second
+    with pytest.raises(ChatError, match="ambiguous"):
+        resolve_live_target([first, second], first.alias)
+
+
+def test_sender_readiness_is_bound_to_the_existing_sender_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = route(tmp_path, pid=os.getppid())
+    Registry(root).upsert(source)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_: True)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda *_args, **_kwargs: {"status": "READY", "generation": source.generation},
+    )
+
+    assert sender_readiness(root, "codex", os.getppid(), source.session_id) == {"status": "ready"}
+    assert sender_readiness(root, "codex", os.getppid(), str(uuid4())) == {
+        "status": "unavailable",
+        "reason": "exact Codex sender is unavailable",
+    }
+
+
+def test_event_status_reads_only_an_exact_source_owned_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = route(tmp_path, project="source", pid=os.getpid())
+    target = route(tmp_path, project="target", pid=os.getpid())
+    store = IntentStore(root)
+    event_id = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    before = store.path.read_bytes()
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_: True)
+
+    status = event_status(root, source, event_id)
+
+    assert status == {
+        "schema_version": 1,
+        "event_id": event_id,
+        "status": "PENDING",
+        "source_alias": source.alias,
+        "target_handle": session_key(target.provider, target.session_id),
+        "target_generation": target.generation,
+        "timestamp": store.intents()[0].timestamp,
+        "delivery_observation": "not_observed",
+    }
+    assert store.path.read_bytes() == before
+    with pytest.raises(ChatError, match="event is unavailable"):
+        event_status(root, target, event_id)
+
+
+def test_stale_session_end_with_a_different_working_directory_keeps_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    root = tmp_path / "state"
+    source = route(tmp_path, pid=os.getpid())
+    stale_cwd = tmp_path / "stale"
+    stale_cwd.mkdir()
+    Registry(root).upsert(source)
+    monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "hook_input",
+        lambda _: {
+            "hook_event_name": "SessionEnd",
+            "session_id": source.session_id,
+            "cwd": str(stale_cwd),
+        },
+    )
+
+    with pytest.raises(ChatError, match="exact session route is unavailable"):
+        unregister(source.provider, source.pid, str(root))
+    assert Registry(root).routes() == [source]
 
 
 def test_long_project_label_is_bounded_without_changing_route_identity(tmp_path: Path) -> None:

@@ -590,6 +590,27 @@ class IntentStore:
             fail("intent state contains duplicate events")
         return intents
 
+    def intent_for_source(
+        self, *, event_id: str, source_key: str, source_generation: str
+    ) -> Intent | None:
+        """Read one exact source-owned event without changing durable state."""
+        identifier = valid_uuid(event_id, "event id")
+        valid_uuid(source_generation, "source generation")
+        if re.fullmatch(r"[0-9a-f]{64}", source_key) is None:
+            fail("source key is invalid")
+        matches = [
+            item
+            for item in self.intents()
+            if (
+                item.event_id == identifier
+                and item.source_key == source_key
+                and item.source_generation == source_generation
+            )
+        ]
+        if len(matches) > 1:
+            fail("intent state contains duplicate events")
+        return matches[0] if matches else None
+
     def begin(
         self,
         source: Route,

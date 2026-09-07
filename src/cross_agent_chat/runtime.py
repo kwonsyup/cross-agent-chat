@@ -26,7 +26,7 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import FrameType
 from typing import BinaryIO, Final, Literal, cast
@@ -44,7 +44,7 @@ from cross_agent_chat.claude_runtime import (
     exact_agent,
     sendmessage,
 )
-from cross_agent_chat.codex import CodexCourier, deliver_at_stop
+from cross_agent_chat.codex import CodexCourier, deliver_at_stop, native_thread_titles
 from cross_agent_chat.core import (
     SCHEMA_VERSION,
     ChatError,
@@ -85,6 +85,7 @@ REMOTE_TIMEOUT_SECONDS: Final = (
 )
 LOCAL_DISCOVERY_WORKERS: Final = 32
 LOCAL_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS
+NATIVE_TITLE_TIMEOUT_SECONDS: Final = 2.0
 PRESENCE_ENV_VAR: Final = "CROSS_AGENT_CHAT_PRESENCE"
 PROC_PIDTBSDINFO: Final = 3
 PROC_BSDINFO_SIZE: Final = 136
@@ -144,8 +145,15 @@ class Target:
     pid: int | None = None
     tailnet_address: str | None = None
     delivery_mode: DeliveryMode | None = None
+    title: str | None = None
 
-    def public(self, *, include_delivery_mode: bool = False) -> dict[str, str]:
+    def public(
+        self,
+        *,
+        include_delivery_mode: bool = False,
+        include_handle: bool = True,
+        include_title: bool = True,
+    ) -> dict[str, str]:
         result = {
             "alias": self.alias,
             "provider": self.provider,
@@ -153,6 +161,10 @@ class Target:
             "project": self.project,
             "status": "available",
         }
+        if include_handle:
+            result["handle"] = self.session_key
+        if include_title and self.title is not None:
+            result["title"] = self.title
         if include_delivery_mode:
             result["delivery_mode"] = (
                 "unknown" if self.delivery_mode is None else self.delivery_mode
@@ -572,10 +584,16 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
     raw = hook_input("SessionEnd")
     root = state_root(state_root_value)
     session_id = cast(str, raw["session_id"])
+    cwd = cast(str, raw["cwd"])
     routes = [
         route
         for route in Registry(root).routes()
-        if route.provider == provider and route.session_id == session_id and route.pid == pid
+        if (
+            route.provider == provider
+            and route.session_id == session_id
+            and route.pid == pid
+            and route.cwd == cwd
+        )
     ]
     if len(routes) != 1:
         raise ChatError("exact session route is unavailable")
@@ -1019,7 +1037,47 @@ def local_targets(root: Path) -> list[Target]:
         for future in futures:
             future.cancel()
         workers.shutdown(wait=False, cancel_futures=True)
-    return [target for target in results if target is not None]
+    targets = [target for target in results if target is not None]
+    return _with_codex_titles(root, targets, deadline)
+
+
+def _with_codex_titles(root: Path, targets: list[Target], deadline: float) -> list[Target]:
+    """Add optional title hints after courier health, never as route authority."""
+    groups: dict[tuple[Path, str], list[Target]] = {}
+    for target in targets:
+        if target.provider != "codex" or target.pid is None or target.session_id is None:
+            continue
+        try:
+            identity, binary = recipient_owner_identity("codex", target.pid)
+        except (ChatError, OSError):
+            continue
+        route_matches = [
+            route
+            for route in Registry(root).routes()
+            if route.provider == "codex"
+            and route.pid == target.pid
+            and route.session_id == target.session_id
+            and route.generation == target.generation
+            and route.owner_identity == identity
+        ]
+        if len(route_matches) != 1:
+            continue
+        profile = route_matches[0].profile_root or recipient_profile_root("codex")
+        groups.setdefault((binary, profile), []).append(target)
+    titles: dict[str, str] = {}
+    for (binary, profile), group in groups.items():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        titles.update(
+            native_thread_titles(
+                binary=binary,
+                environment={"CODEX_HOME": profile},
+                thread_ids=[target.session_id for target in group if target.session_id is not None],
+                deadline=time.monotonic() + min(remaining, NATIVE_TITLE_TIMEOUT_SECONDS),
+            )
+        )
+    return [replace(target, title=titles.get(target.session_id or "")) for target in targets]
 
 
 def _targets_from_tailnet(
@@ -1183,10 +1241,10 @@ def all_targets(
             targets = [*local.result(), *remote.result()]
     else:
         targets = local_targets(root)
-    aliases = [target.alias.casefold() for target in targets]
-    if len(set(aliases)) != len(aliases):
-        raise ChatError("peer discovery returned duplicate aliases")
-    return sorted(targets, key=lambda target: target.alias.casefold())
+    handles = [target.session_key for target in targets]
+    if len(set(handles)) != len(handles):
+        raise ChatError("peer discovery returned duplicate handles")
+    return sorted(targets, key=lambda target: (target.alias.casefold(), target.session_key))
 
 
 def _target_matches(target: Target, query: str) -> bool:
@@ -1197,9 +1255,18 @@ def _target_matches(target: Target, query: str) -> bool:
     return bool(wanted) and all(token in available for token in wanted)
 
 
+def _exact_target_matches(target: Target, query: str) -> bool:
+    return target.alias.casefold() == query.casefold() or target.session_key == query
+
+
 def resolve_target(targets: list[Target], query: str) -> Target:
     if not query.strip() or len(query) > 160:
         raise ChatError("target query is invalid")
+    handle_matches = [target for target in targets if target.session_key == query]
+    if len(handle_matches) == 1:
+        return handle_matches[0]
+    if len(handle_matches) > 1:
+        raise ChatError("target handle is unavailable")
     exact_matches = [target for target in targets if target.alias.casefold() == query.casefold()]
     if len(exact_matches) == 1:
         return exact_matches[0]
@@ -1322,22 +1389,38 @@ def send_local(root: Path, source: Route, target_query: str, message: str) -> di
 def send(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
     deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
     local = local_targets(root)
-    exact_local_matches = [
-        target for target in local if target.alias.casefold() == target_query.casefold()
+    exact_local_handles = [target for target in local if target.session_key == target_query]
+    if len(exact_local_handles) == 1:
+        target = exact_local_handles[0]
+        return _send_local_target(root, source, target, message, deadline=deadline)
+    exact_local_codex_aliases = [
+        target
+        for target in local
+        if target.provider == "codex" and target.alias.casefold() == target_query.casefold()
     ]
-    if len(exact_local_matches) == 1:
-        target = exact_local_matches[0]
+    if len(exact_local_codex_aliases) == 1:
+        target = exact_local_codex_aliases[0]
         return _send_local_target(root, source, target, message, deadline=deadline)
     remote, remote_complete = _remote_discovery()
-    exact_remote_matches = [
-        target for target in remote if target.alias.casefold() == target_query.casefold()
-    ]
-    if len(exact_remote_matches) == 1:
-        target = exact_remote_matches[0]
+    exact_remote_handles = [target for target in remote if target.session_key == target_query]
+    if len(exact_remote_handles) == 1:
+        target = exact_remote_handles[0]
     else:
-        if not remote_complete:
-            raise ChatError("remote peer discovery is incomplete; use an exact available recipient")
-        target = resolve_target([*local, *remote], target_query)
+        exact_aliases = [
+            target
+            for target in [*local, *remote]
+            if target.alias.casefold() == target_query.casefold()
+        ]
+        if len(exact_aliases) == 1:
+            target = exact_aliases[0]
+        elif len(exact_aliases) > 1:
+            raise ChatError("target is ambiguous or unavailable")
+        else:
+            if not remote_complete:
+                raise ChatError(
+                    "remote peer discovery is incomplete; use an exact available recipient"
+                )
+            target = resolve_target([*local, *remote], target_query)
     if not target.remote:
         return _send_local_target(root, source, target, message, deadline=deadline)
     if target.tailnet_address is None:
@@ -1543,12 +1626,66 @@ def peers(
     )
     items: list[dict[str, str]] = []
     for target in targets:
-        item = target.public(include_delivery_mode=include_delivery_mode)
+        item = target.public(
+            include_delivery_mode=include_delivery_mode,
+            include_handle=not internal,
+            include_title=not internal,
+        )
         if internal:
             item["generation"] = target.generation
             item["session_key"] = target.session_key
         items.append(item)
     return {"schema_version": SCHEMA_VERSION, "peers": items}
+
+
+def sender_readiness(
+    root: Path, provider: str, parent_pid: int, thread_id: str | None
+) -> dict[str, str]:
+    """Report whether this MCP caller can pass the existing send identity gate."""
+    try:
+        source = authenticate_mcp_sender(root, provider, parent_pid, thread_id)
+    except ChatError as error:
+        return {"status": "unavailable", "reason": str(error)}
+    if not _route_current(root, source):
+        return {"status": "unavailable", "reason": "registered sender route is not current"}
+    try:
+        response = request_socket(
+            socket_path(root, source),
+            {
+                "schema_version": SCHEMA_VERSION,
+                "operation": "health",
+                "generation": source.generation,
+            },
+            timeout=HEALTH_TIMEOUT_SECONDS,
+        )
+    except ChatError:
+        return {"status": "unavailable", "reason": "sender courier is unavailable"}
+    if response.get("status") != "READY" or response.get("generation") != source.generation:
+        return {"status": "unavailable", "reason": "sender courier is not ready"}
+    return {"status": "ready"}
+
+
+def event_status(root: Path, source: Route, event_id: str) -> dict[str, object]:
+    """Return body-free custody state for one exact authenticated source event."""
+    if not _route_current(root, source):
+        raise ChatError("event is unavailable")
+    intent = IntentStore(root).intent_for_source(
+        event_id=event_id,
+        source_key=session_key(source.provider, source.session_id),
+        source_generation=source.generation,
+    )
+    if intent is None:
+        raise ChatError("event is unavailable")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": intent.event_id,
+        "status": intent.status,
+        "source_alias": intent.source_alias,
+        "target_handle": intent.target_key,
+        "target_generation": intent.target_generation,
+        "timestamp": intent.timestamp,
+        "delivery_observation": "not_observed",
+    }
 
 
 def codex_stop(pid: int, state_root_value: str | None) -> None:

@@ -13,12 +13,19 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Final, cast
 
-from cross_agent_chat.core import ChatError, UnknownDeliveryError, bounded_message, valid_uuid
+from cross_agent_chat.core import (
+    ChatError,
+    UnknownDeliveryError,
+    bounded_message,
+    valid_name,
+    valid_uuid,
+)
 
 DEFAULT_CAPACITY: Final = 32
 MAX_PEEK_FRAME_BYTES: Final = 64 * 1024
 NATIVE_QUEUE_TIMEOUT_SECONDS: Final = 15.0
 MAX_NATIVE_STDOUT_BYTES: Final = 64 * 1024
+NATIVE_METADATA_TIMEOUT_SECONDS: Final = 2.0
 
 
 def queue_native_input(
@@ -142,6 +149,107 @@ def queue_native_input(
         or received_input != expected_input
     ):
         raise UnknownDeliveryError("Codex native queue outcome is unknown")
+
+
+def native_thread_titles(
+    *, binary: Path, environment: dict[str, str], thread_ids: list[str], deadline: float
+) -> dict[str, str]:
+    """Read bounded user-facing titles through one metadata-only app-server session."""
+    identifiers = [valid_uuid(item, "Codex thread id") for item in thread_ids]
+    if not identifiers or time.monotonic() >= deadline:
+        return {}
+    try:
+        process = subprocess.Popen(
+            [str(binary), "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            close_fds=True,
+        )
+    except OSError:
+        return {}
+    if process.stdin is None or process.stdout is None:
+        process.terminate()
+        return {}
+    stdin, stdout = process.stdin, process.stdout
+    selector = selectors.DefaultSelector()
+    selector.register(stdout, selectors.EVENT_READ)
+    buffer = b""
+
+    def write(payload: dict[str, object]) -> None:
+        stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+        stdin.flush()
+
+    def read(identifier: int) -> dict[str, object] | None:
+        nonlocal buffer
+        while time.monotonic() < deadline:
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                value = json.loads(line)
+                if isinstance(value, dict) and value.get("id") == identifier:
+                    return cast(dict[str, object], value)
+            if selector.select(max(0.0, deadline - time.monotonic())):
+                chunk = os.read(stdout.fileno(), 65536)
+                if not chunk:
+                    return None
+                buffer += chunk
+                if len(buffer) > MAX_NATIVE_STDOUT_BYTES:
+                    return None
+        return None
+
+    titles: dict[str, str] = {}
+    try:
+        write(
+            {
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "cross-agent-chat", "version": "0.1.5"},
+                    "capabilities": {"experimentalApi": True},
+                },
+            }
+        )
+        initialized = read(0)
+        result = initialized.get("result") if initialized is not None else None
+        expected_home = environment.get("CODEX_HOME")
+        reported_home = result.get("codexHome") if isinstance(result, dict) else None
+        if not isinstance(expected_home, str) or not isinstance(reported_home, str):
+            return {}
+        if Path(reported_home).resolve() != Path(expected_home).resolve():
+            return {}
+        write({"method": "initialized"})
+        for index, thread_id in enumerate(identifiers, start=1):
+            write(
+                {
+                    "id": index,
+                    "method": "thread/read",
+                    "params": {"threadId": thread_id, "includeTurns": False},
+                }
+            )
+            response = read(index)
+            result = response.get("result") if response is not None else None
+            thread = result.get("thread") if isinstance(result, dict) else None
+            name = thread.get("name") if isinstance(thread, dict) else None
+            if isinstance(name, str):
+                try:
+                    titles[thread_id] = valid_name(name, "Codex thread title")
+                except ChatError:
+                    continue
+    except (OSError, ValueError):
+        return {}
+    finally:
+        selector.close()
+        with suppress(OSError):
+            stdin.close()
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=0.5)
+        stdout.close()
+    return titles
 
 
 class CodexCourier:

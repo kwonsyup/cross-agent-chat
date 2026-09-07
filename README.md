@@ -28,8 +28,9 @@ Start a fresh session, then ask naturally:
 Cross Agent Chat follows the provider processes you already use. There are no peer files,
 Cross Agent Chat accounts, or terminal-specific extensions. Permitted online Tailnet Macs appear
 automatically.
-Use the exact recipient returned by `chat_peers`. Fuzzy names are checked across devices;
+Use the opaque exact `handle` returned by `chat_peers` when display labels repeat. Fuzzy names are checked across devices;
 multiple matches or incomplete remote discovery require a more precise recipient.
+`chat_peers` reports the invoking sender's readiness separately from each recipient's delivery mode.
 
 Disposable worker launchers can set `CROSS_AGENT_CHAT_PRESENCE=off`. That worker remains out
 of Cross Agent Chat's peer roster and creates no route or courier; ordinary sessions remain
@@ -73,6 +74,8 @@ perimeter. Messages are still delivered as untrusted peer/user input, not system
   after confirming arrival or abandoning that event.
 - A deterministic pre-effect error means no message effect occurred; correct it and send
   fresh.
+- `chat_status(EVENT_ID)` reads the exact sender's body-free custody record. It never contacts a
+  provider, replays delivery, or treats custody as consumption.
 
 `chat_peers` also reports each recipient's observed delivery mode: Claude native messaging,
 Codex Stop-bound delivery, or the experimental Codex queue. Older couriers report `unknown`.
