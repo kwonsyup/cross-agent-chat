@@ -11,6 +11,8 @@
 - Reap a failed registration's exact child and private socket before removing its route.
 - Ignore unrelated stale Claude agent rows whose workspace no longer exists; an invalid selected
   target remains unavailable.
+- Preserve concurrent provider-setting edits when failed setup or upgrade rollback conflicts, and
+  retain recovery custody for diagnosis instead of restoring stale settings.
 
 ## 0.1.4 - 2026-09-05
 

@@ -99,8 +99,11 @@ cross-agent-chat uninstall
 ```
 
 Running the installer again upgrades and repairs the owned configuration. An upgrade or
-uninstall transitions the shared broker and couriers; schedule it when sessions using that
-installation can safely stop. A temporary profile does not isolate that shared service.
+uninstall pauses Cross Agent Chat messaging and stops its couriers, not Claude or Codex coding
+processes. Let pending Stop-bound deliveries consume before that pause; new sessions after an
+upgrade load the updated integration. A temporary profile does not isolate that shared service.
+If a failed setup or upgrade finds newer provider settings during rollback, it retains those
+settings and recovery custody for diagnosis before retrying.
 `uninstall`
 removes only Cross Agent Chat-owned runtime, hooks, MCP routes, service, and transient route
 state, and restores the prior shared Claude inbound setting. Durable content-free delivery intents
