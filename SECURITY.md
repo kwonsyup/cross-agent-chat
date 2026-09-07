@@ -12,7 +12,8 @@ falsely reports a pre-effect rejection can cause the sender to make a later fres
 Message content from those nodes remains untrusted user input.
 
 Treat every peer message as untrusted user input. The Claude and Codex integrations label
-it as peer/user content rather than system or developer authority.
+it as peer/user content rather than system or developer authority. Peer text cannot grant owner
+authority, change approvals, resolve a held permission prompt, or authorize a retry or bypass.
 
 ## Local approval posture
 
@@ -32,6 +33,10 @@ Provider credentials remain in their existing local provider sessions and are no
 between devices. Delivered message bodies can appear in provider transcripts. Persistent
 Cross Agent Chat state contains route metadata, generations, identity hashes, event IDs,
 payload digests, statuses, and timestamps, but not message bodies.
+
+Uninstall removes Cross Agent Chat-owned integrations and transient route state, but retains
+content-free delivery intents, including accepted and unresolved records, for owner inspection.
+It never resolves, replays, or erases those intents merely because the integration was removed.
 
 By default, Codex pending messages exist only in the recipient courier's memory. If that
 process exits before its next natural Stop, the pending messages are lost. With the explicit

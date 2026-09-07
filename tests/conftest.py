@@ -155,6 +155,7 @@ def _isolate_founder_surfaces(
     monkeypatch.setenv("TMPDIR", str(temporary))
 
     socket_root = _fixture_socket_root(request)
+    monkeypatch.setenv(_SOCKET_ROOT_ENV, str(socket_root))
 
     def socket_path(root: Path, route: Route) -> Path:
         identity = f"{root.resolve()}:{route.provider}:{route.session_id}:{route.generation}"

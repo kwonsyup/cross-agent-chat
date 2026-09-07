@@ -689,6 +689,7 @@ def test_sigterm_registration_cleanup_removes_the_exact_generation_in_an_owned_p
     project.mkdir()
     session_id = str(uuid4())
     code = f"""
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -698,6 +699,14 @@ from cross_agent_chat.core import ChatError, Registry
 root = Path({str(root)!r})
 project = Path({str(project)!r})
 session_id = {session_id!r}
+socket_root = Path(os.environ["CROSS_AGENT_CHAT_TEST_SOCKET_ROOT"])
+def fixture_socket_path(state_root, route):
+    identity = (
+        f"{{state_root.resolve()}}:{{route.provider}}:"
+        f"{{route.session_id}}:{{route.generation}}"
+    )
+    return socket_root / f"{{hashlib.sha256(identity.encode()).hexdigest()[:32]}}.sock"
+runtime.socket_path = fixture_socket_path
 runtime.hook_input = lambda _event: {{
     "hook_event_name": "SessionStart", "session_id": session_id, "cwd": str(project)
 }}
@@ -755,6 +764,7 @@ def test_sigterm_scope_begins_before_route_publication_in_an_owned_process(tmp_p
     project.mkdir()
     session_id = str(uuid4())
     code = f"""
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -762,6 +772,14 @@ from cross_agent_chat import runtime
 
 root = Path({str(root)!r})
 project = Path({str(project)!r})
+socket_root = Path(os.environ["CROSS_AGENT_CHAT_TEST_SOCKET_ROOT"])
+def fixture_socket_path(state_root, route):
+    identity = (
+        f"{{state_root.resolve()}}:{{route.provider}}:"
+        f"{{route.session_id}}:{{route.generation}}"
+    )
+    return socket_root / f"{{hashlib.sha256(identity.encode()).hexdigest()[:32]}}.sock"
+runtime.socket_path = fixture_socket_path
 runtime.hook_input = lambda _event: {{
     "hook_event_name": "SessionStart", "session_id": {session_id!r}, "cwd": str(project)
 }}
@@ -1114,7 +1132,16 @@ def test_incomplete_prebootstrap_frame_cannot_delay_initial_bootstrap(
         time.sleep(0.01)
     assert path.exists()
     partial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    partial.connect(str(path))
+    while True:
+        try:
+            partial.connect(str(path))
+            break
+        except (ConnectionRefusedError, FileNotFoundError):
+            partial.close()
+            if time.monotonic() >= deadline:
+                pytest.fail("courier listener did not become ready")
+            time.sleep(0.01)
+            partial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     partial.sendall(b'{"schema_version":1')
     assert frame_started.wait(1.0)
     try:
