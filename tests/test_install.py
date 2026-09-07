@@ -4043,7 +4043,7 @@ def test_install_allows_broker_readiness_after_sixty_seconds(
     assert checks == 241
 
 
-def test_upgrade_install_stops_old_couriers_before_reloading(
+def test_upgrade_install_preserves_live_couriers_and_routes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     installer = Installer(
@@ -4053,13 +4053,13 @@ def test_upgrade_install_stops_old_couriers_before_reloading(
     report = InstallReport(changed_paths=(), backup=tmp_path / "backup")
     monkeypatch.setattr(installer, "setup", lambda **_: report)
     monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
-    monkeypatch.setattr(installer, "_stop_couriers", lambda: calls.append("stop"))
-    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: calls.append("remove"))
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: pytest.fail("couriers stopped"))
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: pytest.fail("routes removed"))
     monkeypatch.setattr(installer, "activate", lambda: calls.append("activate"))
     monkeypatch.setattr(installer, "verify", lambda **_kwargs: True)
 
     assert installer.install() == report
-    assert calls == ["stop", "remove", "activate"]
+    assert calls == ["activate"]
 
 
 def test_uninstall_removes_only_owned_background_surfaces(

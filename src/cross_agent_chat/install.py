@@ -1562,8 +1562,9 @@ class Installer:
         report = self.setup(prepared=prepared_setup)
         service_transition_started = False
         try:
-            self._stop_couriers()
-            self._remove_runtime_state()
+            # Existing couriers belong to still-running provider sessions. Keeping
+            # their exact route generations preserves accepted in-memory queues;
+            # fresh sessions load the newly installed hooks normally.
             service_transition_started = True
             self.activate()
             if not self._wait_for_broker_health(lambda timeout: self.verify(timeout=timeout)):
@@ -2119,7 +2120,6 @@ class Installer:
         runtime_transition_started = False
         config_transition_started = False
         try:
-            self._stop_couriers()
             if (
                 _snapshot_path(self.current_runtime) != current_snapshot
                 or _snapshot_path(stable) != entrypoint_snapshot
@@ -2138,7 +2138,6 @@ class Installer:
                 config_transition_started = False
                 raise
             record("config_written")
-            self._remove_runtime_state()
             record("service_starting")
             service_transition_started = True
             self.activate()
