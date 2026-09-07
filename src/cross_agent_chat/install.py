@@ -2006,6 +2006,12 @@ class Installer:
         shutil.rmtree(resolved)
 
     def _prune_committed_releases(self, current: Path, previous: PathSnapshot) -> None:
+        # A live route may still run a courier from an older retained runtime.
+        # Route state has no runtime path, so pruning is unsafe until all routes end.
+        from cross_agent_chat.core import Registry
+
+        if Registry(self.state).routes():
+            return
         retained = {current.resolve()}
         if previous.kind == "symlink" and previous.target is not None:
             retained.add((self.current_runtime.parent / previous.target).resolve())

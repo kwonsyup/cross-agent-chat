@@ -1081,7 +1081,7 @@ def _with_codex_titles(root: Path, targets: list[Target], deadline: float) -> li
 
 
 def _targets_from_tailnet(
-    address: str, raw: object, *, include_delivery_mode: bool = False
+    address: str, raw: object, *, include_delivery_mode: bool = False, include_title: bool = False
 ) -> list[Target]:
     if not isinstance(raw, dict) or set(raw) != {"schema_version", "peers"}:
         raise ChatError("Tailnet peer returned invalid discovery")
@@ -1100,7 +1100,9 @@ def _targets_from_tailnet(
             "generation",
             "session_key",
         }
-        allowed = required | ({"delivery_mode"} if include_delivery_mode else set())
+        allowed = required | ({"delivery_mode"} if include_delivery_mode else set()) | (
+            {"title"} if include_title else set()
+        )
         if not isinstance(raw_item, dict) or set(raw_item) not in (required, allowed):
             raise ChatError("Tailnet peer returned invalid discovery")
         item = cast(dict[object, object], raw_item)
@@ -1130,6 +1132,9 @@ def _targets_from_tailnet(
         ):
             raise ChatError("Tailnet peer returned invalid discovery")
         observed_mode = item.get("delivery_mode")
+        title = item.get("title")
+        if title is not None and (not include_title or not isinstance(title, str)):
+            raise ChatError("Tailnet peer returned invalid discovery")
         targets.append(
             Target(
                 alias=valid_name(cast(str, item["alias"]), "remote alias"),
@@ -1145,13 +1150,18 @@ def _targets_from_tailnet(
                     if isinstance(observed_mode, str) and observed_mode != "unknown"
                     else None
                 ),
+                title=valid_name(title, "remote title") if isinstance(title, str) else None,
             )
         )
     return targets
 
 
 def _remote_node_targets(
-    address: str, deadline: float | None = None, *, include_delivery_mode: bool = False
+    address: str,
+    deadline: float | None = None,
+    *,
+    include_delivery_mode: bool = False,
+    include_title: bool = False,
 ) -> tuple[list[Target], bool]:
     remaining = (
         REMOTE_DISCOVERY_TIMEOUT_SECONDS if deadline is None else deadline - time.monotonic()
@@ -1161,6 +1171,8 @@ def _remote_node_targets(
     request: dict[str, object] = {"schema_version": SCHEMA_VERSION, "operation": "peers"}
     if include_delivery_mode:
         request["include_delivery_mode"] = True
+    if include_title:
+        request["include_title"] = True
     try:
         raw = request_tailnet(
             address,
@@ -1169,11 +1181,16 @@ def _remote_node_targets(
             timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining),
         )
         return (
-            _targets_from_tailnet(address, raw, include_delivery_mode=include_delivery_mode),
+            _targets_from_tailnet(
+                address,
+                raw,
+                include_delivery_mode=include_delivery_mode,
+                include_title=include_title,
+            ),
             True,
         )
     except (ChatError, UnknownDeliveryError):
-        if not include_delivery_mode:
+        if not include_delivery_mode and not include_title:
             return [], False
         remaining = deadline - time.monotonic() if deadline is not None else 0.0
         if remaining <= 0:
@@ -1204,6 +1221,7 @@ def _remote_discovery(*, include_delivery_mode: bool = False) -> tuple[list[Targ
                 address,
                 deadline,
                 include_delivery_mode=True,
+                include_title=True,
             )
             if include_delivery_mode
             else workers.submit(_remote_node_targets, address, deadline)
@@ -1618,6 +1636,7 @@ def peers(
     include_remote: bool = True,
     internal: bool = False,
     include_delivery_mode: bool = False,
+    include_title: bool = False,
 ) -> dict[str, object]:
     targets = all_targets(
         root,
@@ -1629,7 +1648,7 @@ def peers(
         item = target.public(
             include_delivery_mode=include_delivery_mode,
             include_handle=not internal,
-            include_title=not internal,
+            include_title=not internal or include_title,
         )
         if internal:
             item["generation"] = target.generation
