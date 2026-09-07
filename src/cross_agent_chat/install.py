@@ -1453,6 +1453,21 @@ class Installer:
                     if shared and original.kind == "file"
                     else 0o600
                 )
+                try:
+                    current_destination = path.resolve(strict=False)
+                except (OSError, RuntimeError) as error:
+                    raise ConfigurationChangedError(
+                        "provider configuration changed before setup write"
+                    ) from error
+                logical_original = transaction.originals.get(path)
+                if (
+                    current_destination != destination
+                    or (logical_original is not None and _snapshot_path(path) != logical_original)
+                    or _snapshot_path(destination) != original
+                ):
+                    raise ConfigurationChangedError(
+                        "provider configuration changed before setup write"
+                    )
                 _atomic_write(destination, payload, mode=mode)
                 written.append(destination)
             if self.legacy_peers.exists():

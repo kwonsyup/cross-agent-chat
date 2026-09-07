@@ -1532,6 +1532,48 @@ def test_setup_rejects_provider_change_after_payload_preparation(tmp_path: Path)
     assert claude_config.read_text() == concurrent
 
 
+def test_setup_rechecks_later_provider_destination_after_prior_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import install
+
+    home = tmp_path / "home"
+    claude_config = home / ".claude.json"
+    claude_config.parent.mkdir(parents=True)
+    claude_config.write_text(json.dumps({"mcpServers": {"before": {}}}))
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    prepared = installer._prepare_setup()
+    concurrent = json.dumps({"mcpServers": {"concurrent-user": {}}})
+    first_destination = prepared.destinations[installer.claude_settings]
+    real_write = install._atomic_write
+
+    def write(path: Path, payload: bytes, mode: int = 0o600) -> None:
+        real_write(path, payload, mode)
+        if path == first_destination:
+            claude_config.write_text(concurrent)
+
+    monkeypatch.setattr(install, "_atomic_write", write)
+
+    with pytest.raises(ConfigurationChangedError, match="changed before setup write"):
+        installer.setup(prepared=prepared)
+
+    assert claude_config.read_text() == concurrent
+    assert not installer.claude_settings.exists()
+
+
+def test_setup_accepts_unchanged_in_home_claude_parent_symlink(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    shared_claude = home / "shared/claude"
+    shared_claude.mkdir(parents=True)
+    (home / ".claude").symlink_to(shared_claude, target_is_directory=True)
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    assert installer.claude_settings.resolve() == shared_claude / "settings.json"
+    assert installer.claude_settings.is_file()
+
+
 def test_prepare_setup_retries_and_converges_on_transient_provider_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
