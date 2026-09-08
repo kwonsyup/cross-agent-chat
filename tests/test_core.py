@@ -469,6 +469,35 @@ def test_stale_session_end_with_a_different_working_directory_keeps_route(
     assert Registry(root).routes() == [source]
 
 
+def test_session_end_ignores_untrusted_unavailable_cwd_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = route(tmp_path, pid=os.getpid())
+    stale_cwd = tmp_path / "stale"
+    stale_cwd.mkdir()
+    Registry(root).upsert(source)
+    monkeypatch.setattr("cross_agent_chat.runtime.presence_is_enabled", lambda: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "SessionEnd",
+                    "session_id": source.session_id,
+                    "cwd": str(stale_cwd),
+                    "_cwd_unavailable": True,
+                }
+            )
+        ),
+    )
+
+    with pytest.raises(ChatError, match="exact session route is unavailable"):
+        unregister(source.provider, source.pid, str(root))
+
+    assert Registry(root).routes() == [source]
+
+
 def test_session_end_removes_exact_owned_route_after_its_cwd_disappears(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -485,6 +514,34 @@ def test_session_end_removes_exact_owned_route_after_its_cwd_disappears(
                     "hook_event_name": "SessionEnd",
                     "session_id": source.session_id,
                     "cwd": source.cwd,
+                }
+            )
+        ),
+    )
+
+    unregister(source.provider, source.pid, str(root))
+
+    assert Registry(root).routes() == []
+
+
+def test_session_end_removes_exact_owned_route_after_its_symlinked_cwd_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = route(tmp_path, pid=os.getpid())
+    Registry(root).upsert(source)
+    link = tmp_path / "linked-project"
+    link.symlink_to(source.cwd, target_is_directory=True)
+    link.unlink()
+    monkeypatch.setattr("cross_agent_chat.runtime.presence_is_enabled", lambda: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "SessionEnd",
+                    "session_id": source.session_id,
+                    "cwd": str(link),
                 }
             )
         ),

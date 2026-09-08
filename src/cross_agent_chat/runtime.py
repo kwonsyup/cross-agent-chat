@@ -304,6 +304,7 @@ def hook_input(expected_event: str) -> dict[str, object]:
     if not isinstance(session_id, str) or not isinstance(cwd, str):
         raise ChatError("hook lacks session identity or cwd")
     raw["session_id"] = valid_uuid(session_id, "session id")
+    raw["_cwd_unavailable"] = False
     if expected_event != "SessionEnd":
         raw["cwd"] = canonical_cwd(cwd)
         return cast(dict[str, object], raw)
@@ -313,6 +314,7 @@ def hook_input(expected_event: str) -> dict[str, object]:
         if not isinstance(error.__cause__, FileNotFoundError):
             raise error
         raw["cwd"] = stored_cwd(cwd)
+        raw["_cwd_unavailable"] = True
     return cast(dict[str, object], raw)
 
 
@@ -594,6 +596,7 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
     root = state_root(state_root_value)
     session_id = cast(str, raw["session_id"])
     cwd = cast(str, raw["cwd"])
+    cwd_unavailable = raw.get("_cwd_unavailable") is True
     routes = [
         route
         for route in Registry(root).routes()
@@ -601,7 +604,7 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
             route.provider == provider
             and route.session_id == session_id
             and route.pid == pid
-            and route.cwd == cwd
+            and (cwd_unavailable or route.cwd == cwd)
         )
     ]
     if len(routes) != 1:

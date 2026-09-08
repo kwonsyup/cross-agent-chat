@@ -798,6 +798,24 @@ def test_setup_removes_owned_tool_approval_overrides_and_preserves_other_propert
     assert installer.verify_configuration()
 
 
+def test_setup_removes_chat_status_approval_override(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    codex_config = home / ".codex" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_text(
+        '[mcp_servers."cross-agent-chat".tools.chat_status]\n'
+        'approval_mode = "never"\n'
+        "enabled = false\n"
+    )
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+
+    installer.setup()
+
+    config = tomllib.loads(codex_config.read_text())
+    assert config["mcp_servers"]["cross-agent-chat"]["tools"]["chat_status"] == {"enabled": False}
+    assert installer.verify_configuration()
+
+
 def test_uninstall_removes_preserved_owned_tool_tables(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1360,14 +1378,17 @@ def test_uninstall_preserves_shared_file_modes_when_removing_owned_content(
     assert all(stat.S_IMODE(path.stat().st_mode) == 0o644 for path in shared)
 
 
-def test_verify_configuration_rejects_conflicting_owned_tool_approval(tmp_path: Path) -> None:
+@pytest.mark.parametrize("tool", ("chat_send", "chat_status"))
+def test_verify_configuration_rejects_conflicting_owned_tool_approval(
+    tmp_path: Path, tool: str
+) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
     installer.setup()
     codex_config = home / ".codex" / "config.toml"
     codex_config.write_text(
         codex_config.read_text()
-        + '\n[mcp_servers."cross-agent-chat".tools.chat_send]\napproval_mode = "prompt"\n'
+        + f'\n[mcp_servers."cross-agent-chat".tools.{tool}]\napproval_mode = "prompt"\n'
     )
 
     assert not installer.verify_configuration()

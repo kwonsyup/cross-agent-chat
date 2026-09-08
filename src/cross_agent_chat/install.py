@@ -36,6 +36,7 @@ from cross_agent_chat.runtime import MCP_TOOL_TIMEOUT_SECONDS
 from cross_agent_chat.tailnet import LOCAL_BROKER_HOST, LOCAL_BROKER_PORT, valid_tailnet_address
 
 SERVER_NAME: Final = "cross-agent-chat"
+OWNED_CODEX_TOOLS: Final[tuple[str, ...]] = ("chat_peers", "chat_send", "chat_status")
 LAUNCH_AGENT_LABEL: Final = "io.github.kwonsyup.cross-agent-chat"
 BROKER_HEALTH_ATTEMPTS: Final = 300
 BROKER_HEALTH_INTERVAL_SECONDS: Final = 0.25
@@ -603,7 +604,7 @@ def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
             tools = server.get("tools")
             if isinstance(tools, MutableMapping):
                 preserved_tools = copy.deepcopy(tools)
-                for name in ("chat_peers", "chat_send"):
+                for name in OWNED_CODEX_TOOLS:
                     tool = preserved_tools.get(name)
                     if isinstance(tool, MutableMapping):
                         tool.pop("approval_mode", None)
@@ -2217,7 +2218,7 @@ class Installer:
             if codex_tools is not None:
                 if not isinstance(codex_tools, dict):
                     return False
-                for name in ("chat_peers", "chat_send"):
+                for name in OWNED_CODEX_TOOLS:
                     tool = codex_tools.get(name)
                     if not isinstance(tool, dict):
                         continue

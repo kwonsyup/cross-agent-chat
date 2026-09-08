@@ -54,7 +54,7 @@ To have an existing coding agent assist with installation, give it this prompt:
 
 | Surface or mode | Support |
 |---|---|
-| Claude Code 2.1.263 | iMac interactive startup and same-cwd native-messaging request/reply tested with the configured cross-session inbound `accept` policy |
+| Claude Code 2.1.263 (historical observation, 2026-09-06; source `317b18e`; not v0.1.5 candidate proof) | iMac interactive startup and same-cwd native-messaging request/reply tested with the configured cross-session inbound `accept` policy |
 | Claude Code 2.1.261 (historical observation) | Interactive and native background sessions; native SendMessage delivery |
 | Codex CLI 0.152.1 / 0.153.2 (historical observation), default Stop | Next-turn delivery; accepted work remains pending while genuinely idle |
 | Codex Native, embedded 0.153.1 (historical observation), default Stop | Next-turn delivery; accepted work remains pending while genuinely idle |
