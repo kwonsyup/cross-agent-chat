@@ -96,14 +96,14 @@ if [ -n "$previous_executable" ]; then
 fi
 
 "$staged_runtime/bin/python" -c 'import cross_agent_chat'
-"$staged_runtime/bin/cross-agent-chat" --version
+"$staged_runtime/bin/python" "$staged_runtime/bin/cross-agent-chat" --version
 set -- \
     --staged-runtime "$staged_runtime" \
     --stable-entrypoint "$stable_entrypoint"
 if [ -n "${CROSS_AGENT_CHAT_DEVICE:-}" ]; then
     set -- "$@" --device "$CROSS_AGENT_CHAT_DEVICE"
 fi
-"$staged_runtime/bin/cross-agent-chat" _install-staged "$@"
+"$staged_runtime/bin/python" "$staged_runtime/bin/cross-agent-chat" _install-staged "$@"
 
 published_executable=$(command -v cross-agent-chat 2>/dev/null || true)
 if [ "$published_executable" != "$stable_entrypoint" ]; then
