@@ -9,9 +9,14 @@ non-default roots). Local sessions do not need Tailscale; remote sessions need T
 allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
 files, or turn a remote peer into an owner.
 
+After `v0.1.5` is published, install that immutable release tag with:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.1.5/install.sh | sh
 ```
+
+Until publication, the `v0.1.5` URL above is intentionally unavailable; use the latest
+published release tag when installing an existing release.
 
 The installer supplies a Python runtime when the Mac lacks a compatible one. Its default stable
 command is `~/.local/bin/cross-agent-chat`; it stages releases under
@@ -61,7 +66,8 @@ To have an existing coding agent assist with installation, give it this prompt:
 | Linux | No live-support claim |
 
 These are per-version observations, not v0.1.5 beta certification, fleet parity, or
-account/profile-parity claims. The package classifier remains Alpha while beta acceptance is open.
+account/profile-parity claims. A version row does not certify every profile, session mode, or the
+v0.1.5 package. The package classifier remains Alpha while beta acceptance is open.
 
 ## Trust and delivery
 
