@@ -122,7 +122,10 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                                     "capability, not a receipt. Do not "
                                     "call for unrelated work. The opaque "
                                     "handle selects one discovered peer; "
-                                    "sender readiness is separate from "
+                                    "remote discovery reports complete or "
+                                    "incomplete; a missing peer under an "
+                                    "incomplete result is inconclusive. "
+                                    "Sender readiness is separate from "
                                     "recipient availability."
                                 ),
                                 "inputSchema": {

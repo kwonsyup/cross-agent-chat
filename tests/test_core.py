@@ -681,6 +681,44 @@ def test_configured_tool_deadline_covers_one_remote_discovery_and_delivery() -> 
     assert MCP_TOOL_TIMEOUT_SECONDS >= OPERATION_TIMEOUT_SECONDS + 10
 
 
+@pytest.mark.parametrize(
+    ("include_remote", "complete", "expected"),
+    ((True, True, "complete"), (True, False, "incomplete"), (False, True, "not_requested")),
+)
+def test_peers_reports_remote_discovery_completeness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    include_remote: bool,
+    complete: bool,
+    expected: str,
+) -> None:
+    from cross_agent_chat import runtime
+
+    local = Target(
+        "codex@local:project:00000000", "codex", "local", "project", str(uuid4()), "a" * 64, False
+    )
+    remote = Target(
+        "claude@remote:project:00000000",
+        "claude",
+        "remote",
+        "project",
+        str(uuid4()),
+        "b" * 64,
+        True,
+        tailnet_address="100.64.0.2",
+    )
+    monkeypatch.setattr(runtime, "local_targets", lambda _: [local] if not complete else [])
+    monkeypatch.setattr(
+        runtime, "_remote_discovery", lambda **_: ([remote] if not complete else [], complete)
+    )
+
+    result = runtime.peers(tmp_path / "state", include_remote=include_remote)
+
+    assert result["remote_discovery"] == expected
+    if not complete:
+        assert result["peers"] == [remote.public(), local.public()]
+
+
 def test_local_send_by_exact_handle_skips_remote_discovery_and_title_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

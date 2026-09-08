@@ -1666,12 +1666,24 @@ def peers(
     deadline = time.monotonic() + (
         REMOTE_DISCOVERY_TIMEOUT_SECONDS if include_remote else LOCAL_DISCOVERY_TIMEOUT_SECONDS
     )
-    targets = all_targets(
-        root,
-        include_remote=include_remote,
-        include_delivery_mode=include_delivery_mode,
-        include_title=display_titles,
-    )
+    if include_remote:
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            local = workers.submit(local_targets, root)
+            remote = workers.submit(
+                _remote_discovery,
+                include_delivery_mode=include_delivery_mode,
+                include_title=display_titles,
+            )
+            remote_targets, remote_complete = remote.result()
+            targets = [*local.result(), *remote_targets]
+        remote_discovery = "complete" if remote_complete else "incomplete"
+    else:
+        targets = local_targets(root)
+        remote_discovery = "not_requested"
+    handles = [target.session_key for target in targets]
+    if len(set(handles)) != len(handles):
+        raise ChatError("peer discovery returned duplicate handles")
+    targets = sorted(targets, key=lambda target: (target.alias.casefold(), target.session_key))
     if display_titles:
         targets = _with_codex_titles(root, targets, deadline)
     items: list[dict[str, str]] = []
@@ -1685,7 +1697,13 @@ def peers(
             item["generation"] = target.generation
             item["session_key"] = target.session_key
         items.append(item)
-    return {"schema_version": SCHEMA_VERSION, "peers": items}
+    result: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "peers": items,
+    }
+    if not internal:
+        result["remote_discovery"] = remote_discovery
+    return result
 
 
 def sender_readiness(
