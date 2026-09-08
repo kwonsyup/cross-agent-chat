@@ -1629,7 +1629,7 @@ class Installer:
         if not candidate_python.is_file() or not os.access(candidate_python, os.X_OK):
             raise SettingsError("candidate staging failed: Python runtime is unavailable")
         version = subprocess.run(
-            [str(candidate_python), str(candidate), "--version"],
+            [str(candidate), "--version"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -1649,7 +1649,7 @@ class Installer:
         if imported.returncode != 0:
             raise SettingsError("candidate staging failed: import verification failed")
         broker_smoke = subprocess.run(
-            [str(candidate_python), str(candidate), "_broker", "--help"],
+            [str(candidate), "_broker", "--help"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
