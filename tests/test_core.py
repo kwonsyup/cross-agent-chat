@@ -31,6 +31,7 @@ from cross_agent_chat.core import (
     resolve_target,
     session_key,
 )
+from cross_agent_chat.remote import parse_remote_envelope
 from cross_agent_chat.runtime import (
     HEALTH_TIMEOUT_SECONDS,
     LOCAL_DISCOVERY_TIMEOUT_SECONDS,
@@ -54,6 +55,7 @@ from cross_agent_chat.runtime import (
     sender_readiness,
     socket_path,
     unregister,
+    wrapped_message,
 )
 from cross_agent_chat.runtime import (
     resolve_target as resolve_live_target,
@@ -272,6 +274,128 @@ def test_target_handle_selects_one_duplicate_display_alias(tmp_path: Path) -> No
         resolve_live_target([first, second], first.alias)
 
 
+def test_reply_instruction_preserves_alias_hint_but_requires_exact_sender_handle(
+    tmp_path: Path,
+) -> None:
+    source = route(tmp_path, provider="claude", session_id=str(uuid4()))
+    duplicate = route(tmp_path, provider="claude", session_id=str(uuid4()))
+    source_handle = session_key(source.provider, source.session_id)
+    duplicate_handle = session_key(duplicate.provider, duplicate.session_id)
+
+    assert source.alias == duplicate.alias
+    body = wrapped_message(source.alias, source_handle, "reply when ready", str(uuid4()))
+
+    assert source.alias in body
+    assert source_handle in body
+    assert "Do not use a display alias as a fallback." in body
+    assert (
+        resolve_live_target(
+            [
+                Target(
+                    source.alias,
+                    source.provider,
+                    source.device,
+                    source.project,
+                    source.generation,
+                    source_handle,
+                    False,
+                ),
+                Target(
+                    duplicate.alias,
+                    duplicate.provider,
+                    duplicate.device,
+                    duplicate.project,
+                    duplicate.generation,
+                    duplicate_handle,
+                    False,
+                ),
+            ],
+            source_handle,
+        ).session_key
+        == source_handle
+    )
+
+
+def test_local_delivery_wraps_reply_with_authenticated_sender_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    root = tmp_path / "state"
+    source = route(tmp_path, pid=os.getpid(), project="source")
+    target = route(tmp_path, pid=os.getpid(), project="target")
+    Registry(root).upsert(source)
+    Registry(root).upsert(target)
+    resolved = Target(
+        target.alias,
+        target.provider,
+        target.device,
+        target.project,
+        target.generation,
+        session_key(target.provider, target.session_id),
+        False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(runtime, "local_targets", lambda _: [resolved])
+
+    def accept(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        captured.update(payload)
+        return {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": target.provider,
+        }
+
+    monkeypatch.setattr(runtime, "request_socket", accept)
+    send_local(root, source, resolved.session_key, "reply when ready")
+
+    assert session_key(source.provider, source.session_id) in str(captured["message"])
+
+
+def test_remote_delivery_wraps_reply_with_authenticated_sender_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    root = tmp_path / "state"
+    source = route(tmp_path, pid=os.getpid(), project="source")
+    Registry(root).upsert(source)
+    target = Target(
+        "codex@remote:target:123456789abc",
+        "codex",
+        "remote",
+        "target",
+        str(uuid4()),
+        "a" * 64,
+        True,
+        tailnet_address="100.64.0.2",
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(runtime, "local_targets", lambda _: [])
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([target], True))
+
+    def accept(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        captured.update(payload)
+        event_id = parse_remote_envelope(str(payload["envelope"]))[0]
+        return {
+            "schema_version": 1,
+            "event_id": event_id,
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": target.provider,
+        }
+
+    monkeypatch.setattr(runtime, "request_tailnet", accept)
+    runtime.send(root, source, target.session_key, "reply when ready")
+
+    assert session_key(source.provider, source.session_id) in str(captured["envelope"])
+
+
 def test_sender_readiness_is_bound_to_the_existing_sender_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -333,7 +457,7 @@ def test_stale_session_end_with_a_different_working_directory_keeps_route(
     monkeypatch.setattr(
         runtime,
         "hook_input",
-        lambda _: {
+        lambda *_args, **_kwargs: {
             "hook_event_name": "SessionEnd",
             "session_id": source.session_id,
             "cwd": str(stale_cwd),
@@ -343,6 +467,84 @@ def test_stale_session_end_with_a_different_working_directory_keeps_route(
     with pytest.raises(ChatError, match="exact session route is unavailable"):
         unregister(source.provider, source.pid, str(root))
     assert Registry(root).routes() == [source]
+
+
+def test_session_end_removes_exact_owned_route_after_its_cwd_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = route(tmp_path, pid=os.getpid())
+    Registry(root).upsert(source)
+    Path(source.cwd).rmdir()
+    monkeypatch.setattr("cross_agent_chat.runtime.presence_is_enabled", lambda: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "SessionEnd",
+                    "session_id": source.session_id,
+                    "cwd": source.cwd,
+                }
+            )
+        ),
+    )
+
+    unregister(source.provider, source.pid, str(root))
+
+    assert Registry(root).routes() == []
+
+
+def test_session_end_canonicalizes_an_existing_symlinked_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = route(tmp_path, pid=os.getpid())
+    Registry(root).upsert(source)
+    link = tmp_path / "linked-project"
+    link.symlink_to(source.cwd, target_is_directory=True)
+    monkeypatch.setattr("cross_agent_chat.runtime.presence_is_enabled", lambda: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "SessionEnd",
+                    "session_id": source.session_id,
+                    "cwd": str(link),
+                }
+            )
+        ),
+    )
+
+    unregister(source.provider, source.pid, str(root))
+
+    assert Registry(root).routes() == []
+
+
+def test_session_end_canonicalizes_an_existing_non_normal_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = route(tmp_path, pid=os.getpid())
+    Registry(root).upsert(source)
+    monkeypatch.setattr("cross_agent_chat.runtime.presence_is_enabled", lambda: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "SessionEnd",
+                    "session_id": source.session_id,
+                    "cwd": f"{source.cwd}/.",
+                }
+            )
+        ),
+    )
+
+    unregister(source.provider, source.pid, str(root))
+
+    assert Registry(root).routes() == []
 
 
 def test_long_project_label_is_bounded_without_changing_route_identity(tmp_path: Path) -> None:

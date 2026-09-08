@@ -59,6 +59,7 @@ from cross_agent_chat.core import (
     ensure_private_dir,
     session_key,
     state_lock,
+    stored_cwd,
     valid_device,
     valid_name,
     valid_uuid,
@@ -303,7 +304,15 @@ def hook_input(expected_event: str) -> dict[str, object]:
     if not isinstance(session_id, str) or not isinstance(cwd, str):
         raise ChatError("hook lacks session identity or cwd")
     raw["session_id"] = valid_uuid(session_id, "session id")
-    raw["cwd"] = canonical_cwd(cwd)
+    if expected_event != "SessionEnd":
+        raw["cwd"] = canonical_cwd(cwd)
+        return cast(dict[str, object], raw)
+    try:
+        raw["cwd"] = canonical_cwd(cwd)
+    except ChatError as error:
+        if not isinstance(error.__cause__, FileNotFoundError):
+            raise error
+        raw["cwd"] = stored_cwd(cwd)
     return cast(dict[str, object], raw)
 
 
@@ -1316,10 +1325,12 @@ def resolve_target(targets: list[Target], query: str) -> Target:
     return matches[0]
 
 
-def wrapped_message(source_alias: str, message: str, event_id: str) -> str:
+def wrapped_message(source_alias: str, source_handle: str, message: str, event_id: str) -> str:
     body = (
         f"From {source_alias} (Cross Agent Chat event {event_id}): {message}\n\n"
-        f"Reply with chat_send to {source_alias} only if the sender explicitly asks for a reply."
+        "Reply with chat_send only if the sender explicitly asks for a reply. First call "
+        f"chat_peers and select this sender's exact handle: {source_handle}. Do not use a display "
+        "alias as a fallback."
     )
     return bounded_message(body)
 
@@ -1365,7 +1376,8 @@ def _send_local_target(
     target_route = route_matches[0]
     source_alias = canonical_source_alias(root, source)
     event_id = str(uuid4())
-    body = wrapped_message(source_alias, bounded_message(message), event_id)
+    source_handle = session_key(source.provider, source.session_id)
+    body = wrapped_message(source_alias, source_handle, bounded_message(message), event_id)
     timeout = _remaining_operation_timeout(deadline, ACCEPT_TIMEOUT_SECONDS)
     store = IntentStore(root)
     store.begin(
@@ -1453,7 +1465,8 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
         raise ChatError("remote target route is incomplete")
     source_alias = canonical_source_alias(root, source)
     event_id = str(uuid4())
-    body = wrapped_message(source_alias, bounded_message(message), event_id)
+    source_handle = session_key(source.provider, source.session_id)
+    body = wrapped_message(source_alias, source_handle, bounded_message(message), event_id)
     timeout = _remaining_operation_timeout(deadline, REMOTE_TIMEOUT_SECONDS)
     store = IntentStore(root)
     store.begin_identity(
