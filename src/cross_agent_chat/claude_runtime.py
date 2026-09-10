@@ -15,7 +15,7 @@ import sys
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Final, TypedDict, cast
+from typing import Final, Literal, NoReturn, TypedDict, cast
 
 from cross_agent_chat.core import (
     ChatError,
@@ -67,6 +67,22 @@ CLAUDE_CONTEXT_ENV_KEYS: Final = (
 )
 BOUND_CLAUDE_BINARY_ENV: Final = "CROSS_AGENT_CHAT_CLAUDE_BINARY"
 TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z")
+ClaudeUnknownPhase = Literal[
+    "pretool_gate_unobserved",
+    "pretool_gate_unreadable",
+    "helper_timeout",
+    "helper_execution_failed",
+    "helper_exit_nonzero",
+    "receipt_invalid",
+]
+
+
+class ClaudeSendMessageUnknownDelivery(UnknownDeliveryError):
+    """A body-free local phase for an otherwise unknown Claude delivery."""
+
+    def __init__(self, phase: ClaudeUnknownPhase) -> None:
+        super().__init__("Claude SendMessage outcome is unknown")
+        self.phase = phase
 
 
 class ClaudeAgent(TypedDict):
@@ -238,10 +254,6 @@ def discover_target_ref(session_name: str) -> str:
     return refs[0]
 
 
-def content_mirror(message: str) -> str:
-    return message if len(message) <= 50 else message[:49] + "…"
-
-
 def pretool_decision(expected: dict[str, object], payload: object, content_hmac_key: str) -> bool:
     if set(expected) != {"recipient", "message_hmac"}:
         return False
@@ -267,15 +279,18 @@ def pretool_decision(expected: dict[str, object], payload: object, content_hmac_
         "summary",
     }:
         return False
-    message = tool_input.get("message")
-    if not isinstance(message, str):
+    if not all(isinstance(tool_input.get(key), str) for key in tool_input):
         return False
-    actual = hmac.new(bytes.fromhex(content_hmac_key), message.encode(), hashlib.sha256).hexdigest()
+    message = cast(str, tool_input["message"])
+    try:
+        encoded_message = message.encode()
+    except UnicodeEncodeError:
+        return False
+    actual = hmac.new(bytes.fromhex(content_hmac_key), encoded_message, hashlib.sha256).hexdigest()
     return (
         tool_input.get("to") == recipient
         and tool_input.get("recipient") == recipient
         and hmac.compare_digest(digest, actual)
-        and tool_input.get("content") == content_mirror(message)
         and tool_input.get("type") == "message"
         and tool_input.get("summary") == "Cross Agent Chat"
     )
@@ -355,8 +370,13 @@ def parse_sendmessage_receipt(text: str, target_ref: str, message: str) -> str:
     if (
         not isinstance(tool_id, str)
         or not isinstance(tool_input, dict)
+        or set(tool_input) != {"to", "message", "recipient", "content", "type", "summary"}
+        or not all(isinstance(tool_input.get(key), str) for key in tool_input)
+        or tool_input.get("to") != target_ref
         or tool_input.get("recipient") != target_ref
-        or tool_input.get("content") != content_mirror(message)
+        or tool_input.get("message") != message
+        or tool_input.get("type") != "message"
+        or tool_input.get("summary") != "Cross Agent Chat"
         or len(matches) != 1
         or matches[0].get("is_error") is True
     ):
@@ -395,10 +415,14 @@ def gate_consumed(gate: Path) -> bool:
     except FileNotFoundError:
         return False
     except OSError as error:
-        raise UnknownDeliveryError("Claude SendMessage outcome is unknown") from error
+        raise ClaudeSendMessageUnknownDelivery("pretool_gate_unreadable") from error
     if marker != b"consumed\n":
-        raise UnknownDeliveryError("Claude SendMessage outcome is unknown")
+        raise ClaudeSendMessageUnknownDelivery("pretool_gate_unreadable")
     return True
+
+
+def _unknown(phase: ClaudeUnknownPhase) -> NoReturn:
+    raise ClaudeSendMessageUnknownDelivery(phase)
 
 
 def sendmessage(target_ref: str, message: str, executable: Path) -> None:
@@ -491,14 +515,14 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
                 check=False,
             )
         except subprocess.TimeoutExpired as error:
-            raise UnknownDeliveryError("Claude SendMessage outcome is unknown") from error
+            raise ClaudeSendMessageUnknownDelivery("helper_timeout") from error
         except (OSError, subprocess.SubprocessError) as error:
-            raise UnknownDeliveryError("Claude SendMessage outcome is unknown") from error
+            raise ClaudeSendMessageUnknownDelivery("helper_execution_failed") from error
         if not gate_consumed(gate):
-            raise UnknownDeliveryError("Claude SendMessage outcome is unknown")
+            _unknown("pretool_gate_unobserved")
+        if completed.returncode != 0:
+            _unknown("helper_exit_nonzero")
         try:
             parse_sendmessage_receipt(completed.stdout, target_ref, message)
         except ChatError as error:
-            raise UnknownDeliveryError("Claude SendMessage outcome is unknown") from error
-    if completed.returncode != 0:
-        raise UnknownDeliveryError("Claude SendMessage outcome is unknown")
+            raise ClaudeSendMessageUnknownDelivery("receipt_invalid") from error

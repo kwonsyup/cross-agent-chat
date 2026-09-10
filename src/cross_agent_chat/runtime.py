@@ -37,6 +37,7 @@ from cross_agent_chat.claude_runtime import (
     COURIER_ENV_KEYS,
     DISCOVERY_TIMEOUT_SECONDS,
     SEND_TIMEOUT_SECONDS,
+    ClaudeSendMessageUnknownDelivery,
     claude_alias,
     claude_binary,
     courier_environment,
@@ -671,6 +672,14 @@ def courier_accept(
             "to": target_alias,
             "provider": "claude",
         }
+    except ClaudeSendMessageUnknownDelivery as error:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "event_id": event_id,
+            "status": "UNKNOWN_DELIVERY",
+            "provider": route.provider,
+            "diagnostic": f"claude_{error.phase}",
+        }
     except UnknownDeliveryError:
         return {
             "schema_version": SCHEMA_VERSION,
@@ -708,6 +717,32 @@ def pre_effect_error(response: dict[str, object], event_id: str, provider: Provi
     except UnicodeEncodeError:
         return None
     return error
+
+
+def unknown_delivery_diagnostic(
+    response: dict[str, object], event_id: str, provider: Provider
+) -> str | None:
+    diagnostic = response.get("diagnostic")
+    if (
+        set(response) != {"schema_version", "event_id", "status", "provider", "diagnostic"}
+        or response.get("schema_version") != SCHEMA_VERSION
+        or response.get("event_id") != event_id
+        or response.get("status") != "UNKNOWN_DELIVERY"
+        or response.get("provider") != provider
+        or provider != "claude"
+        or not isinstance(diagnostic, str)
+        or diagnostic
+        not in {
+            "claude_pretool_gate_unobserved",
+            "claude_pretool_gate_unreadable",
+            "claude_helper_timeout",
+            "claude_helper_execution_failed",
+            "claude_helper_exit_nonzero",
+            "claude_receipt_invalid",
+        }
+    ):
+        return None
+    return diagnostic
 
 
 def _delivery_mode(route: Route, courier: CodexCourier | None) -> DeliveryMode:
@@ -1422,9 +1457,18 @@ def _send_local_target(
         store.mark(event_id, "PRE_EFFECT_REJECTED")
         # Local courier errors originate in a same-uid process, not a remote peer.
         raise ChatError(rejection)
+    diagnostic = unknown_delivery_diagnostic(response, event_id, target.provider)
+    if diagnostic is not None:
+        store.mark(event_id, "UNKNOWN_DELIVERY")
+        raise UnknownDeliveryError(
+            f"delivery state is unknown for event {event_id}; diagnostic {diagnostic}; "
+            "do not retry automatically"
+        )
     if response != expected:
         store.mark(event_id, "UNKNOWN_DELIVERY")
-        raise UnknownDeliveryError("delivery state is unknown")
+        raise UnknownDeliveryError(
+            f"delivery state is unknown for event {event_id}; do not retry automatically"
+        )
     store.mark(event_id, "TRANSPORT_ACCEPTED")
     return expected
 
