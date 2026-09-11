@@ -10,6 +10,7 @@ import re
 import secrets
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,15 @@ TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z
 ClaudeUnknownPhase = Literal[
     "pretool_gate_unobserved",
     "pretool_gate_unreadable",
+    "pretool_gate_denied",
+    "pretool_gate_conflict",
+    "no_sendmessage_tool_use",
+    "multiple_sendmessage_tool_use",
+    "sendmessage_payload_mismatch",
+    "sendmessage_target_mismatch",
+    "sendmessage_message_mismatch",
+    "sendmessage_control_mismatch",
+    "helper_stream_invalid",
     "helper_timeout",
     "helper_execution_failed",
     "helper_exit_nonzero",
@@ -254,9 +264,11 @@ def discover_target_ref(session_name: str) -> str:
     return refs[0]
 
 
-def pretool_decision(expected: dict[str, object], payload: object, content_hmac_key: str) -> bool:
+def _pretool_denial(
+    expected: dict[str, object], payload: object, content_hmac_key: str
+) -> ClaudeUnknownPhase | None:
     if set(expected) != {"recipient", "message_hmac"}:
-        return False
+        return "sendmessage_payload_mismatch"
     recipient = expected.get("recipient")
     digest = expected.get("message_hmac")
     if (
@@ -268,7 +280,7 @@ def pretool_decision(expected: dict[str, object], payload: object, content_hmac_
         or payload.get("hook_event_name") != "PreToolUse"
         or payload.get("tool_name") != "SendMessage"
     ):
-        return False
+        return "sendmessage_payload_mismatch"
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict) or set(tool_input) != {
         "to",
@@ -278,37 +290,51 @@ def pretool_decision(expected: dict[str, object], payload: object, content_hmac_
         "type",
         "summary",
     }:
-        return False
+        return "sendmessage_payload_mismatch"
     if not all(isinstance(tool_input.get(key), str) for key in tool_input):
-        return False
+        return "sendmessage_payload_mismatch"
     message = cast(str, tool_input["message"])
     try:
         encoded_message = message.encode()
     except UnicodeEncodeError:
-        return False
+        return "sendmessage_message_mismatch"
     actual = hmac.new(bytes.fromhex(content_hmac_key), encoded_message, hashlib.sha256).hexdigest()
-    return (
-        tool_input.get("to") == recipient
-        and tool_input.get("recipient") == recipient
-        and hmac.compare_digest(digest, actual)
-        and tool_input.get("type") == "message"
-        and tool_input.get("summary") == "Cross Agent Chat"
-    )
+    if tool_input["to"] != recipient or tool_input["recipient"] != recipient:
+        return "sendmessage_target_mismatch"
+    if not hmac.compare_digest(digest, actual):
+        return "sendmessage_message_mismatch"
+    if tool_input["type"] != "message" or tool_input["summary"] != "Cross Agent Chat":
+        return "sendmessage_control_mismatch"
+    return None
+
+
+def pretool_decision(expected: dict[str, object], payload: object, content_hmac_key: str) -> bool:
+    return _pretool_denial(expected, payload, content_hmac_key) is None
 
 
 def run_pretool_gate(expected_path: str, content_hmac_key: str) -> bool:
+    gate_parent: Path | None = None
+    denial: ClaudeUnknownPhase | None = "pretool_gate_denied"
     try:
         path = Path(expected_path)
         if not path.is_absolute() or path.is_symlink():
             raise ChatError("pre-tool expectation is unsafe")
+        parent_metadata = path.parent.stat()
+        if (
+            path.parent.is_symlink()
+            or parent_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+        ):
+            raise ChatError("pre-tool gate directory is unsafe")
+        gate_parent = path.parent
         expected_raw = json.loads(path.read_text(encoding="utf-8"))
         payload_text = sys.stdin.read(65537)
         payload = json.loads(payload_text)
-        allowed = (
-            isinstance(expected_raw, dict)
-            and len(payload_text.encode()) <= 65536
-            and pretool_decision(cast(dict[str, object], expected_raw), payload, content_hmac_key)
-        )
+        if isinstance(expected_raw, dict) and len(payload_text.encode()) <= 65536:
+            denial = _pretool_denial(
+                cast(dict[str, object], expected_raw), payload, content_hmac_key
+            )
+        allowed = denial is None
         if allowed:
             consumed = path.parent / "consumed"
             descriptor = os.open(
@@ -320,8 +346,23 @@ def run_pretool_gate(expected_path: str, content_hmac_key: str) -> bool:
                 handle.write(b"consumed\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError):
+    except (OSError, UnicodeError, json.JSONDecodeError, ChatError):
         allowed = False
+        denial = "pretool_gate_denied"
+    if not allowed and gate_parent is not None:
+        try:
+            denied = gate_parent / "denied"
+            descriptor = os.open(
+                denied,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(DENIAL_MARKERS[denial or "pretool_gate_denied"])
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            pass
     output = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -408,17 +449,83 @@ def parse_sendmessage_receipt(text: str, target_ref: str, message: str) -> str:
     return valid_uuid(cast(str, result["msg_id"]), "courier message id")
 
 
-def gate_consumed(gate: Path) -> bool:
-    """Return whether the exact native-send gate marker is present and valid."""
+DENIAL_MARKERS: Final[dict[ClaudeUnknownPhase, bytes]] = {
+    "pretool_gate_denied": b"denied\n",
+    "sendmessage_payload_mismatch": b"sendmessage_payload_mismatch\n",
+    "sendmessage_target_mismatch": b"sendmessage_target_mismatch\n",
+    "sendmessage_message_mismatch": b"sendmessage_message_mismatch\n",
+    "sendmessage_control_mismatch": b"sendmessage_control_mismatch\n",
+}
+
+
+def _gate_marker(gate: Path, name: str, allowed: tuple[bytes, ...]) -> bytes | None:
+    """Read one bounded private marker without following links or blocking on a FIFO."""
     try:
-        marker = (gate / "consumed").read_bytes()
-    except FileNotFoundError:
-        return False
+        parent = gate.lstat()
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.getuid()
+            or stat.S_IMODE(parent.st_mode) != 0o700
+        ):
+            raise ClaudeSendMessageUnknownDelivery("pretool_gate_unreadable")
     except OSError as error:
         raise ClaudeSendMessageUnknownDelivery("pretool_gate_unreadable") from error
-    if marker != b"consumed\n":
+    try:
+        descriptor = os.open(
+            gate / name, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ClaudeSendMessageUnknownDelivery("pretool_gate_unreadable") from error
+    try:
+        marker = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(marker.st_mode)
+            or marker.st_uid != os.getuid()
+            or stat.S_IMODE(marker.st_mode) != 0o600
+        ):
+            raise ClaudeSendMessageUnknownDelivery("pretool_gate_unreadable")
+        value = os.read(descriptor, max(map(len, allowed)) + 1)
+    except OSError as error:
+        raise ClaudeSendMessageUnknownDelivery("pretool_gate_unreadable") from error
+    finally:
+        os.close(descriptor)
+    if value not in allowed:
         raise ClaudeSendMessageUnknownDelivery("pretool_gate_unreadable")
-    return True
+    return value
+
+
+def gate_consumed(gate: Path) -> bool:
+    """Return whether the exact native-send gate marker is present and valid."""
+    consumed = _gate_marker(gate, "consumed", (b"consumed\n",))
+    denied = _gate_marker(gate, "denied", tuple(DENIAL_MARKERS.values()))
+    if consumed is not None and denied is not None:
+        raise ClaudeSendMessageUnknownDelivery("pretool_gate_conflict")
+    return consumed is not None
+
+
+def _unconsumed_gate_phase(gate: Path, text: str) -> ClaudeUnknownPhase:
+    # Only the actual normalized hook input can establish why its predicate denied.
+    denied = _gate_marker(gate, "denied", tuple(DENIAL_MARKERS.values()))
+    if denied is not None:
+        return next(phase for phase, value in DENIAL_MARKERS.items() if value == denied)
+    try:
+        if len(text.encode()) > 64 * 1024:
+            return "helper_stream_invalid"
+        for line in text.splitlines():
+            if line and not isinstance(json.loads(line), dict):
+                return "helper_stream_invalid"
+        uses, _ = _tool_records(text)
+    except (UnicodeEncodeError, json.JSONDecodeError):
+        return "helper_stream_invalid"
+    if any(item.get("name") != "SendMessage" for item in uses):
+        return "helper_stream_invalid"
+    if not uses:
+        return "no_sendmessage_tool_use"
+    if len(uses) != 1:
+        return "multiple_sendmessage_tool_use"
+    return "pretool_gate_unobserved"
 
 
 def _unknown(phase: ClaudeUnknownPhase) -> NoReturn:
@@ -523,10 +630,10 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
             raise ClaudeSendMessageUnknownDelivery("helper_timeout") from error
         except (OSError, subprocess.SubprocessError) as error:
             raise ClaudeSendMessageUnknownDelivery("helper_execution_failed") from error
-        if not gate_consumed(gate):
-            _unknown("pretool_gate_unobserved")
         if completed.returncode != 0:
             _unknown("helper_exit_nonzero")
+        if not gate_consumed(gate):
+            _unknown(_unconsumed_gate_phase(gate, completed.stdout))
         try:
             parse_sendmessage_receipt(completed.stdout, target_ref, message)
         except ChatError as error:

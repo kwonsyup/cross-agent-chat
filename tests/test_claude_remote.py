@@ -661,12 +661,15 @@ def test_sendmessage_helper_control_mismatch_is_unknown(
     _assert_unknown_helper_phase(monkeypatch, stream, "pretool_gate_unobserved")
 
 
-@pytest.mark.parametrize("denial", [
-    "sendmessage_payload_mismatch",
-    "sendmessage_target_mismatch",
-    "sendmessage_message_mismatch",
-    "sendmessage_control_mismatch",
-])
+@pytest.mark.parametrize(
+    "denial",
+    [
+        "sendmessage_payload_mismatch",
+        "sendmessage_target_mismatch",
+        "sendmessage_message_mismatch",
+        "sendmessage_control_mismatch",
+    ],
+)
 def test_pretool_gate_writes_specific_fixed_denial_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
