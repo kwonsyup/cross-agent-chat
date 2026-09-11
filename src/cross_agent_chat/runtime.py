@@ -1243,15 +1243,18 @@ def _remote_node_targets(
         variants.append(({**legacy, "include_delivery_mode": True}, True, False))
     if include_delivery_mode or include_title:
         variants.append((legacy, False, False))
-    for payload, mode_requested, title_requested in variants:
+    for index, (payload, mode_requested, title_requested) in enumerate(variants):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return [], False
+        fallback_count = len(variants) - index - 1
+        reserved = min(3.0 * fallback_count, remaining / 2)
+        variant_budget = remaining - reserved
         try:
             raw = request_tailnet(
                 address,
                 payload,
-                timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining),
+                timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, variant_budget),
             )
             return (
                 _targets_from_tailnet(

@@ -6,6 +6,7 @@ import os
 import select
 import socket
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
@@ -83,6 +84,190 @@ def _remote_peer(*, provider: str = "codex", title: str | None = None) -> dict[s
     if title is not None:
         peer["title"] = title
     return peer
+
+
+class _FakeClock:
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def test_remote_node_targets_rich_success_preserves_optional_identity_with_reserved_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer = _remote_peer(title="Remote Canary")
+    peer["delivery_mode"] = "codex_stop_bound"
+    clock = _FakeClock()
+    calls: list[tuple[dict[str, object], float]] = []
+
+    def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        calls.append((payload, timeout))
+        clock.now += 15.0
+        return {"schema_version": 1, "peers": [peer]}
+
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1",
+        deadline=22.0,
+        include_delivery_mode=True,
+        include_title=True,
+    )
+
+    assert complete is True
+    assert len(calls) == 1
+    assert calls[0][1] == pytest.approx(16.0)
+    assert calls[0][0] == {
+        "schema_version": 1,
+        "operation": "peers",
+        "include_delivery_mode": True,
+        "include_title": True,
+    }
+    assert targets[0].alias == peer["alias"]
+    assert targets[0].session_key == peer["session_key"]
+    assert targets[0].title == "Remote Canary"
+    assert targets[0].delivery_mode == "codex_stop_bound"
+
+
+def test_remote_node_targets_rich_timeout_then_mode_success_uses_reserved_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer = _remote_peer()
+    peer["delivery_mode"] = "codex_stop_bound"
+    clock = _FakeClock()
+    calls: list[tuple[dict[str, object], float]] = []
+
+    def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        calls.append((payload, timeout))
+        if len(calls) == 1:
+            clock.now += timeout
+            raise ChatError("rich request timed out")
+        clock.now += 1.62
+        return {"schema_version": 1, "peers": [peer]}
+
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1",
+        deadline=22.0,
+        include_delivery_mode=True,
+        include_title=True,
+    )
+
+    assert complete is True
+    assert [timeout for _, timeout in calls] == [pytest.approx(16.0), pytest.approx(3.0)]
+    assert calls[1][0] == {
+        "schema_version": 1,
+        "operation": "peers",
+        "include_delivery_mode": True,
+    }
+    assert targets[0].delivery_mode == "codex_stop_bound"
+    assert targets[0].title is None
+
+
+def test_remote_node_targets_rich_and_mode_timeout_then_uses_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer = _remote_peer()
+    clock = _FakeClock()
+    calls: list[tuple[dict[str, object], float]] = []
+
+    def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        calls.append((payload, timeout))
+        if len(calls) < 3:
+            clock.now += timeout
+            raise ChatError("fallback request timed out")
+        clock.now += 1.0
+        return {"schema_version": 1, "peers": [peer]}
+
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1",
+        deadline=22.0,
+        include_delivery_mode=True,
+        include_title=True,
+    )
+
+    assert complete is True
+    assert [timeout for _, timeout in calls] == [
+        pytest.approx(16.0),
+        pytest.approx(3.0),
+        pytest.approx(3.0),
+    ]
+    assert [payload for payload, _ in calls] == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
+            "include_title": True,
+        },
+        {"schema_version": 1, "operation": "peers", "include_delivery_mode": True},
+        {"schema_version": 1, "operation": "peers"},
+    ]
+    assert targets[0].title is None
+
+
+def test_remote_node_targets_all_timeouts_return_incomplete_within_shared_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    timeouts: list[float] = []
+
+    def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        timeouts.append(timeout)
+        clock.now += timeout
+        raise ChatError("request timed out")
+
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1",
+        deadline=22.0,
+        include_delivery_mode=True,
+        include_title=True,
+    )
+
+    assert targets == []
+    assert complete is False
+    assert timeouts == [pytest.approx(16.0), pytest.approx(3.0), pytest.approx(3.0)]
+    assert sum(timeouts) <= 22.0 + 1e-9
+    assert clock.now <= 22.0
+
+
+def test_remote_node_targets_short_remaining_budget_stays_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock(20.0)
+    timeouts: list[float] = []
+
+    def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        assert timeout > 0.0
+        timeouts.append(timeout)
+        clock.now += timeout
+        raise ChatError("request timed out")
+
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1",
+        deadline=22.0,
+        include_delivery_mode=True,
+        include_title=True,
+    )
+
+    assert targets == []
+    assert complete is False
+    assert timeouts
+    assert all(timeout > 0.0 for timeout in timeouts)
+    assert clock.now <= 22.0
 
 
 def test_new_remote_title_negotiation_returns_title(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6 - 2026-09-10
+
+- Reserve remaining remote-discovery time across rich, mode-only, and legacy peer requests so an
+  optional title query cannot starve compatible fallback discovery.
+
 ## 0.1.5 - 2026-09-10
 
 - Complete local courier bootstrap without waiting for Claude's native session listing. Routes
