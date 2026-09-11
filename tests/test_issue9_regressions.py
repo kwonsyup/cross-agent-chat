@@ -159,7 +159,7 @@ def test_shared_canonical_root_survives_first_uninstall_and_restores_on_last_own
         ).get("mcp_servers", {})
 
 
-def test_exact_local_target_does_not_wait_for_remote_discovery(
+def test_exact_local_handle_does_not_wait_for_remote_discovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = runtime.Target(
@@ -187,7 +187,9 @@ def test_exact_local_target_does_not_wait_for_remote_discovery(
     )
     monkeypatch.setattr(runtime, "_send_local_target", lambda *args, **kwargs: expected)
 
-    assert runtime.send(tmp_path / "state", source, target.alias, "synthetic probe") == expected
+    assert (
+        runtime.send(tmp_path / "state", source, target.session_key, "synthetic probe") == expected
+    )
 
 
 def test_fuzzy_target_refuses_incomplete_remote_discovery_before_intent(
@@ -217,7 +219,7 @@ def test_fuzzy_target_refuses_incomplete_remote_discovery_before_intent(
     assert not (tmp_path / "state").exists()
 
 
-def test_exact_remote_target_survives_unrelated_incomplete_discovery(
+def test_exact_remote_handle_survives_unrelated_incomplete_discovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = runtime.Target(
@@ -258,7 +260,7 @@ def test_exact_remote_target_survives_unrelated_incomplete_discovery(
 
     monkeypatch.setattr(runtime, "request_tailnet", send_remote)
 
-    result = runtime.send(tmp_path / "state", source, target.alias, "synthetic probe")
+    result = runtime.send(tmp_path / "state", source, target.session_key, "synthetic probe")
     assert result["to"] == target.alias
     assert len(responses) == 1
 

@@ -1,38 +1,75 @@
 # Cross Agent Chat
 
-Chat between live Claude Code and Codex sessions on your Mac or Tailnet.
+Chat between authenticated Claude Code and Codex sessions on your Mac or permitted Tailnet.
+
+Before installing, each Mac needs a supported macOS Claude Code or Codex installation with its
+own working authenticated provider session. Install Cross Agent Chat separately on every Mac and
+selected provider-profile root that will use it (`CLAUDE_CONFIG_DIR` and `CODEX_HOME` select
+non-default roots). Local sessions do not need Tailscale; remote sessions need Tailnet reachability
+allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
+files, or turn a remote peer into an owner.
+
+Install v0.1.5 with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.1.4/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.1.5/install.sh | sh
 ```
 
-That is the whole setup. The installer supplies its own Python runtime when the Mac does
-not already have a compatible one. Start fresh Claude or Codex sessions, then ask naturally:
+Installation requires Git because the installer builds from the release tag.
+
+The installer supplies a Python runtime when the Mac lacks a compatible one. Its default stable
+command is `~/.local/bin/cross-agent-chat`; it stages releases under
+`~/.local/share/cross-agent-chat-runtime`, then writes the selected Claude `settings.json` and
+`.claude.json`, selected Codex `config.toml` and `hooks.json`, per-profile install metadata, and
+the owner-local LaunchAgent broker. Setup can replace the shared broker, so inspect active
+consumers and selected roots before an install, upgrade, or uninstall. Upgrades preserve existing
+couriers and their route generations. Existing sessions keep their loaded integration; fresh
+Claude or Codex sessions use the updated tools and hooks.
+
+Start a fresh session, then ask naturally:
 
 > List my live Cross Agent Chat peers and send hello to the Claude session on my other Mac.
 
+Codex uses Stop-bound delivery by default: accepted input waits for its next natural turn and is
+not an idle-wake guarantee. The experimental queue remains an explicit profile-local opt-in.
+
 Cross Agent Chat follows the provider processes you already use. There are no peer files,
-copied provider credentials, Cross Agent Chat accounts, or terminal-specific extensions.
-Local sessions work without Tailscale; permitted online Tailnet Macs appear automatically.
-Use the exact recipient returned by `chat_peers`. Fuzzy names are checked across devices;
-multiple matches or incomplete remote discovery require a more precise recipient.
+Cross Agent Chat accounts, or terminal-specific extensions. Permitted online Tailnet Macs appear
+automatically.
+Use the opaque exact `handle` returned by `chat_peers` to select a recipient. Display names are
+checked across devices; multiple matches or incomplete discovery require an exact handle.
+`chat_peers` reports the invoking sender's readiness separately from each recipient's delivery mode.
 
 Disposable worker launchers can set `CROSS_AGENT_CHAT_PRESENCE=off`. That worker remains out
 of Cross Agent Chat's peer roster and creates no route or courier; ordinary sessions remain
 visible by default.
 
+To have an existing coding agent assist with installation, give it this prompt:
+
+> Install the released `v0.1.5` tag, not an arbitrary PR. Identify active consumers and the
+> selected Claude/Codex roots, obtain approval before shared effects, preserve existing intent
+> records, run `cross-agent-chat doctor --json`, and test only fresh actors.
+
 ## Supported surfaces
 
-| Surface | Support |
+| Surface or mode | Support |
 |---|---|
-| Claude Code 2.1.261 | Interactive and native background sessions; native SendMessage delivery |
-| Codex CLI 0.152.1 / 0.153.2 | Next-turn delivery; idle wake with explicit experimental queue opt-in |
-| Codex Native, embedded 0.153.1 | Next-turn delivery; idle wake with explicit experimental queue opt-in |
+| Claude Code 2.1.263 (historical observation, 2026-09-06; source `317b18e`; not v0.1.5 candidate proof) | iMac interactive startup and same-cwd native-messaging request/reply tested with the configured cross-session inbound `accept` policy |
+| Claude Code 2.1.261 (historical observation) | Interactive and native background sessions; native SendMessage delivery |
+| Claude Code 2.1.268 (observed 2026-09-10, macOS Terminal.app/iTerm2) | Fresh original-session reciprocal request/result with exact `to`/`message` calls; no echo |
+| Codex CLI 0.153.4 (observed 2026-09-09, isolated authenticated root, Stop-bound) | Bounded original-session cross-device request/result; account relationship was not established |
+| Codex CLI 0.152.1 / 0.153.2 (historical observation), default Stop | Next-turn delivery; accepted work remains pending while genuinely idle |
+| Codex Native, embedded 0.153.1 (historical observation), default Stop | Next-turn delivery; accepted work remains pending while genuinely idle |
+| Explicit experimental Codex native queue | Version-bound idle queue path observed on Native 0.153.1 and CLI 0.152.1/0.153.2; not selected by default |
 | Same Mac | Yes |
 | Tailnet Mac | Yes, subject to your Tailscale ACL |
 | ChatGPT web or Claude web | No |
 | Windows | No claim |
 | Linux | No live-support claim |
+
+v0.1.5 is a macOS beta. The table records the configurations actually observed; rows marked
+historical were tested with earlier candidates. Support remains limited to the listed provider
+versions and delivery modes.
 
 ## Trust and delivery
 
@@ -46,12 +83,15 @@ perimeter. Messages are still delivered as untrusted peer/user input, not system
   after confirming arrival or abandoning that event.
 - A deterministic pre-effect error means no message effect occurred; correct it and send
   fresh.
+- `chat_status(EVENT_ID)` reads the exact sender's body-free custody record. It never contacts a
+  provider, replays delivery, or treats custody as consumption.
 
 `chat_peers` also reports each recipient's observed delivery mode: Claude native messaging,
 Codex Stop-bound delivery, or the experimental Codex queue. Older couriers report `unknown`.
 The mode identifies the active adapter; it does not establish consumption or a reply.
 
-Codex uses natural Stop delivery by default. An explicit, profile-local experimental queue can
+Codex uses natural Stop delivery by default: a received message is delivered at the next natural
+turn boundary. An explicit, profile-local experimental queue can
 be enabled for fresh Codex sessions; it uses Codex's version-bound stdio app-server
 `thread/queue/add` interface, whose provider owns queued message bodies. The Cross Agent Chat
 state remains content-free. The experimental path was observed on Codex Native 0.153.1 and CLI
@@ -71,9 +111,14 @@ cross-agent-chat peers --json
 cross-agent-chat uninstall
 ```
 
-Running the installer again upgrades and repairs the owned configuration. An upgrade or
-uninstall transitions the shared broker and couriers; schedule it when sessions using that
-installation can safely stop. A temporary profile does not isolate that shared service.
+Running the installer again upgrades and repairs the owned configuration. Upgrades briefly
+restart the shared broker while preserving existing couriers, pending input, and route identity.
+Older runtimes are retained while route registrations remain, so repeated upgrades do not remove
+a live courier's executable. Fresh sessions load the updated integration. Uninstall stops
+couriers; let pending Stop-bound deliveries consume before uninstalling. A temporary profile
+does not isolate the shared service. Neither operation restarts Claude or Codex coding processes.
+If a failed setup or upgrade finds newer provider settings during rollback, it retains those
+settings and recovery custody for diagnosis before retrying.
 `uninstall`
 removes only Cross Agent Chat-owned runtime, hooks, MCP routes, service, and transient route
 state, and restores the prior shared Claude inbound setting. Durable content-free delivery intents
@@ -86,6 +131,11 @@ ownership information are handled conservatively; unavailable original values ar
 Sharing only one of a Codex config file and its hook file across profiles is rejected before
 setup writes.
 
+Claude users may choose `dialogExpiry: "never"` in trusted user settings to remove the provider
+approval-dialog deadline for future held inbound messages. It does not change the recipient inbound
+policy, extend an existing hold, survive recipient shutdown, or guarantee delivery. Cross Agent
+Chat does not set it globally or store/retry message bodies.
+
 `setup` uses the active provider roots: by default Claude reads `~/.claude/settings.json` and
 `~/.claude.json`, while an explicit `CLAUDE_CONFIG_DIR=/path/to/profile` reads
 `/path/to/profile/settings.json` and `/path/to/profile/.claude.json`. Codex uses the active
@@ -97,10 +147,45 @@ sessions to next-turn delivery.
 
 ## Architecture
 
-The package provides one CLI and MCP surface, native Claude/Codex lifecycle hooks, one
-owner-local discovery broker, and one process-scoped courier per live destination. Remote
-traffic binds directly to the Mac's Tailnet address; it does not use Tailscale Serve, SSH,
-hosted services, accounts, or message persistence.
+The path is `install → hooks → registration/bootstrap → discovery → exact destination validation
+→ provider delivery → separate reply → cleanup/recovery`. Setup merges owned Claude SessionStart/
+SessionEnd and Codex SessionStart/SessionEnd/Stop hooks into the selected provider roots and starts
+one owner-local LaunchAgent broker. A fresh hook registers its provider, process and profile context;
+bootstrap health and later native-provider health are checked separately.
+
+The broker discovers live routes. `chat_send` resolves one exact, current destination from an exact
+or unique fuzzy query; ambiguous names and incomplete discovery are rejected before an effect. It
+hands delivery to the recipient's process-scoped courier (or, only with explicit profile-local
+opt-in, Codex's version-bound native queue). A reply is a separate send and consumption event, not
+proof supplied by the original send.
+Session-end hooks remove owned live routes; recovery preserves content-free intent metadata and does
+not replay accepted or unknown events.
+
+Local couriers use owner-local sockets. Remote broker traffic binds directly to the Mac's Tailnet
+address and relies on the Tailnet ACL; SSH is operator tooling, not product transport. A default
+Codex Stop-bound courier holds pending input only in memory, so it can lose it if that courier exits
+before the next natural Stop. The experimental queue leaves the message body with Codex's provider
+queue and transcript, while Cross Agent Chat retains only metadata and digests. Neither mode
+synchronizes permissions, accounts, files, or provider state between Macs.
+
+### Provider updates and contained contributor checks
+
+For a provider update, record the installed provider version, selected profile roots, and native
+queue schema/mode; run the affected contained adapter contracts; perform one fresh owned idle,
+busy, or compaction smoke as applicable; then update the tested matrix. Do not infer support for
+future provider versions from these checks.
+
+From a development environment with the dev dependencies installed, run the contained checks with:
+
+```bash
+python -m pytest tests/test_install.py tests/test_codex.py tests/test_claude_remote.py tests/test_tailnet.py
+```
+
+The test fixtures redirect `HOME`, `CODEX_HOME`, sockets, temporary files, and provider/service
+calls into fixture-owned paths; they test contracts and failure boundaries, not a live account or
+installed macOS service. They also guard the subprocess calls made by the suite, but are not an OS
+sandbox for every arbitrary child process. Review any new child-process path and use an approved
+environment for live installation or provider testing.
 
 See [SECURITY.md](SECURITY.md) for the trust boundary and vulnerability reporting.
 

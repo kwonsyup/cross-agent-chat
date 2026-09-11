@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.5 - 2026-09-10
+
+- Complete local courier bootstrap without waiting for Claude's native session listing. Routes
+  become available only after the existing native health and pre-delivery identity checks pass.
+- Keep initial bootstrap ahead of native health and delivery work; pre-bootstrap health remains
+  unavailable and delivery is rejected before effect.
+- Reuse an exact bootstrapped courier on duplicate SessionStart events, preserving its generation
+  and accepted in-memory queue while native routing is temporarily unavailable.
+- Reap a failed registration's exact child and private socket before removing its route.
+- Ignore unrelated stale Claude agent rows whose workspace no longer exists; an invalid selected
+  target remains unavailable.
+- Preserve concurrent provider-setting edits when failed setup or upgrade rollback conflicts, and
+  retain recovery custody for diagnosis instead of restoring stale settings.
+- Expose exact peer handles, optional native task titles, and caller readiness separately from
+  recipient delivery modes. Resolve display aliases globally before sending.
+- Add authenticated, read-only MCP event status without changing stored intents or replaying work.
+- Preserve live couriers, route generations, and retained runtimes through compatible upgrades.
+- Preserve accepted queued input only for exact-courier duplicate SessionStart reuse and the
+  observed same-artifact runtime transition; do not claim pending-input version-upgrade support.
+- Bind Claude native SendMessage authorization to the full message and exact target envelope while
+  reporting body-free local unknown phases without retrying delivery.
+
 ## 0.1.4 - 2026-09-05
 
 - Resolve fuzzy destinations across local and remote peers before creating a delivery intent.

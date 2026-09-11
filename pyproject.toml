@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cross-agent-chat"
-version = "0.1.4"
+version = "0.1.5"
 description = "Local-first cross-session chat for Claude Code and Codex CLI/Native App."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Kwon Syup" }]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "License :: OSI Approved :: Apache Software License",
   "Operating System :: MacOS",
   "Programming Language :: Python :: 3",

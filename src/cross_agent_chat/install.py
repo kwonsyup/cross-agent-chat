@@ -36,6 +36,7 @@ from cross_agent_chat.runtime import MCP_TOOL_TIMEOUT_SECONDS
 from cross_agent_chat.tailnet import LOCAL_BROKER_HOST, LOCAL_BROKER_PORT, valid_tailnet_address
 
 SERVER_NAME: Final = "cross-agent-chat"
+OWNED_CODEX_TOOLS: Final[tuple[str, ...]] = ("chat_peers", "chat_send", "chat_status")
 LAUNCH_AGENT_LABEL: Final = "io.github.kwonsyup.cross-agent-chat"
 BROKER_HEALTH_ATTEMPTS: Final = 300
 BROKER_HEALTH_INTERVAL_SECONDS: Final = 0.25
@@ -61,7 +62,7 @@ class SettingsError(RuntimeError):
 
 
 class ConfigurationChangedError(SettingsError):
-    """Provider configuration changed before any setup write."""
+    """Provider configuration changed before setup writes or guarded rollback."""
 
 
 class SetupRollbackError(SettingsError):
@@ -111,6 +112,7 @@ class RecoveryTransaction:
     current_snapshot: PathSnapshot
     entrypoint_snapshot: PathSnapshot
     config_backup: Path
+    config_expected: dict[Path, PathSnapshot] | None
     previous_broker_loaded: bool
     previous_broker_healthy: bool
     package_tree_sha256: str
@@ -602,7 +604,7 @@ def _remove_owned_codex_tool_approval_overrides(text: str) -> str:
             tools = server.get("tools")
             if isinstance(tools, MutableMapping):
                 preserved_tools = copy.deepcopy(tools)
-                for name in ("chat_peers", "chat_send"):
+                for name in OWNED_CODEX_TOOLS:
                     tool = preserved_tools.get(name)
                     if isinstance(tool, MutableMapping):
                         tool.pop("approval_mode", None)
@@ -1396,6 +1398,24 @@ class Installer:
             backup=backup,
         )
 
+    def _setup_candidates(self, transaction: PreparedSetup) -> dict[Path, PathSnapshot]:
+        candidates = dict(transaction.originals)
+        for path, payload in transaction.payloads.items():
+            destination = transaction.destinations[path]
+            original = transaction.originals[destination]
+            shared = path in {
+                self.claude_settings,
+                self.claude_config,
+                self.codex_config,
+                self.codex_hooks,
+            }
+            mode = _safe_shared_mode(original.mode) if shared and original.kind == "file" else 0o600
+            candidates[destination] = PathSnapshot(
+                path=destination, kind="file", payload=payload, mode=mode
+            )
+        candidates[self.legacy_peers] = PathSnapshot(path=self.legacy_peers, kind="absent")
+        return candidates
+
     def setup(
         self,
         verify: Callable[[], bool] | None = None,
@@ -1412,6 +1432,7 @@ class Installer:
         prepared: PreparedSetup | None = None,
     ) -> InstallReport:
         transaction = self._prepare_setup() if prepared is None else prepared
+        candidates = self._setup_candidates(transaction)
         written: list[Path] = []
         try:
             if any(
@@ -1433,6 +1454,21 @@ class Installer:
                     if shared and original.kind == "file"
                     else 0o600
                 )
+                try:
+                    current_destination = path.resolve(strict=False)
+                except (OSError, RuntimeError) as error:
+                    raise ConfigurationChangedError(
+                        "provider configuration changed before setup write"
+                    ) from error
+                logical_original = transaction.originals.get(path)
+                if (
+                    current_destination != destination
+                    or (logical_original is not None and _snapshot_path(path) != logical_original)
+                    or _snapshot_path(destination) != original
+                ):
+                    raise ConfigurationChangedError(
+                        "provider configuration changed before setup write"
+                    )
                 _atomic_write(destination, payload, mode=mode)
                 written.append(destination)
             if self.legacy_peers.exists():
@@ -1444,13 +1480,41 @@ class Installer:
         except (OSError, SettingsError) as failure:
             try:
                 for path in reversed(written):
+                    original = transaction.originals[path]
+                    current = _snapshot_path(path)
+                    if current == original:
+                        continue
+                    if current != candidates[path] or _snapshot_path(path) != candidates[path]:
+                        raise ConfigurationChangedError(
+                            "provider configuration changed during setup rollback"
+                        )
                     _restore_path(transaction.originals[path])
             except (OSError, SettingsError) as rollback:
                 raise SetupRollbackError(failure, rollback, transaction.backup) from failure
             raise
         return InstallReport(tuple(transaction.payloads), transaction.backup)
 
-    def _restore(self, backup: Path) -> None:
+    def _backup_destination(self, relative: str) -> Path:
+        if relative.startswith("CODEX_HOME/"):
+            relative_path = Path(relative.removeprefix("CODEX_HOME/"))
+            destination = self.codex_home / relative_path
+        elif relative.startswith("CLAUDE_CONFIG_DIR/"):
+            if self.claude_config_dir is None:
+                raise SettingsError("backup manifest is invalid")
+            relative_path = Path(relative.removeprefix("CLAUDE_CONFIG_DIR/"))
+            destination = self.claude_config_dir / relative_path
+        else:
+            relative_path = Path(relative)
+            destination = self.home / relative_path
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or self._managed_root(destination.parent) is None
+        ):
+            raise SettingsError("backup manifest is invalid")
+        return destination
+
+    def _restore(self, backup: Path, *, expected: dict[Path, PathSnapshot] | None = None) -> None:
         manifest_path = backup / "manifest.json"
         if manifest_path.is_symlink() or not manifest_path.is_file():
             raise SettingsError("backup manifest is invalid")
@@ -1458,23 +1522,21 @@ class Installer:
         for relative, encoded in manifest.items():
             if not isinstance(relative, str):
                 raise SettingsError("backup manifest is invalid")
-            if relative.startswith("CODEX_HOME/"):
-                relative_path = Path(relative.removeprefix("CODEX_HOME/"))
-                destination = self.codex_home / relative_path
-            elif relative.startswith("CLAUDE_CONFIG_DIR/"):
-                if self.claude_config_dir is None:
-                    raise SettingsError("backup manifest is invalid")
-                relative_path = Path(relative.removeprefix("CLAUDE_CONFIG_DIR/"))
-                destination = self.claude_config_dir / relative_path
-            else:
-                relative_path = Path(relative)
-                destination = self.home / relative_path
-            if (
-                relative_path.is_absolute()
-                or ".." in relative_path.parts
-                or self._managed_root(destination.parent) is None
-            ):
-                raise SettingsError("backup manifest is invalid")
+            destination = self._backup_destination(relative)
+            if expected is not None:
+                if not isinstance(encoded, dict) or destination not in expected:
+                    raise SettingsError("configuration rollback state is invalid")
+                original = _snapshot_from_json(destination, encoded)
+                current = _snapshot_path(destination)
+                if current == original:
+                    continue
+                candidate = expected[destination]
+                if current != candidate or _snapshot_path(destination) != candidate:
+                    raise ConfigurationChangedError(
+                        "provider configuration changed during rollback"
+                    )
+                _restore_path(original)
+                continue
             if isinstance(encoded, dict):
                 _restore_path(_snapshot_from_json(destination, encoded))
             elif encoded is None:
@@ -1496,11 +1558,14 @@ class Installer:
         self._recover_unfinished_transaction()
         previous_broker_loaded = self.broker_is_loaded()
         previous_broker_healthy = previous_broker_loaded and self._wait_for_previous_broker_health()
-        report = self.setup()
+        prepared_setup = self._prepare_setup()
+        config_expected = self._setup_candidates(prepared_setup)
+        report = self.setup(prepared=prepared_setup)
         service_transition_started = False
         try:
-            self._stop_couriers()
-            self._remove_runtime_state()
+            # Existing couriers belong to still-running provider sessions. Keeping
+            # their exact route generations preserves accepted in-memory queues;
+            # fresh sessions load the newly installed hooks normally.
             service_transition_started = True
             self.activate()
             if not self._wait_for_broker_health(lambda timeout: self.verify(timeout=timeout)):
@@ -1515,7 +1580,7 @@ class Installer:
                 except (OSError, subprocess.SubprocessError, SettingsError) as error:
                     rollback_failures.append(f"broker stop failed: {error}")
             try:
-                self._restore(report.backup)
+                self._restore(report.backup, expected=config_expected)
             except (OSError, SettingsError) as error:
                 rollback_failures.append(f"configuration restore failed: {error}")
             if previous_broker_loaded and (not service_transition_started or service_stopped):
@@ -1648,22 +1713,27 @@ class Installer:
         previous_broker_loaded: bool,
         previous_broker_healthy: bool,
         package_tree_sha256: str,
+        config_expected: dict[Path, PathSnapshot] | None = None,
     ) -> None:
-        atomic_json(
-            transaction / "metadata.json",
-            {
-                "schema_version": 1,
-                "phase": phase,
-                "candidate_name": staged.name,
-                "stable_entrypoint": str(stable_entrypoint.relative_to(self.home)),
-                "current_snapshot": _snapshot_json(current_snapshot),
-                "entrypoint_snapshot": _snapshot_json(entrypoint_snapshot),
-                "config_backup": str(config_backup.relative_to(self.home)),
-                "previous_broker_loaded": previous_broker_loaded,
-                "previous_broker_healthy": previous_broker_healthy,
-                "package_tree_sha256": package_tree_sha256,
-            },
-        )
+        metadata: dict[str, object] = {
+            "schema_version": 1,
+            "phase": phase,
+            "candidate_name": staged.name,
+            "stable_entrypoint": str(stable_entrypoint.relative_to(self.home)),
+            "current_snapshot": _snapshot_json(current_snapshot),
+            "entrypoint_snapshot": _snapshot_json(entrypoint_snapshot),
+            "config_backup": str(config_backup.relative_to(self.home)),
+            "previous_broker_loaded": previous_broker_loaded,
+            "previous_broker_healthy": previous_broker_healthy,
+            "package_tree_sha256": package_tree_sha256,
+        }
+        if config_expected is not None:
+            metadata["schema_version"] = 2
+            metadata["config_expected"] = {
+                self._backup_key(path): _snapshot_json(snapshot)
+                for path, snapshot in config_expected.items()
+            }
+        atomic_json(transaction / "metadata.json", metadata)
 
     def _read_transaction(self, transaction: Path) -> RecoveryTransaction:
         metadata = _json_object(transaction / "metadata.json")
@@ -1679,7 +1749,10 @@ class Installer:
             "previous_broker_healthy",
             "package_tree_sha256",
         }
-        if set(metadata) != expected_keys or metadata.get("schema_version") != 1:
+        schema_version = metadata.get("schema_version")
+        if schema_version == 2:
+            expected_keys.add("config_expected")
+        if set(metadata) != expected_keys or schema_version not in {1, 2}:
             raise SettingsError("transaction metadata is invalid")
         phase = metadata["phase"]
         candidate_name = metadata["candidate_name"]
@@ -1688,6 +1761,17 @@ class Installer:
         previous_loaded = metadata["previous_broker_loaded"]
         previous_healthy = metadata["previous_broker_healthy"]
         package_digest = metadata["package_tree_sha256"]
+        config_expected: dict[Path, PathSnapshot] | None = None
+        if schema_version == 2:
+            raw_expected = metadata["config_expected"]
+            if not isinstance(raw_expected, dict):
+                raise SettingsError("transaction metadata is invalid")
+            config_expected = {}
+            for relative, encoded in raw_expected.items():
+                if not isinstance(relative, str):
+                    raise SettingsError("transaction metadata is invalid")
+                destination = self._backup_destination(relative)
+                config_expected[destination] = _snapshot_from_json(destination, encoded)
         if (
             not isinstance(phase, str)
             or phase
@@ -1763,6 +1847,7 @@ class Installer:
             ),
             entrypoint_snapshot=_snapshot_from_json(stable, metadata["entrypoint_snapshot"]),
             config_backup=backup,
+            config_expected=config_expected,
             previous_broker_loaded=previous_loaded,
             previous_broker_healthy=previous_healthy,
             package_tree_sha256=package_digest,
@@ -1782,6 +1867,7 @@ class Installer:
         previous_broker_loaded: bool,
         previous_broker_healthy: bool,
         cleanup_on_success: bool = True,
+        config_expected: dict[Path, PathSnapshot] | None = None,
     ) -> None:
         failures: list[str] = []
         service_stopped = not service_transition_started
@@ -1793,7 +1879,9 @@ class Installer:
                 failures.append(f"broker stop failed: {error}")
         if config_transition_started:
             try:
-                self._restore(config_backup)
+                if config_expected is None:
+                    raise SettingsError("configuration rollback state is unavailable")
+                self._restore(config_backup, expected=config_expected)
             except (OSError, SettingsError) as error:
                 failures.append(f"configuration restore failed: {error}")
         if runtime_transition_started:
@@ -1874,6 +1962,7 @@ class Installer:
             self._rollback_transition(
                 transaction_path=transaction_path,
                 config_backup=transaction.config_backup,
+                config_expected=transaction.config_expected,
                 current_snapshot=transaction.current_snapshot,
                 entrypoint_snapshot=transaction.entrypoint_snapshot,
                 candidate=transaction.candidate,
@@ -1918,6 +2007,12 @@ class Installer:
         shutil.rmtree(resolved)
 
     def _prune_committed_releases(self, current: Path, previous: PathSnapshot) -> None:
+        # A live route may still run a courier from an older retained runtime.
+        # Route state has no runtime path, so pruning is unsafe until all routes end.
+        from cross_agent_chat.core import Registry
+
+        if Registry(self.state).routes():
+            return
         retained = {current.resolve()}
         if previous.kind == "symlink" and previous.target is not None:
             retained.add((self.current_runtime.parent / previous.target).resolve())
@@ -1990,6 +2085,7 @@ class Installer:
         transaction = self.transactions / transaction_id
         ensure_private_dir(preparing_transaction)
         final_runtime = staged
+        config_expected = self._setup_candidates(prepared_setup)
 
         def record(phase: str) -> None:
             self._record_transaction(
@@ -2003,6 +2099,7 @@ class Installer:
                 previous_broker_loaded=previous_broker_loaded,
                 previous_broker_healthy=previous_broker_healthy,
                 package_tree_sha256=package_digest,
+                config_expected=config_expected,
             )
 
         self._record_transaction(
@@ -2016,6 +2113,7 @@ class Installer:
             previous_broker_loaded=previous_broker_loaded,
             previous_broker_healthy=previous_broker_healthy,
             package_tree_sha256=package_digest,
+            config_expected=config_expected,
         )
         _atomic_write(
             final_runtime / RELEASE_MARKER,
@@ -2029,7 +2127,6 @@ class Installer:
         runtime_transition_started = False
         config_transition_started = False
         try:
-            self._stop_couriers()
             if (
                 _snapshot_path(self.current_runtime) != current_snapshot
                 or _snapshot_path(stable) != entrypoint_snapshot
@@ -2044,11 +2141,10 @@ class Installer:
             config_transition_started = True
             try:
                 report = self.setup(prepared=prepared_setup)
-            except ConfigurationChangedError:
+            except SettingsError:
                 config_transition_started = False
                 raise
             record("config_written")
-            self._remove_runtime_state()
             record("service_starting")
             service_transition_started = True
             self.activate()
@@ -2068,6 +2164,7 @@ class Installer:
                 self._rollback_transition(
                     transaction_path=transaction,
                     config_backup=prepared_setup.backup,
+                    config_expected=config_expected,
                     current_snapshot=current_snapshot,
                     entrypoint_snapshot=entrypoint_snapshot,
                     candidate=final_runtime,
@@ -2121,7 +2218,7 @@ class Installer:
             if codex_tools is not None:
                 if not isinstance(codex_tools, dict):
                     return False
-                for name in ("chat_peers", "chat_send"):
+                for name in OWNED_CODEX_TOOLS:
                     tool = codex_tools.get(name)
                     if not isinstance(tool, dict):
                         continue

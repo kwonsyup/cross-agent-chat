@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import os
 import shlex
+import stat
 import subprocess
+import sys
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,18 +17,98 @@ import pytest
 
 from cross_agent_chat.claude_runtime import (
     AGENTS_TIMEOUT_SECONDS,
+    DENIAL_MARKERS,
     DISCOVERY_TIMEOUT_SECONDS,
     SEND_TIMEOUT_SECONDS,
+    ClaudeSendMessageUnknownDelivery,
+    ClaudeUnknownPhase,
     claude_binary,
     courier_environment,
+    gate_consumed,
     parse_claude_agents,
     parse_sendmessage_receipt,
     pretool_decision,
+    run_pretool_gate,
     sendmessage,
 )
-from cross_agent_chat.core import ChatError, Route, UnknownDeliveryError
+from cross_agent_chat.core import (
+    ChatError,
+    IntentStore,
+    Registry,
+    Route,
+    UnknownDeliveryError,
+    session_key,
+)
 from cross_agent_chat.remote import parse_remote_envelope
-from cross_agent_chat.runtime import ACCEPT_TIMEOUT_SECONDS, REMOTE_TIMEOUT_SECONDS, courier_accept
+from cross_agent_chat.runtime import (
+    ACCEPT_TIMEOUT_SECONDS,
+    REMOTE_TIMEOUT_SECONDS,
+    Target,
+    _send_local_target,
+    courier_accept,
+    unknown_delivery_diagnostic,
+)
+
+
+def _write_private_marker(path: Path, value: bytes) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(value)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _sendmessage_stream(
+    target: str,
+    message: str,
+    *,
+    tool_name: str = "SendMessage",
+    tool_input: dict[str, object] | None = None,
+    extra_uses: int = 0,
+) -> str:
+    input_value = tool_input or {
+        "to": target,
+        "recipient": target,
+        "message": message,
+        "content": "provider preview",
+        "type": "message",
+        "summary": "Cross Agent Chat",
+    }
+    uses = [
+        {
+            "type": "tool_use",
+            "id": f"tool-{index}",
+            "name": tool_name,
+            "input": input_value,
+        }
+        for index in range(extra_uses + 1)
+    ]
+    return "\n".join(json.dumps({"message": {"content": [use]}}) for use in uses)
+
+
+def _assert_unknown_helper_phase(
+    monkeypatch: pytest.MonkeyPatch,
+    stream: str,
+    phase: ClaudeUnknownPhase,
+) -> None:
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.subprocess.run",
+        lambda command, **_: subprocess.CompletedProcess(command, 0, stream, ""),
+    )
+    body = "private body that must not be echoed"
+    with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
+        sendmessage("API work [ABC123]", body, Path("/usr/bin/false"))
+    assert error.value.phase == phase
+    assert body not in str(error.value)
+    if stream:
+        assert stream[:64] not in str(error.value)
 
 
 def test_remote_transport_outlives_claude_delivery_window() -> None:
@@ -80,6 +164,46 @@ def test_claude_agents_requires_exact_interactive_identity(tmp_path: Path) -> No
     ]
 
 
+def test_claude_agents_skip_an_unrelated_disappeared_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import claude_runtime
+
+    healthy_session = str(uuid4())
+    stale_session = str(uuid4())
+    stale_workspace = tmp_path / "disappeared"
+    payload = json.dumps(
+        [
+            {
+                "sessionId": healthy_session,
+                "name": "Healthy session",
+                "kind": "interactive",
+                "cwd": str(tmp_path),
+            },
+            {
+                "sessionId": stale_session,
+                "name": "Stale session",
+                "kind": "interactive",
+                "cwd": str(stale_workspace),
+            },
+        ]
+    )
+
+    agents = parse_claude_agents(payload)
+
+    assert agents == [
+        {
+            "session_id": healthy_session,
+            "name": "Healthy session",
+            "kind": "interactive",
+            "cwd": str(tmp_path.resolve()),
+        }
+    ]
+    monkeypatch.setattr(claude_runtime, "claude_agents", lambda: agents)
+    with pytest.raises(ChatError, match="exact live supported"):
+        claude_runtime.exact_agent(stale_session, str(stale_workspace))
+
+
 def test_claude_binary_uses_fixed_user_local_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -128,8 +252,495 @@ def test_pretool_gate_binds_recipient_and_full_message() -> None:
     }
 
     assert pretool_decision(expected, payload, key.hex())
+    tool_input["content"] = "provider-rendered preview"
+    assert pretool_decision(expected, payload, key.hex())
+    tool_input["extra"] = "reject"
+    assert not pretool_decision(expected, payload, key.hex())
+    tool_input.pop("extra")
+    tool_input["content"] = 7
+    assert not pretool_decision(expected, payload, key.hex())
+    tool_input["content"] = "provider-rendered preview"
     tool_input["message"] = "changed"
     assert not pretool_decision(expected, payload, key.hex())
+
+
+def test_pretool_gate_uses_full_unicode_body_not_cosmetic_preview() -> None:
+    key = bytes.fromhex("22" * 32)
+    message = "e\u0301 family 👨‍👩‍👧‍👦 " + "wide界" * 20
+    recipient = "API work [ABC123]"
+    expected: dict[str, object] = {
+        "recipient": recipient,
+        "message_hmac": hmac.new(key, message.encode(), hashlib.sha256).hexdigest(),
+    }
+    tool_input: dict[str, object] = {
+        "to": recipient,
+        "recipient": recipient,
+        "message": message,
+        "content": "provider preview with different display width",
+        "type": "message",
+        "summary": "Cross Agent Chat",
+    }
+    payload: dict[str, object] = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "SendMessage",
+        "tool_input": tool_input,
+    }
+
+    assert pretool_decision(expected, payload, key.hex())
+    tool_input["message"] = message[:-1] + "x"
+    assert not pretool_decision(expected, payload, key.hex())
+
+
+def test_pretool_gate_denies_an_unpaired_surrogate_without_consuming(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    key = "33" * 32
+    recipient = "API work [ABC123]"
+    expected = tmp_path / "expected.json"
+    expected.write_text(
+        json.dumps({"recipient": recipient, "message_hmac": "0" * 64}), encoding="utf-8"
+    )
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "SendMessage",
+        "tool_input": {
+            "to": recipient,
+            "recipient": recipient,
+            "message": "\ud800",
+            "content": "preview",
+            "type": "message",
+            "summary": "Cross Agent Chat",
+        },
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+
+    assert not run_pretool_gate(str(expected), key)
+    assert not (tmp_path / "consumed").exists()
+    denied = tmp_path / "denied"
+    assert denied.read_bytes() == DENIAL_MARKERS["sendmessage_message_mismatch"]
+    assert stat.S_IMODE(denied.stat().st_mode) == 0o600
+    response = json.loads(capsys.readouterr().out)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_pretool_gate_writes_owned_private_consumed_marker_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    key = "44" * 32
+    target = "API work [ABC123]"
+    message = "hello"
+    expected_path = tmp_path / "expected.json"
+    expected_path.write_text(
+        json.dumps(
+            {
+                "recipient": target,
+                "message_hmac": hmac.new(
+                    bytes.fromhex(key), message.encode(), hashlib.sha256
+                ).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "SendMessage",
+        "tool_input": {
+            "to": target,
+            "recipient": target,
+            "message": message,
+            "content": "preview",
+            "type": "message",
+            "summary": "Cross Agent Chat",
+        },
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+
+    assert run_pretool_gate(str(expected_path), key)
+    consumed = tmp_path / "consumed"
+    assert consumed.read_bytes() == b"consumed\n"
+    assert stat.S_ISREG(consumed.stat().st_mode)
+    assert consumed.stat().st_uid == os.getuid()
+    assert stat.S_IMODE(consumed.stat().st_mode) == 0o600
+    response = json.loads(capsys.readouterr().out)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+
+@pytest.mark.parametrize(
+    ("marker", "mode"),
+    [
+        (b"", 0o600),
+        (b"consumed", 0o600),
+        (b"consumed\nextra", 0o600),
+        (b"denied\n", 0o644),
+    ],
+)
+def test_gate_consumed_rejects_malformed_or_unsafe_marker(
+    tmp_path: Path, marker: bytes, mode: int
+) -> None:
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    gate.chmod(0o700)
+    marker_path = gate / "consumed"
+    marker_path.write_bytes(marker)
+    marker_path.chmod(mode)
+
+    with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
+        gate_consumed(gate)
+
+    assert error.value.phase == "pretool_gate_unreadable"
+
+
+def test_gate_consumed_rejects_marker_symlink(tmp_path: Path) -> None:
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    gate.chmod(0o700)
+    target = tmp_path / "target"
+    target.write_bytes(b"consumed\n")
+    (gate / "consumed").symlink_to(target)
+
+    with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
+        gate_consumed(gate)
+
+    assert error.value.phase == "pretool_gate_unreadable"
+
+
+def test_gate_consumed_rejects_unsafe_parent_mode(tmp_path: Path) -> None:
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    gate.chmod(0o755)
+    _write_private_marker(gate / "consumed", b"consumed\n")
+
+    with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
+        gate_consumed(gate)
+
+    assert error.value.phase == "pretool_gate_unreadable"
+
+
+def test_gate_consumed_rejects_parent_symlink(tmp_path: Path) -> None:
+    real_gate = tmp_path / "real-gate"
+    real_gate.mkdir()
+    _write_private_marker(real_gate / "consumed", b"consumed\n")
+    gate = tmp_path / "gate-link"
+    gate.symlink_to(real_gate, target_is_directory=True)
+
+    with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
+        gate_consumed(gate)
+
+    assert error.value.phase == "pretool_gate_unreadable"
+
+
+def test_gate_consumed_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    gate.chmod(0o700)
+    os.mkfifo(gate / "consumed", 0o600)
+    script = """
+import sys
+from pathlib import Path
+from cross_agent_chat.claude_runtime import ClaudeSendMessageUnknownDelivery, gate_consumed
+
+try:
+    gate_consumed(Path(sys.argv[1]))
+except ClaudeSendMessageUnknownDelivery as error:
+    print(error.phase)
+    """
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(gate)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=1,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "pretool_gate_unreadable"
+
+
+@pytest.mark.parametrize("operation", ["fstat", "read"])
+def test_gate_consumed_converts_marker_io_errors_to_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    gate.chmod(0o700)
+    _write_private_marker(gate / "consumed", b"consumed\n")
+    monkeypatch.setattr(
+        f"cross_agent_chat.claude_runtime.os.{operation}",
+        lambda *_: (_ for _ in ()).throw(OSError("EIO")),
+    )
+
+    with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
+        gate_consumed(gate)
+
+    assert error.value.phase == "pretool_gate_unreadable"
+
+
+def test_gate_consumed_rejects_unsafe_parent_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    gate.chmod(0o700)
+    _write_private_marker(gate / "consumed", b"consumed\n")
+    current_uid = os.getuid()
+    monkeypatch.setattr("cross_agent_chat.claude_runtime.os.getuid", lambda: current_uid + 1)
+
+    with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
+        gate_consumed(gate)
+
+    assert error.value.phase == "pretool_gate_unreadable"
+
+
+def test_gate_consumed_accepts_consumed_only_marker(tmp_path: Path) -> None:
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    gate.chmod(0o700)
+    _write_private_marker(gate / "consumed", b"consumed\n")
+
+    assert gate_consumed(gate)
+
+
+def test_gate_consumed_reports_denied_only_marker_as_not_consumed(tmp_path: Path) -> None:
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    gate.chmod(0o700)
+    _write_private_marker(gate / "denied", b"denied\n")
+
+    assert not gate_consumed(gate)
+
+
+def test_gate_consumed_rejects_conflicting_markers(tmp_path: Path) -> None:
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    gate.chmod(0o700)
+    _write_private_marker(gate / "consumed", b"consumed\n")
+    _write_private_marker(gate / "denied", b"denied\n")
+
+    with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
+        gate_consumed(gate)
+
+    assert error.value.phase == "pretool_gate_conflict"
+
+
+def test_sendmessage_with_valid_helper_but_no_markers_is_unobserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_unknown_helper_phase(
+        monkeypatch,
+        _sendmessage_stream("API work [ABC123]", "private body that must not be echoed"),
+        "pretool_gate_unobserved",
+    )
+
+
+def test_sendmessage_with_valid_helper_and_denied_marker_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = _sendmessage_stream("API work [ABC123]", "private body that must not be echoed")
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        settings = json.loads(command[command.index("--settings") + 1])
+        hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        tokens = shlex.split(hook)
+        expected_path = Path(tokens[tokens.index("--expected") + 1])
+        _write_private_marker(expected_path.parent / "denied", b"denied\n")
+        return subprocess.CompletedProcess(command, 0, stream, "")
+
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
+    monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
+    with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
+        sendmessage(
+            "API work [ABC123]", "private body that must not be echoed", Path("/usr/bin/false")
+        )
+
+    assert error.value.phase == "pretool_gate_denied"
+
+
+def test_sendmessage_with_conflicting_markers_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = _sendmessage_stream("API work [ABC123]", "private body that must not be echoed")
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        settings = json.loads(command[command.index("--settings") + 1])
+        hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        tokens = shlex.split(hook)
+        expected_path = Path(tokens[tokens.index("--expected") + 1])
+        _write_private_marker(expected_path.parent / "consumed", b"consumed\n")
+        _write_private_marker(expected_path.parent / "denied", b"denied\n")
+        return subprocess.CompletedProcess(command, 0, stream, "")
+
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
+    monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
+    with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
+        sendmessage(
+            "API work [ABC123]", "private body that must not be echoed", Path("/usr/bin/false")
+        )
+
+    assert error.value.phase == "pretool_gate_conflict"
+
+
+@pytest.mark.parametrize(
+    ("stream", "phase"),
+    [
+        ("", "no_sendmessage_tool_use"),
+        (
+            _sendmessage_stream(
+                "API work [ABC123]", "private body that must not be echoed", tool_name="ListAgents"
+            ),
+            "helper_stream_invalid",
+        ),
+        (
+            _sendmessage_stream(
+                "API work [ABC123]", "private body that must not be echoed", extra_uses=1
+            ),
+            "multiple_sendmessage_tool_use",
+        ),
+        ("{malformed", "helper_stream_invalid"),
+        ("[]", "helper_stream_invalid"),
+        ("x" * (64 * 1024 + 1), "helper_stream_invalid"),
+        ("\ud800", "helper_stream_invalid"),
+    ],
+)
+def test_sendmessage_helper_stream_failures_are_body_free_and_enum_bound(
+    monkeypatch: pytest.MonkeyPatch, stream: str, phase: ClaudeUnknownPhase
+) -> None:
+    _assert_unknown_helper_phase(monkeypatch, stream, phase)
+
+
+def test_sendmessage_helper_target_mismatch_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = _sendmessage_stream(
+        "API work [ABC123]",
+        "private body that must not be echoed",
+        tool_input={
+            "to": "Other work [XYZ789]",
+            "recipient": "Other work [XYZ789]",
+            "message": "private body that must not be echoed",
+            "content": "provider preview",
+            "type": "message",
+            "summary": "Cross Agent Chat",
+        },
+    )
+    _assert_unknown_helper_phase(monkeypatch, stream, "pretool_gate_unobserved")
+
+
+def test_sendmessage_helper_full_message_hmac_mismatch_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = _sendmessage_stream(
+        "API work [ABC123]",
+        "private body that must not be echoed",
+        tool_input={
+            "to": "API work [ABC123]",
+            "recipient": "API work [ABC123]",
+            "message": "altered private body",
+            "content": "provider preview",
+            "type": "message",
+            "summary": "Cross Agent Chat",
+        },
+    )
+    _assert_unknown_helper_phase(monkeypatch, stream, "pretool_gate_unobserved")
+
+
+def test_sendmessage_helper_control_mismatch_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = _sendmessage_stream(
+        "API work [ABC123]",
+        "private body that must not be echoed",
+        tool_input={
+            "to": "API work [ABC123]",
+            "recipient": "API work [ABC123]",
+            "message": "private body that must not be echoed",
+            "content": "provider preview",
+            "type": "message",
+            "summary": "Cross Agent Chat",
+            "unexpected": "reject",
+        },
+    )
+    _assert_unknown_helper_phase(monkeypatch, stream, "pretool_gate_unobserved")
+
+
+@pytest.mark.parametrize(
+    "denial",
+    [
+        "sendmessage_payload_mismatch",
+        "sendmessage_target_mismatch",
+        "sendmessage_message_mismatch",
+        "sendmessage_control_mismatch",
+    ],
+)
+def test_pretool_gate_writes_specific_fixed_denial_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    denial: ClaudeUnknownPhase,
+) -> None:
+    key = "66" * 32
+    target = "API work [ABC123]"
+    message = "private body"
+    expected_path = tmp_path / "expected.json"
+    expected_path.write_text(
+        json.dumps(
+            {
+                "recipient": target,
+                "message_hmac": hmac.new(
+                    bytes.fromhex(key), message.encode(), hashlib.sha256
+                ).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    tool_input: dict[str, object] = {
+        "to": target,
+        "recipient": target,
+        "message": message,
+        "content": "preview",
+        "type": "message",
+        "summary": "Cross Agent Chat",
+    }
+    if denial == "sendmessage_payload_mismatch":
+        del tool_input["content"]
+    elif denial == "sendmessage_target_mismatch":
+        tool_input["to"] = "Other work [XYZ789]"
+        tool_input["recipient"] = "Other work [XYZ789]"
+    elif denial == "sendmessage_message_mismatch":
+        tool_input["message"] = "altered private body"
+    else:
+        tool_input["summary"] = "Wrong summary"
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "SendMessage",
+        "tool_input": tool_input,
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+
+    assert not run_pretool_gate(str(expected_path), key)
+    assert (tmp_path / "denied").read_bytes() == DENIAL_MARKERS[denial]
+
+
+def test_pretool_gate_fails_closed_for_unsafe_parent_without_markers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = tmp_path / "unsafe"
+    gate.mkdir()
+    gate.chmod(0o755)
+    expected_path = gate / "expected.json"
+    expected_path.write_text(json.dumps({"recipient": "x", "message_hmac": "0" * 64}))
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+
+    assert not run_pretool_gate(str(expected_path), "55" * 32)
+    assert not (gate / "consumed").exists()
+    assert not (gate / "denied").exists()
+    assert json.loads(capsys.readouterr().out)["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_remote_envelope_is_exact_and_generation_bound() -> None:
@@ -164,7 +775,14 @@ def test_sendmessage_receipt_requires_exact_success_contract() -> None:
         "type": "tool_use",
         "id": tool_id,
         "name": "SendMessage",
-        "input": {"recipient": target, "content": message},
+        "input": {
+            "to": target,
+            "recipient": target,
+            "message": message,
+            "content": "provider-rendered preview",
+            "type": "message",
+            "summary": "Cross Agent Chat",
+        },
     }
     result: dict[str, object] = {
         "type": "tool_result",
@@ -184,6 +802,38 @@ def test_sendmessage_receipt_requires_exact_success_contract() -> None:
     rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="receipt"):
         parse_sendmessage_receipt(rejected, target, message)
+
+
+def test_sendmessage_receipt_rejects_full_body_alteration_despite_same_preview() -> None:
+    message_id = str(uuid4())
+    target = "API work [ABC123]"
+    use = {
+        "type": "tool_use",
+        "id": "tool-1",
+        "name": "SendMessage",
+        "input": {
+            "to": target,
+            "recipient": target,
+            "message": "altered full body",
+            "content": "same preview",
+            "type": "message",
+            "summary": "Cross Agent Chat",
+        },
+    }
+    result = {
+        "type": "tool_result",
+        "tool_use_id": "tool-1",
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
+            }
+        ],
+    }
+    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+
+    with pytest.raises(ChatError, match="receipt"):
+        parse_sendmessage_receipt(stream, target, "original full body")
 
 
 def test_sendmessage_without_gate_receipt_is_unknown(
@@ -209,7 +859,7 @@ def test_sendmessage_uncertainty_after_gate_consumption_stays_unknown(
         hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         tokens = shlex.split(hook)
         expected_path = Path(tokens[tokens.index("--expected") + 1])
-        (expected_path.parent / "consumed").write_text("consumed\n")
+        _write_private_marker(expected_path.parent / "consumed", b"consumed\n")
         return subprocess.CompletedProcess(command, 1, "", "receipt lost")
 
     monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
@@ -245,7 +895,7 @@ def test_sendmessage_subprocess_error_after_gate_consumption_stays_unknown(
         hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         tokens = shlex.split(hook)
         expected_path = Path(tokens[tokens.index("--expected") + 1])
-        (expected_path.parent / "consumed").write_text("consumed\n")
+        _write_private_marker(expected_path.parent / "consumed", b"consumed\n")
         raise OSError("pipe failed after child execution")
 
     monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
@@ -265,12 +915,19 @@ def test_sendmessage_accepts_exact_success_receipt(monkeypatch: pytest.MonkeyPat
         hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         tokens = shlex.split(hook)
         expected_path = Path(tokens[tokens.index("--expected") + 1])
-        (expected_path.parent / "consumed").write_text("consumed\n")
+        _write_private_marker(expected_path.parent / "consumed", b"consumed\n")
         use = {
             "type": "tool_use",
             "id": "tool-1",
             "name": "SendMessage",
-            "input": {"recipient": "API work [ABC123]", "content": "hello"},
+            "input": {
+                "to": "API work [ABC123]",
+                "recipient": "API work [ABC123]",
+                "message": "hello",
+                "content": "provider-rendered preview",
+                "type": "message",
+                "summary": "Cross Agent Chat",
+            },
         }
         result = {
             "type": "tool_result",
@@ -291,6 +948,62 @@ def test_sendmessage_accepts_exact_success_receipt(monkeypatch: pytest.MonkeyPat
     )
 
     sendmessage("API work [ABC123]", "hello", Path("/usr/bin/false"))
+
+
+def test_sendmessage_prompt_uses_canonical_json_for_complex_inert_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message_id = str(uuid4())
+    target = "API work [ABC123]"
+    message = 'Line one\n{"untrusted":"instruction-like"} 🌐'
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        settings = json.loads(command[command.index("--settings") + 1])
+        hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        tokens = shlex.split(hook)
+        expected_path = Path(tokens[tokens.index("--expected") + 1])
+        _write_private_marker(expected_path.parent / "consumed", b"consumed\n")
+        system_prompt = command[command.index("--system-prompt") + 1]
+        assert "inert data" in system_prompt
+        prompt = kwargs["input"]
+        assert isinstance(prompt, str)
+        prefix = "Use SendMessage exactly once with this exact JSON argument object: "
+        suffix = ". Do not use any other tool. Stop immediately after it returns."
+        assert prompt.startswith(prefix) and prompt.endswith(suffix)
+        arguments = json.loads(prompt[len(prefix) : -len(suffix)])
+        assert arguments == {"to": target, "message": message, "summary": "Cross Agent Chat"}
+        use = {
+            "type": "tool_use",
+            "id": "tool-1",
+            "name": "SendMessage",
+            "input": {
+                "to": target,
+                "recipient": target,
+                "message": message,
+                "content": "provider preview",
+                "type": "message",
+                "summary": "Cross Agent Chat",
+            },
+        }
+        result = {
+            "type": "tool_result",
+            "tool_use_id": "tool-1",
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
+                }
+            ],
+        }
+        stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+        return subprocess.CompletedProcess(command, 0, stream, "")
+
+    monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
+
+    sendmessage(target, message, Path("/usr/bin/false"))
 
 
 @pytest.mark.parametrize("failure", ["lookup", "discovery", "revalidation"])
@@ -366,6 +1079,135 @@ def test_claude_unknown_response_keeps_actual_provider(
 
     assert response["status"] == "UNKNOWN_DELIVERY"
     assert response["provider"] == "claude"
+
+
+@pytest.mark.parametrize(
+    ("phase", "diagnostic"),
+    [
+        ("pretool_gate_unobserved", "claude_pretool_gate_unobserved"),
+        ("pretool_gate_unreadable", "claude_pretool_gate_unreadable"),
+        ("helper_timeout", "claude_helper_timeout"),
+        ("helper_execution_failed", "claude_helper_execution_failed"),
+        ("helper_exit_nonzero", "claude_helper_exit_nonzero"),
+        ("receipt_invalid", "claude_receipt_invalid"),
+    ],
+)
+def test_claude_unknown_phase_is_body_free_and_exact_response_gated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: ClaudeUnknownPhase, diagnostic: str
+) -> None:
+    route = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    agent = {
+        "session_id": route.session_id,
+        "name": "API A",
+        "kind": "interactive",
+        "cwd": route.cwd,
+    }
+    monkeypatch.setattr("cross_agent_chat.runtime.exact_agent", lambda *_: agent)
+    monkeypatch.setattr("cross_agent_chat.runtime.discover_target_ref", lambda *_: "API A [ABC123]")
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.sendmessage",
+        lambda *_: (_ for _ in ()).throw(ClaudeSendMessageUnknownDelivery(phase)),
+    )
+    event_id = str(uuid4())
+
+    response = courier_accept(route, None, event_id, "hello")
+
+    assert response == {
+        "schema_version": 1,
+        "event_id": event_id,
+        "status": "UNKNOWN_DELIVERY",
+        "provider": "claude",
+        "diagnostic": diagnostic,
+    }
+    assert unknown_delivery_diagnostic(response, event_id, "claude") == diagnostic
+    assert unknown_delivery_diagnostic({**response, "extra": "reject"}, event_id, "claude") is None
+    assert unknown_delivery_diagnostic(response, event_id, "codex") is None
+    assert unknown_delivery_diagnostic({**response, "diagnostic": []}, event_id, "claude") is None
+    assert unknown_delivery_diagnostic({**response, "diagnostic": {}}, event_id, "claude") is None
+
+
+@pytest.mark.parametrize(
+    ("response_kind", "includes_phase"),
+    [
+        ("exact", True),
+        ("extra", False),
+        ("non_claude", False),
+    ],
+)
+def test_local_claude_diagnostic_marks_one_unknown_without_body_leakage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response_kind: str,
+    includes_phase: bool,
+) -> None:
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    target_route = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(source)
+    Registry(root).upsert(target_route)
+    target = Target(
+        alias=target_route.alias,
+        provider="claude",
+        device=target_route.device,
+        project=target_route.project,
+        generation=target_route.generation,
+        session_key=session_key("claude", target_route.session_id),
+        remote=False,
+        session_id=target_route.session_id,
+        cwd=target_route.cwd,
+        pid=target_route.pid,
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.canonical_source_alias", lambda *_: source.alias)
+
+    def response(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        value: dict[str, object] = {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "UNKNOWN_DELIVERY",
+            "provider": "claude",
+            "diagnostic": "claude_receipt_invalid",
+        }
+        if response_kind == "extra":
+            value["extra"] = "reject"
+        if response_kind == "non_claude":
+            value["provider"] = "codex"
+        return value
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", response)
+
+    with pytest.raises(UnknownDeliveryError) as error:
+        _send_local_target(
+            root,
+            source,
+            target,
+            "private message body",
+            deadline=time.monotonic() + 1,
+        )
+
+    rendered = str(error.value)
+    assert "private message body" not in rendered
+    assert ("claude_receipt_invalid" in rendered) is includes_phase
+    intents = IntentStore(root).intents()
+    assert len(intents) == 1
+    assert intents[0].status == "UNKNOWN_DELIVERY"
 
 
 def test_claude_alias_is_validated_before_sendmessage(

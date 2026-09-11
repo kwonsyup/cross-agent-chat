@@ -4,12 +4,18 @@ import io
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
-from cross_agent_chat.codex import CodexCourier, deliver_at_stop, queue_native_input
+from cross_agent_chat.codex import (
+    CodexCourier,
+    deliver_at_stop,
+    native_thread_titles,
+    queue_native_input,
+)
 from cross_agent_chat.core import ChatError, UnknownDeliveryError
 from cross_agent_chat.runtime import MAX_FRAME_BYTES, codex_stop, register, unregister
 
@@ -62,6 +68,176 @@ def test_queue_has_no_age_expiration() -> None:
     assert courier.peek()[0]["event_id"] == event_id
 
 
+def test_native_thread_titles_are_metadata_only_and_bounded(tmp_path: Path) -> None:
+    first, second = str(uuid4()), str(uuid4())
+    trace = tmp_path / "trace.jsonl"
+    binary = tmp_path / "fake-codex"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        + r"""
+import json, os, sys
+with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
+    for line in sys.stdin:
+        request = json.loads(line)
+        trace.write(json.dumps(request) + "\n")
+        if request.get("id") == 0:
+            response = {"id": 0, "result": {"codexHome": os.environ["CODEX_HOME"]}}
+            print(json.dumps(response), flush=True)
+        elif request.get("method") == "thread/read":
+            thread_id = request["params"]["threadId"]
+            thread = {"id": thread_id, "name": "Canary " + thread_id[:8], "turns": []}
+            print(json.dumps({"id": request["id"], "result": {"thread": thread}}), flush=True)
+"""
+    )
+    binary.chmod(0o700)
+
+    titles = native_thread_titles(
+        binary=binary,
+        environment={"CODEX_HOME": str(tmp_path), "TEST_TRACE": str(trace)},
+        thread_ids=[first, second],
+        deadline=time.monotonic() + 2,
+    )
+
+    assert titles == {first: f"Canary {first[:8]}", second: f"Canary {second[:8]}"}
+    requests = [json.loads(line) for line in trace.read_text().splitlines()]
+    reads = [request for request in requests if request.get("method") == "thread/read"]
+    assert [request["params"] for request in reads] == [
+        {"threadId": first, "includeTurns": False},
+        {"threadId": second, "includeTurns": False},
+    ]
+
+
+def test_native_thread_titles_rejects_a_different_profile(tmp_path: Path) -> None:
+    thread_id = str(uuid4())
+    trace = tmp_path / "trace.jsonl"
+    binary = tmp_path / "fake-codex"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        + r"""
+import json, os, sys
+with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
+    for line in sys.stdin:
+        request = json.loads(line)
+        trace.write(json.dumps(request) + "\n")
+        if request.get("id") == 0:
+            print(json.dumps({"id": 0, "result": {"codexHome": "/wrong-profile"}}), flush=True)
+"""
+    )
+    binary.chmod(0o700)
+
+    titles = native_thread_titles(
+        binary=binary,
+        environment={"CODEX_HOME": str(tmp_path), "TEST_TRACE": str(trace)},
+        thread_ids=[thread_id],
+        deadline=time.monotonic() + 1,
+    )
+
+    assert titles == {}
+    assert [json.loads(line) for line in trace.read_text().splitlines()] == [
+        {
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "cross-agent-chat", "version": "0.1.5"},
+                "capabilities": {"experimentalApi": True},
+            },
+        }
+    ]
+
+
+def test_native_thread_titles_stops_at_the_metadata_deadline(tmp_path: Path) -> None:
+    binary = tmp_path / "fake-codex"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        + r"""
+import time
+for _line in __import__("sys").stdin:
+    time.sleep(5)
+"""
+    )
+    binary.chmod(0o700)
+    started = time.monotonic()
+
+    titles = native_thread_titles(
+        binary=binary,
+        environment={"CODEX_HOME": str(tmp_path)},
+        thread_ids=[str(uuid4())],
+        deadline=started + 0.05,
+    )
+
+    assert titles == {}
+    assert time.monotonic() - started < 1.5
+
+
+def test_native_thread_titles_rejects_a_title_for_another_thread(tmp_path: Path) -> None:
+    requested, wrong = str(uuid4()), str(uuid4())
+    binary = tmp_path / "fake-codex"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        + r"""
+import json, os, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("id") == 0:
+        print(json.dumps({"id": 0, "result": {"codexHome": os.environ["CODEX_HOME"]}}), flush=True)
+    elif request.get("method") == "thread/read":
+        response = {
+            "id": request["id"],
+            "result": {"thread": {"id": os.environ["WRONG_THREAD"], "name": "Wrong title"}},
+        }
+        print(json.dumps(response), flush=True)
+"""
+    )
+    binary.chmod(0o700)
+
+    assert (
+        native_thread_titles(
+            binary=binary,
+            environment={"CODEX_HOME": str(tmp_path), "WRONG_THREAD": wrong},
+            thread_ids=[requested],
+            deadline=time.monotonic() + 1,
+        )
+        == {}
+    )
+
+
+def test_native_thread_titles_kills_a_stubborn_metadata_process(tmp_path: Path) -> None:
+    pid_file = tmp_path / "stubborn.pid"
+    binary = tmp_path / "fake-codex"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        + r"""
+import json, os, signal, sys, time
+from pathlib import Path
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(os.environ["PID_FILE"]).write_text(str(os.getpid()))
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("id") == 0:
+        print(json.dumps({"id": 0, "result": {"codexHome": os.environ["CODEX_HOME"]}}), flush=True)
+    elif request.get("method") == "thread/read":
+        while True:
+            time.sleep(1)
+"""
+    )
+    binary.chmod(0o700)
+    started = time.monotonic()
+
+    assert (
+        native_thread_titles(
+            binary=binary,
+            environment={"CODEX_HOME": str(tmp_path), "PID_FILE": str(pid_file)},
+            thread_ids=[str(uuid4())],
+            deadline=started + 1,
+        )
+        == {}
+    )
+    assert time.monotonic() - started < 3
+    assert pid_file.exists()
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+
+
 def test_queue_is_idempotent_for_exact_repeats_and_rejects_conflicts() -> None:
     courier = CodexCourier(
         alias="codex@studio:api:123456789abc", generation=str(uuid4()), capacity=2
@@ -102,12 +278,15 @@ def test_native_queue_effect_boundary(
 
     event_id, thread_id = str(uuid4()), str(uuid4())
     trace = tmp_path / "trace.jsonl"
+    ready = tmp_path / "ready"
     binary = tmp_path / "fake-codex"
     binary.write_text(
         f"#!{sys.executable}\n"
         + r"""
 import json, os, sys, time
+from pathlib import Path
 mode = os.environ["TEST_MODE"]
+Path(os.environ["TEST_READY"]).touch()
 with open(os.environ["TEST_TRACE"], "a", buffering=1) as log:
     log.write(json.dumps({"argv": sys.argv[1:]}) + "\n")
     for line in sys.stdin:
@@ -156,7 +335,24 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as log:
     )
     monkeypatch.setattr(codex, "MAX_NATIVE_STDOUT_BYTES", 4096)
     body = "peer body only on stdin"
-    environment = {"CODEX_HOME": str(tmp_path), "TEST_MODE": mode, "TEST_TRACE": str(trace)}
+    environment = {
+        "CODEX_HOME": str(tmp_path),
+        "TEST_MODE": mode,
+        "TEST_READY": str(ready),
+        "TEST_TRACE": str(trace),
+    }
+    real_monotonic = time.monotonic
+    real_sleep = time.sleep
+
+    def monotonic_after_fake_server_starts() -> float:
+        deadline = real_monotonic() + 5.0
+        while not ready.exists():
+            if real_monotonic() >= deadline:
+                pytest.fail("fake Codex app-server did not become ready")
+            real_sleep(0.01)
+        return real_monotonic()
+
+    monkeypatch.setattr("cross_agent_chat.codex.time.monotonic", monotonic_after_fake_server_starts)
     if expected_error is None:
         queue_native_input(
             binary=binary,
