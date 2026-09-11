@@ -39,6 +39,8 @@ automatically.
 Use the opaque exact `handle` returned by `chat_peers` to select a recipient. Display names are
 checked across devices; multiple matches or incomplete discovery require an exact handle.
 `chat_peers` reports the invoking sender's readiness separately from each recipient's delivery mode.
+An incomplete roster may be refreshed with another read-only `chat_peers` call; that does not
+authorize resending an accepted or unknown message.
 
 Disposable worker launchers can set `CROSS_AGENT_CHAT_PRESENCE=off`. That worker remains out
 of Cross Agent Chat's peer roster and creates no route or courier; ordinary sessions remain
@@ -52,11 +54,17 @@ To have an existing coding agent assist with installation, give it this prompt:
 
 ## Supported surfaces
 
+This maintained table includes dated observations collected after publication. A tagged README
+is a snapshot of the evidence available when that tag was created. The
+[v0.1.6 release notes](https://github.com/kwonsyup/cross-agent-chat/releases/tag/v0.1.6)
+record the subsequent Stop-bound exchange below; the published tag and assets are unchanged.
+
 | Surface or mode | Support |
 |---|---|
 | Claude Code 2.1.263 (historical observation, 2026-09-06; source `317b18e`; not v0.1.5 candidate proof) | iMac interactive startup and same-cwd native-messaging request/reply tested with the configured cross-session inbound `accept` policy |
 | Claude Code 2.1.261 (historical observation) | Interactive and native background sessions; native SendMessage delivery |
 | Claude Code 2.1.268 (observed 2026-09-10, macOS Terminal.app/iTerm2) | Fresh original-session reciprocal request/result with exact `to`/`message` calls; no echo |
+| Codex CLI 0.154.0, Stop-bound (observed 2026-09-10, public v0.1.6) | Fresh cross-device request accepted during a busy turn, consumed at the natural Stop boundary, and answered once to the original Claude Code 2.1.268 requester, which received and verified the result |
 | Codex CLI 0.153.4 (observed 2026-09-09, isolated authenticated root, Stop-bound) | Bounded original-session cross-device request/result; account relationship was not established |
 | Codex CLI 0.152.1 / 0.153.2 (historical observation), default Stop | Next-turn delivery; accepted work remains pending while genuinely idle |
 | Codex Native, embedded 0.153.1 (historical observation), default Stop | Next-turn delivery; accepted work remains pending while genuinely idle |
@@ -69,7 +77,11 @@ To have an existing coding agent assist with installation, give it this prompt:
 
 v0.1.6 is a macOS beta. The table records the configurations actually observed; rows marked
 historical were tested with earlier candidates. Support remains limited to the listed provider
-versions and delivery modes.
+versions and delivery modes. The later 0.154.0 Stop-bound result does not extend the historical
+Native or experimental-queue observations to every configured session. A separate v0.1.6
+experimental-queue request was consumed, but its return remained `UNKNOWN_DELIVERY`; that
+roundtrip is not accepted, its cause is unresolved, and the event was not replayed. Healthy
+installation checks are not all-mode workflow or unattended-production proof.
 
 ## Trust and delivery
 
