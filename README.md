@@ -9,14 +9,13 @@ non-default roots). Local sessions do not need Tailscale; remote sessions need T
 allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
 files, or turn a remote peer into an owner.
 
-After `v0.1.5` is published, install that immutable release tag with:
+Install v0.1.5 with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.1.5/install.sh | sh
 ```
 
-Until publication, the `v0.1.5` URL above is intentionally unavailable; use the latest
-published release tag when installing an existing release.
+Installation requires Git because the installer builds from the release tag.
 
 The installer supplies a Python runtime when the Mac lacks a compatible one. Its default stable
 command is `~/.local/bin/cross-agent-chat`; it stages releases under
@@ -31,6 +30,9 @@ Start a fresh session, then ask naturally:
 
 > List my live Cross Agent Chat peers and send hello to the Claude session on my other Mac.
 
+Codex uses Stop-bound delivery by default: accepted input waits for its next natural turn and is
+not an idle-wake guarantee. The experimental queue remains an explicit profile-local opt-in.
+
 Cross Agent Chat follows the provider processes you already use. There are no peer files,
 Cross Agent Chat accounts, or terminal-specific extensions. Permitted online Tailnet Macs appear
 automatically.
@@ -44,11 +46,9 @@ visible by default.
 
 To have an existing coding agent assist with installation, give it this prompt:
 
-> Inspect this repository and install the latest released Cross Agent Chat tag, not an arbitrary
-> PR. Identify active consumers and the selected Claude/Codex roots, obtain approval before shared
-> effects, preserve existing intent records, run `cross-agent-chat doctor --json`, and test only
-> fresh actors. If the README's v0.1.5 candidate tag is not published, report that condition rather
-> than substituting a branch.
+> Install the released `v0.1.5` tag, not an arbitrary PR. Identify active consumers and the
+> selected Claude/Codex roots, obtain approval before shared effects, preserve existing intent
+> records, run `cross-agent-chat doctor --json`, and test only fresh actors.
 
 ## Supported surfaces
 
@@ -56,6 +56,8 @@ To have an existing coding agent assist with installation, give it this prompt:
 |---|---|
 | Claude Code 2.1.263 (historical observation, 2026-09-06; source `317b18e`; not v0.1.5 candidate proof) | iMac interactive startup and same-cwd native-messaging request/reply tested with the configured cross-session inbound `accept` policy |
 | Claude Code 2.1.261 (historical observation) | Interactive and native background sessions; native SendMessage delivery |
+| Claude Code 2.1.268 (observed 2026-09-10, macOS Terminal.app/iTerm2) | Fresh original-session reciprocal request/result with exact `to`/`message` calls; no echo |
+| Codex CLI 0.153.4 (observed 2026-09-09, isolated authenticated root, Stop-bound) | Bounded original-session cross-device request/result; account relationship was not established |
 | Codex CLI 0.152.1 / 0.153.2 (historical observation), default Stop | Next-turn delivery; accepted work remains pending while genuinely idle |
 | Codex Native, embedded 0.153.1 (historical observation), default Stop | Next-turn delivery; accepted work remains pending while genuinely idle |
 | Explicit experimental Codex native queue | Version-bound idle queue path observed on Native 0.153.1 and CLI 0.152.1/0.153.2; not selected by default |
@@ -65,9 +67,9 @@ To have an existing coding agent assist with installation, give it this prompt:
 | Windows | No claim |
 | Linux | No live-support claim |
 
-These are per-version observations, not v0.1.5 beta certification, fleet parity, or
-account/profile-parity claims. A version row does not certify every profile, session mode, or the
-v0.1.5 package. The package classifier remains Alpha while beta acceptance is open.
+v0.1.5 is a macOS beta. The table records the configurations actually observed; rows marked
+historical were tested with earlier candidates. Support remains limited to the listed provider
+versions and delivery modes.
 
 ## Trust and delivery
 
@@ -88,7 +90,8 @@ perimeter. Messages are still delivered as untrusted peer/user input, not system
 Codex Stop-bound delivery, or the experimental Codex queue. Older couriers report `unknown`.
 The mode identifies the active adapter; it does not establish consumption or a reply.
 
-Codex uses natural Stop delivery by default. An explicit, profile-local experimental queue can
+Codex uses natural Stop delivery by default: a received message is delivered at the next natural
+turn boundary. An explicit, profile-local experimental queue can
 be enabled for fresh Codex sessions; it uses Codex's version-bound stdio app-server
 `thread/queue/add` interface, whose provider owns queued message bodies. The Cross Agent Chat
 state remains content-free. The experimental path was observed on Codex Native 0.153.1 and CLI
@@ -127,6 +130,11 @@ Codex hooks settings while retaining unrelated settings. Older install records t
 ownership information are handled conservatively; unavailable original values are not invented.
 Sharing only one of a Codex config file and its hook file across profiles is rejected before
 setup writes.
+
+Claude users may choose `dialogExpiry: "never"` in trusted user settings to remove the provider
+approval-dialog deadline for future held inbound messages. It does not change the recipient inbound
+policy, extend an existing hold, survive recipient shutdown, or guarantee delivery. Cross Agent
+Chat does not set it globally or store/retry message bodies.
 
 `setup` uses the active provider roots: by default Claude reads `~/.claude/settings.json` and
 `~/.claude.json`, while an explicit `CLAUDE_CONFIG_DIR=/path/to/profile` reads

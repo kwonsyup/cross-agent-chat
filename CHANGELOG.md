@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.5 - Unreleased
+## 0.1.5 - 2026-09-10
 
 - Complete local courier bootstrap without waiting for Claude's native session listing. Routes
   become available only after the existing native health and pre-delivery identity checks pass.
@@ -17,6 +17,10 @@
   recipient delivery modes. Resolve display aliases globally before sending.
 - Add authenticated, read-only MCP event status without changing stored intents or replaying work.
 - Preserve live couriers, route generations, and retained runtimes through compatible upgrades.
+- Preserve accepted queued input only for exact-courier duplicate SessionStart reuse and the
+  observed same-artifact runtime transition; do not claim pending-input version-upgrade support.
+- Bind Claude native SendMessage authorization to the full message and exact target envelope while
+  reporting body-free local unknown phases without retrying delivery.
 
 ## 0.1.4 - 2026-09-05
 
