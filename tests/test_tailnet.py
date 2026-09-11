@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 from uuid import uuid4
@@ -94,189 +95,380 @@ class _FakeClock:
         return self.now
 
 
-def test_remote_node_targets_rich_success_preserves_optional_identity_with_reserved_budget(
+def test_remote_node_targets_base_then_rich_success_preserves_identity_and_title(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    peer = _remote_peer(title="Remote Canary")
-    peer["delivery_mode"] = "codex_stop_bound"
+    base = _remote_peer()
+    base["delivery_mode"] = "codex_stop_bound"
+    rich = {**base, "title": "Remote Canary"}
     clock = _FakeClock()
     calls: list[tuple[dict[str, object], float]] = []
 
     def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         calls.append((payload, timeout))
-        clock.now += 15.0
-        return {"schema_version": 1, "peers": [peer]}
+        return {"schema_version": 1, "peers": [base if len(calls) == 1 else rich]}
 
     monkeypatch.setattr(time, "monotonic", clock.monotonic)
     monkeypatch.setattr(runtime, "request_tailnet", request)
 
     targets, complete = runtime._remote_node_targets(
-        "100.64.0.1",
-        deadline=22.0,
-        include_delivery_mode=True,
-        include_title=True,
+        "100.64.0.1", deadline=22.0, include_delivery_mode=True, include_title=True
     )
 
     assert complete is True
-    assert len(calls) == 1
-    assert calls[0][1] == pytest.approx(16.0)
-    assert calls[0][0] == {
-        "schema_version": 1,
-        "operation": "peers",
-        "include_delivery_mode": True,
-        "include_title": True,
-    }
-    assert targets[0].alias == peer["alias"]
-    assert targets[0].session_key == peer["session_key"]
-    assert targets[0].title == "Remote Canary"
-    assert targets[0].delivery_mode == "codex_stop_bound"
-
-
-def test_remote_node_targets_rich_timeout_then_mode_success_uses_reserved_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    peer = _remote_peer()
-    peer["delivery_mode"] = "codex_stop_bound"
-    clock = _FakeClock()
-    calls: list[tuple[dict[str, object], float]] = []
-
-    def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
-        calls.append((payload, timeout))
-        if len(calls) == 1:
-            clock.now += timeout
-            raise ChatError("rich request timed out")
-        clock.now += 1.62
-        return {"schema_version": 1, "peers": [peer]}
-
-    monkeypatch.setattr(time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(runtime, "request_tailnet", request)
-
-    targets, complete = runtime._remote_node_targets(
-        "100.64.0.1",
-        deadline=22.0,
-        include_delivery_mode=True,
-        include_title=True,
-    )
-
-    assert complete is True
-    assert [timeout for _, timeout in calls] == [pytest.approx(16.0), pytest.approx(3.0)]
-    assert calls[1][0] == {
-        "schema_version": 1,
-        "operation": "peers",
-        "include_delivery_mode": True,
-    }
-    assert targets[0].delivery_mode == "codex_stop_bound"
-    assert targets[0].title is None
-
-
-def test_remote_node_targets_rich_and_mode_timeout_then_uses_legacy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    peer = _remote_peer()
-    clock = _FakeClock()
-    calls: list[tuple[dict[str, object], float]] = []
-
-    def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
-        calls.append((payload, timeout))
-        if len(calls) < 3:
-            clock.now += timeout
-            raise ChatError("fallback request timed out")
-        clock.now += 1.0
-        return {"schema_version": 1, "peers": [peer]}
-
-    monkeypatch.setattr(time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(runtime, "request_tailnet", request)
-
-    targets, complete = runtime._remote_node_targets(
-        "100.64.0.1",
-        deadline=22.0,
-        include_delivery_mode=True,
-        include_title=True,
-    )
-
-    assert complete is True
-    assert [timeout for _, timeout in calls] == [
-        pytest.approx(16.0),
-        pytest.approx(3.0),
-        pytest.approx(3.0),
-    ]
     assert [payload for payload, _ in calls] == [
+        {"schema_version": 1, "operation": "peers", "include_delivery_mode": True},
         {
             "schema_version": 1,
             "operation": "peers",
             "include_delivery_mode": True,
             "include_title": True,
         },
+    ]
+    assert calls[1][1] == pytest.approx(21.0)
+    assert targets[0].alias == base["alias"]
+    assert targets[0].generation == base["generation"]
+    assert targets[0].session_key == base["session_key"]
+    assert targets[0].delivery_mode == "codex_stop_bound"
+    assert targets[0].title == "Remote Canary"
+
+
+def test_remote_node_targets_slow_rich_timeout_retains_valid_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _remote_peer()
+    base["delivery_mode"] = "codex_stop_bound"
+    clock = _FakeClock()
+    calls: list[float] = []
+
+    def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        calls.append(timeout)
+        if len(calls) == 1:
+            return {"schema_version": 1, "peers": [base]}
+        clock.now += timeout
+        raise ChatError("rich request timed out")
+
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1", deadline=22.0, include_delivery_mode=True, include_title=True
+    )
+
+    assert complete is True
+    assert targets[0].alias == base["alias"]
+    assert targets[0].title is None
+    assert targets[0].delivery_mode == "codex_stop_bound"
+    assert calls[1] <= 21.0 + 1e-9
+    assert clock.now <= 22.0
+
+
+def test_remote_node_targets_mode_base_prompt_failure_falls_back_to_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _remote_peer()
+    calls: list[dict[str, object]] = []
+
+    def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        calls.append(payload)
+        if len(calls) == 1:
+            raise ChatError("old server")
+        return {"schema_version": 1, "peers": [base]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1", deadline=time.monotonic() + 22.0, include_delivery_mode=True
+    )
+
+    assert complete is True
+    assert targets[0].alias == base["alias"]
+    assert calls == [
         {"schema_version": 1, "operation": "peers", "include_delivery_mode": True},
         {"schema_version": 1, "operation": "peers"},
     ]
+
+
+def test_remote_node_targets_title_only_uses_rich_wire_but_hides_mode_publicly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _remote_peer()
+    rich = {**base, "delivery_mode": "codex_stop_bound", "title": "Title only"}
+    calls: list[dict[str, object]] = []
+
+    def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        calls.append(payload)
+        return {"schema_version": 1, "peers": [base if len(calls) == 1 else rich]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1", deadline=time.monotonic() + 22.0, include_title=True
+    )
+
+    assert complete is True
+    assert calls == [
+        {"schema_version": 1, "operation": "peers"},
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
+            "include_title": True,
+        },
+    ]
+    assert targets[0].title == "Title only"
+    assert targets[0].delivery_mode is None
+
+
+def test_remote_node_targets_without_title_uses_one_base_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _remote_peer()
+    calls: list[dict[str, object]] = []
+
+    def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        calls.append(payload)
+        return {"schema_version": 1, "peers": [base]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1", deadline=time.monotonic() + 22.0, include_delivery_mode=True
+    )
+
+    assert complete is True
+    assert len(targets) == 1
+    assert calls == [{"schema_version": 1, "operation": "peers", "include_delivery_mode": True}]
+
+
+def test_remote_node_targets_little_remaining_budget_skips_optional_rich_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _remote_peer()
+    clock = _FakeClock(21.5)
+    calls: list[dict[str, object]] = []
+
+    def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        calls.append(payload)
+        return {"schema_version": 1, "peers": [base]}
+
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1", deadline=22.0, include_title=True
+    )
+
+    assert complete is True
+    assert len(targets) == 1
+    assert calls == [{"schema_version": 1, "operation": "peers"}]
+
+
+def test_remote_node_targets_no_base_response_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        calls.append(payload)
+        raise ChatError("no response")
+
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1", deadline=time.monotonic() + 22.0, include_delivery_mode=True
+    )
+
+    assert targets == []
+    assert complete is False
+    assert calls == [
+        {"schema_version": 1, "operation": "peers", "include_delivery_mode": True},
+        {"schema_version": 1, "operation": "peers"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["alias", "generation", "session_key", "provider", "device", "project", "delivery_mode"],
+)
+def test_remote_node_targets_rich_identity_drift_retains_base(
+    monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    base = _remote_peer()
+    base["delivery_mode"] = "codex_stop_bound"
+    rich = {**base, "title": "Drifted"}
+    if field == "alias":
+        rich["alias"] = "codex@remote:other:123456789abc"
+    elif field == "generation":
+        rich["generation"] = str(uuid4())
+    elif field == "session_key":
+        rich["session_key"] = "b" * 64
+    elif field == "provider":
+        rich["provider"] = "claude"
+    elif field == "device":
+        rich["device"] = "other"
+    elif field == "project":
+        rich["project"] = "other"
+    else:
+        rich["delivery_mode"] = "codex_experimental_queue"
+    calls = 0
+
+    def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"schema_version": 1, "peers": [base if calls == 1 else rich]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1",
+        deadline=time.monotonic() + 22.0,
+        include_delivery_mode=True,
+        include_title=True,
+    )
+
+    assert complete is True
+    assert targets[0].alias == base["alias"]
+    assert targets[0].generation == base["generation"]
+    assert targets[0].delivery_mode == "codex_stop_bound"
     assert targets[0].title is None
 
 
-def test_remote_node_targets_all_timeouts_return_incomplete_within_shared_deadline(
+def test_remote_node_targets_rich_address_drift_retains_base(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = _FakeClock()
-    timeouts: list[float] = []
+    base = _remote_peer()
+    rich = {**base, "title": "Drifted"}
+    calls = 0
+    original = runtime._targets_from_tailnet
+
+    def parse(address: str, raw: object, **kwargs: bool) -> list[Target]:
+        nonlocal calls
+        calls += 1
+        targets = original(address, raw, **kwargs)
+        if calls == 2:
+            targets[0] = replace(targets[0], tailnet_address="100.64.0.2")
+        return targets
 
     def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
-        timeouts.append(timeout)
-        clock.now += timeout
-        raise ChatError("request timed out")
+        return {"schema_version": 1, "peers": [base if calls == 0 else rich]}
 
-    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runtime, "_targets_from_tailnet", parse)
     monkeypatch.setattr(runtime, "request_tailnet", request)
-
     targets, complete = runtime._remote_node_targets(
-        "100.64.0.1",
-        deadline=22.0,
-        include_delivery_mode=True,
-        include_title=True,
+        "100.64.0.1", deadline=time.monotonic() + 22.0, include_title=True
     )
 
-    assert targets == []
-    assert complete is False
-    assert timeouts == [pytest.approx(16.0), pytest.approx(3.0), pytest.approx(3.0)]
-    assert sum(timeouts) <= 22.0 + 1e-9
-    assert clock.now <= 22.0
+    assert complete is True
+    assert targets[0].tailnet_address == "100.64.0.1"
+    assert targets[0].title is None
 
 
-def test_remote_node_targets_short_remaining_budget_stays_positive(
+def test_remote_node_targets_malformed_rich_response_retains_base(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = _FakeClock(20.0)
-    timeouts: list[float] = []
+    base = _remote_peer()
+    calls = 0
 
     def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
-        assert timeout > 0.0
-        timeouts.append(timeout)
-        clock.now += timeout
-        raise ChatError("request timed out")
+        nonlocal calls
+        calls += 1
+        return {"schema_version": 1, "peers": [base]} if calls == 1 else {"schema_version": 1}
 
-    monkeypatch.setattr(time, "monotonic", clock.monotonic)
     monkeypatch.setattr(runtime, "request_tailnet", request)
-
     targets, complete = runtime._remote_node_targets(
-        "100.64.0.1",
-        deadline=22.0,
-        include_delivery_mode=True,
-        include_title=True,
+        "100.64.0.1", deadline=time.monotonic() + 22.0, include_title=True
     )
 
-    assert targets == []
-    assert complete is False
-    assert timeouts
-    assert all(timeout > 0.0 for timeout in timeouts)
-    assert clock.now <= 22.0
+    assert complete is True
+    assert targets[0].alias == base["alias"]
+    assert targets[0].title is None
+
+
+@pytest.mark.parametrize("field", ["provider", "delivery_mode"])
+def test_remote_node_targets_malformed_rich_metadata_retains_base(
+    monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    base = _remote_peer()
+    rich = {**base, "title": "Malformed"}
+    rich[field] = []
+    calls = 0
+
+    def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"schema_version": 1, "peers": [base if calls == 1 else rich]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1", deadline=time.monotonic() + 22.0, include_title=True
+    )
+
+    assert complete is True
+    assert targets[0].alias == base["alias"]
+    assert targets[0].title is None
+
+
+def test_remote_node_targets_duplicate_rich_response_retains_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _remote_peer()
+    rich = {**base, "title": "Duplicate"}
+    calls = 0
+
+    def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return (
+            {"schema_version": 1, "peers": [base]}
+            if calls == 1
+            else {
+                "schema_version": 1,
+                "peers": [rich, rich],
+            }
+        )
+
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1", deadline=time.monotonic() + 22.0, include_title=True
+    )
+
+    assert complete is True
+    assert len(targets) == 1
+    assert targets[0].title is None
+
+
+def test_remote_node_targets_missing_rich_peer_snapshot_retains_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _remote_peer()
+    calls = 0
+
+    def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return (
+            {"schema_version": 1, "peers": [base]}
+            if calls == 1
+            else {
+                "schema_version": 1,
+                "peers": [],
+            }
+        )
+
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.1", deadline=time.monotonic() + 22.0, include_title=True
+    )
+
+    assert complete is True
+    assert len(targets) == 1
+    assert targets[0].alias == base["alias"]
+    assert targets[0].title is None
 
 
 def test_new_remote_title_negotiation_returns_title(monkeypatch: pytest.MonkeyPatch) -> None:
-    peer = _remote_peer(title="Remote Canary")
+    base = _remote_peer()
+    peer = {**base, "title": "Remote Canary"}
     calls: list[dict[str, object]] = []
 
     def request(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
         calls.append(payload)
-        return {"schema_version": 1, "peers": [peer]}
+        return {"schema_version": 1, "peers": [base if len(calls) == 1 else peer]}
 
     monkeypatch.setattr(runtime, "request_tailnet", request)
     targets, complete = runtime._remote_node_targets(
@@ -290,8 +482,13 @@ def test_new_remote_title_negotiation_returns_title(monkeypatch: pytest.MonkeyPa
             "schema_version": 1,
             "operation": "peers",
             "include_delivery_mode": True,
+        },
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
             "include_title": True,
-        }
+        },
     ]
 
 
@@ -317,10 +514,14 @@ def test_new_remote_title_negotiation_retries_legacy_peer(monkeypatch: pytest.Mo
             "schema_version": 1,
             "operation": "peers",
             "include_delivery_mode": True,
+        },
+        {"schema_version": 1, "operation": "peers"},
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
             "include_title": True,
         },
-        {"schema_version": 1, "operation": "peers", "include_delivery_mode": True},
-        {"schema_version": 1, "operation": "peers"},
     ]
 
 
@@ -350,9 +551,13 @@ def test_new_remote_title_negotiation_preserves_mode_from_an_older_mode_peer(
             "schema_version": 1,
             "operation": "peers",
             "include_delivery_mode": True,
+        },
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
             "include_title": True,
         },
-        {"schema_version": 1, "operation": "peers", "include_delivery_mode": True},
     ]
 
 
