@@ -1177,19 +1177,23 @@ def _targets_from_tailnet(
             item.get("session_key"),
         )
         if (
-            provider not in {"claude", "codex"}
+            not isinstance(provider, str)
+            or provider not in {"claude", "codex"}
             or not all(isinstance(value, str) for value in values)
             or item.get("status") != "available"
             or not re.fullmatch(r"[0-9a-f]{64}", cast(str, item.get("session_key")))
             or (
                 "delivery_mode" in item
-                and item["delivery_mode"]
-                not in {
-                    "claude_native_cross_session",
-                    "codex_stop_bound",
-                    "codex_experimental_queue",
-                    "unknown",
-                }
+                and (
+                    not isinstance(item["delivery_mode"], str)
+                    or item["delivery_mode"]
+                    not in {
+                        "claude_native_cross_session",
+                        "codex_stop_bound",
+                        "codex_experimental_queue",
+                        "unknown",
+                    }
+                )
             )
         ):
             raise ChatError("Tailnet peer returned invalid discovery")
@@ -1200,7 +1204,7 @@ def _targets_from_tailnet(
         targets.append(
             Target(
                 alias=valid_name(cast(str, item["alias"]), "remote alias"),
-                provider=provider,
+                provider=cast(Provider, provider),
                 device=valid_device(cast(str, item["device"])),
                 project=valid_name(cast(str, item["project"]), "remote project"),
                 generation=valid_uuid(cast(str, item["generation"]), "route generation"),
@@ -1227,44 +1231,53 @@ def _remote_node_targets(
 ) -> tuple[list[Target], bool]:
     if deadline is None:
         deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        return [], False
-    request: dict[str, object] = {"schema_version": SCHEMA_VERSION, "operation": "peers"}
-    if include_delivery_mode:
-        request["include_delivery_mode"] = True
-    if include_title:
-        request["include_title"] = True
-    variants: list[tuple[dict[str, object], bool, bool]] = [
-        (request, include_delivery_mode, include_title)
-    ]
     legacy: dict[str, object] = {"schema_version": SCHEMA_VERSION, "operation": "peers"}
-    if include_title and include_delivery_mode:
-        variants.append(({**legacy, "include_delivery_mode": True}, True, False))
-    if include_delivery_mode or include_title:
-        variants.append((legacy, False, False))
-    for payload, mode_requested, title_requested in variants:
+    variants: list[tuple[dict[str, object], bool]] = []
+    if include_delivery_mode:
+        variants.append(({**legacy, "include_delivery_mode": True}, True))
+    variants.append((legacy, False))
+    base: list[Target] | None = None
+    for payload, mode_requested in variants:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return [], False
         try:
             raw = request_tailnet(
-                address,
-                payload,
-                timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining),
+                address, payload, timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining)
             )
-            return (
-                _targets_from_tailnet(
-                    address,
-                    raw,
-                    include_delivery_mode=mode_requested,
-                    include_title=title_requested,
-                ),
-                True,
-            )
+            base = _targets_from_tailnet(address, raw, include_delivery_mode=mode_requested)
+            break
         except (ChatError, UnknownDeliveryError):
             continue
-    return [], False
+    if base is None:
+        return [], False
+    remaining = deadline - time.monotonic()
+    # Return validated identities even when optional title work cannot finish.
+    # Leave time for the outer discovery collector to receive the retained result.
+    if not include_title or remaining <= 1.0:
+        return base, True
+    try:
+        raw = request_tailnet(
+            address,
+            {**legacy, "include_delivery_mode": True, "include_title": True},
+            timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining - 1.0),
+        )
+        enriched = _targets_from_tailnet(
+            address, raw, include_delivery_mode=True, include_title=True
+        )
+    except (ChatError, UnknownDeliveryError):
+        return base, True
+    if not include_delivery_mode:
+        enriched = [replace(target, delivery_mode=None) for target in enriched]
+    base_authority = {target.session_key: replace(target, title=None) for target in base}
+    rich_authority = {target.session_key: replace(target, title=None) for target in enriched}
+    if (
+        len(base_authority) == len(base)
+        and len(rich_authority) == len(enriched)
+        and rich_authority == base_authority
+    ):
+        return enriched, True
+    return base, True
 
 
 def _remote_discovery(

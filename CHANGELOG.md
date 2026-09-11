@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.6 - 2026-09-10
+
+- Discover remote peer identities and delivery modes before optional title hints. Slow, malformed,
+  or changed title responses no longer hide already-validated peers; discovery keeps its existing
+  overall time budget.
+
 ## 0.1.5 - 2026-09-10
 
 - Complete local courier bootstrap without waiting for Claude's native session listing. Routes

@@ -3,7 +3,7 @@ set -eu
 
 # The default release tag is usable after that tag is published. Before publication, set
 # CROSS_AGENT_CHAT_SOURCE to an available release or local candidate explicitly.
-source_ref=${CROSS_AGENT_CHAT_SOURCE:-git+https://github.com/kwonsyup/cross-agent-chat.git@v0.1.5}
+source_ref=${CROSS_AGENT_CHAT_SOURCE:-git+https://github.com/kwonsyup/cross-agent-chat.git@v0.1.6}
 home_root=$(cd "$HOME" && pwd -P)
 mkdir -p "$HOME/.local"
 local_root=$(cd "$HOME/.local" && pwd -P)
