@@ -96,6 +96,9 @@ def _assert_unknown_helper_phase(
     phase: ClaudeUnknownPhase,
 ) -> None:
     monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
+    monkeypatch.setattr(
         "cross_agent_chat.claude_runtime.subprocess.run",
         lambda command, **_: subprocess.CompletedProcess(command, 0, stream, ""),
     )
@@ -546,6 +549,9 @@ def test_sendmessage_with_valid_helper_and_denied_marker_is_denied(
         _write_private_marker(expected_path.parent / "denied", b"denied\n")
         return subprocess.CompletedProcess(command, 0, stream, "")
 
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
     monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
     with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
         sendmessage(
@@ -569,6 +575,9 @@ def test_sendmessage_with_conflicting_markers_is_unknown(
         _write_private_marker(expected_path.parent / "denied", b"denied\n")
         return subprocess.CompletedProcess(command, 0, stream, "")
 
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
     monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
     with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
         sendmessage(
