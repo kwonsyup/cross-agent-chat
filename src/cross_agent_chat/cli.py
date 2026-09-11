@@ -169,13 +169,16 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
-                                        "to": {"type": "string"},
-                                        "recipient": {"type": "string"},
-                                        "destination": {"type": "string"},
+                                        "to": {
+                                            "type": "string",
+                                            "description": (
+                                                "Fresh opaque handle returned by chat_peers "
+                                                "for the intended recipient."
+                                            ),
+                                        },
                                         "message": {"type": "string"},
-                                        "wait_for_reply": {"type": "boolean", "const": False},
-                                        "request_reply": {"type": "boolean", "const": False},
                                     },
+                                    "required": ["to", "message"],
                                     "additionalProperties": False,
                                 },
                             },

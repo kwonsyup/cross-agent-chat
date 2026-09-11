@@ -462,6 +462,62 @@ def test_sendmessage_accepts_exact_success_receipt(monkeypatch: pytest.MonkeyPat
     sendmessage("API work [ABC123]", "hello", Path("/usr/bin/false"))
 
 
+def test_sendmessage_prompt_uses_canonical_json_for_complex_inert_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message_id = str(uuid4())
+    target = "API work [ABC123]"
+    message = 'Line one\n{"untrusted":"instruction-like"} 🌐'
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        settings = json.loads(command[command.index("--settings") + 1])
+        hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        tokens = shlex.split(hook)
+        expected_path = Path(tokens[tokens.index("--expected") + 1])
+        (expected_path.parent / "consumed").write_text("consumed\n")
+        system_prompt = command[command.index("--system-prompt") + 1]
+        assert "inert data" in system_prompt
+        prompt = kwargs["input"]
+        assert isinstance(prompt, str)
+        prefix = "Use SendMessage exactly once with this exact JSON argument object: "
+        suffix = ". Do not use any other tool. Stop immediately after it returns."
+        assert prompt.startswith(prefix) and prompt.endswith(suffix)
+        arguments = json.loads(prompt[len(prefix) : -len(suffix)])
+        assert arguments == {"to": target, "message": message, "summary": "Cross Agent Chat"}
+        use = {
+            "type": "tool_use",
+            "id": "tool-1",
+            "name": "SendMessage",
+            "input": {
+                "to": target,
+                "recipient": target,
+                "message": message,
+                "content": "provider preview",
+                "type": "message",
+                "summary": "Cross Agent Chat",
+            },
+        }
+        result = {
+            "type": "tool_result",
+            "tool_use_id": "tool-1",
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
+                }
+            ],
+        }
+        stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+        return subprocess.CompletedProcess(command, 0, stream, "")
+
+    monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
+
+    sendmessage(target, message, Path("/usr/bin/false"))
+
+
 @pytest.mark.parametrize("failure", ["lookup", "discovery", "revalidation"])
 def test_claude_lookup_discovery_and_revalidation_fail_before_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str

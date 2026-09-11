@@ -121,6 +121,13 @@ def test_mcp_status_requires_the_trusted_codex_thread_and_current_generation(
         "chat_send",
         "chat_status",
     }
+    send_tool = next(
+        tool for tool in responses[0]["result"]["tools"] if tool["name"] == "chat_send"
+    )
+    schema = send_tool["inputSchema"]
+    assert set(schema["properties"]) == {"to", "message"}
+    assert schema["required"] == ["to", "message"]
+    assert "opaque handle" in schema["properties"]["to"]["description"]
     assert json.loads(responses[1]["result"]["content"][0]["text"])["event_id"] == event_id
 
     replacement = Route.create(
