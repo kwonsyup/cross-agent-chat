@@ -739,12 +739,30 @@ def test_broker_keeps_local_listener_and_discovers_tailnet_after_start(
         return local_listener
 
     select_timeouts: list[float | None] = []
+    refresh_calls = 0
+    refresh_ready = threading.Event()
+    second_refresh_ready = threading.Event()
+    clock = _FakeClock()
+
+    def refresh_bindings() -> list[tuple[str, int]]:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        refresh_ready.set()
+        if refresh_calls == 2:
+            second_refresh_ready.set()
+        return next(discovered)
 
     def select_once_then_stop(
         _readers: object, _writers: object, _errors: object, timeout: float | None
     ) -> tuple[list[object], list[object], list[object]]:
         select_timeouts.append(timeout)
-        if len(select_timeouts) == 2:
+        if len(select_timeouts) == 1:
+            assert refresh_ready.wait(timeout=1.0)
+        elif len(select_timeouts) == 2:
+            clock.now = tailnet_broker_module.TAILNET_BIND_RETRY_SECONDS
+        elif len(select_timeouts) == 3:
+            assert second_refresh_ready.wait(timeout=1.0)
+        elif len(select_timeouts) == 4:
             raise RuntimeError("stop fixture")
         return [], [], []
 
@@ -756,7 +774,8 @@ def test_broker_keeps_local_listener_and_discovers_tailnet_after_start(
             [("127.0.0.1", 47072), ("100.64.0.13", 47071)],
         )
     )
-    monkeypatch.setattr("cross_agent_chat.tailnet_broker.broker_bindings", lambda: next(discovered))
+    monkeypatch.setattr("cross_agent_chat.tailnet_broker.broker_bindings", refresh_bindings)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
 
     with pytest.raises(RuntimeError, match="stop fixture"):
         broker_server(str(tmp_path))
@@ -765,9 +784,197 @@ def test_broker_keeps_local_listener_and_discovers_tailnet_after_start(
         (("127.0.0.1", 47072), False),
         (("100.64.0.13", 47071), True),
     ]
-    assert select_timeouts == [5.0, 5.0]
+    assert select_timeouts == [5.0, 5.0, 5.0, 5.0]
     local_listener.close.assert_called_once_with()
     tailnet_listener.close.assert_called_once_with()
+
+
+def test_broker_serves_local_health_while_tailnet_refresh_is_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stalled optional refresh must not delay the required local health endpoint."""
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    stop = threading.Event()
+    bound = threading.Event()
+    listeners: list[socket.socket] = []
+    failures: list[BaseException] = []
+    original_select = select.select
+
+    def bind(binding: tuple[str, int], *, allow_unavailable: bool = False) -> socket.socket | None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(binding)
+        listener.listen(16)
+        listener.setblocking(False)
+        listeners.append(listener)
+        if not allow_unavailable:
+            bound.set()
+        return listener
+
+    def blocking_bindings() -> list[tuple[str, int]]:
+        refresh_started.set()
+        assert release_refresh.wait(timeout=2.0)
+        return [("127.0.0.1", 0)]
+
+    def selectable(
+        readers: list[socket.socket],
+        writers: list[socket.socket],
+        errors: list[socket.socket],
+        timeout: float,
+    ) -> tuple[list[socket.socket], list[socket.socket], list[socket.socket]]:
+        if stop.is_set():
+            raise RuntimeError("stop fixture")
+        return original_select(readers, writers, errors, min(timeout, 0.01))
+
+    def run_server() -> None:
+        try:
+            broker_server(str(tmp_path))
+        except RuntimeError as error:
+            if str(error) != "stop fixture":
+                failures.append(error)
+
+    monkeypatch.setattr(tailnet_broker_module, "LOCAL_BROKER_PORT", 0)
+    monkeypatch.setattr(tailnet_broker_module, "bind_broker_listener", bind)
+    monkeypatch.setattr(tailnet_broker_module, "broker_bindings", blocking_bindings)
+    monkeypatch.setattr(select, "select", selectable)
+
+    server_thread = threading.Thread(target=run_server)
+    server_thread.start()
+    try:
+        assert bound.wait(timeout=1.0)
+        assert refresh_started.wait(timeout=1.0)
+        with socket.create_connection(listeners[0].getsockname(), timeout=0.2) as connection:
+            connection.settimeout(0.4)
+            connection.sendall(b'{"schema_version":1,"operation":"health"}\n')
+            response = json.loads(connection.recv(4096))
+        assert response["status"] == "READY"
+    finally:
+        release_refresh.set()
+        stop.set()
+        server_thread.join(timeout=2.0)
+
+    assert not server_thread.is_alive()
+    assert failures == []
+
+
+def test_broker_excludes_remote_listener_while_refresh_is_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local_listener = mock.Mock()
+    remote_listener = mock.Mock()
+    listeners = iter((local_listener, remote_listener))
+    clock = _FakeClock()
+    first_refresh_ready = threading.Event()
+    second_refresh_started = threading.Event()
+    release_second_refresh = threading.Event()
+    bindings = iter(
+        (
+            [("127.0.0.1", 47072), ("100.64.0.13", 47071)],
+            [("127.0.0.1", 47072), ("100.64.0.13", 47071)],
+        )
+    )
+    dispatched: list[list[object]] = []
+
+    def refresh_bindings() -> list[tuple[str, int]]:
+        result = next(bindings)
+        if not first_refresh_ready.is_set():
+            first_refresh_ready.set()
+            return result
+        second_refresh_started.set()
+        assert release_second_refresh.wait(timeout=1.0)
+        return result
+
+    def select_until_pending(
+        readers: list[object], *_args: object
+    ) -> tuple[list[object], list[object], list[object]]:
+        if remote_listener in readers:
+            clock.now = tailnet_broker_module.TAILNET_BIND_RETRY_SECONDS
+            return [], [], []
+        if not first_refresh_ready.is_set():
+            assert first_refresh_ready.wait(timeout=1.0)
+            return [], [], []
+        assert second_refresh_started.wait(timeout=1.0)
+        assert readers == [local_listener]
+        release_second_refresh.set()
+        raise RuntimeError("stop fixture")
+
+    def record_dispatch(
+        _workers: object, _root: Path, readable: list[object], _admission: BrokerAdmission
+    ) -> int:
+        dispatched.append(readable)
+        return 0
+
+    monkeypatch.setattr(
+        tailnet_broker_module, "bind_broker_listener", lambda *_args, **_kwargs: next(listeners)
+    )
+    monkeypatch.setattr(tailnet_broker_module, "broker_bindings", refresh_bindings)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(select, "select", select_until_pending)
+    monkeypatch.setattr(
+        tailnet_broker_module,
+        "dispatch_ready_brokers",
+        record_dispatch,
+    )
+
+    with pytest.raises(RuntimeError, match="stop fixture"):
+        broker_server(str(tmp_path))
+
+    assert dispatched
+    assert all(readable == [] for readable in dispatched)
+    remote_listener.close.assert_called_once_with()
+    local_listener.close.assert_called_once_with()
+
+
+def test_broker_keeps_verified_listener_when_refresh_confirms_same_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local_listener = mock.Mock()
+    remote_listener = mock.Mock()
+    listeners = iter((local_listener, remote_listener))
+    clock = _FakeClock()
+    refresh_calls = 0
+    first_refresh_ready = threading.Event()
+    second_refresh_ready = threading.Event()
+
+    def refresh_bindings() -> list[tuple[str, int]]:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 1:
+            first_refresh_ready.set()
+        else:
+            second_refresh_ready.set()
+        return [("127.0.0.1", 47072), ("100.64.0.13", 47071)]
+
+    def select_until_confirmed(
+        readers: list[object], *_args: object
+    ) -> tuple[list[object], list[object], list[object]]:
+        if not first_refresh_ready.is_set():
+            assert first_refresh_ready.wait(timeout=1.0)
+            return [], [], []
+        if refresh_calls == 1:
+            if remote_listener in readers:
+                clock.now = tailnet_broker_module.TAILNET_BIND_RETRY_SECONDS
+            return [], [], []
+        if refresh_calls == 2 and remote_listener not in readers:
+            assert second_refresh_ready.wait(timeout=1.0)
+            return [], [], []
+        assert readers == [local_listener, remote_listener]
+        raise RuntimeError("stop fixture")
+
+    monkeypatch.setattr(
+        tailnet_broker_module, "bind_broker_listener", lambda *_args, **_kwargs: next(listeners)
+    )
+    monkeypatch.setattr(tailnet_broker_module, "broker_bindings", refresh_bindings)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(select, "select", select_until_confirmed)
+
+    with pytest.raises(RuntimeError, match="stop fixture"):
+        broker_server(str(tmp_path))
+
+    assert refresh_calls == 2
+    remote_listener.close.assert_called_once_with()
+    local_listener.close.assert_called_once_with()
 
 
 def test_broker_replaces_listener_when_tailnet_address_changes(
@@ -788,13 +995,33 @@ def test_broker_replaces_listener_when_tailnet_address_changes(
         "cross_agent_chat.tailnet_broker.bind_broker_listener",
         lambda _binding, **_kwargs: next(listeners),
     )
-    monkeypatch.setattr("cross_agent_chat.tailnet_broker.broker_bindings", lambda: next(discovered))
+    refresh_calls = 0
+    refresh_ready = threading.Event()
+    second_refresh_ready = threading.Event()
+    clock = _FakeClock()
+
+    def refresh_bindings() -> list[tuple[str, int]]:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        refresh_ready.set()
+        if refresh_calls == 2:
+            second_refresh_ready.set()
+        return next(discovered)
+
+    monkeypatch.setattr("cross_agent_chat.tailnet_broker.broker_bindings", refresh_bindings)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
     calls = 0
 
     def select_once_then_stop(*_args: object) -> tuple[list[object], list[object], list[object]]:
         nonlocal calls
         calls += 1
-        if calls == 2:
+        if calls == 1:
+            assert refresh_ready.wait(timeout=1.0)
+        elif calls == 2:
+            clock.now = tailnet_broker_module.TAILNET_BIND_RETRY_SECONDS
+        elif calls == 3:
+            assert second_refresh_ready.wait(timeout=1.0)
+        elif calls == 4:
             raise RuntimeError("stop fixture")
         return [], [], []
 
@@ -881,6 +1108,41 @@ def test_silent_connection_does_not_block_another_broker_request(tmp_path: Path)
 
         silent_client.close()
         active_client.close()
+
+
+def test_accepted_remote_connection_survives_listener_close(tmp_path: Path) -> None:
+    class RemoteListener(socket.socket):
+        def accept(self) -> tuple[socket.socket, tuple[str, int]]:
+            connection, _ = super().accept()
+            return connection, ("100.64.0.11", 47071)
+
+    listener = RemoteListener(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.setblocking(False)
+    try:
+        with (
+            socket.create_connection(listener.getsockname(), timeout=0.5) as client,
+            ThreadPoolExecutor(max_workers=1) as workers,
+        ):
+            assert (
+                dispatch_ready_brokers(
+                    workers,
+                    tmp_path,
+                    [listener],
+                    BrokerAdmission(),
+                )
+                == 1
+            )
+            listener.close()
+            client.sendall(b'{"schema_version":1,"operation":"peers"}\n')
+            client.settimeout(0.5)
+            assert json.loads(client.recv(4096)) == {
+                "schema_version": 1,
+                "peers": [],
+            }
+    finally:
+        listener.close()
 
 
 def test_vanished_ready_connection_does_not_block_broker_loop(tmp_path: Path) -> None:
@@ -1385,13 +1647,33 @@ def test_broker_revokes_listener_when_verified_identity_disappears(
     monkeypatch.setattr(
         tailnet_broker_module, "bind_broker_listener", lambda *args, **kwargs: next(listeners)
     )
-    monkeypatch.setattr(tailnet_broker_module, "broker_bindings", lambda: next(bindings))
+    refresh_calls = 0
+    refresh_ready = threading.Event()
+    second_refresh_ready = threading.Event()
+    clock = _FakeClock()
+
+    def refresh_bindings() -> list[tuple[str, int]]:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        refresh_ready.set()
+        if refresh_calls == 2:
+            second_refresh_ready.set()
+        return next(bindings)
+
+    monkeypatch.setattr(tailnet_broker_module, "broker_bindings", refresh_bindings)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
 
     def ready(
         servers: list[object], *_args: object
     ) -> tuple[list[object], list[object], list[object]]:
         observed.append(list(servers))
-        if len(observed) == 2:
+        if len(observed) == 1:
+            assert refresh_ready.wait(timeout=1.0)
+        elif len(observed) == 2:
+            clock.now = tailnet_broker_module.TAILNET_BIND_RETRY_SECONDS
+        elif len(observed) == 3:
+            assert second_refresh_ready.wait(timeout=1.0)
+        elif len(observed) == 4:
             private.close.assert_called_once_with()
             raise RuntimeError("stop fixture")
         return [], [], []
@@ -1399,7 +1681,8 @@ def test_broker_revokes_listener_when_verified_identity_disappears(
     monkeypatch.setattr(select, "select", ready)
     with pytest.raises(RuntimeError, match="stop fixture"):
         broker_server(str(tmp_path))
-    assert observed == [[local, private], [local]]
+    assert any(servers == [local, private] for servers in observed)
+    assert observed[-2:] == [[local], [local]]
     private.close.assert_called_once_with()
     local.close.assert_called_once_with()
 

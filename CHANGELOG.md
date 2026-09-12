@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.9 - 2026-09-12
+
+- Keep localhost broker health and local delivery responsive while the optional Tailnet binding
+  refresh is pending. A remote listener is excluded from acceptance until its fresh validation
+  completes, then retained unchanged when its verified address is unchanged.
+
 ## 0.1.8 - 2026-09-12
 
 - Mark inbound Cross Agent Chat source metadata separately from the actual local delivery
