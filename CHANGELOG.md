@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.8 - 2026-09-12
+
+- Mark inbound Cross Agent Chat source metadata separately from the actual local delivery
+  principal, keep peer content untrusted, and remove the generic reply instruction footer.
+- Let bare Doctor use one unambiguous device identity from the active installed Claude/Codex
+  routes. Conflicting or malformed installed identities fail clearly; `--device` remains explicit.
+- Preserve exact recipient selection, helper/pretool validation, no-replay handling, and body-free
+  durable intent state. This release does not add Desktop built-in `send_message_to_thread` routing.
+
 ## 0.1.7 - 2026-09-11
 
 - Keep a valid broker installation healthy when its optional Tailscale address hint was unavailable

@@ -43,6 +43,7 @@ from cross_agent_chat.install import (
     _restore_path,
     _snapshot_path,
     discover_executable,
+    installed_device,
 )
 
 
@@ -162,6 +163,141 @@ def test_cli_maps_active_provider_profile_roots(
     assert installer.codex_hooks == codex_profile / "hooks.json"
 
 
+def test_bare_doctor_uses_the_unique_installed_device_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="installed")
+    payloads = installer._payloads()
+    installer.claude_config.parent.mkdir(parents=True)
+    installer.claude_config.write_bytes(payloads[installer.claude_config])
+    installer.codex_config.parent.mkdir(parents=True)
+    installer.codex_config.write_bytes(payloads[installer.codex_config])
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: Path("/opt/cross-agent-chat"))
+
+    assert cli._installer(None).device == "installed"
+
+
+def test_installed_device_rejects_conflicting_provider_identities(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    claude = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="claude-device")
+    codex = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="codex-device")
+    claude_payloads = claude._payloads()
+    codex_payloads = codex._payloads()
+    claude.claude_config.parent.mkdir(parents=True)
+    claude.claude_config.write_bytes(claude_payloads[claude.claude_config])
+    codex.codex_config.parent.mkdir(parents=True)
+    codex.codex_config.write_bytes(codex_payloads[codex.codex_config])
+
+    with pytest.raises(SettingsError, match="ambiguous"):
+        installed_device(home=home, codex_home=None, claude_config_dir=None)
+
+
+def test_installed_device_uses_only_the_active_profile_roots(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    alternate_claude = tmp_path / "alternate-claude"
+    alternate_codex = tmp_path / "alternate-codex"
+    default = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="default")
+    alternate = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="alternate",
+        claude_config_dir=alternate_claude,
+        codex_home=alternate_codex,
+    )
+    default_payloads = default._payloads()
+    alternate_payloads = alternate._payloads()
+    for installer, payloads in ((default, default_payloads), (alternate, alternate_payloads)):
+        installer.claude_config.parent.mkdir(parents=True, exist_ok=True)
+        installer.claude_config.write_bytes(payloads[installer.claude_config])
+        installer.codex_config.parent.mkdir(parents=True, exist_ok=True)
+        installer.codex_config.write_bytes(payloads[installer.codex_config])
+
+    assert (
+        installed_device(
+            home=home,
+            codex_home=alternate_codex,
+            claude_config_dir=alternate_claude,
+        )
+        == "alternate"
+    )
+
+
+def test_explicit_doctor_device_does_not_resolve_malformed_installed_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    claude_config = home / ".claude.json"
+    claude_config.parent.mkdir(parents=True)
+    claude_config.write_text('{"mcpServers":{"cross-agent-chat":{"args":[]}}}')
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: Path("/opt/cross-agent-chat"))
+
+    assert cli._installer("explicit-device").device == "explicit-device"
+
+
+def test_staged_install_uses_the_unique_installed_device_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="installed")
+    payloads = installer._payloads()
+    installer.claude_config.parent.mkdir(parents=True)
+    installer.claude_config.write_bytes(payloads[installer.claude_config])
+    installer.codex_config.parent.mkdir(parents=True)
+    installer.codex_config.write_bytes(payloads[installer.codex_config])
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    captured: list[str] = []
+
+    def install_staged(self: Installer, _stage: Path, _stable: Path) -> None:
+        captured.append(self.device)
+
+    monkeypatch.setattr(Installer, "install_staged", install_staged)
+
+    assert (
+        cli.run(
+            parser().parse_args(
+                [
+                    "_install-staged",
+                    "--staged-runtime",
+                    str(tmp_path / "stage"),
+                    "--stable-entrypoint",
+                    str(tmp_path / "bin/cross-agent-chat"),
+                ]
+            )
+        )
+        == 0
+    )
+    assert captured == ["installed"]
+
+
+def test_installed_device_rejects_malformed_cross_agent_chat_route(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    claude_config = home / ".claude.json"
+    claude_config.parent.mkdir(parents=True)
+    claude_config.write_text('{"mcpServers":{"cross-agent-chat":{"args":[]}}}')
+
+    with pytest.raises(SettingsError, match="device identity is invalid"):
+        installed_device(home=home, codex_home=None, claude_config_dir=None)
+
+
+def test_bare_doctor_fails_clearly_for_a_malformed_installed_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    claude_config = home / ".claude.json"
+    claude_config.parent.mkdir(parents=True)
+    claude_config.write_text('{"mcpServers":{"cross-agent-chat":{"args":[]}}}')
+    monkeypatch.setenv("HOME", str(home))
+
+    assert cli.main(["doctor", "--json"]) == 2
+    assert "installed Cross Agent Chat device identity is invalid" in capsys.readouterr().err
+
+
 def test_doctor_reports_the_selected_profile_queue_mode(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -185,8 +321,35 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "local_broker": "healthy",
         "next": "start fresh Claude/Codex sessions",
         "remote_trust": "tailscale_acl",
-        "version": "0.1.7",
+        "version": "0.1.8",
     }
+
+
+def test_doctor_explicit_device_overrides_automatic_identity(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class ObservedInstaller:
+        def verify_configuration(self) -> bool:
+            return True
+
+        def broker_is_healthy(self) -> bool:
+            return True
+
+        def _codex_native_queue_enabled(self) -> bool:
+            return False
+
+    captured: list[str | None] = []
+
+    def observed(device: str | None) -> ObservedInstaller:
+        captured.append(device)
+        return ObservedInstaller()
+
+    monkeypatch.setattr(cli, "_installer", observed)
+
+    assert cli.run(parser().parse_args(["doctor", "--device", "chosen", "--json"])) == 0
+
+    assert captured == ["chosen"]
+    assert json.loads(capsys.readouterr().out)["integration"] == "healthy"
 
 
 def test_install_script_package_failure_leaves_predecessor_untouched(tmp_path: Path) -> None:
@@ -2925,7 +3088,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.1.7')\n"
+        "    print('cross-agent-chat 0.1.8')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -2951,7 +3114,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.1.7"
+    assert completed.stdout.strip() == "cross-agent-chat 0.1.8"
     assert stage.exists()
 
 
@@ -4393,7 +4556,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.1.7",
+            "version": "0.1.8",
             "module_path": str(module),
         },
     )
@@ -4571,7 +4734,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.1.7",
+            "version": "0.1.8",
             "module_path": str(module),
         }
 

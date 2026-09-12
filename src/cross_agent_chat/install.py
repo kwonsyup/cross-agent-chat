@@ -133,6 +133,81 @@ def default_device() -> str:
         raise SettingsError("hostname cannot be used as a device name; pass --device") from error
 
 
+def _installed_mcp_device(server: object, provider: str) -> str:
+    if not isinstance(server, MutableMapping):
+        raise SettingsError("installed Cross Agent Chat device identity is invalid")
+    command = server.get("command")
+    arguments = server.get("args")
+    expected_prefix = ("_mcp", "--provider", provider, "--device")
+    if (
+        not isinstance(command, str)
+        or Path(command).name != SERVER_NAME
+        or not isinstance(arguments, list)
+        or len(arguments) != 5
+        or tuple(arguments[:4]) != expected_prefix
+        or not isinstance(arguments[4], str)
+    ):
+        raise SettingsError("installed Cross Agent Chat device identity is invalid")
+    try:
+        return valid_device(arguments[4])
+    except RuntimeError as error:
+        raise SettingsError("installed Cross Agent Chat device identity is invalid") from error
+
+
+def installed_device(
+    *, home: Path, codex_home: Path | None, claude_config_dir: Path | None
+) -> str | None:
+    """Read one unambiguous installed device identity for the active profiles."""
+    if claude_config_dir is not None:
+        claude_root = claude_config_dir.expanduser()
+        if not claude_root.is_absolute() or claude_root == Path("/"):
+            raise SettingsError("CLAUDE_CONFIG_DIR must be an absolute configuration directory")
+        claude_config = claude_root.resolve(strict=False) / ".claude.json"
+    else:
+        claude_config = home.resolve() / ".claude.json"
+    selected_codex_home = home / ".codex" if codex_home is None else codex_home.expanduser()
+    if not selected_codex_home.is_absolute() or selected_codex_home == Path("/"):
+        raise SettingsError("CODEX_HOME must be an absolute configuration directory")
+    codex_config = selected_codex_home.resolve(strict=False) / "config.toml"
+
+    claude = _json_object(claude_config)
+    raw_claude_servers = claude.get("mcpServers")
+    if raw_claude_servers is None:
+        claude_device = None
+    elif not isinstance(raw_claude_servers, MutableMapping):
+        raise SettingsError("installed Cross Agent Chat device identity is invalid")
+    else:
+        claude_server = raw_claude_servers.get(SERVER_NAME)
+        claude_device = (
+            None if claude_server is None else _installed_mcp_device(claude_server, "claude")
+        )
+
+    if not codex_config.exists():
+        codex_device = None
+    else:
+        try:
+            codex = tomlkit.parse(codex_config.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, TOMLKitError) as error:
+            raise SettingsError("installed Cross Agent Chat device identity is invalid") from error
+        raw_codex_servers = codex.get("mcp_servers")
+        if raw_codex_servers is None:
+            codex_device = None
+        elif not isinstance(raw_codex_servers, MutableMapping):
+            raise SettingsError("installed Cross Agent Chat device identity is invalid")
+        else:
+            codex_server = raw_codex_servers.get(SERVER_NAME)
+            codex_device = (
+                None if codex_server is None else _installed_mcp_device(codex_server, "codex")
+            )
+
+    candidates = {device for device in (claude_device, codex_device) if device is not None}
+    if len(candidates) > 1:
+        raise SettingsError(
+            "installed Cross Agent Chat device identity is ambiguous; pass --device"
+        )
+    return next(iter(candidates)) if candidates else None
+
+
 def _json_object(path: Path) -> dict[str, object]:
     if not path.exists():
         return {}

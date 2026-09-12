@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from cross_agent_chat import cli
 from cross_agent_chat.cli import mcp
 from cross_agent_chat.core import ChatError, IntentStore, Registry, Route
 from cross_agent_chat.mcp_server import normalize_send_arguments
@@ -60,6 +61,7 @@ def test_presence_off_mcp_initializes_without_tools_or_state(
 
     responses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert responses[0]["result"]["serverInfo"]["name"] == "cross-agent-chat"
+    assert responses[0]["result"]["instructions"] == cli.MCP_INSTRUCTIONS
     assert responses[1] == {"jsonrpc": "2.0", "id": 2, "result": {"tools": []}}
     assert responses[2] == {
         "jsonrpc": "2.0",
