@@ -9,10 +9,10 @@ non-default roots). Local sessions do not need Tailscale; remote sessions need T
 allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
 files, or turn a remote peer into an owner.
 
-Install v0.1.6 with:
+Install v0.1.7 with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.1.6/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.1.7/install.sh | sh
 ```
 
 Installation requires Git because the installer builds from the release tag.
@@ -48,7 +48,7 @@ visible by default.
 
 To have an existing coding agent assist with installation, give it this prompt:
 
-> Install the released `v0.1.6` tag, not an arbitrary PR. Identify active consumers and the
+> Install the released `v0.1.7` tag, not an arbitrary PR. Identify active consumers and the
 > selected Claude/Codex roots, obtain approval before shared effects, preserve existing intent
 > records, run `cross-agent-chat doctor --json`, and test only fresh actors.
 
@@ -75,7 +75,7 @@ record the subsequent Stop-bound exchange below; the published tag and assets ar
 | Windows | No claim |
 | Linux | No live-support claim |
 
-v0.1.6 is a macOS beta. The table records the configurations actually observed; rows marked
+v0.1.7 is a macOS beta. The table records the configurations actually observed; rows marked
 historical were tested with earlier candidates. Support remains limited to the listed provider
 versions and delivery modes. The later 0.154.0 Stop-bound result does not extend the historical
 Native or experimental-queue observations to every configured session. A separate v0.1.6

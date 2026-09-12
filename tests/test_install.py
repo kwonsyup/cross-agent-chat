@@ -185,7 +185,7 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "local_broker": "healthy",
         "next": "start fresh Claude/Codex sessions",
         "remote_trust": "tailscale_acl",
-        "version": "0.1.6",
+        "version": "0.1.7",
     }
 
 
@@ -557,6 +557,53 @@ def test_setup_passes_known_tailnet_address_to_broker(tmp_path: Path) -> None:
 
     payload = plistlib.loads(installer.launch_agent.read_bytes())
     assert payload["EnvironmentVariables"] == {"CROSS_AGENT_CHAT_TAILNET_ADDRESS": "100.64.0.10"}
+    assert installer.verify_configuration()
+
+
+def test_verify_accepts_address_discovered_after_installation(tmp_path: Path) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    installer.setup()
+    snapshot = {path: path.read_bytes() for path in installer.config_paths if path.exists()}
+    observed = Installer(
+        home=installer.home,
+        executable=installer.executable,
+        device=installer.device,
+        tailnet_address="100.64.0.10",
+    )
+
+    assert observed.verify_configuration()
+    assert {path: path.read_bytes() for path in snapshot} == snapshot
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("EnvironmentVariables", {"UNEXPECTED": "value"}),
+        ("EnvironmentVariables", {"CROSS_AGENT_CHAT_TAILNET_ADDRESS": "100.64.0.11"}),
+        ("ProgramArguments", ["/opt/other", "_broker"]),
+        ("KeepAlive", False),
+    ],
+)
+def test_optional_address_does_not_hide_modified_broker_configuration(
+    tmp_path: Path, key: str, value: object
+) -> None:
+    installer = Installer(
+        home=tmp_path / "home", executable=Path("/opt/cross-agent-chat"), device="studio"
+    )
+    installer.setup()
+    payload: dict[str, object] = plistlib.loads(installer.launch_agent.read_bytes())
+    payload[key] = value
+    installer.launch_agent.write_bytes(plistlib.dumps(payload))
+    observed = Installer(
+        home=installer.home,
+        executable=installer.executable,
+        device=installer.device,
+        tailnet_address="100.64.0.10",
+    )
+
+    assert not observed.verify_configuration()
 
 
 def test_setup_uses_the_explicit_codex_profile_root(tmp_path: Path) -> None:
@@ -2878,7 +2925,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.1.6')\n"
+        "    print('cross-agent-chat 0.1.7')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -2904,7 +2951,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.1.6"
+    assert completed.stdout.strip() == "cross-agent-chat 0.1.7"
     assert stage.exists()
 
 
@@ -4346,7 +4393,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.1.6",
+            "version": "0.1.7",
             "module_path": str(module),
         },
     )
@@ -4524,7 +4571,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.1.6",
+            "version": "0.1.7",
             "module_path": str(module),
         }
 

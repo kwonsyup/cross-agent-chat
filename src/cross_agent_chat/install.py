@@ -2231,8 +2231,13 @@ class Installer:
             if OWNED_TOML_START not in codex_text or OWNED_TOML_END not in codex_text:
                 return False
             launch_agent = plistlib.loads(self.launch_agent.read_bytes())
-            if launch_agent != plistlib.loads(self._launch_agent_payload()):
-                return False
+            expected_launch_agent: dict[str, object] = plistlib.loads(self._launch_agent_payload())
+            if launch_agent != expected_launch_agent:
+                # The address is an optional startup hint. An installation made
+                # without it remains valid when discovery later knows the address.
+                expected_launch_agent.pop("EnvironmentVariables", None)
+                if launch_agent != expected_launch_agent:
+                    return False
             self._install_metadata(settings)
             for config, provider, events, native_queue in (
                 (settings, "claude", ("SessionStart", "SessionEnd"), False),
