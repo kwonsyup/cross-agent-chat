@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.7 - 2026-09-11
+
+- Keep a valid broker installation healthy when its optional Tailscale address hint was unavailable
+  during installation but becomes discoverable later. Doctor still rejects modified broker
+  commands, unexpected environment entries, and conflicting present hints.
+- Preserve existing message delivery, recipient identity, and no-replay behavior.
+
 ## 0.1.6 - 2026-09-10
 
 - Discover remote peer identities and delivery modes before optional title hints. Slow, malformed,
