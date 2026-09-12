@@ -8,7 +8,8 @@ import os
 import select
 import socket
 import threading
-from concurrent.futures import Executor, ThreadPoolExecutor
+import time
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -262,25 +263,47 @@ def broker_server(state_root_value: str | None) -> None:
         tailnet_binding: tuple[str, int] | None = None
         tailnet_server: socket.socket | None = None
         admission = BrokerAdmission()
-        with ThreadPoolExecutor(
-            max_workers=MAX_BROKER_CONNECTIONS,
-            thread_name_prefix="cross-agent-chat",
-        ) as workers:
+        with (
+            ThreadPoolExecutor(
+                max_workers=MAX_BROKER_CONNECTIONS,
+                thread_name_prefix="cross-agent-chat",
+            ) as workers,
+            ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="cross-agent-chat-refresh",
+            ) as refresh_workers,
+        ):
+            refresh: Future[list[tuple[str, int]]] | None = refresh_workers.submit(broker_bindings)
+            next_refresh_at: float | None = None
             while True:
-                current_bindings = broker_bindings()
-                desired_tailnet = current_bindings[1] if len(current_bindings) == 2 else None
-                if tailnet_server is not None and desired_tailnet != tailnet_binding:
-                    servers.remove(tailnet_server)
-                    tailnet_server.close()
-                    tailnet_server = None
-                    tailnet_binding = None
-                if desired_tailnet is not None and desired_tailnet != tailnet_binding:
-                    replacement = bind_broker_listener(desired_tailnet, allow_unavailable=True)
-                    if replacement is not None:
-                        servers.append(replacement)
-                        tailnet_server = replacement
-                        tailnet_binding = desired_tailnet
-                readable, _, _ = select.select(servers, [], [], TAILNET_BIND_RETRY_SECONDS)
+                if refresh is not None and refresh.done():
+                    current_bindings = refresh.result()
+                    desired_tailnet = current_bindings[1] if len(current_bindings) == 2 else None
+                    if tailnet_server is not None and desired_tailnet != tailnet_binding:
+                        servers.remove(tailnet_server)
+                        tailnet_server.close()
+                        tailnet_server = None
+                        tailnet_binding = None
+                    if desired_tailnet is not None and desired_tailnet != tailnet_binding:
+                        replacement = bind_broker_listener(desired_tailnet, allow_unavailable=True)
+                        if replacement is not None:
+                            servers.append(replacement)
+                            tailnet_server = replacement
+                            tailnet_binding = desired_tailnet
+                    refresh = None
+                    next_refresh_at = time.monotonic() + TAILNET_BIND_RETRY_SECONDS
+                if (
+                    refresh is None
+                    and next_refresh_at is not None
+                    and time.monotonic() >= next_refresh_at
+                ):
+                    refresh = refresh_workers.submit(broker_bindings)
+                    next_refresh_at = None
+                timeout = TAILNET_BIND_RETRY_SECONDS
+                if next_refresh_at is not None:
+                    timeout = max(0.0, next_refresh_at - time.monotonic())
+                selectable_servers = [local_server] if refresh is not None else servers
+                readable, _, _ = select.select(selectable_servers, [], [], timeout)
                 dispatch_ready_brokers(workers, root, readable, admission)
     finally:
         for server in servers:
