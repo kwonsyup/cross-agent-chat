@@ -39,7 +39,7 @@ def queue_native_input(
         "id": 0,
         "method": "initialize",
         "params": {
-            "clientInfo": {"name": "cross-agent-chat", "version": "0.1.7"},
+            "clientInfo": {"name": "cross-agent-chat", "version": "0.1.8"},
             "capabilities": {"experimentalApi": True},
         },
     }
@@ -223,7 +223,7 @@ def native_thread_titles(
                 "id": 0,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "cross-agent-chat", "version": "0.1.7"},
+                    "clientInfo": {"name": "cross-agent-chat", "version": "0.1.8"},
                     "capabilities": {"experimentalApi": True},
                 },
             }

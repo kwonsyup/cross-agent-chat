@@ -78,7 +78,7 @@ def valid_name(value: str, field: str) -> str:
         value.encode("utf-8")
     except UnicodeEncodeError:
         fail(f"{field} is invalid")
-    if any(unicodedata.category(character).startswith("C") for character in value):
+    if any(unicodedata.category(character).startswith(("C", "Zl", "Zp")) for character in value):
         fail(f"{field} is invalid")
     return value
 

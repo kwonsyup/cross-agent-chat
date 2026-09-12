@@ -138,7 +138,7 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
             "id": 0,
             "method": "initialize",
             "params": {
-                "clientInfo": {"name": "cross-agent-chat", "version": "0.1.7"},
+                "clientInfo": {"name": "cross-agent-chat", "version": "0.1.8"},
                 "capabilities": {"experimentalApi": True},
             },
         }
