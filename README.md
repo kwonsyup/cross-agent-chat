@@ -75,10 +75,12 @@ record the subsequent Stop-bound exchange below; the published tag and assets ar
 | Windows | No claim |
 | Linux | No live-support claim |
 
-v0.1.7 is a macOS beta. The table records the configurations actually observed; rows marked
-historical were tested with earlier candidates. Support remains limited to the listed provider
-versions and delivery modes. The later 0.154.0 Stop-bound result does not extend the historical
-Native or experimental-queue observations to every configured session. A separate v0.1.6
+v0.1.7 is a macOS beta and corrects Doctor's optional broker-hint comparison only; it does not
+add Desktop built-in `send_message_to_thread` routing. The table records the configurations
+actually observed; rows marked historical were tested with earlier candidates. Support remains
+limited to the listed provider versions and delivery modes. The later 0.154.0 Stop-bound result
+does not extend the historical Native or experimental-queue observations to every configured
+session. A separate v0.1.6
 experimental-queue request was consumed, but its return remained `UNKNOWN_DELIVERY`; that
 roundtrip is not accepted, its cause is unresolved, and the event was not replayed. Healthy
 installation checks are not all-mode workflow or unattended-production proof.
