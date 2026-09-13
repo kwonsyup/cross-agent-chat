@@ -182,7 +182,7 @@ def test_stop_callback_rejects_invalid_or_unbounded_source() -> None:
 @pytest.mark.parametrize("character", ['"', "\\"])
 def test_stop_callback_budget_handles_json_escaping_at_valid_core_limit(character: str) -> None:
     event_id = str(uuid4())
-    source = character * (MAX_MESSAGE_BYTES // 2)
+    source = character * MAX_MESSAGE_BYTES
 
     payload = build_stop_callback_payload(event_id, source)
 
