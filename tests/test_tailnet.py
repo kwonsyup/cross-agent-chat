@@ -158,6 +158,17 @@ def test_negotiated_devin_roster_preserves_delivery_mode_and_title(
         "delivery_mode": "devin_stop_or_prompt_bound",
         "title": "Devin canary",
     }
+    codex_peer = {
+        "alias": "codex@remote:api:123456789abc",
+        "provider": "codex",
+        "device": "remote",
+        "project": "api",
+        "status": "available",
+        "generation": str(uuid4()),
+        "session_key": session_key("codex", str(uuid4())),
+        "delivery_mode": "codex_stop_bound",
+        "title": "Codex peer",
+    }
     calls: list[dict[str, object]] = []
 
     def new_broker(
@@ -165,12 +176,11 @@ def test_negotiated_devin_roster_preserves_delivery_mode_and_title(
     ) -> dict[str, object]:
         del timeout
         calls.append(payload)
-        item = (
-            peer
-            if "include_title" in payload
-            else {key: value for key, value in peer.items() if key != "title"}
-        )
-        return {"schema_version": 1, "peers": [item]}
+        items = [peer, codex_peer] if "include_title" in payload else [
+            {key: value for key, value in peer.items() if key != "title"},
+            {key: value for key, value in codex_peer.items() if key != "title"},
+        ]
+        return {"schema_version": 1, "peers": items}
 
     monkeypatch.setattr(runtime, "request_tailnet", new_broker)
 
@@ -183,10 +193,13 @@ def test_negotiated_devin_roster_preserves_delivery_mode_and_title(
     )
 
     assert complete is True
-    assert len(targets) == 1
-    assert targets[0].provider == "devin"
-    assert targets[0].delivery_mode == "devin_stop_or_prompt_bound"
-    assert targets[0].title == "Devin canary"
+    assert {target.provider for target in targets} == {"devin", "codex"}
+    devin = next(target for target in targets if target.provider == "devin")
+    codex = next(target for target in targets if target.provider == "codex")
+    assert devin.delivery_mode == "devin_stop_or_prompt_bound"
+    assert devin.title == "Devin canary"
+    assert codex.delivery_mode == "codex_stop_bound"
+    assert codex.title == "Codex peer"
     assert calls == [
         {
             "schema_version": 1,
