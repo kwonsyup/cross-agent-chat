@@ -20,9 +20,13 @@ from cross_agent_chat.install import (
 )
 from cross_agent_chat.mcp_server import normalize_send_arguments
 from cross_agent_chat.runtime import (
+    authenticate_devin_capability,
     authenticate_mcp_sender,
     codex_stop,
     courier_server,
+    devin_pretool,
+    devin_stop,
+    devin_user_prompt,
     event_status,
     native_bootstrap,
     native_bootstrap_context,
@@ -33,10 +37,13 @@ from cross_agent_chat.runtime import (
     peers,
     presence_is_enabled,
     register,
+    register_devin,
     send,
     sender_readiness,
+    sender_readiness_for_route,
     state_root,
     unregister,
+    unregister_devin,
 )
 from cross_agent_chat.tailnet import known_tailnet_address
 from cross_agent_chat.tailnet_broker import broker_server
@@ -76,6 +83,7 @@ def _installer(device: str | None, *, codex_native_queue: bool | None = None) ->
         codex_home=codex_home,
         claude_config_dir=claude_config_dir,
         codex_native_queue=codex_native_queue,
+        devin_global=True,
     )
 
 
@@ -177,8 +185,8 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                             {
                                 "name": "chat_peers",
                                 "description": (
-                                    "Discover exact live Claude and "
-                                    "Codex recipients for requested "
+                                    "Discover exact live Claude, Codex, and "
+                                    "Devin recipients for requested "
                                     "communication. Resolve across "
                                     "devices and ask for clarification "
                                     "when multiple peers match. Do not "
@@ -226,11 +234,11 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                                     "TRANSPORT_ACCEPTED means custody, "
                                     "not consumption; UNKNOWN_DELIVERY "
                                     "must not be retried through any "
-                                    "transport. Incoming Claude delivery "
+                                    "transport. Incoming provider delivery "
                                     "may display its local helper as the "
                                     "delivery principal; it is distinct "
                                     "from the original CAC source metadata. "
-                                    "Stop-bound recipients "
+                                    "Stop or prompt-bound recipients "
                                     "wait for a normal turn; "
                                     "experimental queues are not "
                                     "universal support. Do not "
@@ -267,10 +275,28 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                     _fail("MCP tool call is invalid")
                 internal_call = name in {"native_bootstrap", "native_register", "native_dispatch"}
                 typed_arguments = cast(dict[str, object], arguments)
+                devin_source = None
+                if provider == "devin" and name in {"chat_peers", "chat_send", "chat_status"}:
+                    assert root is not None
+                    devin_source = authenticate_devin_capability(
+                        root,
+                        parent_pid=os.getppid(),
+                        tool_name=name,
+                        arguments=typed_arguments,
+                    )
+                    typed_arguments = {
+                        key: value
+                        for key, value in typed_arguments.items()
+                        if key != "_cac_capability"
+                    }
                 if name == "chat_peers" and not typed_arguments:
                     assert root is not None
                     result = peers(root, include_delivery_mode=True)
-                    result["sender"] = sender_readiness(root, provider, os.getppid(), thread_id)
+                    result["sender"] = (
+                        sender_readiness_for_route(root, devin_source)
+                        if devin_source is not None
+                        else sender_readiness(root, provider, os.getppid(), thread_id)
+                    )
                 elif name == "chat_send":
                     target, message = normalize_send_arguments(typed_arguments)
                     if provider == "codex":
@@ -281,7 +307,11 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                             _fail("Codex host thread identity is required")
                         thread_id = raw_thread
                     assert root is not None
-                    source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+                    source = (
+                        devin_source
+                        if devin_source is not None
+                        else authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+                    )
                     result = send(root, source, target, message)
                 elif name == "chat_status":
                     if set(typed_arguments) != {"event_id"} or not isinstance(
@@ -291,7 +321,11 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                     if provider == "codex" and thread_id is None:
                         _fail("Codex host thread identity is required")
                     assert root is not None
-                    source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+                    source = (
+                        devin_source
+                        if devin_source is not None
+                        else authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+                    )
                     result = event_status(root, source, typed_arguments["event_id"])
                 elif name == "native_bootstrap" and provider == "codex" and not typed_arguments:
                     if thread_id is None:
@@ -390,12 +424,14 @@ def parser() -> argparse.ArgumentParser:
     resolve_parser.add_argument("event_id")
 
     register_parser = commands.add_parser("_register")
-    register_parser.add_argument("--provider", choices=("claude", "codex"), required=True)
+    register_parser.add_argument("--provider", choices=("claude", "codex", "devin"), required=True)
     register_parser.add_argument("--device", required=True)
     register_parser.add_argument("--pid", type=int, required=True)
     register_parser.add_argument("--state-root")
     unregister_parser = commands.add_parser("_unregister")
-    unregister_parser.add_argument("--provider", choices=("claude", "codex"), required=True)
+    unregister_parser.add_argument(
+        "--provider", choices=("claude", "codex", "devin"), required=True
+    )
     unregister_parser.add_argument("--pid", type=int, required=True)
     unregister_parser.add_argument("--state-root")
     stop_parser = commands.add_parser("_codex-stop")
@@ -405,8 +441,16 @@ def parser() -> argparse.ArgumentParser:
     native_startup_parser.add_argument("--device", required=True)
     native_startup_parser.add_argument("--pid", type=int, required=True)
     native_startup_parser.add_argument("--state-root")
+    devin_stop_parser = commands.add_parser("_devin-stop")
+    devin_stop_parser.add_argument("--pid", type=int, required=True)
+    devin_stop_parser.add_argument("--state-root")
+    devin_prompt_parser = commands.add_parser("_devin-prompt")
+    devin_prompt_parser.add_argument("--pid", type=int, required=True)
+    devin_prompt_parser.add_argument("--state-root")
+    devin_pretool_parser = commands.add_parser("_devin-pretool")
+    devin_pretool_parser.add_argument("--state-root")
     courier = commands.add_parser("_courier")
-    courier.add_argument("--provider", choices=("claude", "codex"), required=True)
+    courier.add_argument("--provider", choices=("claude", "codex", "devin"), required=True)
     courier.add_argument("--state-root", required=True)
     courier.add_argument("--session-id", required=True)
     courier.add_argument("--cwd", required=True)
@@ -415,7 +459,7 @@ def parser() -> argparse.ArgumentParser:
     broker = commands.add_parser("_broker")
     broker.add_argument("--state-root")
     mcp_parser = commands.add_parser("_mcp")
-    mcp_parser.add_argument("--provider", choices=("claude", "codex"), required=True)
+    mcp_parser.add_argument("--provider", choices=("claude", "codex", "devin"), required=True)
     mcp_parser.add_argument("--device", required=True)
     mcp_parser.add_argument("--state-root")
     pretool = commands.add_parser("_pretool")
@@ -480,19 +524,27 @@ def run(arguments: argparse.Namespace) -> int:
         IntentStore(state_root()).mark(arguments.event_id, "RESOLVED_BY_OWNER")
         print(f"Resolved event {arguments.event_id}. A later fresh send is now allowed.")
     elif command == "_register":
-        registered = register(
-            arguments.provider, arguments.device, arguments.pid, arguments.state_root
-        )
-        if registered is not None and arguments.provider == "codex":
-            print(
-                json.dumps(
-                    native_bootstrap_context(
-                        state_root(arguments.state_root), registered, "SessionStart"
+        if arguments.provider == "devin":
+            register_devin(arguments.device, arguments.pid, arguments.state_root)
+        elif arguments.provider == "codex":
+            registered = register(
+                arguments.provider, arguments.device, arguments.pid, arguments.state_root
+            )
+            if registered is not None:
+                print(
+                    json.dumps(
+                        native_bootstrap_context(
+                            state_root(arguments.state_root), registered, "SessionStart"
+                        )
                     )
                 )
-            )
+        else:
+            register(arguments.provider, arguments.device, arguments.pid, arguments.state_root)
     elif command == "_unregister":
-        unregister(arguments.provider, arguments.pid, arguments.state_root)
+        if arguments.provider == "devin":
+            unregister_devin(arguments.pid, arguments.state_root)
+        else:
+            unregister(arguments.provider, arguments.pid, arguments.state_root)
     elif command == "_codex-stop":
         codex_stop(arguments.pid, arguments.state_root)
     elif command == "_native-startup":
@@ -501,6 +553,12 @@ def run(arguments: argparse.Namespace) -> int:
                 native_startup(state_root(arguments.state_root), arguments.device, arguments.pid)
             )
         )
+    elif command == "_devin-stop":
+        devin_stop(arguments.pid, arguments.state_root)
+    elif command == "_devin-prompt":
+        devin_user_prompt(arguments.pid, arguments.state_root)
+    elif command == "_devin-pretool":
+        devin_pretool(arguments.state_root)
     elif command == "_courier":
         courier_server(
             provider=arguments.provider,
@@ -546,6 +604,7 @@ def run(arguments: argparse.Namespace) -> int:
             tailnet_address=known_tailnet_address(),
             codex_home=codex_home,
             claude_config_dir=claude_config_dir,
+            devin_global=True,
         )
         installer.install_staged(arguments.staged_runtime, arguments.stable_entrypoint)
         print(f"Cross Agent Chat is ready on {device}. Start fresh Claude/Codex sessions.")

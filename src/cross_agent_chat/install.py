@@ -32,6 +32,7 @@ from tomlkit.exceptions import TOMLKitError
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import ChatError, atomic_json, ensure_private_dir, valid_device
+from cross_agent_chat.devin import devin_profile_root
 from cross_agent_chat.runtime import MCP_TOOL_TIMEOUT_SECONDS
 from cross_agent_chat.tailnet import LOCAL_BROKER_HOST, LOCAL_BROKER_PORT, valid_tailnet_address
 
@@ -169,6 +170,7 @@ def installed_device(
     if not selected_codex_home.is_absolute() or selected_codex_home == Path("/"):
         raise SettingsError("CODEX_HOME must be an absolute configuration directory")
     codex_config = selected_codex_home.resolve(strict=False) / "config.toml"
+    devin_mcp_config = (home / ".config" / "devin" / "mcp_config.json").resolve(strict=False)
 
     claude = _json_object(claude_config)
     raw_claude_servers = claude.get("mcpServers")
@@ -200,7 +202,21 @@ def installed_device(
                 None if codex_server is None else _installed_mcp_device(codex_server, "codex")
             )
 
-    candidates = {device for device in (claude_device, codex_device) if device is not None}
+    devin = _json_object(devin_mcp_config)
+    raw_devin_servers = devin.get("mcpServers")
+    if raw_devin_servers is None:
+        devin_device = None
+    elif not isinstance(raw_devin_servers, MutableMapping):
+        raise SettingsError("installed Cross Agent Chat device identity is invalid")
+    else:
+        devin_server = raw_devin_servers.get(SERVER_NAME)
+        devin_device = (
+            None if devin_server is None else _installed_mcp_device(devin_server, "devin")
+        )
+
+    candidates = {
+        device for device in (claude_device, codex_device, devin_device) if device is not None
+    }
     if len(candidates) > 1:
         raise SettingsError(
             "installed Cross Agent Chat device identity is ambiguous; pass --device"
@@ -431,11 +447,19 @@ def _hook_command(
         )
         return command if provider == "codex" else command + " >/dev/null"
     if event == "SessionEnd":
+        if provider == "devin":
+            return f'{binary} _unregister --provider devin --pid "$PPID" >/dev/null'
         return f'{native_queue}{binary} _unregister --provider {provider} --pid "$PPID" >/dev/null'
     if provider == "codex" and event == "Stop":
         return f'{native_queue}{binary} _codex-stop --pid "$PPID"'
     if provider == "codex" and event == "UserPromptSubmit":
         return f'{binary} _native-startup --device {shlex.quote(device)} --pid "$PPID"'
+    if provider == "devin" and event == "Stop":
+        return f'{binary} _devin-stop --pid "$PPID"'
+    if provider == "devin" and event == "UserPromptSubmit":
+        return f'{binary} _devin-prompt --pid "$PPID"'
+    if provider == "devin" and event == "PreToolUse":
+        return f"{binary} _devin-pretool"
     raise SettingsError("unsupported provider hook")
 
 
@@ -476,7 +500,16 @@ def _owned_hook(value: object) -> bool:
     return (
         len(tokens) >= 2
         and Path(tokens[0]).name == SERVER_NAME
-        and tokens[1] in {"_register", "_unregister", "_codex-stop", "_native-startup"}
+        and tokens[1]
+        in {
+            "_register",
+            "_unregister",
+            "_codex-stop",
+            "_devin-stop",
+            "_devin-prompt",
+            "_devin-pretool",
+            "_native-startup",
+        }
     )
 
 
@@ -509,7 +542,7 @@ def _hook_group(
     timeout = 10 if (provider, event) == ("claude", "SessionStart") else 5
     if event in {"SessionEnd", "Stop"}:
         timeout = 3
-    return {
+    group: dict[str, object] = {
         "hooks": [
             {
                 "type": "command",
@@ -524,6 +557,9 @@ def _hook_group(
             }
         ]
     }
+    if provider == "devin" and event == "PreToolUse":
+        group["matcher"] = "^mcp__cross-agent-chat__(chat_peers|chat_send|chat_status)$"
+    return group
 
 
 def _native_helper_create_hook_group() -> dict[str, object]:
@@ -655,6 +691,49 @@ def _remove_hooks(config: dict[str, object]) -> None:
             del hook_map[event]
     if not hook_map:
         del config["hooks"]
+
+
+def _merge_devin_hook(config: dict[str, object], event: str, owned: dict[str, object]) -> None:
+    """Merge one owned hook in Devin's documented top-level event schema."""
+
+    existing = config.get(event, [])
+    if not isinstance(existing, list):
+        raise SettingsError(f"Devin hook {event} must be a list")
+    owned_indices = [index for index, item in enumerate(existing) if _owned_hook(item)]
+    if len(owned_indices) > 1:
+        raise SettingsError(f"Devin hook {event} ownership is ambiguous")
+    merged: list[object] = []
+    replaced = False
+    for item in existing:
+        if not _owned_hook(item):
+            merged.append(item)
+        elif not replaced:
+            merged.append(owned)
+            replaced = True
+    if not replaced:
+        merged.append(owned)
+    config[event] = merged
+
+
+def _remove_devin_hooks(config: dict[str, object]) -> None:
+    for event in (
+        "PreToolUse",
+        "PostToolUse",
+        "PermissionRequest",
+        "UserPromptSubmit",
+        "Stop",
+        "PostCompaction",
+        "SessionStart",
+        "SessionEnd",
+    ):
+        values = config.get(event)
+        if not isinstance(values, list):
+            continue
+        retained = [item for item in values if not _owned_hook(item)]
+        if retained:
+            config[event] = retained
+        else:
+            config.pop(event, None)
 
 
 def _mcp_route(executable: Path, provider: str, device: str) -> dict[str, object]:
@@ -957,6 +1036,7 @@ class Installer:
         codex_home: Path | None = None,
         claude_config_dir: Path | None = None,
         codex_native_queue: bool | None = None,
+        devin_global: bool = False,
     ) -> None:
         self.home = home.resolve()
         self.executable = executable if executable.is_absolute() else executable.absolute()
@@ -978,6 +1058,7 @@ class Installer:
             None if tailnet_address is None else valid_tailnet_address(tailnet_address)
         )
         self.codex_native_queue = codex_native_queue
+        self.devin_global = devin_global
         self.state = self.home / ".local" / "state" / SERVER_NAME
         profile_identity = json.dumps(
             {
@@ -989,7 +1070,11 @@ class Installer:
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
-        default_profile = self.claude_config_dir is None and self.codex_home == self.home / ".codex"
+        default_profile = (
+            self.claude_config_dir is None
+            and self.codex_home == self.home / ".codex"
+            and not self.devin_global
+        )
         install_name = (
             "install.json"
             if default_profile
@@ -1006,6 +1091,10 @@ class Installer:
             self.claude_config = self.claude_config_dir / ".claude.json"
         self.codex_config = self.codex_home / "config.toml"
         self.codex_hooks = self.codex_home / "hooks.json"
+        self.devin_mcp = devin_profile_root(self.home) / "mcp_config.json"
+        self.devin_hooks: Path | None = (
+            devin_profile_root(self.home) / "config.json" if self.devin_global else None
+        )
         self.launch_agent = self.home / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
         self.runtime_root = self.home / ".local" / "share" / f"{SERVER_NAME}-runtime"
         self.releases = self.runtime_root / "releases"
@@ -1016,7 +1105,7 @@ class Installer:
 
     @property
     def config_paths(self) -> tuple[Path, ...]:
-        return (
+        base = (
             self.claude_settings,
             self.claude_config,
             self.codex_config,
@@ -1024,6 +1113,7 @@ class Installer:
             self.launch_agent,
             self.install_state,
         )
+        return base if self.devin_hooks is None else (*base, self.devin_mcp, self.devin_hooks)
 
     def _validate_runtime_roots(self) -> None:
         for root in (self.runtime_root, self.releases, self.transactions):
@@ -1228,15 +1318,23 @@ class Installer:
         }
 
     def _provider_paths(self) -> dict[str, str]:
-        return {
+        paths = {
             "claude_settings": str(self.claude_settings.resolve(strict=False)),
             "claude_config": str(self.claude_config.resolve(strict=False)),
             "codex_config": str(self.codex_config.resolve(strict=False)),
             "codex_hooks": str(self.codex_hooks.resolve(strict=False)),
         }
+        if self.devin_hooks is not None:
+            paths["devin_mcp"] = str(self.devin_mcp.resolve(strict=False))
+            paths["devin_hooks"] = str(self.devin_hooks.resolve(strict=False))
+        return paths
 
     def _require_recorded_provider_paths(self, recorded: dict[str, str]) -> None:
-        if self._provider_paths() != recorded:
+        current = self._provider_paths()
+        if current != recorded:
+            optional_upgrade = set(current) - set(recorded) <= {"devin_mcp", "devin_hooks"}
+            if optional_upgrade and all(current[name] == value for name, value in recorded.items()):
+                return
             raise SettingsError("provider configuration ownership changed")
 
     def _update_json_for_uninstall(
@@ -1312,19 +1410,20 @@ class Installer:
         if schema_version != 4:
             raise SettingsError("Cross Agent Chat install state is invalid")
         names = {"claude_settings", "claude_config", "codex_config", "codex_hooks"}
+        allowed_names = names | {"devin_mcp", "devin_hooks"}
         raw_paths = metadata.get("provider_paths")
-        if not isinstance(raw_paths, dict) or set(raw_paths) != names:
+        if not isinstance(raw_paths, dict) or not names <= set(raw_paths) <= allowed_names:
             raise SettingsError("Cross Agent Chat install state is invalid")
         paths = cast(dict[str, object], raw_paths)
-        if not all(isinstance(paths[name], str) for name in names):
+        if not all(isinstance(paths[name], str) for name in raw_paths):
             raise SettingsError("Cross Agent Chat install state is invalid")
         if any(
             not Path(cast(str, paths[name])).is_absolute()
             or os.path.normpath(cast(str, paths[name])) != paths[name]
-            for name in names
+            for name in raw_paths
         ):
             raise SettingsError("Cross Agent Chat install state is invalid")
-        return {name: cast(str, paths[name]) for name in names}
+        return {name: cast(str, paths[name]) for name in raw_paths}
 
     def _remaining_profile_metadata(self) -> list[dict[str, object]]:
         if not self.install_state.parent.exists():
@@ -1521,7 +1620,43 @@ class Installer:
             codex_native_queue=codex_native_queue,
         )
 
-        return {
+        devin_mcp: dict[str, object] | None = None
+        devin_hooks: dict[str, object] | None = None
+        devin_hooks_document: dict[str, object] | None = None
+        if self.devin_hooks is not None:
+            devin_mcp = _json_object(self.devin_mcp)
+            raw_devin_servers = devin_mcp.get("mcpServers")
+            if raw_devin_servers is None:
+                devin_servers: dict[str, object] = {}
+                devin_mcp["mcpServers"] = devin_servers
+            elif isinstance(raw_devin_servers, dict):
+                devin_servers = cast(dict[str, object], raw_devin_servers)
+            else:
+                raise SettingsError("Devin mcpServers must be an object")
+            devin_servers[SERVER_NAME] = _mcp_route(self.executable, "devin", self.device)
+            devin_hooks_document = _json_object(self.devin_hooks)
+            raw_hooks = devin_hooks_document.get("hooks")
+            if raw_hooks is None:
+                devin_hooks = {}
+                devin_hooks_document["hooks"] = devin_hooks
+            elif isinstance(raw_hooks, dict):
+                devin_hooks = cast(dict[str, object], raw_hooks)
+            else:
+                raise SettingsError("Devin hooks must be an object")
+            for event in (
+                "SessionStart",
+                "SessionEnd",
+                "Stop",
+                "UserPromptSubmit",
+                "PreToolUse",
+            ):
+                _merge_devin_hook(
+                    devin_hooks,
+                    event,
+                    _hook_group(self.executable, "devin", self.device, event),
+                )
+
+        payloads = {
             self.claude_settings: _json_bytes(claude_settings),
             self.claude_config: _json_bytes(claude_config),
             self.codex_config: codex_text.encode(),
@@ -1529,6 +1664,11 @@ class Installer:
             self.launch_agent: self._launch_agent_payload(),
             self.install_state: _json_bytes(install_metadata),
         }
+        if devin_mcp is not None:
+            payloads[self.devin_mcp] = _json_bytes(devin_mcp)
+        if self.devin_hooks is not None and devin_hooks_document is not None:
+            payloads[self.devin_hooks] = _json_bytes(devin_hooks_document)
+        return payloads
 
     def _backup(self, originals: dict[Path, PathSnapshot]) -> Path:
         root = self.home / ".cache" / SERVER_NAME / "backups"
@@ -1614,6 +1754,8 @@ class Installer:
                 self.claude_config,
                 self.codex_config,
                 self.codex_hooks,
+                self.devin_mcp,
+                self.devin_hooks,
             }
             mode = _safe_shared_mode(original.mode) if shared and original.kind == "file" else 0o600
             candidates[destination] = PathSnapshot(
@@ -1654,6 +1796,8 @@ class Installer:
                     self.claude_config,
                     self.codex_config,
                     self.codex_hooks,
+                    self.devin_mcp,
+                    self.devin_hooks,
                 }
                 mode = (
                     _safe_shared_mode(original.mode)
@@ -2478,6 +2622,32 @@ class Installer:
                 or native_hooks.get("PostToolUse") is None
             ):
                 return False
+            if self.devin_hooks is not None:
+                devin_mcp = _json_object(self.devin_mcp)
+                devin_servers = devin_mcp.get("mcpServers")
+                expected_devin_server = _mcp_route(self.executable, "devin", self.device)
+                if (
+                    not isinstance(devin_servers, dict)
+                    or devin_servers.get(SERVER_NAME) != expected_devin_server
+                ):
+                    return False
+                devin_hooks_document = _json_object(self.devin_hooks)
+                raw_hooks = devin_hooks_document.get("hooks")
+                if not isinstance(raw_hooks, dict):
+                    return False
+                devin_hooks = cast(dict[str, object], raw_hooks)
+                for event in (
+                    "SessionStart",
+                    "SessionEnd",
+                    "Stop",
+                    "UserPromptSubmit",
+                    "PreToolUse",
+                ):
+                    groups = devin_hooks.get(event)
+                    if not isinstance(groups, list) or [
+                        item for item in groups if _owned_hook(item)
+                    ] != [_hook_group(self.executable, "devin", self.device, event)]:
+                        return False
             startup = [
                 item
                 for item in cast(list[object], native_hooks["UserPromptSubmit"])
@@ -2936,11 +3106,11 @@ class Installer:
             return False
         if self.state.is_symlink() or not self.state.is_dir():
             raise SettingsError("runtime state ownership is invalid")
-        routes = self.state / "routes.json"
-        if routes.is_symlink() or routes.is_file():
-            routes.unlink()
-        elif routes.exists():
-            raise SettingsError("transient route state is invalid")
+        for routes in (self.state / "routes.json", self.state / "devin-routes.json"):
+            if routes.is_symlink() or routes.is_file():
+                routes.unlink()
+            elif routes.exists():
+                raise SettingsError("transient route state is invalid")
         intents = self.state / "intents.json"
         if intents.exists() or intents.is_symlink():
             return True
@@ -2956,7 +3126,7 @@ class Installer:
         current_path = self._provider_paths()[provider_path]
         for metadata in remaining:
             paths = self._metadata_provider_paths(metadata)
-            if paths is None or paths[provider_path] == current_path:
+            if paths is None or paths.get(provider_path) == current_path:
                 return True
         return False
 
@@ -3111,6 +3281,9 @@ class Installer:
         _json_object(destinations[self.claude_settings])
         _json_object(destinations[self.claude_config])
         _json_object(destinations[self.codex_hooks])
+        if self.devin_hooks is not None:
+            _json_object(destinations[self.devin_hooks])
+            _json_object(destinations[self.devin_mcp])
         codex_preflight = self._codex_config_text()
         if codex_preflight is not None:
             _remove_owned_codex_server(_strip_owned_toml_block(codex_preflight))
@@ -3133,6 +3306,16 @@ class Installer:
         )
         codex_hooks_has_remaining_owner = self._provider_path_has_remaining_owner(
             "codex_hooks", remaining_profiles
+        )
+        devin_mcp_has_remaining_owner = (
+            self._provider_path_has_remaining_owner("devin_mcp", remaining_profiles)
+            if self.devin_hooks is not None
+            else False
+        )
+        devin_hooks_has_remaining_owner = (
+            self._provider_path_has_remaining_owner("devin_hooks", remaining_profiles)
+            if self.devin_hooks is not None
+            else False
         )
         runtime_removal = (
             None
@@ -3228,6 +3411,32 @@ class Installer:
                 self._update_json_for_uninstall(
                     current_destinations[self.claude_config],
                     remove_claude_server,
+                    recorded_paths=recorded_paths,
+                    writes=uninstall_writes,
+                )
+            if self.devin_hooks is not None and not devin_mcp_has_remaining_owner:
+
+                def remove_devin_server(value: dict[str, object]) -> None:
+                    servers = value.get("mcpServers")
+                    if isinstance(servers, dict):
+                        cast(dict[str, object], servers).pop(SERVER_NAME, None)
+
+                self._update_json_for_uninstall(
+                    current_destinations[self.devin_mcp],
+                    remove_devin_server,
+                    recorded_paths=recorded_paths,
+                    writes=uninstall_writes,
+                )
+            if self.devin_hooks is not None and not devin_hooks_has_remaining_owner:
+
+                def remove_devin_hooks(value: dict[str, object]) -> None:
+                    hooks = value.get("hooks")
+                    if isinstance(hooks, dict):
+                        _remove_devin_hooks(cast(dict[str, object], hooks))
+
+                self._update_json_for_uninstall(
+                    current_destinations[self.devin_hooks],
+                    remove_devin_hooks,
                     recorded_paths=recorded_paths,
                     writes=uninstall_writes,
                 )

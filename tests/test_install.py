@@ -225,6 +225,62 @@ def test_cli_maps_active_provider_profile_roots(
     assert installer.codex_hooks == codex_profile / "hooks.json"
 
 
+def test_devin_global_hooks_and_user_mcp_are_owned_and_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        devin_global=True,
+    )
+    assert installer.devin_hooks is not None
+    installer.devin_hooks.parent.mkdir(parents=True)
+    installer.devin_hooks.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"matcher": "", "hooks": [{"type": "command", "command": "keep-me"}]}
+                    ],
+                    "SessionEnd": [],
+                    "Stop": [],
+                    "UserPromptSubmit": [],
+                    "PreToolUse": [],
+                }
+            }
+        )
+    )
+    installer.devin_mcp.parent.mkdir(parents=True, exist_ok=True)
+    installer.devin_mcp.write_text(json.dumps({"mcpServers": {"keep": {"command": "keep-me"}}}))
+
+    installer.setup(verify=lambda: True)
+
+    hooks = json.loads(installer.devin_hooks.read_text())
+    assert any(item["hooks"][0]["command"] == "keep-me" for item in hooks["hooks"]["SessionStart"])
+    assert len([item for item in hooks["hooks"]["SessionStart"] if _owned_hook(item)]) == 1
+    mcp = json.loads(installer.devin_mcp.read_text())
+    assert set(mcp["mcpServers"]) == {"keep", "cross-agent-chat"}
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+    installer.uninstall()
+
+    assert (
+        json.loads(installer.devin_hooks.read_text())["hooks"]["SessionStart"][0]["hooks"][0][
+            "command"
+        ]
+        == "keep-me"
+    )
+    hooks_after = json.loads(installer.devin_hooks.read_text())["hooks"]
+    assert all(
+        event not in hooks_after
+        for event in ("SessionEnd", "Stop", "UserPromptSubmit", "PreToolUse")
+    )
+    assert set(json.loads(installer.devin_mcp.read_text())["mcpServers"]) == {"keep"}
+
+
 def test_bare_doctor_uses_the_unique_installed_device_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -71,6 +71,18 @@ from cross_agent_chat.core import (
     valid_name,
     valid_uuid,
 )
+from cross_agent_chat.devin import (
+    DEVIN_CAPABILITY_FIELD,
+    DevinCapabilityStore,
+    DevinCapabilityTool,
+    build_pretool_callback,
+    build_stop_callback_payload,
+    build_user_prompt_callback_payload,
+    devin_binary,
+    devin_profile_root,
+    parse_hook_input,
+    parse_pretool_input,
+)
 from cross_agent_chat.native_helper import NativeDispatchStore, NativeHelperStore
 from cross_agent_chat.remote import parse_remote_envelope
 from cross_agent_chat.tailnet import TAILNET_PORT, tailnet_nodes, valid_tailnet_address
@@ -102,6 +114,7 @@ DeliveryMode = Literal[
     "claude_native_cross_session",
     "codex_stop_bound",
     "codex_experimental_queue",
+    "devin_stop_or_prompt_bound",
 ]
 
 
@@ -113,6 +126,8 @@ class RegistrationInterrupted(SystemExit):
 
 
 def recipient_profile_root(provider: str) -> str:
+    if provider == "devin":
+        return str(devin_profile_root())
     value = os.environ.get("CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR")
     root = Path(value) if value else Path.home() / (".codex" if provider == "codex" else ".claude")
     return str(root.expanduser().resolve(strict=False))
@@ -135,6 +150,8 @@ def recipient_owner_identity(
     start_seconds = int.from_bytes(info.raw[120:128], sys.byteorder)
     start_microseconds = int.from_bytes(info.raw[128:136], sys.byteorder)
     binary = Path(path_buffer.value.decode()).resolve(strict=True)
+    if provider == "devin" and binary != devin_binary():
+        raise ChatError("provider process identity is unavailable")
     root = Path(profile_root or recipient_profile_root(provider)).expanduser().resolve(strict=False)
     payload = f"{provider}\0{binary}\0{uid}\0{start_seconds}\0{start_microseconds}\0{root}".encode()
     return hashlib.sha256(payload).hexdigest(), binary
@@ -462,7 +479,7 @@ def _spawn_courier(root: Path, route: Route) -> None:
     if route.provider == "claude":
         environment = courier_environment()
         environment["CROSS_AGENT_CHAT_CLAUDE_BINARY"] = str(owner_binary or claude_binary())
-    else:
+    elif route.provider == "codex":
         environment = {
             key: os.environ[key]
             for key in (*COURIER_ENV_KEYS, "CODEX_HOME", "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE")
@@ -473,6 +490,8 @@ def _spawn_courier(root: Path, route: Route) -> None:
         if codex is not None:
             with suppress(OSError):
                 environment["CROSS_AGENT_CHAT_CODEX_BINARY"] = str(Path(codex).resolve(strict=True))
+    else:
+        environment = {key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ}
     try:
         read_descriptor, write_descriptor = os.pipe()
     except OSError as error:
@@ -538,7 +557,7 @@ def _spawn_courier(root: Path, route: Route) -> None:
 def register(provider: str, device: str, pid: int, state_root_value: str | None) -> Route | None:
     if not presence_is_enabled():
         return None
-    if provider not in {"claude", "codex"}:
+    if provider not in {"claude", "codex", "devin"}:
         raise ChatError("provider is invalid")
     if isinstance(pid, bool) or pid <= 0:
         raise ChatError("provider process is invalid")
@@ -598,23 +617,21 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
 def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
     if not presence_is_enabled():
         return
-    if provider not in {"claude", "codex"}:
+    if provider not in {"claude", "codex", "devin"}:
         raise ChatError("provider is invalid")
     raw = hook_input("SessionEnd")
     root = state_root(state_root_value)
     session_id = cast(str, raw["session_id"])
     cwd = cast(str, raw["cwd"])
     cwd_unavailable = raw.get("_cwd_unavailable") is True
-    routes = [
+    session_routes = [
         route
         for route in Registry(root).routes()
-        if (
-            route.provider == provider
-            and route.session_id == session_id
-            and route.pid == pid
-            and (cwd_unavailable or route.cwd == cwd)
-        )
+        if route.provider == provider and route.session_id == session_id and route.pid == pid
     ]
+    routes = [route for route in session_routes if cwd_unavailable or route.cwd == cwd]
+    if not routes and not session_routes:
+        return
     if len(routes) != 1:
         raise ChatError("exact session route is unavailable")
     route = routes[0]
@@ -632,11 +649,255 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
         return
 
 
+def devin_hook_cwd() -> str:
+    """Resolve the provider-supplied workspace root for a Devin hook."""
+
+    value = os.environ.get("DEVIN_PROJECT_DIR")
+    if not isinstance(value, str) or not value:
+        raise ChatError("Devin hook workspace is unavailable")
+    return canonical_cwd(value)
+
+
+def _devin_route(
+    root: Path, event_session_id: str, pid: int, *, require_cwd: bool = True
+) -> Route | None:
+    """Resolve Devin's exact route from hook session, trusted cwd, and process."""
+
+    cwd: str | None = None
+    if require_cwd:
+        try:
+            cwd = devin_hook_cwd()
+        except (OSError, ChatError):
+            return None
+    matches = [
+        route
+        for route in Registry(root).routes()
+        if route.provider == "devin"
+        and route.session_id == event_session_id
+        and route.pid == pid
+        and (cwd is None or route.cwd == cwd)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def register_devin(device: str, pid: int, state_root_value: str | None) -> Route | None:
+    """Register a local Devin CLI or Native App session from its lifecycle hook."""
+
+    if not presence_is_enabled():
+        return None
+    if isinstance(pid, bool) or pid <= 0:
+        raise ChatError("provider process is invalid")
+    event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="SessionStart")
+    cwd = devin_hook_cwd()
+    owner_identity, _ = recipient_owner_identity("devin", pid)
+    route = Route.create(
+        provider="devin",
+        session_id=event.session_id,
+        device=valid_device(device),
+        cwd=cwd,
+        pid=pid,
+        owner_identity=owner_identity,
+        profile_root=recipient_profile_root("devin"),
+    )
+    root = state_root(state_root_value)
+    try:
+        with (
+            _registration_sigterm_scope(),
+            state_lock(root, "register-" + session_key(route.provider, route.session_id)),
+        ):
+            registry = Registry(root)
+            registry.compact_dead()
+            registered = registry.upsert_or_reuse_live_owner(route)
+            if registered != route:
+                try:
+                    bootstrap = request_socket(
+                        socket_path(root, registered),
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            "operation": "bootstrap",
+                            "generation": registered.generation,
+                        },
+                        timeout=0.5,
+                    )
+                except ChatError:
+                    registry.upsert(route)
+                else:
+                    if _bootstrap_response(bootstrap, registered):
+                        return registered
+                    raise ChatError("existing courier ownership could not be verified")
+            _spawn_courier(root, route)
+            return route
+    except BaseException:
+        Registry(root).remove(
+            route.provider, route.session_id, route.pid, generation=route.generation
+        )
+        raise
+
+
+def unregister_devin(pid: int, state_root_value: str | None) -> None:
+    if not presence_is_enabled():
+        return
+    event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="SessionEnd")
+    root = state_root(state_root_value)
+    DevinCapabilityStore(root).revoke_session(event.session_id)
+    route = _devin_route(root, event.session_id, pid)
+    if route is None:
+        raise ChatError("exact Devin session route is unavailable")
+    Registry(root).remove(route.provider, route.session_id, route.pid, generation=route.generation)
+    with suppress(ChatError):
+        request_socket(
+            socket_path(root, route),
+            {
+                "schema_version": SCHEMA_VERSION,
+                "operation": "shutdown",
+                "generation": route.generation,
+            },
+        )
+
+
+def devin_pretool(state_root_value: str | None) -> None:
+    """Bind one exact Devin MCP call to the hook session that authorized it."""
+
+    if not presence_is_enabled():
+        return
+    event = parse_pretool_input(sys.stdin.read(MAX_FRAME_BYTES + 1))
+    prefix = "mcp__cross-agent-chat__"
+    if not event.tool_name.startswith(prefix):
+        return
+    tool_name = event.tool_name.removeprefix(prefix)
+    if tool_name not in {"chat_peers", "chat_send", "chat_status"}:
+        return
+    root = state_root(state_root_value)
+    route = _devin_route(root, event.session_id, os.getppid())
+    if route is None or not _route_current(root, route):
+        DevinCapabilityStore(root).revoke_session(event.session_id)
+        return
+    arguments = {
+        key: value for key, value in event.tool_input.items() if key != DEVIN_CAPABILITY_FIELD
+    }
+    typed_tool = cast(DevinCapabilityTool, tool_name)
+    token = DevinCapabilityStore(root).issue(
+        route,
+        prompt_id=event.prompt_id,
+        tool_name=typed_tool,
+        arguments=arguments,
+    )
+    payload = build_pretool_callback(replace(event, tool_input=arguments), token)
+    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
+
+
+def authenticate_devin_capability(
+    root: Path,
+    *,
+    parent_pid: int,
+    tool_name: str,
+    arguments: dict[str, object],
+) -> Route:
+    token = arguments.get(DEVIN_CAPABILITY_FIELD)
+    if not isinstance(token, str):
+        raise ChatError("Devin sender capability is required")
+    original_arguments = {
+        key: value for key, value in arguments.items() if key != DEVIN_CAPABILITY_FIELD
+    }
+    if tool_name not in {"chat_peers", "chat_send", "chat_status"}:
+        raise ChatError("Devin sender capability tool is invalid")
+    capability = DevinCapabilityStore(root).consume(
+        token,
+        tool_name=cast(DevinCapabilityTool, tool_name),
+        arguments=original_arguments,
+    )
+    route = _devin_route(root, capability.session_id, parent_pid, require_cwd=False)
+    if (
+        route is None
+        or route.generation != capability.generation
+        or not _route_current(root, route)
+    ):
+        DevinCapabilityStore(root).revoke_session(capability.session_id)
+        raise ChatError("Devin sender capability route is unavailable")
+    return route
+
+
+def _devin_messages(root: Path, route: Route) -> list[dict[str, str]]:
+    response = request_socket(
+        socket_path(root, route),
+        {"schema_version": SCHEMA_VERSION, "operation": "peek", "generation": route.generation},
+    )
+    raw_messages = response.get("messages")
+    if not isinstance(raw_messages, list):
+        raise ChatError("Devin courier response is invalid")
+    messages: list[dict[str, str]] = []
+    for item in raw_messages:
+        if not isinstance(item, dict) or set(item) != {"event_id", "message"}:
+            raise ChatError("Devin courier response is invalid")
+        event_id = item.get("event_id")
+        message = item.get("message")
+        if not isinstance(event_id, str) or not isinstance(message, str):
+            raise ChatError("Devin courier response is invalid")
+        messages.append(
+            {
+                "event_id": valid_uuid(event_id, "event id"),
+                "message": bounded_message(message),
+            }
+        )
+    return messages
+
+
+def _ack_devin(root: Path, route: Route, messages: list[dict[str, str]]) -> None:
+    request_socket(
+        socket_path(root, route),
+        {
+            "schema_version": SCHEMA_VERSION,
+            "operation": "ack",
+            "generation": route.generation,
+            "event_ids": [item["event_id"] for item in messages],
+        },
+    )
+
+
+def devin_stop(pid: int, state_root_value: str | None) -> None:
+    if not presence_is_enabled():
+        return
+    event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="Stop")
+    root = state_root(state_root_value)
+    DevinCapabilityStore(root).revoke_session(event.session_id)
+    if event.stop_hook_active is True:
+        print("{}", flush=True)
+        return
+    route = _devin_route(root, event.session_id, pid)
+    if route is None or not _route_current(root, route):
+        print("{}", flush=True)
+        return
+    messages = _devin_messages(root, route)
+    if not messages:
+        print("{}", flush=True)
+        return
+    selected = messages[0]
+    payload = build_stop_callback_payload(selected["event_id"], selected["message"])
+    _ack_devin(root, route, [selected])
+    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
+
+
+def devin_user_prompt(pid: int, state_root_value: str | None) -> None:
+    if not presence_is_enabled():
+        return
+    event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="UserPromptSubmit")
+    root = state_root(state_root_value)
+    DevinCapabilityStore(root).revoke_session(event.session_id)
+    route = _devin_route(root, event.session_id, pid)
+    if route is None or not _route_current(root, route):
+        return
+    messages = _devin_messages(root, route)
+    if not messages:
+        return
+    selected = messages[0]
+    payload = build_user_prompt_callback_payload(selected["message"])
+    _ack_devin(root, route, [selected])
+    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
+
+
 def _route_current(root: Path, expected: Route) -> bool:
     if expected.owner_identity is not None:
-        profile = expected.profile_root or str(
-            Path.home() / (".codex" if expected.provider == "codex" else ".claude")
-        )
+        profile = expected.profile_root or recipient_profile_root(expected.provider)
         try:
             if (
                 recipient_owner_identity(expected.provider, expected.pid, profile)[0]
@@ -665,6 +926,10 @@ def courier_accept(
         if route.provider == "codex":
             if courier is None:
                 raise ChatError("Codex courier is unavailable")
+            return courier.accept(identifier, body)
+        if route.provider == "devin":
+            if courier is None:
+                raise ChatError("Devin inbox is unavailable")
             return courier.accept(identifier, body)
         agent = exact_agent(route.session_id, route.cwd)
         target_ref = discover_target_ref(agent["name"])
@@ -768,6 +1033,8 @@ def _delivery_mode(
 ) -> DeliveryMode:
     if route.provider == "claude":
         return "claude_native_cross_session"
+    if route.provider == "devin":
+        return "devin_stop_or_prompt_bound"
     return (
         "codex_experimental_queue"
         if native_helper or (courier is not None and courier.native_queue)
@@ -874,8 +1141,9 @@ def courier_server(
             generation=route.generation,
             native_queue=native_queue,
             native_helper=helper_lineage,
+            provider=cast(Provider, provider),
         )
-        if provider == "codex"
+        if provider in {"codex", "devin"}
         else None
     )
     bound = path.lstat()
@@ -1119,18 +1387,25 @@ def _local_target(
         or (
             observed_mode is not None
             and observed_mode
-            not in {"claude_native_cross_session", "codex_stop_bound", "codex_experimental_queue"}
+            not in {
+                "claude_native_cross_session",
+                "codex_stop_bound",
+                "codex_experimental_queue",
+                "devin_stop_or_prompt_bound",
+            }
         )
     ):
         return None
     if route.provider == "codex":
         if alias != route.alias:
             return None
-    else:
+    elif route.provider == "claude":
         prefix = f"claude@{route.device}:{route.project}:"
         shortened = prefix[:115] + "~" + session_key("claude", route.session_id)[:12]
         if not alias.startswith(prefix) and not (len(prefix) > 115 and alias == shortened):
             return None
+    elif alias != route.alias:
+        return None
     try:
         return Target(
             alias=valid_name(alias, "route alias"),
@@ -1237,7 +1512,12 @@ def _with_codex_titles(root: Path, targets: list[Target], deadline: float) -> li
 
 
 def _targets_from_tailnet(
-    address: str, raw: object, *, include_delivery_mode: bool = False, include_title: bool = False
+    address: str,
+    raw: object,
+    *,
+    include_delivery_mode: bool = False,
+    include_title: bool = False,
+    include_devin: bool = False,
 ) -> list[Target]:
     if not isinstance(raw, dict) or set(raw) != {"schema_version", "peers"}:
         raise ChatError("Tailnet peer returned invalid discovery")
@@ -1274,7 +1554,8 @@ def _targets_from_tailnet(
         )
         if (
             not isinstance(provider, str)
-            or provider not in {"claude", "codex"}
+            or provider not in {"claude", "codex", "devin"}
+            or (provider == "devin" and not include_devin)
             or not all(isinstance(value, str) for value in values)
             or item.get("status") != "available"
             or not re.fullmatch(r"[0-9a-f]{64}", cast(str, item.get("session_key")))
@@ -1287,6 +1568,7 @@ def _targets_from_tailnet(
                         "claude_native_cross_session",
                         "codex_stop_bound",
                         "codex_experimental_queue",
+                        "devin_stop_or_prompt_bound",
                         "unknown",
                     }
                 )
@@ -1324,13 +1606,18 @@ def _remote_node_targets(
     *,
     include_delivery_mode: bool = False,
     include_title: bool = False,
+    include_devin: bool = False,
 ) -> tuple[list[Target], bool]:
     if deadline is None:
         deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
     legacy: dict[str, object] = {"schema_version": SCHEMA_VERSION, "operation": "peers"}
     variants: list[tuple[dict[str, object], bool]] = []
+    if include_delivery_mode and include_devin:
+        variants.append(({**legacy, "include_delivery_mode": True, "include_devin": True}, True))
     if include_delivery_mode:
         variants.append(({**legacy, "include_delivery_mode": True}, True))
+    if include_devin:
+        variants.append(({**legacy, "include_devin": True}, False))
     variants.append((legacy, False))
     base: list[Target] | None = None
     for payload, mode_requested in variants:
@@ -1341,7 +1628,12 @@ def _remote_node_targets(
             raw = request_tailnet(
                 address, payload, timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining)
             )
-            base = _targets_from_tailnet(address, raw, include_delivery_mode=mode_requested)
+            base = _targets_from_tailnet(
+                address,
+                raw,
+                include_delivery_mode=mode_requested,
+                include_devin=include_devin,
+            )
             break
         except (ChatError, UnknownDeliveryError):
             continue
@@ -1353,13 +1645,24 @@ def _remote_node_targets(
     if not include_title or remaining <= 1.0:
         return base, True
     try:
+        rich_payload: dict[str, object] = {
+            **legacy,
+            "include_delivery_mode": True,
+            "include_title": True,
+        }
+        if include_devin:
+            rich_payload["include_devin"] = True
         raw = request_tailnet(
             address,
-            {**legacy, "include_delivery_mode": True, "include_title": True},
+            rich_payload,
             timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining - 1.0),
         )
         enriched = _targets_from_tailnet(
-            address, raw, include_delivery_mode=True, include_title=True
+            address,
+            raw,
+            include_delivery_mode=True,
+            include_title=True,
+            include_devin=include_devin,
         )
     except (ChatError, UnknownDeliveryError):
         return base, True
@@ -1377,7 +1680,7 @@ def _remote_node_targets(
 
 
 def _remote_discovery(
-    *, include_delivery_mode: bool = False, include_title: bool = False
+    *, include_delivery_mode: bool = False, include_title: bool = False, include_devin: bool = True
 ) -> tuple[list[Target], bool]:
     addresses = tailnet_nodes()
     if not addresses:
@@ -1394,8 +1697,9 @@ def _remote_discovery(
                 deadline,
                 include_delivery_mode=include_delivery_mode,
                 include_title=include_title,
+                include_devin=include_devin,
             )
-            if include_delivery_mode or include_title
+            if include_delivery_mode or include_title or include_devin
             else workers.submit(_remote_node_targets, address, deadline)
         )
         for address in addresses
@@ -1416,10 +1720,16 @@ def _remote_discovery(
 
 
 def remote_targets(
-    _root: Path, *, include_delivery_mode: bool = False, include_title: bool = False
+    _root: Path,
+    *,
+    include_delivery_mode: bool = False,
+    include_title: bool = False,
+    include_devin: bool = False,
 ) -> list[Target]:
     return _remote_discovery(
-        include_delivery_mode=include_delivery_mode, include_title=include_title
+        include_delivery_mode=include_delivery_mode,
+        include_title=include_title,
+        include_devin=include_devin,
     )[0]
 
 
@@ -1438,6 +1748,7 @@ def all_targets(
                 root,
                 include_delivery_mode=include_delivery_mode,
                 include_title=include_title,
+                include_devin=True,
             )
             targets = [*local.result(), *remote.result()]
     else:
@@ -1486,6 +1797,8 @@ def _delivery_principal(target_provider: str) -> str:
         return "the installed Claude Code Cross Agent Chat helper"
     if target_provider == "codex":
         return "the configured Cross Agent Chat Codex courier"
+    if target_provider == "devin":
+        return "the configured Cross Agent Chat Devin inbox"
     raise ChatError("target provider is invalid")
 
 
@@ -1517,7 +1830,7 @@ def canonical_source_alias(root: Path, source: Route) -> str:
     """Return the exact currently live public alias for an authenticated sender."""
     if not _route_current(root, source):
         raise ChatError("sender route changed before transport acceptance")
-    if source.provider == "codex":
+    if source.provider in {"codex", "devin"}:
         return source.alias
     agent = exact_agent(source.session_id, source.cwd)
     return claude_alias(source.device, source.project, agent)
@@ -1783,7 +2096,7 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         parse_remote_envelope(text)
     )
     target_provider = target_alias.split("@", 1)[0]
-    if target_provider not in {"claude", "codex"}:
+    if target_provider not in {"claude", "codex", "devin"}:
         raise ChatError("remote target provider is invalid")
     try:
         matches = [
@@ -1894,6 +2207,7 @@ def peers(
     internal: bool = False,
     include_delivery_mode: bool = False,
     include_title: bool = False,
+    include_devin: bool = True,
 ) -> dict[str, object]:
     display_titles = not internal or include_title
     deadline = time.monotonic() + (
@@ -1913,6 +2227,8 @@ def peers(
     else:
         targets = local_targets(root)
         remote_discovery = "not_requested"
+    if not include_devin:
+        targets = [target for target in targets if target.provider != "devin"]
     handles = [target.session_key for target in targets]
     if len(set(handles)) != len(handles):
         raise ChatError("peer discovery returned duplicate handles")
@@ -1947,6 +2263,12 @@ def sender_readiness(
         source = authenticate_mcp_sender(root, provider, parent_pid, thread_id)
     except ChatError as error:
         return {"status": "unavailable", "reason": str(error)}
+    return sender_readiness_for_route(root, source)
+
+
+def sender_readiness_for_route(root: Path, source: Route) -> dict[str, str]:
+    """Check one already-authenticated source route without PID re-resolution."""
+
     if not _route_current(root, source):
         return {"status": "unavailable", "reason": "registered sender route is not current"}
     try:

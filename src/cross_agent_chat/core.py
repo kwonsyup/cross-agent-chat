@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Final, Literal, NoReturn, cast
 from uuid import UUID, uuid4
 
-Provider = Literal["claude", "codex"]
+Provider = Literal["claude", "codex", "devin"]
 IntentStatus = Literal[
     "PENDING",
     "REMOTE_AUTHORIZED",
@@ -35,6 +35,9 @@ MAX_NAME_CODEPOINTS: Final = 128
 MAX_ALIAS_CODEPOINTS: Final = 128
 SAFE_DEVICE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}\Z")
 UUID_RE: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+DEVIN_SESSION_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}\Z")
+# Devin documents this as an opaque session id. Keep a bounded, path-safe
+# representation so hooks can bind it without assuming UUIDs or exposing it.
 
 
 class ChatError(RuntimeError):
@@ -63,6 +66,14 @@ def valid_uuid(value: str, field: str) -> str:
     if str(parsed) != value:
         fail(f"{field} is invalid")
     return value
+
+
+def valid_session_id(provider: str, value: str, field: str = "session id") -> str:
+    if provider == "devin":
+        if DEVIN_SESSION_RE.fullmatch(value) is None:
+            fail(f"{field} is invalid")
+        return value
+    return valid_uuid(value, field)
 
 
 def valid_device(value: str) -> str:
@@ -110,7 +121,7 @@ def stored_cwd(value: str) -> str:
 
 
 def session_key(provider: Provider, session_id: str) -> str:
-    valid_uuid(session_id, "session id")
+    valid_session_id(provider, session_id)
     return hashlib.sha256(f"{provider}:{session_id}".encode()).hexdigest()
 
 
@@ -181,9 +192,9 @@ class Route:
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
             fail("route schema is unsupported")
-        if self.provider not in {"claude", "codex"}:
+        if self.provider not in {"claude", "codex", "devin"}:
             fail("route provider is invalid")
-        valid_uuid(self.session_id, "session id")
+        valid_session_id(self.provider, self.session_id)
         valid_uuid(self.generation, "route generation")
         valid_device(self.device)
         if stored_cwd(self.cwd) != self.cwd:
@@ -218,7 +229,7 @@ class Route:
         owner_identity: str | None = None,
         profile_root: str | None = None,
     ) -> Route:
-        if provider not in {"claude", "codex"}:
+        if provider not in {"claude", "codex", "devin"}:
             fail("route provider is invalid")
         typed_provider = cast(Provider, provider)
         canonical = canonical_cwd(cwd)
@@ -226,7 +237,7 @@ class Route:
         return cls(
             schema_version=SCHEMA_VERSION,
             provider=typed_provider,
-            session_id=valid_uuid(session_id, "session id"),
+            session_id=valid_session_id(typed_provider, session_id),
             device=valid_device(device),
             cwd=canonical,
             project=project,
@@ -267,7 +278,7 @@ class Route:
         if (
             not isinstance(values["schema_version"], int)
             or isinstance(values["schema_version"], bool)
-            or values["provider"] not in {"claude", "codex"}
+            or values["provider"] not in {"claude", "codex", "devin"}
             or not all(
                 isinstance(values[key], str)
                 for key in (
@@ -397,22 +408,41 @@ class Registry:
         self.root = root
         ensure_private_dir(root)
         self.path = root / "routes.json"
+        self.devin_path = root / "devin-routes.json"
 
     def routes(self) -> list[Route]:
-        if not self.path.exists():
+        routes = self._read(self.path, expected_provider="legacy")
+        routes.extend(self._read(self.devin_path, expected_provider="devin"))
+        identities = {(item.provider, item.session_id) for item in routes}
+        if len(identities) != len(routes):
+            fail("route registry contains duplicate identities")
+        return routes
+
+    def _read(self, path: Path, *, expected_provider: Literal["legacy", "devin"]) -> list[Route]:
+        if not path.exists():
             return []
-        require_private_file(self.path)
+        require_private_file(path)
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ChatError("route registry is invalid") from error
         if not isinstance(raw, list):
             fail("route registry schema is unsupported")
         routes = [Route.from_object(item) for item in raw]
-        identities = {(item.provider, item.session_id) for item in routes}
-        if len(identities) != len(routes):
-            fail("route registry contains duplicate identities")
+        if expected_provider == "legacy" and any(item.provider == "devin" for item in routes):
+            fail("legacy route registry contains unsupported provider")
+        if expected_provider == "devin" and any(item.provider != "devin" for item in routes):
+            fail("Devin route registry contains unsupported provider")
         return routes
+
+    def _write(self, routes: list[Route]) -> None:
+        legacy = [item for item in routes if item.provider != "devin"]
+        devin = [item for item in routes if item.provider == "devin"]
+        atomic_json(self.path, [item.to_dict() for item in legacy])
+        if devin:
+            atomic_json(self.devin_path, [item.to_dict() for item in devin])
+        else:
+            self.devin_path.unlink(missing_ok=True)
 
     def upsert(self, route: Route) -> None:
         with state_lock(self.root, "routes"):
@@ -421,7 +451,7 @@ class Registry:
                 for item in self.routes()
                 if (item.provider, item.session_id) != (route.provider, route.session_id)
             ]
-            atomic_json(self.path, [item.to_dict() for item in [*existing, route]])
+            self._write([*existing, route])
 
     def upsert_or_reuse_live_owner(self, route: Route) -> Route:
         """Preserve a live generation when an identical provider hook repeats."""
@@ -445,7 +475,7 @@ class Registry:
                 for item in existing
                 if (item.provider, item.session_id) != (route.provider, route.session_id)
             ]
-            atomic_json(self.path, [item.to_dict() for item in [*retained, route]])
+            self._write([*retained, route])
             return route
 
     def remove(
@@ -459,7 +489,7 @@ class Registry:
                 if (item.provider, item.session_id, item.pid) != (provider, session_id, pid)
                 or (generation is not None and item.generation != generation)
             ]
-            atomic_json(self.path, [item.to_dict() for item in retained])
+            self._write(retained)
 
     def current(self, route: Route) -> bool:
         return any(item == route for item in self.routes())
@@ -470,7 +500,7 @@ class Registry:
             existing = self.routes()
             retained = [item for item in existing if item.process_is_live()]
             if len(retained) != len(existing):
-                atomic_json(self.path, [item.to_dict() for item in retained])
+                self._write(retained)
             return retained
 
 
@@ -770,10 +800,10 @@ class IntentStore:
 def authenticate_sender(
     routes: list[Route], provider: str, parent_pid: int, host_thread_id: str | None
 ) -> Route:
-    if provider == "claude":
-        matches = [item for item in routes if item.provider == "claude" and item.pid == parent_pid]
+    if provider in {"claude", "devin"}:
+        matches = [item for item in routes if item.provider == provider and item.pid == parent_pid]
         if len(matches) != 1:
-            fail("exact Claude sender is unavailable")
+            fail(f"exact {provider.capitalize()} sender is unavailable")
         return matches[0]
     if provider == "codex":
         if host_thread_id is None:
