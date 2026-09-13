@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1 - 2026-09-12
+
+- Treat the Claude SendMessage `summary` field as the optional, bounded one-line display preview
+  the provider schema documents, instead of an exact-match control value. Exact checks remain on
+  the native type, both recipient selectors, the canonical message body binding, the one-effect
+  gate, and the successful receipt contract.
+- Report distinct `sendmessage_type_mismatch` and `sendmessage_summary_mismatch` diagnostics;
+  remote peers continue to accept the legacy `sendmessage_control_mismatch` phase.
+- Reject Unicode format, private-use, and separator characters in the preview, matching the
+  display-text policy used for other visible fields.
+- Desktop native routing remains dependency openai/codex#45123.
+
 ## 0.2.0 - 2026-09-12
 
 - Snapshot provider configuration after immutable staged-runtime durability work. Concurrent user
