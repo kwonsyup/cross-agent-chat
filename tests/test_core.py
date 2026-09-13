@@ -669,6 +669,14 @@ def test_pending_intent_blocks_a_second_send_but_unknown_quarantines_only_its_ev
     with pytest.raises(ChatError, match="unresolved"):
         store.begin(source, target, source_alias=source.alias, payload_digest="b" * 64)
 
+    authorized = IntentStore(tmp_path / "authorized-state")
+    authorized_event = authorized.begin(
+        source, target, source_alias=source.alias, payload_digest="a" * 64
+    )
+    authorized.mark(authorized_event, "REMOTE_AUTHORIZED")
+    with pytest.raises(ChatError, match="unresolved"):
+        authorized.begin(source, target, source_alias=source.alias, payload_digest="b" * 64)
+
     other = IntentStore(tmp_path / "other-state")
     event_id = other.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
     other.mark(event_id, "UNKNOWN_DELIVERY")
