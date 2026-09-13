@@ -238,6 +238,54 @@ def test_devin_project_hooks_and_user_mcp_are_owned_and_preserved(
     assert set(json.loads(installer.devin_mcp.read_text())["mcpServers"]) == {"keep"}
 
 
+def test_devin_project_installations_have_independent_ownership_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first_project = tmp_path / "first"
+    second_project = tmp_path / "second"
+    first_project.mkdir()
+    second_project.mkdir()
+    first = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        devin_project=first_project,
+    )
+    second = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        devin_project=second_project,
+    )
+
+    first.setup(verify=lambda: True)
+    second.setup(verify=lambda: True)
+
+    assert first.install_state != second.install_state
+    assert first.install_state.exists()
+    assert second.install_state.exists()
+    assert json.loads(first.devin_hooks.read_text())["SessionStart"]
+    assert json.loads(second.devin_hooks.read_text())["SessionStart"]
+
+    monkeypatch.setattr(first, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(first, "_stop_broker", lambda: None)
+    first.uninstall()
+
+    assert not first.install_state.exists()
+    assert second.install_state.exists()
+    assert "SessionStart" not in json.loads(first.devin_hooks.read_text())
+    assert json.loads(second.devin_hooks.read_text())["SessionStart"]
+    assert "cross-agent-chat" in json.loads(second.devin_mcp.read_text())["mcpServers"]
+
+    monkeypatch.setattr(second, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(second, "_stop_broker", lambda: None)
+    second.uninstall()
+
+    assert not second.install_state.exists()
+    assert "cross-agent-chat" not in json.loads(second.devin_mcp.read_text())["mcpServers"]
+
+
 def test_bare_doctor_uses_the_unique_installed_device_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -793,8 +793,8 @@ def devin_stop(pid: int, state_root_value: str | None) -> None:
         return
     selected = messages[0]
     payload = build_stop_callback_payload(selected["event_id"], selected["message"])
-    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
     _ack_devin(root, route, [selected])
+    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
 
 
 def devin_user_prompt(pid: int, state_root_value: str | None) -> None:
@@ -810,8 +810,8 @@ def devin_user_prompt(pid: int, state_root_value: str | None) -> None:
         return
     selected = messages[0]
     payload = build_user_prompt_callback_payload(selected["message"])
-    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
     _ack_devin(root, route, [selected])
+    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
 
 
 def _route_current(root: Path, expected: Route) -> bool:
@@ -1713,7 +1713,7 @@ def canonical_source_alias(root: Path, source: Route) -> str:
     """Return the exact currently live public alias for an authenticated sender."""
     if not _route_current(root, source):
         raise ChatError("sender route changed before transport acceptance")
-    if source.provider == "codex":
+    if source.provider in {"codex", "devin"}:
         return source.alias
     agent = exact_agent(source.session_id, source.cwd)
     return claude_alias(source.device, source.project, agent)

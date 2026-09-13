@@ -1033,11 +1033,18 @@ class Installer:
                 if self.claude_config_dir is None
                 else str(self.claude_config_dir),
                 "codex_home": str(self.codex_home),
+                "devin_project": None
+                if self.devin_project is None
+                else str(self.devin_project),
             },
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
-        default_profile = self.claude_config_dir is None and self.codex_home == self.home / ".codex"
+        default_profile = (
+            self.claude_config_dir is None
+            and self.codex_home == self.home / ".codex"
+            and self.devin_project is None
+        )
         install_name = (
             "install.json"
             if default_profile

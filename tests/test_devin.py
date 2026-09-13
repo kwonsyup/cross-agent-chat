@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
@@ -350,3 +351,181 @@ def test_devin_local_transport_uses_process_memory_inbox_once(tmp_path: Path) ->
     with pytest.raises(ChatError, match="conflicts"):
         courier.accept(event_id, "different source fact")
     assert courier.pending_ids() == [event_id]
+
+
+def test_devin_hook_acknowledges_before_provider_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    route = object()
+    messages = [{"event_id": str(uuid4()), "message": "inbound"}]
+    monkeypatch.setattr(runtime, "state_root", lambda _value: tmp_path)
+    monkeypatch.setattr(runtime, "_devin_route", lambda *_args: route)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_devin_messages", lambda *_args: messages)
+    order: list[str] = []
+
+    def acknowledge(_root: Path, _route: object, _messages: list[dict[str, str]]) -> None:
+        order.append("ack")
+
+    monkeypatch.setattr(runtime, "_ack_devin", acknowledge)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": str(uuid4()),
+                    "prompt_id": str(uuid4()),
+                    "stop_hook_active": False,
+                }
+            )
+        ),
+    )
+
+    runtime.devin_stop(123, str(tmp_path))
+
+    assert order == ["ack"]
+    assert json.loads(capsys.readouterr().out)["decision"] == "block"
+
+
+def test_devin_hook_ack_failure_emits_no_provider_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    route = object()
+    messages = [{"event_id": str(uuid4()), "message": "inbound"}]
+    monkeypatch.setattr(runtime, "state_root", lambda _value: tmp_path)
+    monkeypatch.setattr(runtime, "_devin_route", lambda *_args: route)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_devin_messages", lambda *_args: messages)
+
+    def fail_ack(_root: Path, _route: object, _messages: list[dict[str, str]]) -> None:
+        raise ChatError("ack unavailable")
+
+    monkeypatch.setattr(runtime, "_ack_devin", fail_ack)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": str(uuid4()),
+                    "prompt": "next",
+                }
+            )
+        ),
+    )
+
+    with pytest.raises(ChatError, match="ack unavailable"):
+        runtime.devin_user_prompt(123, str(tmp_path))
+    assert capsys.readouterr().out == ""
+
+
+def test_devin_originates_local_send_with_exact_source_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cross_agent_chat.core import IntentStore, Registry, Route, session_key
+    from cross_agent_chat.runtime import Target
+
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="devin",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(source)
+    Registry(root).upsert(target)
+    target_view = Target(
+        alias=target.alias,
+        provider=target.provider,
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=session_key(target.provider, target.session_id),
+        remote=False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    monkeypatch.setattr(runtime, "local_targets", lambda _root: [target_view])
+    monkeypatch.setattr(
+        runtime,
+        "request_socket",
+        lambda _path, _payload, **_kwargs: {
+            "schema_version": 1,
+            "event_id": _payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": "codex",
+        },
+    )
+
+    result = runtime.send_local(root, source, target.alias, "bounded local fact")
+
+    assert result["to"] == target.alias
+    intent = IntentStore(root).intents()[0]
+    assert intent.source_alias == source.alias
+    assert intent.target_key == target_view.session_key
+
+
+def test_devin_originates_remote_send_with_exact_source_alias_and_intent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cross_agent_chat.core import IntentStore, Registry, Route
+    from cross_agent_chat.runtime import Target
+
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="devin",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(source)
+    target = Target(
+        alias="claude@remote:project",
+        provider="claude",
+        device="remote",
+        project="project",
+        generation=str(uuid4()),
+        session_key="a" * 64,
+        remote=True,
+        tailnet_address="100.64.0.2",
+    )
+    monkeypatch.setattr(runtime, "local_targets", lambda _root: [])
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([target], True))
+    seen: list[dict[str, object]] = []
+
+    def remote(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        seen.append(payload)
+        if payload.get("operation") == "authorize":
+            return {key: value for key, value in payload.items() if key != "operation"} | {
+                "status": "AUTHORIZED"
+            }
+        event_id = runtime.parse_remote_envelope(str(payload["envelope"]))[0]
+        return {
+            "schema_version": 1,
+            "event_id": event_id,
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": target.provider,
+        }
+
+    monkeypatch.setattr(runtime, "request_tailnet", remote)
+
+    result = runtime.send(root, source, target.session_key, "bounded remote fact")
+
+    assert result["to"] == target.alias
+    intent = IntentStore(root).intents()[0]
+    assert intent.source_alias == source.alias
+    assert intent.target_key == target.session_key
+    assert seen[0]["operation"] == "receive"
