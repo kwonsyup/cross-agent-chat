@@ -37,6 +37,7 @@ from cross_agent_chat.install import (
     SettingsError,
     SetupRollbackError,
     _hook_command,
+    _hook_trust_hash,
     _owned_hook,
     _owned_hook_native_queue,
     _package_tree_digest,
@@ -988,21 +989,16 @@ def test_uninstall_keeps_shared_runtime_when_another_profile_is_configured(
     assert (default.state / "intents.json").read_bytes() == original
 
 
-def test_setup_trusts_each_owned_codex_hook(tmp_path: Path) -> None:
+def test_setup_never_mints_codex_hook_trust(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
 
     installer.setup()
 
     config = tomllib.loads((home / ".codex" / "config.toml").read_text())
-    trusted = config["hooks"]["state"]
     assert config["mcp_servers"]["cross-agent-chat"]["tool_timeout_sec"] == 270
     assert config["mcp_servers"]["cross-agent-chat"]["default_tools_approval_mode"] == "approve"
-    assert len(trusted) == 3
-    assert all(
-        isinstance(item, dict) and str(item.get("trusted_hash", "")).startswith("sha256:")
-        for item in trusted.values()
-    )
+    assert "hooks" not in config or "state" not in config["hooks"]
 
 
 @pytest.mark.parametrize(
@@ -1676,36 +1672,30 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     )
     installer.setup()
     config = home / ".codex" / "config.toml"
-    parsed = tomllib.loads(config.read_text())
-    trusted = parsed["hooks"]["state"]
-    assert isinstance(trusted, dict)
-    owned: dict[str, str] = {}
-    for key, value in trusted.items():
-        if not str(key).startswith(f"{installer.codex_hooks}:"):
-            continue
-        assert isinstance(value, dict)
-        trusted_hash = value.get("trusted_hash")
-        assert isinstance(trusted_hash, str)
-        owned[str(key)] = trusted_hash
-    assert len(owned) == 3
-
-    stale = "".join(
-        f"[hooks.state.{json.dumps(key)}] # stale owned trust\n"
-        f"# formatting must not block repair\n"
-        f"trusted_hash = {json.dumps(trusted_hash)}\n\n"
-        for key, trusted_hash in owned.items()
+    hooks = json.loads(installer.codex_hooks.read_text())["hooks"]
+    session_end_index = next(
+        index for index, item in enumerate(hooks["SessionEnd"]) if _owned_hook(item)
+    )
+    session_start_index = next(
+        index for index, item in enumerate(hooks["SessionStart"]) if _owned_hook(item)
+    )
+    matching_key = f"{installer.codex_hooks}:session_end:{session_end_index}:0"
+    stale_key = f"{installer.codex_hooks}:session_start:{session_start_index}:0"
+    matching_hash = _hook_trust_hash(
+        _hook_command(Path("/opt/cross-agent-chat"), "codex", "studio", "SessionEnd"),
+        "SessionEnd",
+        3,
     )
     unrelated_key = f"{installer.codex_hooks}:stop:0:0"
     unrelated_hash = "sha256:" + "0" * 64
-    unrelated = (
+    config.write_text(
+        config.read_text()
+        + f"\n[hooks.state.{json.dumps(matching_key)}]\n"
+        + f"trusted_hash = {json.dumps(matching_hash)}\n"
+        + f"\n[hooks.state.{json.dumps(stale_key)}]\n"
+        + f"trusted_hash = {json.dumps('sha256:' + '1' * 64)}\n"
         f"[hooks.state.{json.dumps(unrelated_key)}]\n"
         f"trusted_hash = {json.dumps(unrelated_hash)}\n\n"
-    )
-    config.write_text(
-        config.read_text().replace(
-            "# cross-agent-chat:start",
-            stale + unrelated + "# cross-agent-chat:start",
-        )
     )
 
     installer.setup()
@@ -1713,10 +1703,8 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     repaired = tomllib.loads(config.read_text())
     repaired_trust = repaired["hooks"]["state"]
     assert isinstance(repaired_trust, dict)
-    repaired_owned = [
-        key for key in repaired_trust if str(key).startswith(f"{installer.codex_hooks}:")
-    ]
-    assert set(repaired_owned) == {*owned, unrelated_key}
+    assert repaired_trust[matching_key] == {"trusted_hash": matching_hash}
+    assert stale_key not in repaired_trust
     assert repaired_trust[unrelated_key] == {"trusted_hash": unrelated_hash}
 
     monkeypatch.setattr(installer, "_stop_broker", lambda: None)
@@ -1725,7 +1713,7 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     uninstalled = tomllib.loads(config.read_text())
     uninstalled_trust = uninstalled["hooks"]["state"]
     assert isinstance(uninstalled_trust, dict)
-    assert not set(owned).intersection(uninstalled_trust)
+    assert matching_key not in uninstalled_trust
     assert uninstalled_trust[unrelated_key] == {"trusted_hash": unrelated_hash}
 
 

@@ -843,8 +843,6 @@ def _strip_owned_toml_block(text: str) -> str:
 def _codex_owned_toml(
     executable: Path,
     device: str,
-    hooks_path: Path,
-    hook_indices: dict[str, int],
     *,
     codex_native_queue: bool = False,
 ) -> str:
@@ -861,19 +859,6 @@ def _codex_owned_toml(
         f"args = {args}\ntool_timeout_sec = {int(MCP_TOOL_TIMEOUT_SECONDS)}\n"
         'default_tools_approval_mode = "approve"\n'
     )
-    for event, timeout in (("SessionStart", 5), ("SessionEnd", 3), ("Stop", 3)):
-        hook_command = _hook_command(
-            executable,
-            "codex",
-            device,
-            event,
-            codex_native_queue=codex_native_queue,
-        )
-        key = f"{hooks_path}:{_hook_event_name(event)}:{hook_indices[event]}:0"
-        text += (
-            f"\n[hooks.state.{_toml_string(key)}]\n"
-            f"trusted_hash = {_toml_string(_hook_trust_hash(hook_command, event, timeout))}\n"
-        )
     return text + f"{OWNED_TOML_END}\n"
 
 
@@ -903,6 +888,45 @@ def _remove_owned_hook_trust(text: str, owned_keys: set[str]) -> str:
         state = hooks.get("state")
         if isinstance(state, MutableMapping):
             for key in owned_keys:
+                state.pop(key, None)
+    return tomlkit.dumps(document)
+
+
+def _retain_matching_owned_command_hook_trust(
+    text: str,
+    config: dict[str, object],
+    hooks_path: Path,
+    executable: Path,
+    device: str,
+    *,
+    codex_native_queue: bool,
+) -> str:
+    """Keep provider-written command trust only when the exact hook still matches."""
+
+    try:
+        document = tomlkit.parse(text)
+    except TOMLKitError as error:
+        raise SettingsError("Codex config.toml is invalid") from error
+    hooks = document.get("hooks")
+    state = hooks.get("state") if isinstance(hooks, MutableMapping) else None
+    raw_hooks = config.get("hooks")
+    if not isinstance(state, MutableMapping) or not isinstance(raw_hooks, dict):
+        return tomlkit.dumps(document)
+    hook_map = cast(dict[str, object], raw_hooks)
+    for event, timeout in (("SessionStart", 5), ("SessionEnd", 3), ("Stop", 3)):
+        groups = hook_map.get(event)
+        if not isinstance(groups, list):
+            continue
+        command = _hook_command(
+            executable, "codex", device, event, codex_native_queue=codex_native_queue
+        )
+        expected = _hook_trust_hash(command, event, timeout)
+        for index, group in enumerate(groups):
+            if not _owned_hook(group):
+                continue
+            key = f"{hooks_path}:{_hook_event_name(event)}:{index}:0"
+            value = state.get(key)
+            if not isinstance(value, MutableMapping) or value.get("trusted_hash") != expected:
                 state.pop(key, None)
     return tomlkit.dumps(document)
 
@@ -1471,30 +1495,29 @@ class Installer:
         raw_hook_map = codex_hooks.get("hooks")
         if not isinstance(raw_hook_map, dict):
             raise SettingsError("Codex hooks must be an object")
-        hook_map = cast(dict[str, object], raw_hook_map)
-        hook_indices: dict[str, int] = {}
         for event in ("SessionStart", "SessionEnd", "Stop"):
-            groups = hook_map.get(event)
+            groups = cast(dict[str, object], raw_hook_map).get(event)
             if not isinstance(groups, list):
                 raise SettingsError(f"Codex hook {event} must be a list")
             indices = [index for index, item in enumerate(groups) if _owned_hook(item)]
             if len(indices) != 1:
                 raise SettingsError(f"Codex hook {event} ownership is ambiguous")
-            hook_indices[event] = indices[0]
 
         codex_text = self._codex_config_text() or ""
         codex_text = _strip_owned_toml_block(codex_text)
-        codex_text = _remove_owned_hook_trust(
+        codex_text = _retain_matching_owned_command_hook_trust(
             codex_text,
-            _owned_hook_trust_keys(codex_hooks, self.codex_hooks),
+            codex_hooks,
+            self.codex_hooks,
+            self.executable,
+            self.device,
+            codex_native_queue=codex_native_queue,
         ).rstrip()
         codex_text = _remove_owned_codex_tool_approval_overrides(codex_text).rstrip()
         codex_text = _enable_hooks_feature(codex_text).rstrip() + "\n\n"
         codex_text += _codex_owned_toml(
             self.executable,
             self.device,
-            self.codex_hooks,
-            hook_indices,
             codex_native_queue=codex_native_queue,
         )
 
