@@ -117,6 +117,37 @@ def test_install_script_stages_before_runtime_transition() -> None:
     assert "your shell resolves" in script
 
 
+def test_published_install_references_match_package_version() -> None:
+    root = Path(__file__).resolve().parents[1]
+    version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+
+    assert isinstance(version, str)
+    assert f'__version__ = "{version}"' in (root / "src/cross_agent_chat/__init__.py").read_text()
+    assert (
+        f"git+https://github.com/kwonsyup/cross-agent-chat.git@v{version}"
+        in (root / "install.sh").read_text()
+    )
+    readme = (root / "README.md").read_text()
+    assert f"Install v{version} with:" in readme
+    install_url = (
+        f"https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v{version}/install.sh"
+    )
+    assert install_url in readme
+    assert f"released `v{version}` tag" in readme
+    changelog_versions = re.findall(
+        r"^## (\d+\.\d+\.\d+) -", (root / "CHANGELOG.md").read_text(), flags=re.MULTILINE
+    )
+    assert changelog_versions[0] == version
+    codex_client_versions = re.findall(
+        r'"clientInfo": \{"name": "cross-agent-chat", "version": "([^"]+)"\}',
+        (root / "src/cross_agent_chat/codex.py").read_text(),
+    )
+    assert codex_client_versions and set(codex_client_versions) == {version}
+    ci = (root / ".github/workflows/ci.yml").read_text()
+    assert re.findall(r"cross-agent-chat (\d+\.\d+\.\d+)", ci) == [version]
+    assert re.findall(r'"version":"(\d+\.\d+\.\d+)"', ci) == [version]
+
+
 def test_staged_install_parser_accepts_explicit_device(tmp_path: Path) -> None:
     arguments = parser().parse_args(
         [
