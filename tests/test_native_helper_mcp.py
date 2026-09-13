@@ -327,6 +327,7 @@ def test_mcp_bootstrap_register_duplicate_journey_is_single_and_nonrecursive(
 
     helper_root = tmp_path / helper_directory
     helper_root.mkdir()
+    assert original.profile_root is not None
     helper = route(
         helper_root,
         session_id="00000000-0000-4000-8000-000000000009",
