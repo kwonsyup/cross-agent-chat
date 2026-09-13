@@ -186,6 +186,7 @@ def patch_startup(
         lambda _event: {"session_id": route.session_id, "cwd": route.cwd},
     )
     monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_native_hook_ready", lambda *_args: True)
     monkeypatch.setattr(runtime, "native_desktop_process", lambda _pid: desktop)
     monkeypatch.setattr(
         runtime,
@@ -203,9 +204,12 @@ def test_native_startup_offers_context_only_to_eligible_unprovisioned_original(
     patch_startup(monkeypatch, route)
 
     assert runtime.native_startup(root, "studio", route.pid) == {
-        "additionalContext": (
-            "Cross Agent Chat needs its native delivery helper. Call native_bootstrap once now."
-        )
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": (
+                "Cross Agent Chat needs its native delivery helper. Call native_bootstrap once now."
+            ),
+        }
     }
 
 
@@ -249,3 +253,21 @@ def test_native_startup_is_noop_for_helper_and_registered_original(
     assert runtime.native_startup(root, "studio", helper.pid) == {}
     patch_startup(monkeypatch, original)
     assert runtime.native_startup(root, "studio", original.pid) == {}
+
+
+def test_native_session_start_uses_the_provider_hook_output_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    route = startup_route(tmp_path)
+    Registry(root).upsert(route)
+    patch_startup(monkeypatch, route)
+
+    assert runtime.native_bootstrap_context(root, route, "SessionStart") == {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": (
+                "Cross Agent Chat needs its native delivery helper. Call native_bootstrap once now."
+            ),
+        }
+    }

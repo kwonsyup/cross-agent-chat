@@ -2018,12 +2018,25 @@ def native_startup(root: Path, device: str, pid: int) -> dict[str, object]:
         return {}
     if identity != candidates[0].owner_identity or not native_desktop_process(candidates[0].pid):
         return {}
-    if native_helper_tools(root, candidates[0]) != ("native_bootstrap",):
+    return native_bootstrap_context(root, candidates[0], "UserPromptSubmit")
+
+
+def native_bootstrap_context(root: Path, source: Route, event_name: str) -> dict[str, object]:
+    """Emit the provider-shaped one-time bootstrap instruction for an eligible Desktop route."""
+
+    if (
+        event_name not in {"SessionStart", "UserPromptSubmit"}
+        or native_helper_tools(root, source) != ("native_bootstrap",)
+        or not _native_hook_ready(source, _native_create_hook_group())
+    ):
         return {}
     return {
-        "additionalContext": (
-            "Cross Agent Chat needs its native delivery helper. Call native_bootstrap once now."
-        )
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": (
+                "Cross Agent Chat needs its native delivery helper. Call native_bootstrap once now."
+            ),
+        }
     }
 
 

@@ -25,6 +25,7 @@ from cross_agent_chat.runtime import (
     courier_server,
     event_status,
     native_bootstrap,
+    native_bootstrap_context,
     native_desktop_mcp_host,
     native_dispatch,
     native_register,
@@ -479,7 +480,17 @@ def run(arguments: argparse.Namespace) -> int:
         IntentStore(state_root()).mark(arguments.event_id, "RESOLVED_BY_OWNER")
         print(f"Resolved event {arguments.event_id}. A later fresh send is now allowed.")
     elif command == "_register":
-        register(arguments.provider, arguments.device, arguments.pid, arguments.state_root)
+        registered = register(
+            arguments.provider, arguments.device, arguments.pid, arguments.state_root
+        )
+        if registered is not None and arguments.provider == "codex":
+            print(
+                json.dumps(
+                    native_bootstrap_context(
+                        state_root(arguments.state_root), registered, "SessionStart"
+                    )
+                )
+            )
     elif command == "_unregister":
         unregister(arguments.provider, arguments.pid, arguments.state_root)
     elif command == "_codex-stop":
