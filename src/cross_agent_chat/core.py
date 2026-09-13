@@ -36,6 +36,8 @@ MAX_ALIAS_CODEPOINTS: Final = 128
 SAFE_DEVICE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}\Z")
 UUID_RE: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 DEVIN_SESSION_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}\Z")
+# Devin documents this as an opaque session id. Keep a bounded, path-safe
+# representation so hooks can bind it without assuming UUIDs or exposing it.
 
 
 class ChatError(RuntimeError):

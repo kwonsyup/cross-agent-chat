@@ -204,6 +204,7 @@ def test_devin_global_hooks_and_user_mcp_are_owned_and_preserved(
         device="studio",
         devin_global=True,
     )
+    assert installer.devin_hooks is not None
     installer.devin_hooks.parent.mkdir(parents=True)
     installer.devin_hooks.write_text(
         json.dumps(
@@ -211,7 +212,11 @@ def test_devin_global_hooks_and_user_mcp_are_owned_and_preserved(
                 "hooks": {
                     "SessionStart": [
                         {"matcher": "", "hooks": [{"type": "command", "command": "keep-me"}]}
-                    ]
+                    ],
+                    "SessionEnd": [],
+                    "Stop": [],
+                    "UserPromptSubmit": [],
+                    "PreToolUse": [],
                 }
             }
         )
@@ -234,6 +239,11 @@ def test_devin_global_hooks_and_user_mcp_are_owned_and_preserved(
     assert (
         json.loads(installer.devin_hooks.read_text())["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         == "keep-me"
+    )
+    hooks_after = json.loads(installer.devin_hooks.read_text())["hooks"]
+    assert all(
+        event not in hooks_after
+        for event in ("SessionEnd", "Stop", "UserPromptSubmit", "PreToolUse")
     )
     assert set(json.loads(installer.devin_mcp.read_text())["mcpServers"]) == {"keep"}
 

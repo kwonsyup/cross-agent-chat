@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import secrets
 import shutil
@@ -117,7 +118,15 @@ class DevinCapability:
         }:
             raise ChatError("Devin capability state is invalid")
         raw = cast(dict[object, object], value)
-        if not all(isinstance(item, (str, int, float)) for item in raw.values()):
+        string_fields = (
+            "token_digest",
+            "session_id",
+            "generation",
+            "prompt_id",
+            "tool_name",
+            "arguments_digest",
+        )
+        if not all(isinstance(raw[field], str) for field in string_fields):
             raise ChatError("Devin capability state is invalid")
         tool = raw["tool_name"]
         if tool not in {"chat_peers", "chat_send", "chat_status"}:
@@ -132,6 +141,7 @@ class DevinCapability:
             or any(character not in "0123456789abcdef" for character in arguments_digest)
             or not isinstance(issued_at, (int, float))
             or isinstance(issued_at, bool)
+            or not math.isfinite(issued_at)
         ):
             raise ChatError("Devin capability state is invalid")
         valid_session_id("devin", cast(str, raw["session_id"]), "Devin capability session id")

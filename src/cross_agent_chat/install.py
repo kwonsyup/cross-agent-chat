@@ -3401,7 +3401,7 @@ class Installer:
                 def remove_devin_hooks(value: dict[str, object]) -> None:
                     hooks = value.get("hooks")
                     if isinstance(hooks, dict):
-                        _remove_hooks(cast(dict[str, object], hooks))
+                        _remove_devin_hooks(cast(dict[str, object], hooks))
 
                 self._update_json_for_uninstall(
                     current_destinations[self.devin_hooks],

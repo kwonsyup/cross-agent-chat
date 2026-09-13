@@ -6,18 +6,20 @@ import os
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import pytest
 
 from cross_agent_chat import runtime
-from cross_agent_chat.core import MAX_MESSAGE_BYTES, ChatError
+from cross_agent_chat.core import MAX_MESSAGE_BYTES, ChatError, valid_session_id
 from cross_agent_chat.devin import (
     DEVIN_CAPABILITY_FIELD,
     DEVIN_CAPABILITY_TTL_SECONDS,
     DEVIN_HOOK_INPUT_MAX_BYTES,
     DEVIN_PRETOOL_INPUT_MAX_BYTES,
     DEVIN_STOP_CALLBACK_MAX_BYTES,
+    DevinCapability,
     DevinCapabilityStore,
     DevinHookEvent,
     build_pretool_callback,
@@ -27,6 +29,7 @@ from cross_agent_chat.devin import (
     parse_hook_input,
     parse_pretool_input,
 )
+from cross_agent_chat.remote import parse_remote_envelope
 
 
 def _hook(event: str, *, session_id: str | None = None, prompt_id: str | None = None) -> str:
@@ -69,6 +72,19 @@ def test_parse_session_start_allows_absent_prompt_id_and_rejects_wrong_event() -
     assert parsed.stop_hook_active is None
     with pytest.raises(ChatError, match="does not match"):
         parse_hook_input(_hook("UserPromptSubmit"), expected_event="Stop")
+
+
+@pytest.mark.parametrize("session_id", ["short", "session/id", "session id", "session\u0000id"])
+def test_devin_session_identity_is_bounded_and_path_safe(session_id: str) -> None:
+    with pytest.raises(ChatError, match="session id is invalid"):
+        valid_session_id("devin", session_id)
+
+
+def test_devin_session_identity_accepts_opaque_provider_value() -> None:
+    session_id = "S-7fA9._opaque"
+
+    assert valid_session_id("devin", session_id) == session_id
+    assert valid_session_id("claude", str(uuid4()))
 
 
 @pytest.mark.parametrize(
@@ -438,7 +454,7 @@ def test_pretool_capability_binds_exact_call_and_is_one_use(tmp_path: Path) -> N
         cwd=str(tmp_path),
         pid=123,
     )
-    arguments = {"to": "devin@remote:project", "message": "bounded"}
+    arguments: dict[str, object] = {"to": "devin@remote:project", "message": "bounded"}
     prompt_id = str(uuid4())
     store = DevinCapabilityStore(tmp_path / "state")
     token = store.issue(
@@ -536,7 +552,7 @@ def test_devin_pretool_overwrites_model_capability_field(
     monkeypatch.setattr(runtime, "state_root", lambda _value: state)
     monkeypatch.setattr(runtime, "_devin_route", lambda *_args: route)
     monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
-    monkeypatch.setattr(runtime.os, "getppid", lambda: 123)
+    monkeypatch.setattr(os, "getppid", lambda: 123)
     payload = {
         "hook_event_name": "PreToolUse",
         "session_id": session_id,
@@ -599,7 +615,7 @@ def test_pretool_accepts_full_message_with_json_escaping() -> None:
     assert len(text.encode()) > MAX_MESSAGE_BYTES
     assert len(text.encode()) <= DEVIN_PRETOOL_INPUT_MAX_BYTES
     parsed = parse_pretool_input(text)
-    assert len(parsed.tool_input["message"]) == MAX_MESSAGE_BYTES // 2
+    assert len(cast(str, parsed.tool_input["message"])) == MAX_MESSAGE_BYTES // 2
 
 
 def test_capability_ttl_prunes_expired_and_revocation_reopens_capacity(
@@ -631,6 +647,64 @@ def test_capability_ttl_prunes_expired_and_revocation_reopens_capacity(
         store.issue(route, prompt_id=str(uuid4()), tool_name="chat_peers", arguments={})
     store.revoke_session(route.session_id)
     store.issue(route, prompt_id=str(uuid4()), tool_name="chat_peers", arguments={})
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "token_digest",
+        "session_id",
+        "generation",
+        "prompt_id",
+        "tool_name",
+        "arguments_digest",
+    ],
+)
+def test_devin_capability_state_requires_string_private_fields(
+    tmp_path: Path, field: str
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    valid = DevinCapability(
+        token_digest="a" * 64,
+        session_id="opaque123",
+        generation=str(uuid4()),
+        prompt_id=str(uuid4()),
+        tool_name="chat_peers",
+        arguments_digest="b" * 64,
+        issued_at=100.0,
+    ).to_dict()
+    valid[field] = 1
+    capability_path = state / "devin-capabilities.json"
+    capability_path.write_text(json.dumps([valid]))
+    capability_path.chmod(0o600)
+
+    with pytest.raises(ChatError, match="state is invalid"):
+        DevinCapabilityStore(state).capabilities()
+
+
+@pytest.mark.parametrize("issued_at", [True, float("nan"), float("inf"), "100"])
+def test_devin_capability_state_requires_finite_numeric_issue_time(
+    tmp_path: Path, issued_at: object
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    value = DevinCapability(
+        token_digest="a" * 64,
+        session_id="opaque123",
+        generation=str(uuid4()),
+        prompt_id=str(uuid4()),
+        tool_name="chat_peers",
+        arguments_digest="b" * 64,
+        issued_at=100.0,
+    ).to_dict()
+    value["issued_at"] = issued_at
+    capability_path = state / "devin-capabilities.json"
+    capability_path.write_text(json.dumps([value], allow_nan=True))
+    capability_path.chmod(0o600)
+
+    with pytest.raises(ChatError, match="state is invalid"):
+        DevinCapabilityStore(state).capabilities()
 
 
 def test_pretool_capability_reaches_public_chat_peers_authentication(
@@ -778,7 +852,7 @@ def test_devin_originates_remote_send_with_exact_source_alias_and_intent(
             return {key: value for key, value in payload.items() if key != "operation"} | {
                 "status": "AUTHORIZED"
             }
-        event_id = runtime.parse_remote_envelope(str(payload["envelope"]))[0]
+        event_id = parse_remote_envelope(str(payload["envelope"]))[0]
         return {
             "schema_version": 1,
             "event_id": event_id,
