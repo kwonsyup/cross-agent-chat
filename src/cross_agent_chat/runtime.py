@@ -1618,6 +1618,13 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
     if rejection is not None:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
         raise ChatError("remote target rejected the message before provider effect")
+    diagnostic = unknown_delivery_diagnostic(response, event_id, target.provider)
+    if diagnostic is not None:
+        store.mark(event_id, "UNKNOWN_DELIVERY")
+        raise UnknownDeliveryError(
+            f"remote delivery state is unknown for event {event_id}; diagnostic {diagnostic}; "
+            "do not retry automatically"
+        )
     if response != expected:
         store.mark(event_id, "UNKNOWN_DELIVERY")
         raise UnknownDeliveryError("remote delivery state is unknown")
@@ -1739,6 +1746,8 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
                 "provider": target.provider,
                 "error": "remote destination rejected before provider effect",
             }
+        if unknown_delivery_diagnostic(response, event_id, target.provider) is not None:
+            return response
         if response != expected:
             raise UnknownDeliveryError("remote delivery state is unknown")
         return expected

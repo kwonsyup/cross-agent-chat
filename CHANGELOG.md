@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 - 2026-09-12
+
+- Snapshot provider configuration after immutable staged-runtime durability work. Concurrent user
+  edits in that interval are included in the staged setup while later changes remain guarded before
+  write and during rollback.
+- Preserve an existing exact, body-free Claude helper unknown-delivery diagnostic across the remote
+  broker boundary. This does not retry, replay, or resolve the delivery.
+
 ## 0.1.9 - 2026-09-12
 
 - Keep localhost broker health and local delivery responsive while the optional Tailnet binding

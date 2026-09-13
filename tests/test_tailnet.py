@@ -18,7 +18,14 @@ import pytest
 import cross_agent_chat.tailnet_broker as tailnet_broker_module
 from cross_agent_chat import __version__, runtime
 from cross_agent_chat.cli import parser
-from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, session_key
+from cross_agent_chat.core import (
+    ChatError,
+    IntentStore,
+    Registry,
+    Route,
+    UnknownDeliveryError,
+    session_key,
+)
 from cross_agent_chat.runtime import (
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     Target,
@@ -1428,6 +1435,117 @@ def test_remote_send_uses_tailnet_broker_without_ssh_configuration(
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     assert "hello" not in (tmp_path / "intents.json").read_text()
+
+
+def test_remote_claude_diagnostic_is_body_free_and_marks_one_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    address = "100.64.0.11"
+    target_alias = "claude@studio:api:api-a1"
+    generation = str(uuid4())
+
+    def request(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        if payload.get("operation") == "peers":
+            return {
+                "schema_version": 1,
+                "peers": [
+                    {
+                        "alias": target_alias,
+                        "provider": "claude",
+                        "device": "studio",
+                        "project": "api",
+                        "status": "available",
+                        "generation": generation,
+                        "session_key": "a" * 64,
+                    }
+                ],
+            }
+        envelope = json.loads(str(payload["envelope"]))
+        return {
+            "schema_version": 1,
+            "event_id": envelope["event_id"],
+            "status": "UNKNOWN_DELIVERY",
+            "provider": "claude",
+            "diagnostic": "claude_helper_timeout",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [address])
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="source",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(source)
+
+    with pytest.raises(UnknownDeliveryError, match="claude_helper_timeout") as error:
+        send(tmp_path, source, target_alias, "private message body")
+
+    assert "private message body" not in str(error.value)
+    assert IntentStore(tmp_path).intents()[0].status == "UNKNOWN_DELIVERY"
+
+
+def test_remote_receiver_forwards_only_exact_claude_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(target)
+    public_target = Target(
+        alias=target.alias,
+        provider=target.provider,
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=session_key(target.provider, target.session_id),
+        remote=False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=str(uuid4()),
+        target_alias=target.alias,
+        generation=target.generation,
+        message="private message body",
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_tailnet",
+        lambda _address, payload, **_: (
+            {key: value for key, value in payload.items() if key != "operation"}
+            | {"status": "AUTHORIZED"}
+        ),
+    )
+    valid_response = {
+        "schema_version": 1,
+        "event_id": event_id,
+        "status": "UNKNOWN_DELIVERY",
+        "provider": "claude",
+        "diagnostic": "claude_helper_timeout",
+    }
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket", lambda *_args, **_kwargs: valid_response
+    )
+
+    assert receive_remote(tmp_path, envelope, "100.64.0.11") == valid_response
+
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda *_args, **_kwargs: {**valid_response, "extra": "reject"},
+    )
+    with pytest.raises(UnknownDeliveryError, match="remote delivery state is unknown"):
+        receive_remote(tmp_path, envelope, "100.64.0.11")
 
 
 def test_remote_pre_effect_rejection_is_safe_and_does_not_block_fresh_send(
