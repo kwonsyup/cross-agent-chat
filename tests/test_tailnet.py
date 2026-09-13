@@ -78,6 +78,132 @@ def test_tailnet_discovery_returns_only_online_ipv4_nodes() -> None:
     assert parse_tailnet_nodes(payload) == ["100.64.0.11"]
 
 
+def test_legacy_broker_peer_request_filters_new_devin_routes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[bool] = []
+
+    def observed_peers(
+        _root: Path, *, include_remote: bool, internal: bool, include_devin: bool
+    ) -> dict[str, object]:
+        assert include_remote is False
+        assert internal is True
+        calls.append(include_devin)
+        return {"schema_version": 1, "peers": []}
+
+    monkeypatch.setattr(tailnet_broker_module, "peers", observed_peers)
+
+    result = handle_broker_request(
+        tmp_path,
+        {"schema_version": 1, "operation": "peers"},
+        "100.64.0.2",
+    )
+
+    assert result == {"schema_version": 1, "peers": []}
+    assert calls == [False]
+
+
+def test_new_devin_discovery_falls_back_to_legacy_broker_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    peer = {
+        "alias": "codex@remote:api:123456789abc",
+        "provider": "codex",
+        "device": "remote",
+        "project": "api",
+        "status": "available",
+        "generation": str(uuid4()),
+        "session_key": session_key("codex", session_id),
+    }
+    calls: list[dict[str, object]] = []
+
+    def old_broker(
+        _address: str, payload: dict[str, object], *, timeout: float
+    ) -> dict[str, object]:
+        del timeout
+        calls.append(payload)
+        if "include_devin" in payload:
+            raise ChatError("legacy broker rejected unknown field")
+        return {"schema_version": 1, "peers": [peer]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", old_broker)
+
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.2",
+        deadline=time.monotonic() + 2,
+        include_devin=True,
+    )
+
+    assert complete is True
+    assert [target.provider for target in targets] == ["codex"]
+    assert calls == [
+        {"schema_version": 1, "operation": "peers", "include_devin": True},
+        {"schema_version": 1, "operation": "peers"},
+    ]
+
+
+def test_negotiated_devin_roster_preserves_delivery_mode_and_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    peer = {
+        "alias": "devin@remote:api",
+        "provider": "devin",
+        "device": "remote",
+        "project": "api",
+        "status": "available",
+        "generation": str(uuid4()),
+        "session_key": session_key("devin", session_id),
+        "delivery_mode": "devin_stop_or_prompt_bound",
+        "title": "Devin canary",
+    }
+    calls: list[dict[str, object]] = []
+
+    def new_broker(
+        _address: str, payload: dict[str, object], *, timeout: float
+    ) -> dict[str, object]:
+        del timeout
+        calls.append(payload)
+        item = (
+            peer
+            if "include_title" in payload
+            else {key: value for key, value in peer.items() if key != "title"}
+        )
+        return {"schema_version": 1, "peers": [item]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", new_broker)
+
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.2",
+        deadline=time.monotonic() + 2,
+        include_devin=True,
+        include_delivery_mode=True,
+        include_title=True,
+    )
+
+    assert complete is True
+    assert len(targets) == 1
+    assert targets[0].provider == "devin"
+    assert targets[0].delivery_mode == "devin_stop_or_prompt_bound"
+    assert targets[0].title == "Devin canary"
+    assert calls == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
+            "include_devin": True,
+        },
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
+            "include_title": True,
+            "include_devin": True,
+        },
+    ]
+
+
 def _remote_peer(*, provider: str = "codex", title: str | None = None) -> dict[str, object]:
     session = str(uuid4())
     peer: dict[str, object] = {
