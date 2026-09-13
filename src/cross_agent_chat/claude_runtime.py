@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Final, Literal, NoReturn, TypedDict, cast
@@ -281,7 +282,10 @@ def _valid_summary(value: object) -> bool:
         value.encode()
     except UnicodeEncodeError:
         return False
-    return True
+    return all(
+        character == "\t" or not unicodedata.category(character).startswith(("C", "Zl", "Zp"))
+        for character in value
+    )
 
 
 def _pretool_denial(

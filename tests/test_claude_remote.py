@@ -316,6 +316,15 @@ def test_pretool_gate_accepts_bounded_one_line_summary_variants(summary: str) ->
         ("sendmessage_summary_mismatch", {"summary": "carriage\rreturn"}),
         ("sendmessage_summary_mismatch", {"summary": "x" * 201}),
         ("sendmessage_summary_mismatch", {"summary": "split\u2028line"}),
+        ("sendmessage_summary_mismatch", {"summary": "para\u2029graph"}),
+        ("sendmessage_summary_mismatch", {"summary": "vertical\x0btab"}),
+        ("sendmessage_summary_mismatch", {"summary": "form\x0cfeed"}),
+        ("sendmessage_summary_mismatch", {"summary": "nel\x85break"}),
+        ("sendmessage_summary_mismatch", {"summary": "del\x7fete"}),
+        ("sendmessage_summary_mismatch", {"summary": "bidi\u202eoverride"}),
+        ("sendmessage_summary_mismatch", {"summary": "zero\u200bwidth"}),
+        ("sendmessage_summary_mismatch", {"summary": "\ufeffbom"}),
+        ("sendmessage_summary_mismatch", {"summary": "private\ue000use"}),
         ("sendmessage_summary_mismatch", {"summary": "bad\ud800 surrogate"}),
         ("sendmessage_summary_mismatch", {"summary": 7}),
         ("sendmessage_payload_mismatch", {"type": "message", "extra": "field"}),
@@ -348,6 +357,79 @@ def test_pretool_gate_separates_type_and_summary_denials(
     }
 
     assert _pretool_denial(expected, payload, key.hex()) == denial
+
+
+@pytest.mark.parametrize("field", ["to", "recipient"])
+def test_pretool_gate_denies_partial_target_alias_divergence(field: str) -> None:
+    key = bytes.fromhex("cc" * 32)
+    message = "one exact body"
+    recipient = "API work [ABC123]"
+    expected: dict[str, object] = {
+        "recipient": recipient,
+        "message_hmac": hmac.new(key, message.encode(), hashlib.sha256).hexdigest(),
+    }
+    tool_input: dict[str, object] = {
+        "to": recipient,
+        "recipient": recipient,
+        "message": message,
+        "content": "provider preview",
+        "type": "message",
+        "summary": "Cross Agent Chat",
+        field: "Other work [XYZ789]",
+    }
+    payload: dict[str, object] = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "SendMessage",
+        "tool_input": tool_input,
+    }
+
+    assert _pretool_denial(expected, payload, key.hex()) == "sendmessage_target_mismatch"
+
+
+def test_pretool_gate_denies_replay_after_consumption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    key = "dd" * 32
+    target = "API work [ABC123]"
+    message = "hello"
+    expected_path = tmp_path / "expected.json"
+    expected_path.write_text(
+        json.dumps(
+            {
+                "recipient": target,
+                "message_hmac": hmac.new(
+                    bytes.fromhex(key), message.encode(), hashlib.sha256
+                ).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "SendMessage",
+        "tool_input": {
+            "to": target,
+            "recipient": target,
+            "message": message,
+            "content": "preview",
+            "type": "message",
+            "summary": "Cross Agent Chat",
+        },
+    }
+    stdin = io.StringIO(json.dumps(payload))
+    monkeypatch.setattr("sys.stdin", stdin)
+
+    assert run_pretool_gate(str(expected_path), key)
+    assert (tmp_path / "consumed").exists()
+
+    stdin.seek(0)
+    assert not run_pretool_gate(str(expected_path), key)
+    assert (tmp_path / "denied").read_bytes() == DENIAL_MARKERS["pretool_gate_denied"]
+    decisions = [
+        json.loads(line)["hookSpecificOutput"]["permissionDecision"]
+        for line in capsys.readouterr().out.splitlines()
+    ]
+    assert decisions == ["allow", "deny"]
 
 
 def test_pretool_gate_uses_full_unicode_body_not_cosmetic_preview() -> None:
@@ -873,21 +955,32 @@ def test_sendmessage_receipt_requires_exact_success_contract() -> None:
             "summary": "Cross Agent Chat",
         },
     }
+    text_block: dict[str, object] = {
+        "type": "text",
+        "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
+    }
     result: dict[str, object] = {
         "type": "tool_result",
         "tool_use_id": tool_id,
-        "content": [
-            {
-                "type": "text",
-                "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
-            }
-        ],
+        "content": [text_block],
     }
     stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
 
     assert parse_sendmessage_receipt(stream, target, message) == message_id
 
     result["is_error"] = True
+    rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+    with pytest.raises(ChatError, match="receipt"):
+        parse_sendmessage_receipt(rejected, target, message)
+
+    result["is_error"] = False
+    text_block["text"] = json.dumps(
+        {"success": True, "message": "sent", "msg_id": message_id, "latency_ms": 3}
+    )
+    rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+    with pytest.raises(ChatError, match="receipt"):
+        parse_sendmessage_receipt(rejected, target, message)
+    text_block["text"] = json.dumps({"success": True, "msg_id": message_id})
     rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="receipt"):
         parse_sendmessage_receipt(rejected, target, message)
@@ -945,6 +1038,12 @@ def test_sendmessage_receipt_accepts_display_only_summary_variants(
         {"summary": "carriage\rreturn"},
         {"summary": "x" * 201},
         {"summary": "split\u2028line"},
+        {"summary": "para\u2029graph"},
+        {"summary": "nel\x85break"},
+        {"summary": "del\x7fete"},
+        {"summary": "bidi\u202eoverride"},
+        {"summary": "zero\u200bwidth"},
+        {"summary": "\ufeffbom"},
         {"summary": 7},
         {"summary": None},
         {"notify_when_idle": True},
@@ -980,6 +1079,68 @@ def test_sendmessage_receipt_rejects_control_and_summary_violations(
         ],
     }
     stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+
+    with pytest.raises(ChatError, match="receipt"):
+        parse_sendmessage_receipt(stream, target, "hello")
+
+
+@pytest.mark.parametrize(
+    "tool_id,result_override,expected_results",
+    [
+        (7, None, "one"),
+        ("tool-1", {"content": "not-a-list"}, "one"),
+        ("tool-1", {"content": []}, "one"),
+        (
+            "tool-1",
+            {
+                "content": [
+                    {"type": "text", "text": "{}"},
+                    {"type": "text", "text": "{}"},
+                ]
+            },
+            "one",
+        ),
+        ("tool-1", {"is_error": True}, "one"),
+        ("tool-1", None, "unmatched"),
+        ("tool-1", None, "duplicate"),
+    ],
+)
+def test_sendmessage_receipt_rejects_result_contract_violations(
+    tool_id: object, result_override: dict[str, object] | None, expected_results: str
+) -> None:
+    message_id = str(uuid4())
+    target = "API work [ABC123]"
+    use = {
+        "type": "tool_use",
+        "id": tool_id,
+        "name": "SendMessage",
+        "input": {
+            "to": target,
+            "recipient": target,
+            "message": "hello",
+            "content": "provider preview",
+            "type": "message",
+            "summary": "Cross Agent Chat",
+        },
+    }
+    result: dict[str, object] = {
+        "type": "tool_result",
+        "tool_use_id": "tool-1",
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
+            }
+        ],
+    }
+    if result_override is not None:
+        result.update(result_override)
+    results = [result]
+    if expected_results == "unmatched":
+        results = [dict(result, tool_use_id="other-tool")]
+    elif expected_results == "duplicate":
+        results = [result, dict(result)]
+    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in [use, *results])
 
     with pytest.raises(ChatError, match="receipt"):
         parse_sendmessage_receipt(stream, target, "hello")
