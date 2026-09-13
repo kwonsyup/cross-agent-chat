@@ -321,7 +321,7 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "local_broker": "healthy",
         "next": "start fresh Claude/Codex sessions",
         "remote_trust": "tailscale_acl",
-        "version": "0.1.9",
+        "version": "0.2.0",
     }
 
 
@@ -2697,6 +2697,38 @@ def test_staged_install_commits_stable_runtime_and_provider_paths(
     assert not list(installer.transactions.iterdir())
 
 
+def test_staged_install_snapshots_provider_config_after_runtime_durability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import install as install_module
+
+    home = tmp_path / "home"
+    stable = home / "custom-tools" / "cross-agent-chat"
+    claude_config = home / ".claude.json"
+    home.mkdir()
+    claude_config.write_text(json.dumps({"mcpServers": {"before": {}}}))
+    installer = Installer(home=home, executable=stable, device="studio")
+    stage = _staged_runtime(installer)
+    concurrent: dict[str, dict[str, dict[str, object]]] = {"mcpServers": {"concurrent-user": {}}}
+
+    def fsync_staged(path: Path) -> None:
+        assert path == stage
+        claude_config.write_text(json.dumps(concurrent))
+
+    monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+    monkeypatch.setattr(installer, "activate", lambda: None)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: True)
+    monkeypatch.setattr(install_module, "_fsync_tree", fsync_staged)
+
+    installer.install_staged(stage, stable)
+
+    assert json.loads(claude_config.read_text())["mcpServers"]["concurrent-user"] == {}
+
+
 def test_staged_upgrade_preserves_durable_unknown_and_accepted_intent_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3070,6 +3102,58 @@ def test_staged_install_fsyncs_backup_and_journal_parents_before_first_effect(
     assert f"fsync:{home}" in before_effect
 
 
+def test_staged_install_fsyncs_retargeted_provider_parent_before_runtime_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import install as install_module
+
+    home = tmp_path / "home"
+    home.mkdir()
+    stable = home / "bin/cross-agent-chat"
+    claude_config = home / ".claude.json"
+    initial = home / "provider-initial/claude.json"
+    retargeted = home / "provider-retargeted/deep/claude.json"
+    initial.parent.mkdir(parents=True)
+    retargeted.parent.mkdir(parents=True)
+    initial.write_text(json.dumps({"mcpServers": {"initial": {}}}))
+    retargeted.write_text(json.dumps({"mcpServers": {"concurrent-user": {}}}))
+    claude_config.symlink_to(initial)
+    installer = Installer(home=home, executable=stable, device="studio")
+    stage = _staged_runtime(installer)
+    events: list[str] = []
+
+    def fsync_staged(path: Path) -> None:
+        assert path == stage
+        claude_config.unlink()
+        claude_config.symlink_to(retargeted)
+
+    def fsync_directory(path: Path) -> None:
+        events.append(f"fsync:{path}")
+
+    original_symlink = install_module._atomic_symlink
+
+    def runtime_switch(target: str, destination: Path) -> None:
+        events.append("first-effect")
+        original_symlink(target, destination)
+
+    monkeypatch.setattr(installer, "_validate_staged_runtime", lambda _: stage.resolve())
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_broker_port_is_available", lambda: True)
+    monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
+    monkeypatch.setattr(installer, "_remove_runtime_state", lambda: None)
+    monkeypatch.setattr(installer, "activate", lambda: None)
+    monkeypatch.setattr(installer, "verify", lambda **_kwargs: True)
+    monkeypatch.setattr(install_module, "_fsync_tree", fsync_staged)
+    monkeypatch.setattr(install_module, "_fsync_directory", fsync_directory)
+    monkeypatch.setattr(install_module, "_atomic_symlink", runtime_switch)
+
+    installer.install_staged(stage, stable)
+
+    before_effect = events[: events.index("first-effect")]
+    assert f"fsync:{retargeted.parent}" in before_effect
+    assert json.loads(retargeted.read_text())["mcpServers"]["concurrent-user"] == {}
+
+
 def test_staged_install_executes_non_relocated_venv_after_cutover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3088,7 +3172,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.1.9')\n"
+        "    print('cross-agent-chat 0.2.0')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -3114,7 +3198,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.1.9"
+    assert completed.stdout.strip() == "cross-agent-chat 0.2.0"
     assert stage.exists()
 
 
@@ -4556,7 +4640,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.1.9",
+            "version": "0.2.0",
             "module_path": str(module),
         },
     )
@@ -4734,7 +4818,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.1.9",
+            "version": "0.2.0",
             "module_path": str(module),
         }
 

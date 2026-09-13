@@ -9,10 +9,10 @@ non-default roots). Local sessions do not need Tailscale; remote sessions need T
 allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
 files, or turn a remote peer into an owner.
 
-Install v0.1.9 with:
+Install v0.2.0 with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.1.9/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.2.0/install.sh | sh
 ```
 
 Installation requires Git because the installer builds from the release tag.
@@ -48,7 +48,7 @@ visible by default.
 
 To have an existing coding agent assist with installation, give it this prompt:
 
-> Install the released `v0.1.9` tag, not an arbitrary PR. Identify active consumers and the
+> Install the released `v0.2.0` tag, not an arbitrary PR. Identify active consumers and the
 > selected Claude/Codex roots, obtain approval before shared effects, preserve existing intent
 > records, run `cross-agent-chat doctor --json`, and test only fresh actors.
 
@@ -75,9 +75,13 @@ record the subsequent Stop-bound exchange below; the published tag and assets ar
 | Windows | No claim |
 | Linux | No live-support claim |
 
-v0.1.9 is a macOS beta. It keeps localhost broker health responsive while an optional Tailnet
-binding refresh is pending, makes inbound CAC provenance explicit, keeps peer content untrusted,
-and lets bare Doctor use one unambiguous installed device identity. It does not add Desktop built-in
+v0.2.0 is a macOS beta. It snapshots provider configuration after immutable staged-runtime
+durability work, so a concurrent user edit in that interval is retained rather than needlessly
+aborting the transition. It forwards existing body-free Claude helper unknown-delivery diagnostics
+across remote broker custody without retrying or resolving them. It keeps localhost broker health
+responsive while an optional Tailnet binding refresh is pending, makes inbound CAC provenance
+explicit, keeps peer content untrusted, and lets bare Doctor use one unambiguous installed device
+identity. It does not add Desktop built-in
 `send_message_to_thread` routing. The table records the configurations actually observed; rows
 marked historical were tested with earlier candidates. Support remains limited to the listed provider
 versions and delivery modes. The later 0.154.0 Stop-bound result

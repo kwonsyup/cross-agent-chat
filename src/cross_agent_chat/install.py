@@ -2141,12 +2141,7 @@ class Installer:
         if not previous_broker_loaded and not self._broker_port_is_available():
             raise SettingsError("predecessor broker state is unmanaged; no changes were made")
         previous_broker_healthy = previous_broker_loaded and self._wait_for_previous_broker_health()
-        prepared_setup = self._prepare_setup(stable)
-        for parent in {
-            stable.parent,
-            *(destination.parent for destination in prepared_setup.destinations.values()),
-        }:
-            self._ensure_durable_parent(parent)
+        self._ensure_durable_parent(stable.parent)
         _fsync_tree(staged)
         package_digest = _package_tree_digest(staged)
 
@@ -2155,6 +2150,9 @@ class Installer:
         _fsync_directory(self.runtime_root.parent)
         _fsync_directory(self.runtime_root.parent.parent)
         _fsync_directory(self.home)
+        prepared_setup = self._prepare_setup(stable)
+        for destination in prepared_setup.destinations.values():
+            self._ensure_durable_parent(destination.parent)
         transaction_id = uuid4().hex
         preparing_transaction = self.transactions / f".preparing-{transaction_id}"
         transaction = self.transactions / transaction_id
