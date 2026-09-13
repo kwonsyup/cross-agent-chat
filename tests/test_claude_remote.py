@@ -22,6 +22,7 @@ from cross_agent_chat.claude_runtime import (
     SEND_TIMEOUT_SECONDS,
     ClaudeSendMessageUnknownDelivery,
     ClaudeUnknownPhase,
+    _pretool_denial,
     claude_binary,
     courier_environment,
     gate_consumed,
@@ -254,6 +255,11 @@ def test_pretool_gate_binds_recipient_and_full_message() -> None:
     assert pretool_decision(expected, payload, key.hex())
     tool_input["content"] = "provider-rendered preview"
     assert pretool_decision(expected, payload, key.hex())
+    tool_input["summary"] = "Delivery to API work"
+    assert pretool_decision(expected, payload, key.hex())
+    del tool_input["summary"]
+    assert pretool_decision(expected, payload, key.hex())
+    tool_input["summary"] = "Cross Agent Chat"
     tool_input["extra"] = "reject"
     assert not pretool_decision(expected, payload, key.hex())
     tool_input.pop("extra")
@@ -262,6 +268,85 @@ def test_pretool_gate_binds_recipient_and_full_message() -> None:
     tool_input["content"] = "provider-rendered preview"
     tool_input["message"] = "changed"
     assert not pretool_decision(expected, payload, key.hex())
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "Cross Agent Chat",
+        "Delivery for API work review",
+        "결과 회신",
+        "shell-like `rm -rf` text stays inert data",
+        "x" * 200,
+        "\tindented but one line",
+        "",
+    ],
+)
+def test_pretool_gate_accepts_bounded_one_line_summary_variants(summary: str) -> None:
+    key = bytes.fromhex("aa" * 32)
+    message = "one exact body"
+    recipient = "API work [ABC123]"
+    expected: dict[str, object] = {
+        "recipient": recipient,
+        "message_hmac": hmac.new(key, message.encode(), hashlib.sha256).hexdigest(),
+    }
+    tool_input: dict[str, object] = {
+        "to": recipient,
+        "recipient": recipient,
+        "message": message,
+        "content": "provider preview",
+        "type": "message",
+        "summary": summary,
+    }
+    payload: dict[str, object] = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "SendMessage",
+        "tool_input": tool_input,
+    }
+
+    assert pretool_decision(expected, payload, key.hex())
+
+
+@pytest.mark.parametrize(
+    ("denial", "tool_input_change"),
+    [
+        ("sendmessage_type_mismatch", {"type": "request"}),
+        ("sendmessage_type_mismatch", {"type": "notify"}),
+        ("sendmessage_summary_mismatch", {"summary": "two\nlines"}),
+        ("sendmessage_summary_mismatch", {"summary": "x" * 201}),
+        ("sendmessage_summary_mismatch", {"summary": "split\u2028line"}),
+        ("sendmessage_summary_mismatch", {"summary": "bad\ud800 surrogate"}),
+        ("sendmessage_summary_mismatch", {"summary": 7}),
+        ("sendmessage_payload_mismatch", {"type": "message", "extra": "field"}),
+        ("sendmessage_payload_mismatch", {"notify_when_idle": True}),
+    ],
+)
+def test_pretool_gate_separates_type_and_summary_denials(
+    denial: ClaudeUnknownPhase, tool_input_change: dict[str, object]
+) -> None:
+    key = bytes.fromhex("bb" * 32)
+    message = "one exact body"
+    recipient = "API work [ABC123]"
+    expected: dict[str, object] = {
+        "recipient": recipient,
+        "message_hmac": hmac.new(key, message.encode(), hashlib.sha256).hexdigest(),
+    }
+    tool_input: dict[str, object] = {
+        "to": recipient,
+        "recipient": recipient,
+        "message": message,
+        "content": "provider preview",
+        "type": "message",
+        "summary": "Cross Agent Chat",
+    }
+    tool_input.update(tool_input_change)
+    payload: dict[str, object] = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "SendMessage",
+        "tool_input": tool_input,
+    }
+
+    assert _pretool_denial(expected, payload, key.hex()) == denial
 
 
 def test_pretool_gate_uses_full_unicode_body_not_cosmetic_preview() -> None:
@@ -651,7 +736,7 @@ def test_sendmessage_helper_full_message_hmac_mismatch_is_unknown(
     _assert_unknown_helper_phase(monkeypatch, stream, "pretool_gate_unobserved")
 
 
-def test_sendmessage_helper_control_mismatch_is_unknown(
+def test_sendmessage_helper_unexpected_field_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stream = _sendmessage_stream(
@@ -676,7 +761,8 @@ def test_sendmessage_helper_control_mismatch_is_unknown(
         "sendmessage_payload_mismatch",
         "sendmessage_target_mismatch",
         "sendmessage_message_mismatch",
-        "sendmessage_control_mismatch",
+        "sendmessage_type_mismatch",
+        "sendmessage_summary_mismatch",
     ],
 )
 def test_pretool_gate_writes_specific_fixed_denial_marker(
@@ -714,8 +800,10 @@ def test_pretool_gate_writes_specific_fixed_denial_marker(
         tool_input["recipient"] = "Other work [XYZ789]"
     elif denial == "sendmessage_message_mismatch":
         tool_input["message"] = "altered private body"
+    elif denial == "sendmessage_type_mismatch":
+        tool_input["type"] = "request"
     else:
-        tool_input["summary"] = "Wrong summary"
+        tool_input["summary"] = "one line\nsecond line"
     payload = {
         "hook_event_name": "PreToolUse",
         "tool_name": "SendMessage",
@@ -802,6 +890,94 @@ def test_sendmessage_receipt_requires_exact_success_contract() -> None:
     rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="receipt"):
         parse_sendmessage_receipt(rejected, target, message)
+
+
+@pytest.mark.parametrize(
+    "summary",
+    ["Cross Agent Chat", "Different one-line preview", "회신 미리보기"],
+)
+def test_sendmessage_receipt_accepts_display_only_summary_variants(
+    summary: str,
+) -> None:
+    tool_id = "tool-1"
+    message_id = str(uuid4())
+    target = "API work [ABC123]"
+    message = "hello"
+    tool_input: dict[str, object] = {
+        "to": target,
+        "recipient": target,
+        "message": message,
+        "content": "provider-rendered preview",
+        "type": "message",
+        "summary": summary,
+    }
+    use = {
+        "type": "tool_use",
+        "id": tool_id,
+        "name": "SendMessage",
+        "input": tool_input,
+    }
+    result: dict[str, object] = {
+        "type": "tool_result",
+        "tool_use_id": tool_id,
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
+            }
+        ],
+    }
+    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+
+    assert parse_sendmessage_receipt(stream, target, message) == message_id
+
+    del tool_input["summary"]
+    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+    assert parse_sendmessage_receipt(stream, target, message) == message_id
+
+
+@pytest.mark.parametrize(
+    "tool_input_change",
+    [
+        {"type": "request"},
+        {"summary": "two\nlines"},
+        {"summary": "x" * 201},
+        {"notify_when_idle": True},
+    ],
+)
+def test_sendmessage_receipt_rejects_control_and_summary_violations(
+    tool_input_change: dict[str, object],
+) -> None:
+    message_id = str(uuid4())
+    target = "API work [ABC123]"
+    use = {
+        "type": "tool_use",
+        "id": "tool-1",
+        "name": "SendMessage",
+        "input": {
+            "to": target,
+            "recipient": target,
+            "message": "hello",
+            "content": "provider preview",
+            "type": "message",
+            "summary": "Cross Agent Chat",
+            **tool_input_change,
+        },
+    }
+    result = {
+        "type": "tool_result",
+        "tool_use_id": "tool-1",
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
+            }
+        ],
+    }
+    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+
+    with pytest.raises(ChatError, match="receipt"):
+        parse_sendmessage_receipt(stream, target, "hello")
 
 
 def test_sendmessage_receipt_rejects_full_body_alteration_despite_same_preview() -> None:
@@ -1090,6 +1266,8 @@ def test_claude_unknown_response_keeps_actual_provider(
         ("helper_execution_failed", "claude_helper_execution_failed"),
         ("helper_exit_nonzero", "claude_helper_exit_nonzero"),
         ("receipt_invalid", "claude_receipt_invalid"),
+        ("sendmessage_type_mismatch", "claude_sendmessage_type_mismatch"),
+        ("sendmessage_summary_mismatch", "claude_sendmessage_summary_mismatch"),
     ],
 )
 def test_claude_unknown_phase_is_body_free_and_exact_response_gated(
