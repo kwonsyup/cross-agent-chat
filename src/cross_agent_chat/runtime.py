@@ -651,20 +651,33 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
         return
 
 
-def _devin_route(root: Path, event_session_id: str, pid: int) -> Route | None:
+def devin_hook_cwd() -> str:
+    """Resolve the provider-supplied workspace root for a Devin hook."""
+
+    value = os.environ.get("DEVIN_PROJECT_DIR")
+    if not isinstance(value, str) or not value:
+        raise ChatError("Devin hook workspace is unavailable")
+    return canonical_cwd(value)
+
+
+def _devin_route(
+    root: Path, event_session_id: str, pid: int, *, require_cwd: bool = True
+) -> Route | None:
     """Resolve Devin's exact route from hook session, trusted cwd, and process."""
 
-    try:
-        cwd = canonical_cwd(os.getcwd())
-    except (OSError, ChatError):
-        return None
+    cwd: str | None = None
+    if require_cwd:
+        try:
+            cwd = devin_hook_cwd()
+        except (OSError, ChatError):
+            return None
     matches = [
         route
         for route in Registry(root).routes()
         if route.provider == "devin"
         and route.session_id == event_session_id
         and route.pid == pid
-        and route.cwd == cwd
+        and (cwd is None or route.cwd == cwd)
     ]
     return matches[0] if len(matches) == 1 else None
 
@@ -677,7 +690,7 @@ def register_devin(device: str, pid: int, state_root_value: str | None) -> Route
     if isinstance(pid, bool) or pid <= 0:
         raise ChatError("provider process is invalid")
     event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="SessionStart")
-    cwd = canonical_cwd(os.getcwd())
+    cwd = devin_hook_cwd()
     owner_identity, _ = recipient_owner_identity("devin", pid)
     route = Route.create(
         provider="devin",
@@ -728,6 +741,7 @@ def unregister_devin(pid: int, state_root_value: str | None) -> None:
         return
     event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="SessionEnd")
     root = state_root(state_root_value)
+    DevinCapabilityStore(root).revoke_session(event.session_id)
     route = _devin_route(root, event.session_id, pid)
     if route is None:
         raise ChatError("exact Devin session route is unavailable")
@@ -758,6 +772,7 @@ def devin_pretool(state_root_value: str | None) -> None:
     root = state_root(state_root_value)
     route = _devin_route(root, event.session_id, os.getppid())
     if route is None or not _route_current(root, route):
+        DevinCapabilityStore(root).revoke_session(event.session_id)
         return
     arguments = {
         key: value for key, value in event.tool_input.items() if key != DEVIN_CAPABILITY_FIELD
@@ -795,12 +810,13 @@ def authenticate_devin_capability(
         tool_name=cast(DevinCapabilityTool, tool_name),
         arguments=original_arguments,
     )
-    route = _devin_route(root, capability.session_id, parent_pid)
+    route = _devin_route(root, capability.session_id, parent_pid, require_cwd=False)
     if (
         route is None
         or route.generation != capability.generation
         or not _route_current(root, route)
     ):
+        DevinCapabilityStore(root).revoke_session(capability.session_id)
         raise ChatError("Devin sender capability route is unavailable")
     return route
 
@@ -846,10 +862,11 @@ def devin_stop(pid: int, state_root_value: str | None) -> None:
     if not presence_is_enabled():
         return
     event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="Stop")
+    root = state_root(state_root_value)
+    DevinCapabilityStore(root).revoke_session(event.session_id)
     if event.stop_hook_active is True:
         print("{}", flush=True)
         return
-    root = state_root(state_root_value)
     route = _devin_route(root, event.session_id, pid)
     if route is None or not _route_current(root, route):
         print("{}", flush=True)
@@ -869,6 +886,7 @@ def devin_user_prompt(pid: int, state_root_value: str | None) -> None:
         return
     event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="UserPromptSubmit")
     root = state_root(state_root_value)
+    DevinCapabilityStore(root).revoke_session(event.session_id)
     route = _devin_route(root, event.session_id, pid)
     if route is None or not _route_current(root, route):
         return

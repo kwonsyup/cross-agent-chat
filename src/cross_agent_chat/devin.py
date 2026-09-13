@@ -13,6 +13,7 @@ import json
 import os
 import secrets
 import shutil
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ from cross_agent_chat.core import (
     bounded_message,
     require_private_file,
     state_lock,
+    valid_session_id,
     valid_uuid,
 )
 
@@ -47,6 +49,9 @@ DEVIN_APP_BINARY: Final = Path(
 )
 DEVIN_CAPABILITY_FIELD: Final = "_cac_capability"
 DEVIN_CAPABILITY_MAX_ACTIVE: Final = 64
+DEVIN_CAPABILITY_TTL_SECONDS: Final = 120.0
+DEVIN_PRETOOL_INPUT_MAX_BYTES: Final = 64 * 1024
+DEVIN_PRETOOL_OUTPUT_MAX_BYTES: Final = 64 * 1024
 DevinCapabilityTool = Literal["chat_peers", "chat_send", "chat_status"]
 
 
@@ -86,8 +91,9 @@ class DevinCapability:
     prompt_id: str
     tool_name: DevinCapabilityTool
     arguments_digest: str
+    issued_at: float
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "token_digest": self.token_digest,
             "session_id": self.session_id,
@@ -95,6 +101,7 @@ class DevinCapability:
             "prompt_id": self.prompt_id,
             "tool_name": self.tool_name,
             "arguments_digest": self.arguments_digest,
+            "issued_at": self.issued_at,
         }
 
     @classmethod
@@ -106,24 +113,28 @@ class DevinCapability:
             "prompt_id",
             "tool_name",
             "arguments_digest",
+            "issued_at",
         }:
             raise ChatError("Devin capability state is invalid")
         raw = cast(dict[object, object], value)
-        if not all(isinstance(item, str) for item in raw.values()):
+        if not all(isinstance(item, (str, int, float)) for item in raw.values()):
             raise ChatError("Devin capability state is invalid")
         tool = raw["tool_name"]
         if tool not in {"chat_peers", "chat_send", "chat_status"}:
             raise ChatError("Devin capability state is invalid")
         token_digest = cast(str, raw["token_digest"])
         arguments_digest = cast(str, raw["arguments_digest"])
+        issued_at = raw["issued_at"]
         if (
             len(token_digest) != 64
             or len(arguments_digest) != 64
             or any(character not in "0123456789abcdef" for character in token_digest)
             or any(character not in "0123456789abcdef" for character in arguments_digest)
+            or not isinstance(issued_at, (int, float))
+            or isinstance(issued_at, bool)
         ):
             raise ChatError("Devin capability state is invalid")
-        valid_uuid(cast(str, raw["session_id"]), "Devin capability session id")
+        valid_session_id("devin", cast(str, raw["session_id"]), "Devin capability session id")
         valid_uuid(cast(str, raw["generation"]), "Devin capability generation")
         valid_uuid(cast(str, raw["prompt_id"]), "Devin capability prompt id")
         return cls(
@@ -133,6 +144,7 @@ class DevinCapability:
             prompt_id=cast(str, raw["prompt_id"]),
             tool_name=tool,
             arguments_digest=arguments_digest,
+            issued_at=float(issued_at),
         )
 
 
@@ -177,9 +189,10 @@ class DevinCapabilityStore:
             prompt_id=prompt_id,
             tool_name=tool_name,
             arguments_digest=capability_arguments_digest(arguments),
+            issued_at=time.time(),
         )
         with state_lock(self.root, "devin-capabilities"):
-            existing = self.capabilities()
+            existing = self._fresh(self.capabilities())
             if len(existing) >= DEVIN_CAPABILITY_MAX_ACTIVE:
                 raise ChatError("Devin capability state is full")
             atomic_json(self.path, [item.to_dict() for item in [*existing, capability]])
@@ -196,7 +209,7 @@ class DevinCapabilityStore:
             raise ChatError("Devin sender capability is invalid")
         token_digest = hashlib.sha256(token.encode("ascii")).hexdigest()
         with state_lock(self.root, "devin-capabilities"):
-            existing = self.capabilities()
+            existing = self._fresh(self.capabilities())
             matches = [item for item in existing if item.token_digest == token_digest]
             if len(matches) != 1:
                 raise ChatError("Devin sender capability is unavailable")
@@ -207,6 +220,23 @@ class DevinCapabilityStore:
         if capability.tool_name != tool_name or capability.arguments_digest != arguments_digest:
             raise ChatError("Devin sender capability does not match the tool call")
         return capability
+
+    @staticmethod
+    def _fresh(capabilities: list[DevinCapability]) -> list[DevinCapability]:
+        now = time.time()
+        return [
+            item
+            for item in capabilities
+            if 0 <= now - item.issued_at <= DEVIN_CAPABILITY_TTL_SECONDS
+        ]
+
+    def revoke_session(self, session_id: str) -> None:
+        valid_session_id("devin", session_id, "Devin capability session id")
+        with state_lock(self.root, "devin-capabilities"):
+            existing = self._fresh(self.capabilities())
+            retained = [item for item in existing if item.session_id != session_id]
+            if retained != existing or self.path.exists():
+                atomic_json(self.path, [item.to_dict() for item in retained])
 # ``bounded_message`` in the shared core reserves this encoded JSON budget for
 # a message.  Keep the same budget here before adding the callback envelope.
 _ENCODED_MESSAGE_MAX_BYTES: Final = 2 * MAX_MESSAGE_BYTES + 2
@@ -265,7 +295,12 @@ def _hook_name(value: object) -> DevinHookName:
     return cast(DevinHookName, value)
 
 
-def parse_hook_input(text: str, *, expected_event: DevinHookName | None = None) -> DevinHookEvent:
+def parse_hook_input(
+    text: str,
+    *,
+    expected_event: DevinHookName | None = None,
+    max_bytes: int = DEVIN_HOOK_INPUT_MAX_BYTES,
+) -> DevinHookEvent:
     """Parse and validate one Devin lifecycle hook stdin payload.
 
     The documented common fields are validated while event-specific fields
@@ -277,7 +312,7 @@ def parse_hook_input(text: str, *, expected_event: DevinHookName | None = None) 
         encoded = text.encode("utf-8")
     except UnicodeEncodeError as error:
         raise ChatError("Devin hook input is not valid UTF-8") from error
-    if not text or len(encoded) > DEVIN_HOOK_INPUT_MAX_BYTES:
+    if not text or len(encoded) > max_bytes:
         raise ChatError("Devin hook input exceeds the bounded limit")
     try:
         decoded: object = json.loads(text)
@@ -292,7 +327,7 @@ def parse_hook_input(text: str, *, expected_event: DevinHookName | None = None) 
     session_value = fields.get("session_id")
     if not isinstance(session_value, str):
         raise ChatError("Devin hook lacks session identity")
-    session_id = valid_uuid(session_value, "session id")
+    session_id = valid_session_id("devin", session_value)
 
     has_prompt_id = "prompt_id" in fields
     prompt_value = fields.get("prompt_id")
@@ -330,7 +365,11 @@ def parse_hook_input(text: str, *, expected_event: DevinHookName | None = None) 
 
 
 def parse_pretool_input(text: str) -> DevinPreToolEvent:
-    parse_hook_input(text, expected_event="PreToolUse")
+    parse_hook_input(
+        text,
+        expected_event="PreToolUse",
+        max_bytes=DEVIN_PRETOOL_INPUT_MAX_BYTES,
+    )
     try:
         decoded: object = json.loads(text)
     except json.JSONDecodeError as error:
@@ -340,7 +379,7 @@ def parse_pretool_input(text: str) -> DevinPreToolEvent:
     prompt_value = fields.get("prompt_id")
     if not isinstance(session_value, str) or not isinstance(prompt_value, str):
         raise ChatError("Devin PreToolUse input lacks session identity")
-    session_id = valid_uuid(session_value, "session id")
+    session_id = valid_session_id("devin", session_value)
     prompt_id = valid_uuid(prompt_value, "prompt id")
     tool_name = fields.get("tool_name")
     tool_input = fields.get("tool_input")
@@ -362,12 +401,16 @@ def build_pretool_callback(event: DevinPreToolEvent, token: str) -> dict[str, ob
         raise ChatError("Devin sender capability is invalid")
     updated = dict(event.tool_input)
     updated[DEVIN_CAPABILITY_FIELD] = token
-    return {
+    payload: dict[str, object] = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "updatedInput": updated,
         }
     }
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > DEVIN_PRETOOL_OUTPUT_MAX_BYTES:
+        raise ChatError("Devin PreToolUse callback exceeds the bounded limit")
+    return payload
 
 
 def _stop_reason(event_id: str, source_text: str) -> str:

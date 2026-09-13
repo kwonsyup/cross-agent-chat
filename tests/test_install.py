@@ -194,36 +194,36 @@ def test_cli_maps_active_provider_profile_roots(
     assert installer.codex_hooks == codex_profile / "hooks.json"
 
 
-def test_devin_project_hooks_and_user_mcp_are_owned_and_preserved(
+def test_devin_global_hooks_and_user_mcp_are_owned_and_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
-    project = tmp_path / "project"
-    project.mkdir()
     installer = Installer(
         home=home,
         executable=Path("/opt/cross-agent-chat"),
         device="studio",
-        devin_project=project,
+        devin_global=True,
     )
     installer.devin_hooks.parent.mkdir(parents=True)
     installer.devin_hooks.write_text(
         json.dumps(
             {
-                "SessionStart": [
-                    {"matcher": "", "hooks": [{"type": "command", "command": "keep-me"}]}
-                ]
+                "hooks": {
+                    "SessionStart": [
+                        {"matcher": "", "hooks": [{"type": "command", "command": "keep-me"}]}
+                    ]
+                }
             }
         )
     )
-    installer.devin_mcp.parent.mkdir(parents=True)
+    installer.devin_mcp.parent.mkdir(parents=True, exist_ok=True)
     installer.devin_mcp.write_text(json.dumps({"mcpServers": {"keep": {"command": "keep-me"}}}))
 
     installer.setup(verify=lambda: True)
 
     hooks = json.loads(installer.devin_hooks.read_text())
-    assert any(item["hooks"][0]["command"] == "keep-me" for item in hooks["SessionStart"])
-    assert len([item for item in hooks["SessionStart"] if _owned_hook(item)]) == 1
+    assert any(item["hooks"][0]["command"] == "keep-me" for item in hooks["hooks"]["SessionStart"])
+    assert len([item for item in hooks["hooks"]["SessionStart"] if _owned_hook(item)]) == 1
     mcp = json.loads(installer.devin_mcp.read_text())
     assert set(mcp["mcpServers"]) == {"keep", "cross-agent-chat"}
 
@@ -232,58 +232,10 @@ def test_devin_project_hooks_and_user_mcp_are_owned_and_preserved(
     installer.uninstall()
 
     assert (
-        json.loads(installer.devin_hooks.read_text())["SessionStart"][0]["hooks"][0]["command"]
+        json.loads(installer.devin_hooks.read_text())["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         == "keep-me"
     )
     assert set(json.loads(installer.devin_mcp.read_text())["mcpServers"]) == {"keep"}
-
-
-def test_devin_project_installations_have_independent_ownership_records(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "home"
-    first_project = tmp_path / "first"
-    second_project = tmp_path / "second"
-    first_project.mkdir()
-    second_project.mkdir()
-    first = Installer(
-        home=home,
-        executable=Path("/opt/cross-agent-chat"),
-        device="studio",
-        devin_project=first_project,
-    )
-    second = Installer(
-        home=home,
-        executable=Path("/opt/cross-agent-chat"),
-        device="studio",
-        devin_project=second_project,
-    )
-
-    first.setup(verify=lambda: True)
-    second.setup(verify=lambda: True)
-
-    assert first.install_state != second.install_state
-    assert first.install_state.exists()
-    assert second.install_state.exists()
-    assert json.loads(first.devin_hooks.read_text())["SessionStart"]
-    assert json.loads(second.devin_hooks.read_text())["SessionStart"]
-
-    monkeypatch.setattr(first, "broker_is_loaded", lambda: False)
-    monkeypatch.setattr(first, "_stop_broker", lambda: None)
-    first.uninstall()
-
-    assert not first.install_state.exists()
-    assert second.install_state.exists()
-    assert "SessionStart" not in json.loads(first.devin_hooks.read_text())
-    assert json.loads(second.devin_hooks.read_text())["SessionStart"]
-    assert "cross-agent-chat" in json.loads(second.devin_mcp.read_text())["mcpServers"]
-
-    monkeypatch.setattr(second, "broker_is_loaded", lambda: False)
-    monkeypatch.setattr(second, "_stop_broker", lambda: None)
-    second.uninstall()
-
-    assert not second.install_state.exists()
-    assert "cross-agent-chat" not in json.loads(second.devin_mcp.read_text())["mcpServers"]
 
 
 def test_bare_doctor_uses_the_unique_installed_device_identity(

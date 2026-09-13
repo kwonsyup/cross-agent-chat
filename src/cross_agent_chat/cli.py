@@ -81,7 +81,7 @@ def _installer(device: str | None, *, codex_native_queue: bool | None = None) ->
         codex_home=codex_home,
         claude_config_dir=claude_config_dir,
         codex_native_queue=codex_native_queue,
-        devin_project=Path.cwd(),
+        devin_global=True,
     )
 
 
@@ -580,7 +580,7 @@ def run(arguments: argparse.Namespace) -> int:
             tailnet_address=known_tailnet_address(),
             codex_home=codex_home,
             claude_config_dir=claude_config_dir,
-            devin_project=Path.cwd(),
+            devin_global=True,
         )
         installer.install_staged(arguments.staged_runtime, arguments.stable_entrypoint)
         print(f"Cross Agent Chat is ready on {device}. Start fresh Claude/Codex sessions.")

@@ -1010,7 +1010,7 @@ class Installer:
         codex_home: Path | None = None,
         claude_config_dir: Path | None = None,
         codex_native_queue: bool | None = None,
-        devin_project: Path | None = None,
+        devin_global: bool = False,
     ) -> None:
         self.home = home.resolve()
         self.executable = executable if executable.is_absolute() else executable.absolute()
@@ -1032,13 +1032,7 @@ class Installer:
             None if tailnet_address is None else valid_tailnet_address(tailnet_address)
         )
         self.codex_native_queue = codex_native_queue
-        if devin_project is None:
-            self.devin_project: Path | None = None
-        else:
-            configured_devin_project = devin_project.expanduser()
-            if not configured_devin_project.is_absolute() or configured_devin_project == Path("/"):
-                raise SettingsError("Devin project must be an absolute workspace directory")
-            self.devin_project = configured_devin_project.resolve(strict=False)
+        self.devin_global = devin_global
         self.state = self.home / ".local" / "state" / SERVER_NAME
         profile_identity = json.dumps(
             {
@@ -1046,9 +1040,6 @@ class Installer:
                 if self.claude_config_dir is None
                 else str(self.claude_config_dir),
                 "codex_home": str(self.codex_home),
-                "devin_project": None
-                if self.devin_project is None
-                else str(self.devin_project),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1056,7 +1047,7 @@ class Installer:
         default_profile = (
             self.claude_config_dir is None
             and self.codex_home == self.home / ".codex"
-            and self.devin_project is None
+            and not self.devin_global
         )
         install_name = (
             "install.json"
@@ -1075,8 +1066,8 @@ class Installer:
         self.codex_config = self.codex_home / "config.toml"
         self.codex_hooks = self.codex_home / "hooks.json"
         self.devin_mcp = devin_profile_root(self.home) / "mcp_config.json"
-        self.devin_hooks = (
-            None if self.devin_project is None else self.devin_project / ".devin" / "hooks.v1.json"
+        self.devin_hooks: Path | None = (
+            devin_profile_root(self.home) / "config.json" if self.devin_global else None
         )
         self.launch_agent = self.home / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
         self.runtime_root = self.home / ".local" / "share" / f"{SERVER_NAME}-runtime"
@@ -1110,8 +1101,6 @@ class Installer:
         roots: tuple[Path, ...] = (self.codex_home, self.home)
         if self.claude_config_dir is not None:
             roots = (*roots, self.claude_config_dir)
-        if self.devin_project is not None:
-            roots = (*roots, self.devin_project)
         for root in sorted(roots, key=lambda item: len(item.parts), reverse=True):
             if resolved.is_relative_to(root):
                 return root
@@ -1608,6 +1597,7 @@ class Installer:
 
         devin_mcp: dict[str, object] | None = None
         devin_hooks: dict[str, object] | None = None
+        devin_hooks_document: dict[str, object] | None = None
         if self.devin_hooks is not None:
             devin_mcp = _json_object(self.devin_mcp)
             raw_devin_servers = devin_mcp.get("mcpServers")
@@ -1619,7 +1609,15 @@ class Installer:
             else:
                 raise SettingsError("Devin mcpServers must be an object")
             devin_servers[SERVER_NAME] = _mcp_route(self.executable, "devin", self.device)
-            devin_hooks = _json_object(self.devin_hooks)
+            devin_hooks_document = _json_object(self.devin_hooks)
+            raw_hooks = devin_hooks_document.get("hooks")
+            if raw_hooks is None:
+                devin_hooks = {}
+                devin_hooks_document["hooks"] = devin_hooks
+            elif isinstance(raw_hooks, dict):
+                devin_hooks = cast(dict[str, object], raw_hooks)
+            else:
+                raise SettingsError("Devin hooks must be an object")
             for event in (
                 "SessionStart",
                 "SessionEnd",
@@ -1643,8 +1641,8 @@ class Installer:
         }
         if devin_mcp is not None:
             payloads[self.devin_mcp] = _json_bytes(devin_mcp)
-        if self.devin_hooks is not None and devin_hooks is not None:
-            payloads[self.devin_hooks] = _json_bytes(devin_hooks)
+        if self.devin_hooks is not None and devin_hooks_document is not None:
+            payloads[self.devin_hooks] = _json_bytes(devin_hooks_document)
         return payloads
 
     def _backup(self, originals: dict[Path, PathSnapshot]) -> Path:
@@ -1666,8 +1664,6 @@ class Installer:
     def _backup_key(self, path: Path) -> str:
         if self.claude_config_dir is not None and path.is_relative_to(self.claude_config_dir):
             return f"CLAUDE_CONFIG_DIR/{path.relative_to(self.claude_config_dir)}"
-        if self.devin_project is not None and path.is_relative_to(self.devin_project):
-            return f"DEVIN_PROJECT/{path.relative_to(self.devin_project)}"
         if path.is_relative_to(self.home):
             return str(path.relative_to(self.home))
         if path.is_relative_to(self.codex_home):
@@ -1832,11 +1828,6 @@ class Installer:
                 raise SettingsError("backup manifest is invalid")
             relative_path = Path(relative.removeprefix("CLAUDE_CONFIG_DIR/"))
             destination = self.claude_config_dir / relative_path
-        elif relative.startswith("DEVIN_PROJECT/"):
-            if self.devin_project is None:
-                raise SettingsError("backup manifest is invalid")
-            relative_path = Path(relative.removeprefix("DEVIN_PROJECT/"))
-            destination = self.devin_project / relative_path
         else:
             relative_path = Path(relative)
             destination = self.home / relative_path
@@ -2615,7 +2606,11 @@ class Installer:
                     or devin_servers.get(SERVER_NAME) != expected_devin_server
                 ):
                     return False
-                devin_hooks = _json_object(self.devin_hooks)
+                devin_hooks_document = _json_object(self.devin_hooks)
+                raw_hooks = devin_hooks_document.get("hooks")
+                if not isinstance(raw_hooks, dict):
+                    return False
+                devin_hooks = cast(dict[str, object], raw_hooks)
                 for event in (
                     "SessionStart",
                     "SessionEnd",
@@ -3403,9 +3398,14 @@ class Installer:
                     writes=uninstall_writes,
                 )
             if self.devin_hooks is not None and not devin_hooks_has_remaining_owner:
+                def remove_devin_hooks(value: dict[str, object]) -> None:
+                    hooks = value.get("hooks")
+                    if isinstance(hooks, dict):
+                        _remove_hooks(cast(dict[str, object], hooks))
+
                 self._update_json_for_uninstall(
                     current_destinations[self.devin_hooks],
-                    _remove_devin_hooks,
+                    remove_devin_hooks,
                     recorded_paths=recorded_paths,
                     writes=uninstall_writes,
                 )

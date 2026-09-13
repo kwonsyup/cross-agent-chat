@@ -35,6 +35,7 @@ MAX_NAME_CODEPOINTS: Final = 128
 MAX_ALIAS_CODEPOINTS: Final = 128
 SAFE_DEVICE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}\Z")
 UUID_RE: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+DEVIN_SESSION_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}\Z")
 
 
 class ChatError(RuntimeError):
@@ -63,6 +64,14 @@ def valid_uuid(value: str, field: str) -> str:
     if str(parsed) != value:
         fail(f"{field} is invalid")
     return value
+
+
+def valid_session_id(provider: str, value: str, field: str = "session id") -> str:
+    if provider == "devin":
+        if DEVIN_SESSION_RE.fullmatch(value) is None:
+            fail(f"{field} is invalid")
+        return value
+    return valid_uuid(value, field)
 
 
 def valid_device(value: str) -> str:
@@ -110,7 +119,7 @@ def stored_cwd(value: str) -> str:
 
 
 def session_key(provider: Provider, session_id: str) -> str:
-    valid_uuid(session_id, "session id")
+    valid_session_id(provider, session_id)
     return hashlib.sha256(f"{provider}:{session_id}".encode()).hexdigest()
 
 
@@ -183,7 +192,7 @@ class Route:
             fail("route schema is unsupported")
         if self.provider not in {"claude", "codex", "devin"}:
             fail("route provider is invalid")
-        valid_uuid(self.session_id, "session id")
+        valid_session_id(self.provider, self.session_id)
         valid_uuid(self.generation, "route generation")
         valid_device(self.device)
         if stored_cwd(self.cwd) != self.cwd:
@@ -226,7 +235,7 @@ class Route:
         return cls(
             schema_version=SCHEMA_VERSION,
             provider=typed_provider,
-            session_id=valid_uuid(session_id, "session id"),
+            session_id=valid_session_id(typed_provider, session_id),
             device=valid_device(device),
             cwd=canonical,
             project=project,

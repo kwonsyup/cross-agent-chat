@@ -14,7 +14,9 @@ from cross_agent_chat import runtime
 from cross_agent_chat.core import MAX_MESSAGE_BYTES, ChatError
 from cross_agent_chat.devin import (
     DEVIN_CAPABILITY_FIELD,
+    DEVIN_CAPABILITY_TTL_SECONDS,
     DEVIN_HOOK_INPUT_MAX_BYTES,
+    DEVIN_PRETOOL_INPUT_MAX_BYTES,
     DEVIN_STOP_CALLBACK_MAX_BYTES,
     DevinCapabilityStore,
     DevinHookEvent,
@@ -583,6 +585,106 @@ def test_devin_mcp_public_tools_require_pretool_capability(
 
     response = json.loads(capsys.readouterr().out)
     assert response["error"]["message"] == "Devin sender capability is required"
+
+
+def test_pretool_accepts_full_message_with_json_escaping() -> None:
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "session_id": str(uuid4()),
+        "prompt_id": str(uuid4()),
+        "tool_name": "mcp__cross-agent-chat__chat_send",
+        "tool_input": {"message": "\\" * (MAX_MESSAGE_BYTES // 2)},
+    }
+    text = json.dumps(payload)
+    assert len(text.encode()) > MAX_MESSAGE_BYTES
+    assert len(text.encode()) <= DEVIN_PRETOOL_INPUT_MAX_BYTES
+    parsed = parse_pretool_input(text)
+    assert len(parsed.tool_input["message"]) == MAX_MESSAGE_BYTES // 2
+
+
+def test_capability_ttl_prunes_expired_and_revocation_reopens_capacity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cross_agent_chat.core import Route
+
+    route = Route.create(
+        provider="devin",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=123,
+    )
+    store = DevinCapabilityStore(tmp_path / "state")
+    clock = [100.0]
+    monkeypatch.setattr("cross_agent_chat.devin.time.time", lambda: clock[0])
+    token = store.issue(route, prompt_id=str(uuid4()), tool_name="chat_peers", arguments={})
+    clock[0] += DEVIN_CAPABILITY_TTL_SECONDS + 1
+    with pytest.raises(ChatError, match="unavailable"):
+        store.consume(token, tool_name="chat_peers", arguments={})
+    assert store.capabilities() != []
+    store.revoke_session(route.session_id)
+    assert store.capabilities() == []
+
+    for _ in range(64):
+        store.issue(route, prompt_id=str(uuid4()), tool_name="chat_peers", arguments={})
+    with pytest.raises(ChatError, match="full"):
+        store.issue(route, prompt_id=str(uuid4()), tool_name="chat_peers", arguments={})
+    store.revoke_session(route.session_id)
+    store.issue(route, prompt_id=str(uuid4()), tool_name="chat_peers", arguments={})
+
+
+def test_pretool_capability_reaches_public_chat_peers_authentication(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from cross_agent_chat.cli import mcp
+    from cross_agent_chat.core import Route
+
+    session_id = str(uuid4())
+    route = Route.create(
+        provider="devin",
+        session_id=session_id,
+        device="studio",
+        cwd=str(tmp_path),
+        pid=123,
+    )
+    state = tmp_path / "state"
+    store = DevinCapabilityStore(state)
+    token = store.issue(route, prompt_id=str(uuid4()), tool_name="chat_peers", arguments={})
+    monkeypatch.setattr("cross_agent_chat.cli.os.getppid", lambda: 123)
+    monkeypatch.setattr("cross_agent_chat.runtime._devin_route", lambda *_args, **_kwargs: route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "cross_agent_chat.cli.peers",
+        lambda *_args, **_kwargs: {"schema_version": 1, "peers": []},
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.cli.sender_readiness_for_route",
+        lambda *_args: {"status": "ready"},
+    )
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "chat_peers",
+                        "arguments": {DEVIN_CAPABILITY_FIELD: token},
+                    },
+                }
+            )
+            + "\n"
+        ),
+    )
+
+    mcp("devin", "studio", str(state))
+
+    response = json.loads(capsys.readouterr().out)
+    result = json.loads(response["result"]["content"][0]["text"])
+    assert result["sender"] == {"status": "ready"}
+    assert store.capabilities() == []
 
 
 def test_devin_originates_local_send_with_exact_source_alias(
