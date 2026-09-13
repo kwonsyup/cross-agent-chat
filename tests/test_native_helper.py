@@ -191,9 +191,23 @@ def test_dead_registered_helper_is_replaced_before_recreation(
 
     assert store.helper_for_original(original, [original, dead_helper]) is None
     assert runtime.native_helper_tools(tmp_path / "state", original) == ("native_bootstrap",)
-    replacement, _ = store.reserve(original, "a" * 64, [original, dead_helper])
+    replacement, replacement_nonce = store.reserve(original, "a" * 64, [original, dead_helper])
 
     assert replacement.state == "UNKNOWN"
     retired, pending = store.bindings()
     assert retired.state == "RETIRED"
     assert pending == replacement
+    replacement_root = tmp_path / replacement.helper_directory
+    replacement_root.mkdir()
+    replacement_helper = route(
+        replacement_root,
+        session="00000000-0000-4000-8000-000000000003",
+        generation="00000000-0000-4000-8000-000000000013",
+        pid=103,
+        profile_root=tmp_path / "profile",
+    )
+    registered = store.register(replacement_helper, replacement_nonce, original, "a" * 64)
+    monkeypatch.setattr(Route, "process_is_live", lambda item: item.pid == replacement_helper.pid)
+
+    assert registered.state == "REGISTERED"
+    assert store.helper_for_original(original, [original, dead_helper, replacement_helper]) == replacement_helper
