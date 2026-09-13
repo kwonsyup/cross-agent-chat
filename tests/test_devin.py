@@ -181,10 +181,32 @@ def test_parse_rejects_oversized_utf8_input_before_json_decode() -> None:
     with pytest.raises(ChatError, match="bounded limit"):
         parse_hook_input(oversized)
 
-    multibyte = "é" * (MAX_MESSAGE_BYTES // 2 + 1)
+    multibyte = "é" * (DEVIN_HOOK_INPUT_MAX_BYTES // 2 + 1)
     assert len(multibyte.encode("utf-8")) > DEVIN_HOOK_INPUT_MAX_BYTES
     with pytest.raises(ChatError, match="bounded limit"):
         parse_hook_input(multibyte)
+
+
+@pytest.mark.parametrize(
+    ("event", "field"),
+    [("UserPromptSubmit", "prompt"), ("Stop", "last_assistant_message")],
+)
+def test_lifecycle_accepts_full_core_message_with_json_escaping(event: str, field: str) -> None:
+    escaped_message = "".join(
+        '"' if index % 2 == 0 else "\\" for index in range(MAX_MESSAGE_BYTES)
+    )
+    payload: dict[str, object] = {
+        "hook_event_name": event,
+        "session_id": str(uuid4()),
+        "prompt_id": str(uuid4()),
+        "stop_hook_active": False,
+        field: escaped_message,
+    }
+    text = json.dumps(payload)
+
+    assert len(text.encode()) > MAX_MESSAGE_BYTES
+    assert len(text.encode()) <= DEVIN_HOOK_INPUT_MAX_BYTES
+    assert parse_hook_input(text).hook_event_name == event
 
 
 def test_stop_callback_preserves_exact_source_and_marks_it_untrusted() -> None:

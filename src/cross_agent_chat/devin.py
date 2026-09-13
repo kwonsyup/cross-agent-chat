@@ -44,7 +44,9 @@ DevinHookName = Literal[
 ]
 StopDecision = Literal["block"]
 
-DEVIN_HOOK_INPUT_MAX_BYTES: Final = MAX_MESSAGE_BYTES
+# Hook envelopes include provider metadata and JSON escaping around the core
+# message. Keep this frame bound separate from the smaller CAC body limit.
+DEVIN_HOOK_INPUT_MAX_BYTES: Final = 64 * 1024
 DEVIN_APP_BINARY: Final = Path(
     "/Applications/Devin.app/Contents/Resources/app/extensions/windsurf/devin/bin/devin"
 )
