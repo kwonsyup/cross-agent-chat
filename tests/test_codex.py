@@ -16,7 +16,7 @@ from cross_agent_chat.codex import (
     native_thread_titles,
     queue_native_input,
 )
-from cross_agent_chat.core import ChatError, UnknownDeliveryError
+from cross_agent_chat.core import ChatError, Registry, Route, UnknownDeliveryError
 from cross_agent_chat.runtime import MAX_FRAME_BYTES, codex_stop, register, unregister
 
 
@@ -31,6 +31,49 @@ def test_stop_without_registered_route_is_silent_noop(
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(hook)))
 
     codex_stop(os.getpid(), str(tmp_path / "state"))
+
+    assert capsys.readouterr().out == "{}\n"
+
+
+def test_stop_skips_legacy_experimental_native_queue_without_peeking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                }
+            )
+        ),
+    )
+
+    def request(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        assert payload["operation"] == "health"
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+            "delivery_mode": "codex_experimental_queue",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+
+    codex_stop(os.getpid(), str(root))
 
     assert capsys.readouterr().out == "{}\n"
 
@@ -300,6 +343,34 @@ def test_ordinary_native_queue_failure_never_leaves_a_stop_body(
         courier.accept(str(uuid4()), "untrusted peer body")
 
     assert courier.pending_ids() == []
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_pending"),
+    [
+        (ChatError("rejected"), []),
+        (UnknownDeliveryError("unknown"), ["event"]),
+    ],
+)
+def test_helper_native_queue_retains_body_only_after_unknown_queue_outcome(
+    monkeypatch: pytest.MonkeyPatch, error: ChatError, expected_pending: list[str]
+) -> None:
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.queue_native_input",
+        lambda **_kwargs: (_ for _ in ()).throw(error),
+    )
+    event_id = str(uuid4())
+    courier = CodexCourier(
+        alias="codex@studio:api:123456789abc",
+        generation=str(uuid4()),
+        native_queue=(Path("/fake-codex"), {"CODEX_HOME": "/profile"}, str(uuid4())),
+        native_helper=True,
+    )
+
+    with pytest.raises(type(error)):
+        courier.accept(event_id, "private helper body")
+
+    assert courier.pending_ids() == ([event_id] if expected_pending else [])
 
 
 @pytest.mark.parametrize(

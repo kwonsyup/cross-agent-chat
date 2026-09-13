@@ -2343,6 +2343,18 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
     if NativeHelperStore(root).is_helper_lineage(route):
         print("{}", flush=True)
         return
+    health = request_socket(
+        socket_path(root, route),
+        {
+            "schema_version": SCHEMA_VERSION,
+            "operation": "health",
+            "generation": route.generation,
+            "include_delivery_mode": True,
+        },
+    )
+    if health.get("delivery_mode") == "codex_experimental_queue":
+        print("{}", flush=True)
+        return
     peek = request_socket(
         socket_path(root, route),
         {"schema_version": 1, "operation": "peek", "generation": route.generation},

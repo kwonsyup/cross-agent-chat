@@ -379,31 +379,47 @@ class CodexCourier:
         identifier = valid_uuid(event_id, "event id")
         body = bounded_message(message)
         if self.native_queue is not None:
+            newly_admitted = False
             if self.native_helper:
                 if identifier in self._pending:
                     if self._pending[identifier] != body:
                         raise UnknownDeliveryError(
                             "Codex courier event conflicts with a pending message"
                         )
+                    return {
+                        "schema_version": 1,
+                        "event_id": identifier,
+                        "status": "TRANSPORT_ACCEPTED",
+                        "to": self.alias,
+                        "provider": "codex",
+                    }
                 elif len(self._pending) >= self.capacity:
                     raise ChatError("Codex courier queue is full")
                 else:
                     self._pending[identifier] = body
+                    newly_admitted = True
             binary, environment, thread_id = self.native_queue
-            queue_native_input(
-                binary=binary,
-                environment=environment,
-                thread_id=thread_id,
-                event_id=identifier,
-                message=(
-                    (
-                        "Cross Agent Chat has one protected delivery event. "
-                        f"Call native_dispatch with event_id {identifier}."
-                    )
-                    if self.native_helper
-                    else body
-                ),
-            )
+            try:
+                queue_native_input(
+                    binary=binary,
+                    environment=environment,
+                    thread_id=thread_id,
+                    event_id=identifier,
+                    message=(
+                        (
+                            "Cross Agent Chat has one protected delivery event. "
+                            f"Call native_dispatch with event_id {identifier}."
+                        )
+                        if self.native_helper
+                        else body
+                    ),
+                )
+            except UnknownDeliveryError:
+                raise
+            except ChatError:
+                if newly_admitted:
+                    del self._pending[identifier]
+                raise
             return {
                 "schema_version": 1,
                 "event_id": identifier,
