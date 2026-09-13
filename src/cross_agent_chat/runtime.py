@@ -1393,7 +1393,12 @@ def _with_codex_titles(root: Path, targets: list[Target], deadline: float) -> li
 
 
 def _targets_from_tailnet(
-    address: str, raw: object, *, include_delivery_mode: bool = False, include_title: bool = False
+    address: str,
+    raw: object,
+    *,
+    include_delivery_mode: bool = False,
+    include_title: bool = False,
+    include_devin: bool = False,
 ) -> list[Target]:
     if not isinstance(raw, dict) or set(raw) != {"schema_version", "peers"}:
         raise ChatError("Tailnet peer returned invalid discovery")
@@ -1431,6 +1436,7 @@ def _targets_from_tailnet(
         if (
             not isinstance(provider, str)
             or provider not in {"claude", "codex", "devin"}
+            or (provider == "devin" and not include_devin)
             or not all(isinstance(value, str) for value in values)
             or item.get("status") != "available"
             or not re.fullmatch(r"[0-9a-f]{64}", cast(str, item.get("session_key")))
@@ -1481,13 +1487,20 @@ def _remote_node_targets(
     *,
     include_delivery_mode: bool = False,
     include_title: bool = False,
+    include_devin: bool = False,
 ) -> tuple[list[Target], bool]:
     if deadline is None:
         deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
     legacy: dict[str, object] = {"schema_version": SCHEMA_VERSION, "operation": "peers"}
     variants: list[tuple[dict[str, object], bool]] = []
+    if include_delivery_mode and include_devin:
+        variants.append(
+            ({**legacy, "include_delivery_mode": True, "include_devin": True}, True)
+        )
     if include_delivery_mode:
         variants.append(({**legacy, "include_delivery_mode": True}, True))
+    if include_devin:
+        variants.append(({**legacy, "include_devin": True}, False))
     variants.append((legacy, False))
     base: list[Target] | None = None
     for payload, mode_requested in variants:
@@ -1498,7 +1511,12 @@ def _remote_node_targets(
             raw = request_tailnet(
                 address, payload, timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining)
             )
-            base = _targets_from_tailnet(address, raw, include_delivery_mode=mode_requested)
+            base = _targets_from_tailnet(
+                address,
+                raw,
+                include_delivery_mode=mode_requested,
+                include_devin=include_devin,
+            )
             break
         except (ChatError, UnknownDeliveryError):
             continue
@@ -1510,13 +1528,24 @@ def _remote_node_targets(
     if not include_title or remaining <= 1.0:
         return base, True
     try:
+        rich_payload: dict[str, object] = {
+            **legacy,
+            "include_delivery_mode": True,
+            "include_title": True,
+        }
+        if include_devin:
+            rich_payload["include_devin"] = True
         raw = request_tailnet(
             address,
-            {**legacy, "include_delivery_mode": True, "include_title": True},
+            rich_payload,
             timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining - 1.0),
         )
         enriched = _targets_from_tailnet(
-            address, raw, include_delivery_mode=True, include_title=True
+            address,
+            raw,
+            include_delivery_mode=True,
+            include_title=True,
+            include_devin=include_devin,
         )
     except (ChatError, UnknownDeliveryError):
         return base, True
@@ -1534,7 +1563,7 @@ def _remote_node_targets(
 
 
 def _remote_discovery(
-    *, include_delivery_mode: bool = False, include_title: bool = False
+    *, include_delivery_mode: bool = False, include_title: bool = False, include_devin: bool = True
 ) -> tuple[list[Target], bool]:
     addresses = tailnet_nodes()
     if not addresses:
@@ -1551,8 +1580,9 @@ def _remote_discovery(
                 deadline,
                 include_delivery_mode=include_delivery_mode,
                 include_title=include_title,
+                include_devin=include_devin,
             )
-            if include_delivery_mode or include_title
+            if include_delivery_mode or include_title or include_devin
             else workers.submit(_remote_node_targets, address, deadline)
         )
         for address in addresses
@@ -1573,10 +1603,16 @@ def _remote_discovery(
 
 
 def remote_targets(
-    _root: Path, *, include_delivery_mode: bool = False, include_title: bool = False
+    _root: Path,
+    *,
+    include_delivery_mode: bool = False,
+    include_title: bool = False,
+    include_devin: bool = False,
 ) -> list[Target]:
     return _remote_discovery(
-        include_delivery_mode=include_delivery_mode, include_title=include_title
+        include_delivery_mode=include_delivery_mode,
+        include_title=include_title,
+        include_devin=include_devin,
     )[0]
 
 
@@ -1595,6 +1631,7 @@ def all_targets(
                 root,
                 include_delivery_mode=include_delivery_mode,
                 include_title=include_title,
+                include_devin=True,
             )
             targets = [*local.result(), *remote.result()]
     else:
@@ -2038,6 +2075,7 @@ def peers(
     internal: bool = False,
     include_delivery_mode: bool = False,
     include_title: bool = False,
+    include_devin: bool = True,
 ) -> dict[str, object]:
     display_titles = not internal or include_title
     deadline = time.monotonic() + (
@@ -2057,6 +2095,8 @@ def peers(
     else:
         targets = local_targets(root)
         remote_discovery = "not_requested"
+    if not include_devin:
+        targets = [target for target in targets if target.provider != "devin"]
     handles = [target.session_key for target in targets]
     if len(set(handles)) != len(handles):
         raise ChatError("peer discovery returned duplicate handles")

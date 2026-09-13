@@ -134,6 +134,23 @@ def test_registry_generation_replacement_invalidates_old_route(tmp_path: Path) -
     assert registry.routes() == [replacement]
 
 
+def test_devin_registry_is_separate_from_legacy_route_file(tmp_path: Path) -> None:
+    registry = Registry(tmp_path / "state")
+    devin = route(tmp_path, provider="devin")
+
+    registry.upsert(devin)
+
+    assert registry.routes() == [devin]
+    assert json.loads(registry.path.read_text()) == []
+    stored = json.loads(registry.devin_path.read_text())
+    assert stored[0]["provider"] == "devin"
+
+    # A v0.2.1/v0.2.0 reader loads routes.json directly and retains its
+    # Claude/Codex-only schema when Devin is present in the new sidecar.
+    legacy_routes = json.loads(registry.path.read_text())
+    assert all(item["provider"] in {"claude", "codex"} for item in legacy_routes)
+
+
 def test_registry_rejects_non_private_state_file(tmp_path: Path) -> None:
     registry = Registry(tmp_path / "state")
     item = route(tmp_path)
@@ -204,6 +221,16 @@ def test_authenticate_claude_sender_requires_unique_parent_pid(tmp_path: Path) -
 
     with pytest.raises(ChatError, match="exact Claude sender"):
         authenticate_sender([first, second], "claude", 1400, None)
+
+
+def test_authenticate_devin_sender_fails_closed_for_multiplexed_process(
+    tmp_path: Path,
+) -> None:
+    first = route(tmp_path, provider="devin", pid=1450, project="one")
+    second = route(tmp_path, provider="devin", pid=1450, project="two")
+
+    with pytest.raises(ChatError, match="exact Devin sender"):
+        authenticate_sender([first, second], "devin", 1450, None)
 
 
 def test_authenticate_codex_sender_requires_host_thread_identity(tmp_path: Path) -> None:

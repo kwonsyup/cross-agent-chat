@@ -3054,11 +3054,11 @@ class Installer:
             return False
         if self.state.is_symlink() or not self.state.is_dir():
             raise SettingsError("runtime state ownership is invalid")
-        routes = self.state / "routes.json"
-        if routes.is_symlink() or routes.is_file():
-            routes.unlink()
-        elif routes.exists():
-            raise SettingsError("transient route state is invalid")
+        for routes in (self.state / "routes.json", self.state / "devin-routes.json"):
+            if routes.is_symlink() or routes.is_file():
+                routes.unlink()
+            elif routes.exists():
+                raise SettingsError("transient route state is invalid")
         intents = self.state / "intents.json"
         if intents.exists() or intents.is_symlink():
             return True

@@ -397,22 +397,41 @@ class Registry:
         self.root = root
         ensure_private_dir(root)
         self.path = root / "routes.json"
+        self.devin_path = root / "devin-routes.json"
 
     def routes(self) -> list[Route]:
-        if not self.path.exists():
+        routes = self._read(self.path, expected_provider="legacy")
+        routes.extend(self._read(self.devin_path, expected_provider="devin"))
+        identities = {(item.provider, item.session_id) for item in routes}
+        if len(identities) != len(routes):
+            fail("route registry contains duplicate identities")
+        return routes
+
+    def _read(self, path: Path, *, expected_provider: Literal["legacy", "devin"]) -> list[Route]:
+        if not path.exists():
             return []
-        require_private_file(self.path)
+        require_private_file(path)
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ChatError("route registry is invalid") from error
         if not isinstance(raw, list):
             fail("route registry schema is unsupported")
         routes = [Route.from_object(item) for item in raw]
-        identities = {(item.provider, item.session_id) for item in routes}
-        if len(identities) != len(routes):
-            fail("route registry contains duplicate identities")
+        if expected_provider == "legacy" and any(item.provider == "devin" for item in routes):
+            fail("legacy route registry contains unsupported provider")
+        if expected_provider == "devin" and any(item.provider != "devin" for item in routes):
+            fail("Devin route registry contains unsupported provider")
         return routes
+
+    def _write(self, routes: list[Route]) -> None:
+        legacy = [item for item in routes if item.provider != "devin"]
+        devin = [item for item in routes if item.provider == "devin"]
+        atomic_json(self.path, [item.to_dict() for item in legacy])
+        if devin:
+            atomic_json(self.devin_path, [item.to_dict() for item in devin])
+        else:
+            self.devin_path.unlink(missing_ok=True)
 
     def upsert(self, route: Route) -> None:
         with state_lock(self.root, "routes"):
@@ -421,7 +440,7 @@ class Registry:
                 for item in self.routes()
                 if (item.provider, item.session_id) != (route.provider, route.session_id)
             ]
-            atomic_json(self.path, [item.to_dict() for item in [*existing, route]])
+            self._write([*existing, route])
 
     def upsert_or_reuse_live_owner(self, route: Route) -> Route:
         """Preserve a live generation when an identical provider hook repeats."""
@@ -445,7 +464,7 @@ class Registry:
                 for item in existing
                 if (item.provider, item.session_id) != (route.provider, route.session_id)
             ]
-            atomic_json(self.path, [item.to_dict() for item in [*retained, route]])
+            self._write([*retained, route])
             return route
 
     def remove(
@@ -459,7 +478,7 @@ class Registry:
                 if (item.provider, item.session_id, item.pid) != (provider, session_id, pid)
                 or (generation is not None and item.generation != generation)
             ]
-            atomic_json(self.path, [item.to_dict() for item in retained])
+            self._write(retained)
 
     def current(self, route: Route) -> bool:
         return any(item == route for item in self.routes())
@@ -470,7 +489,7 @@ class Registry:
             existing = self.routes()
             retained = [item for item in existing if item.process_is_live()]
             if len(retained) != len(existing):
-                atomic_json(self.path, [item.to_dict() for item in retained])
+                self._write(retained)
             return retained
 
 
