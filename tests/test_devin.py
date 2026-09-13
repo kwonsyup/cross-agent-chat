@@ -9,6 +9,7 @@ import pytest
 from cross_agent_chat.core import MAX_MESSAGE_BYTES, ChatError
 from cross_agent_chat.devin import (
     DEVIN_HOOK_INPUT_MAX_BYTES,
+    DEVIN_STOP_CALLBACK_MAX_BYTES,
     DevinHookEvent,
     build_stop_callback_payload,
     inject_stop_callback_once,
@@ -21,7 +22,8 @@ def _hook(event: str, *, session_id: str | None = None, prompt_id: str | None = 
         "hook_event_name": event,
         "session_id": session_id or str(uuid4()),
     }
-    if prompt_id is not None:
+    if prompt_id is not None or event == "Stop":
+        prompt_id = prompt_id or str(uuid4())
         payload["prompt_id"] = prompt_id
     if event == "Stop":
         payload["stop_hook_active"] = False
@@ -89,6 +91,19 @@ def test_parse_rejects_null_prompt_id() -> None:
         )
 
 
+def test_stop_requires_prompt_id() -> None:
+    with pytest.raises(ChatError, match="lacks prompt identity"):
+        parse_hook_input(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": str(uuid4()),
+                    "stop_hook_active": False,
+                }
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("text", "error"),
     [
@@ -105,12 +120,23 @@ def test_parse_rejects_null_prompt_id() -> None:
             "session id is invalid",
         ),
         (
-            json.dumps({"hook_event_name": "Stop", "session_id": str(uuid4())}),
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": str(uuid4()),
+                    "prompt_id": str(uuid4()),
+                }
+            ),
             "lacks stop_hook_active",
         ),
         (
             json.dumps(
-                {"hook_event_name": "Stop", "session_id": str(uuid4()), "stop_hook_active": "false"}
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": str(uuid4()),
+                    "prompt_id": str(uuid4()),
+                    "stop_hook_active": "false",
+                }
             ),
             "stop_hook_active is invalid",
         ),
@@ -151,6 +177,18 @@ def test_stop_callback_rejects_invalid_or_unbounded_source() -> None:
         build_stop_callback_payload("bad", "source")
     with pytest.raises(ChatError, match="16 KiB"):
         build_stop_callback_payload(str(uuid4()), "x" * (MAX_MESSAGE_BYTES + 1))
+
+
+@pytest.mark.parametrize("character", ['"', "\\"])
+def test_stop_callback_budget_handles_json_escaping_at_valid_core_limit(character: str) -> None:
+    event_id = str(uuid4())
+    source = character * (MAX_MESSAGE_BYTES // 2)
+
+    payload = build_stop_callback_payload(event_id, source)
+
+    assert payload["reason"].endswith(source)
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= DEVIN_STOP_CALLBACK_MAX_BYTES
 
 
 def test_injected_consumer_is_called_once_and_active_stop_is_quiet() -> None:
