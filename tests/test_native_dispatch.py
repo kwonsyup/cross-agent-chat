@@ -81,9 +81,7 @@ def patch_dispatch_environment(
     monkeypatch.setattr(runtime, "request_socket", request_socket)
 
 
-def dispatch_response(
-    fixture: DispatchFixture, message: str
-) -> dict[str, object]:
+def dispatch_response(fixture: DispatchFixture, message: str) -> dict[str, object]:
     return {
         "schema_version": runtime.SCHEMA_VERSION,
         "status": "NATIVE_DISPATCH",

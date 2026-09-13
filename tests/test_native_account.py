@@ -151,9 +151,10 @@ def test_native_account_binary_is_the_exact_chatgpt_bundle(
     )
     monkeypatch.setattr(runtime, "native_desktop_process", lambda _pid: True)
 
-    assert runtime._native_account_binary(route) == Path(
-        "/Applications/ChatGPT.app/Contents/Resources/codex"
-    ).resolve()
+    assert (
+        runtime._native_account_binary(route)
+        == Path("/Applications/ChatGPT.app/Contents/Resources/codex").resolve()
+    )
 
 
 def startup_route(root: Path, *, session_id: str | None = None) -> Route:
