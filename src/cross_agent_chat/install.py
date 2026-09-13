@@ -424,11 +424,12 @@ def _hook_command(
         else ""
     )
     if event == "SessionStart":
-        return (
+        command = (
             f"{native_queue}{binary} _register --provider {provider} "
             f"--device {shlex.quote(device)} "
-            '--pid "$PPID" >/dev/null'
+            '--pid "$PPID"'
         )
+        return command if provider == "codex" else command + " >/dev/null"
     if event == "SessionEnd":
         return f'{native_queue}{binary} _unregister --provider {provider} --pid "$PPID" >/dev/null'
     if provider == "codex" and event == "Stop":

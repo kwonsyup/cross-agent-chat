@@ -36,6 +36,7 @@ from cross_agent_chat.install import (
     PathSnapshot,
     SettingsError,
     SetupRollbackError,
+    _hook_command,
     _owned_hook,
     _owned_hook_native_queue,
     _package_tree_digest,
@@ -45,6 +46,19 @@ from cross_agent_chat.install import (
     discover_executable,
     installed_device,
 )
+
+
+def test_codex_session_start_keeps_provider_hook_output() -> None:
+    command = _hook_command(Path("/opt/cross-agent-chat"), "codex", "studio", "SessionStart")
+
+    assert command.endswith('--pid "$PPID"')
+    assert ">/dev/null" not in command
+
+
+def test_claude_session_start_discards_registration_output() -> None:
+    command = _hook_command(Path("/opt/cross-agent-chat"), "claude", "studio", "SessionStart")
+
+    assert command.endswith('--pid "$PPID" >/dev/null')
 
 
 def _seed_durable_intents(installer: Installer) -> bytes:
