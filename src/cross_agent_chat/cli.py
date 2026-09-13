@@ -26,6 +26,7 @@ from cross_agent_chat.runtime import (
     event_status,
     native_bootstrap,
     native_desktop_mcp_host,
+    native_dispatch,
     native_register,
     peers,
     presence_is_enabled,
@@ -152,6 +153,18 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                                 "additionalProperties": False,
                             },
                         },
+                        {
+                            "name": "native_dispatch",
+                            "description": "Internal Cross Agent Chat native delivery operation.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "event_id": {"type": "string"},
+                                },
+                                "required": ["event_id"],
+                                "additionalProperties": False,
+                            },
+                        },
                     ]
                 _mcp_response(
                     identifier,
@@ -250,7 +263,7 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                 arguments = typed_params.get("arguments", {})
                 if not isinstance(name, str) or not isinstance(arguments, dict):
                     _fail("MCP tool call is invalid")
-                internal_call = name in {"native_bootstrap", "native_register"}
+                internal_call = name in {"native_bootstrap", "native_register", "native_dispatch"}
                 typed_arguments = cast(dict[str, object], arguments)
                 if name == "chat_peers" and not typed_arguments:
                     assert root is not None
@@ -281,6 +294,8 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                 elif name == "native_bootstrap" and provider == "codex" and not typed_arguments:
                     if thread_id is None:
                         _fail("Codex host thread identity is required")
+                    if not native_desktop_mcp_host():
+                        _fail("Codex native Desktop host is required")
                     assert root is not None
                     source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
                     result = native_bootstrap(root, source)
@@ -291,9 +306,23 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                         or not isinstance(typed_arguments["token"], str)
                     ):
                         _fail("native helper registration is invalid")
+                    if not native_desktop_mcp_host():
+                        _fail("Codex native Desktop host is required")
                     assert root is not None
                     source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
                     result = native_register(root, source, typed_arguments["token"])
+                elif name == "native_dispatch" and provider == "codex":
+                    if (
+                        thread_id is None
+                        or set(typed_arguments) != {"event_id"}
+                        or not isinstance(typed_arguments["event_id"], str)
+                    ):
+                        _fail("native helper dispatch is invalid")
+                    if not native_desktop_mcp_host():
+                        _fail("Codex native Desktop host is required")
+                    assert root is not None
+                    source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+                    result = native_dispatch(root, source, typed_arguments["event_id"])
                 else:
                     _fail("MCP tool call is invalid")
                 if internal_call:

@@ -443,11 +443,22 @@ def _owned_hook(value: object) -> bool:
     if not isinstance(hooks, list) or len(hooks) != 1 or not isinstance(hooks[0], dict):
         return False
     hook = hooks[0]
-    if (
-        value.get("matcher") == "mcp__cross_agent_chat__native_bootstrap"
-        and hook.get("type") == "mcp_tool"
-        and hook.get("server") == "codex_app"
-        and hook.get("tool") == "create_thread"
+    if hook.get("type") == "mcp_tool" and (
+        (
+            value.get("matcher") == "mcp__cross_agent_chat__native_bootstrap"
+            and hook.get("server") == "codex_app"
+            and hook.get("tool") == "create_thread"
+        )
+        or (
+            value.get("matcher") == "mcp__cross_agent_chat__native_dispatch"
+            and hook.get("server") == "codex_app"
+            and hook.get("tool") == "send_message_to_thread"
+        )
+        or (
+            "matcher" not in value
+            and hook.get("server") == SERVER_NAME
+            and hook.get("tool") == "native_bootstrap"
+        )
     ):
         return True
     command = hook.get("command")
@@ -512,7 +523,7 @@ def _hook_group(
     }
 
 
-def _native_helper_hook_group() -> dict[str, object]:
+def _native_helper_create_hook_group() -> dict[str, object]:
     """Invoke the real app create operation only after internal bootstrap success."""
 
     return {
@@ -534,6 +545,69 @@ def _native_helper_hook_group() -> dict[str, object]:
             }
         ],
     }
+
+
+def _native_helper_dispatch_hook_group() -> dict[str, object]:
+    """Invoke Desktop's original-thread operation after one dispatch claim."""
+
+    return {
+        "matcher": "mcp__cross_agent_chat__native_dispatch",
+        "hooks": [
+            {
+                "type": "mcp_tool",
+                "server": "codex_app",
+                "tool": "send_message_to_thread",
+                "input": {
+                    "threadId": "${tool_response._meta.native_args.threadId}",
+                    "prompt": "${tool_response._meta.native_args.prompt}",
+                },
+                "timeout": 30,
+                "statusMessage": "Delivering Cross Agent Chat message",
+            }
+        ],
+    }
+
+
+def _native_helper_startup_hook_group() -> dict[str, object]:
+    """Request one helper bootstrap on an ordinary Desktop prompt."""
+
+    return {
+        "hooks": [
+            {
+                "type": "mcp_tool",
+                "server": SERVER_NAME,
+                "tool": "native_bootstrap",
+                "input": {},
+                "timeout": 30,
+                "statusMessage": "Preparing Cross Agent Chat delivery",
+            }
+        ]
+    }
+
+
+def _merge_native_helper_hooks(config: dict[str, object]) -> None:
+    """Replace exactly CAC's three native hook definitions without touching peers."""
+
+    hooks = config.get("hooks")
+    if hooks is None:
+        hook_map: dict[str, object] = {}
+        config["hooks"] = hook_map
+    elif isinstance(hooks, dict):
+        hook_map = cast(dict[str, object], hooks)
+    else:
+        raise SettingsError("provider hooks must be an object")
+    for event, owned in (
+        ("UserPromptSubmit", [_native_helper_startup_hook_group()]),
+        (
+            "PostToolUse",
+            [_native_helper_create_hook_group(), _native_helper_dispatch_hook_group()],
+        ),
+    ):
+        existing = hook_map.get(event, [])
+        if not isinstance(existing, list):
+            raise SettingsError(f"provider hook {event} must be a list")
+        retained = [item for item in existing if not _owned_hook(item)]
+        hook_map[event] = [*retained, *owned]
 
 
 def _merge_hook(config: dict[str, object], event: str, owned: dict[str, object]) -> None:
@@ -1392,7 +1466,7 @@ class Installer:
                     codex_native_queue=codex_native_queue,
                 ),
             )
-        _merge_hook(codex_hooks, "PostToolUse", _native_helper_hook_group())
+        _merge_native_helper_hooks(codex_hooks)
         raw_hook_map = codex_hooks.get("hooks")
         if not isinstance(raw_hook_map, dict):
             raise SettingsError("Codex hooks must be an object")
@@ -2372,7 +2446,28 @@ class Installer:
                         )
                     ]:
                         return False
-            return True
+            native_hooks = codex_hooks.get("hooks")
+            if not isinstance(native_hooks, dict):
+                return False
+            if (
+                native_hooks.get("UserPromptSubmit") is None
+                or native_hooks.get("PostToolUse") is None
+            ):
+                return False
+            startup = [
+                item
+                for item in cast(list[object], native_hooks["UserPromptSubmit"])
+                if _owned_hook(item)
+            ]
+            post = [
+                item
+                for item in cast(list[object], native_hooks["PostToolUse"])
+                if _owned_hook(item)
+            ]
+            return startup == [_native_helper_startup_hook_group()] and post == [
+                _native_helper_create_hook_group(),
+                _native_helper_dispatch_hook_group(),
+            ]
         except (
             OSError,
             plistlib.InvalidFileException,

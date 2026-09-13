@@ -40,10 +40,10 @@ def test_unknown_create_blocks_only_its_original_route(tmp_path: Path) -> None:
     )
     store = NativeHelperStore(tmp_path / "state")
 
-    first_binding, _ = store.reserve(first)
+    first_binding, _ = store.reserve(first, "a" * 64)
     with pytest.raises(ChatError, match="bootstrap"):
-        store.reserve(first)
-    second_binding, _ = store.reserve(second)
+        store.reserve(first, "a" * 64)
+    second_binding, _ = store.reserve(second, "a" * 64)
 
     assert first_binding.state == "UNKNOWN"
     assert second_binding.state == "UNKNOWN"
@@ -57,7 +57,9 @@ def test_register_requires_current_original_and_same_selected_profile(tmp_path: 
         generation="00000000-0000-4000-8000-000000000011",
         pid=101,
     )
-    helper_root = tmp_path / "projectless-helper"
+    store = NativeHelperStore(tmp_path / "state")
+    binding, nonce = store.reserve(original, "a" * 64)
+    helper_root = tmp_path / binding.helper_directory
     helper_root.mkdir()
     helper = route(
         helper_root,
@@ -66,15 +68,13 @@ def test_register_requires_current_original_and_same_selected_profile(tmp_path: 
         pid=102,
         profile_root=tmp_path / "profile",
     )
-    store = NativeHelperStore(tmp_path / "state")
-    _, nonce = store.reserve(original)
 
-    registered = store.register(helper, nonce, original)
+    registered = store.register(helper, nonce, original, "a" * 64)
 
     assert registered.state == "REGISTERED"
     assert registered.helper_session_id == helper.session_id
     with pytest.raises(ChatError, match="registration"):
-        store.register(helper, nonce, original)
+        store.register(helper, nonce, original, "a" * 64)
 
 
 def test_register_rejects_changed_original_generation(tmp_path: Path) -> None:
@@ -97,8 +97,56 @@ def test_register_rejects_changed_original_generation(tmp_path: Path) -> None:
         pid=102,
     )
     store = NativeHelperStore(tmp_path / "state")
-    _, nonce = store.reserve(original)
+    _, nonce = store.reserve(original, "a" * 64)
 
     with pytest.raises(ChatError, match="original route changed"):
-        store.register(helper, nonce, changed)
+        store.register(helper, nonce, changed, "a" * 64)
     assert store.bindings()[0].state == "UNKNOWN"
+
+
+def test_register_rejects_nonce_holder_outside_reserved_helper_directory(tmp_path: Path) -> None:
+    original = route(
+        tmp_path,
+        session="00000000-0000-4000-8000-000000000001",
+        generation="00000000-0000-4000-8000-000000000011",
+        pid=101,
+    )
+    store = NativeHelperStore(tmp_path / "state")
+    _, nonce = store.reserve(original, "a" * 64)
+    wrong_directory = tmp_path / "unrelated-projectless-task"
+    wrong_directory.mkdir()
+    helper = route(
+        wrong_directory,
+        session="00000000-0000-4000-8000-000000000002",
+        generation="00000000-0000-4000-8000-000000000012",
+        pid=102,
+        profile_root=tmp_path / "profile",
+    )
+
+    with pytest.raises(ChatError, match="context"):
+        store.register(helper, nonce, original, "a" * 64)
+
+    assert store.bindings()[0].state == "UNKNOWN"
+
+
+def test_helper_lineage_stays_ineligible_after_helper_generation_restarts(tmp_path: Path) -> None:
+    original = route(
+        tmp_path,
+        session="00000000-0000-4000-8000-000000000001",
+        generation="00000000-0000-4000-8000-000000000011",
+        pid=101,
+    )
+    store = NativeHelperStore(tmp_path / "state")
+    binding, _ = store.reserve(original, "a" * 64)
+    helper_root = tmp_path / binding.helper_directory
+    helper_root.mkdir()
+    restarted = route(
+        helper_root,
+        session="00000000-0000-4000-8000-000000000002",
+        generation="00000000-0000-4000-8000-000000000099",
+        pid=102,
+        profile_root=tmp_path / "profile",
+    )
+
+    assert store.is_helper_lineage(restarted)
+    assert not store.needs_bootstrap(restarted)

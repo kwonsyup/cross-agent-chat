@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from collections.abc import Iterator
 from concurrent.futures import (
     Future,
@@ -45,7 +46,12 @@ from cross_agent_chat.claude_runtime import (
     exact_agent,
     sendmessage,
 )
-from cross_agent_chat.codex import CodexCourier, deliver_at_stop, native_thread_titles
+from cross_agent_chat.codex import (
+    CodexCourier,
+    deliver_at_stop,
+    native_account_digest,
+    native_thread_titles,
+)
 from cross_agent_chat.core import (
     SCHEMA_VERSION,
     ChatError,
@@ -65,7 +71,7 @@ from cross_agent_chat.core import (
     valid_name,
     valid_uuid,
 )
-from cross_agent_chat.native_helper import NativeHelperStore
+from cross_agent_chat.native_helper import NativeDispatchStore, NativeHelperStore
 from cross_agent_chat.remote import parse_remote_envelope
 from cross_agent_chat.tailnet import TAILNET_PORT, tailnet_nodes, valid_tailnet_address
 from cross_agent_chat.transport import remote_envelope
@@ -825,7 +831,19 @@ def courier_server(
     finally:
         os.umask(old_umask)
     native_queue: tuple[Path, dict[str, str], str] | None = None
-    native_enabled = os.environ.get("CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE") == "experimental"
+    helper_queue = False
+    if provider == "codex" and NativeHelperStore(root).is_helper_lineage(route):
+        try:
+            identity, executable = recipient_owner_identity("codex", route.pid, route.profile_root)
+        except (ChatError, OSError):
+            identity = ""
+            executable = Path()
+        helper_queue = identity == route.owner_identity and executable == Path(
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+        )
+    native_enabled = (
+        os.environ.get("CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE") == "experimental" or helper_queue
+    )
     if provider == "codex" and native_enabled:
         bound_binary = os.environ.get("CROSS_AGENT_CHAT_CODEX_BINARY")
         if bound_binary is not None:
@@ -935,6 +953,37 @@ def courier_server(
                     else:
                         emit_frame_safely(
                             connection, courier_accept(route, courier, event_id, message)
+                        )
+                elif operation == "native_dispatch":
+                    event_id = request.get("event_id")
+                    if (
+                        route.provider != "codex"
+                        or courier is None
+                        or not isinstance(event_id, str)
+                    ):
+                        continue
+                    try:
+                        message = courier.claim_native_dispatch(event_id)
+                    except ChatError as error:
+                        emit_frame_safely(
+                            connection,
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "status": "UNAVAILABLE",
+                                "generation": route.generation,
+                                "error": str(error),
+                            },
+                        )
+                    else:
+                        emit_frame_safely(
+                            connection,
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "status": "NATIVE_DISPATCH",
+                                "generation": route.generation,
+                                "event_id": event_id,
+                                "message": message,
+                            },
                         )
                 elif operation == "peek":
                     if courier is None:
@@ -1069,7 +1118,9 @@ def local_targets(root: Path) -> list[Target]:
     routes = [
         route
         for route in Registry(root).routes()
-        if route.process_is_live() and route.cwd_is_available()
+        if route.process_is_live()
+        and route.cwd_is_available()
+        and not NativeHelperStore(root).is_helper_lineage(route)
     ]
     if not routes:
         return []
@@ -1459,6 +1510,13 @@ def _send_local_target(
     if len(route_matches) != 1:
         raise ChatError("target changed before transport acceptance")
     target_route = route_matches[0]
+    delivery_route = target_route
+    if target_route.provider == "codex":
+        helper = NativeHelperStore(root).helper_for_original(target_route, current_routes)
+        if helper is not None:
+            if not _route_current(root, helper):
+                raise ChatError("native helper is unavailable")
+            delivery_route = helper
     source_alias = canonical_source_alias(root, source)
     event_id = str(uuid4())
     source_handle = session_key(source.provider, source.session_id)
@@ -1480,11 +1538,11 @@ def _send_local_target(
     )
     try:
         response = request_socket(
-            socket_path(root, target_route),
+            socket_path(root, delivery_route),
             {
                 "schema_version": 1,
                 "operation": "accept",
-                "generation": target_route.generation,
+                "generation": delivery_route.generation,
                 "event_id": event_id,
                 "message": body,
             },
@@ -1498,12 +1556,12 @@ def _send_local_target(
     except ChatError:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
         raise
-    expected = {
+    delivery_expected = {
         "schema_version": 1,
         "event_id": event_id,
         "status": "TRANSPORT_ACCEPTED",
-        "to": target.alias,
-        "provider": target.provider,
+        "to": delivery_route.alias,
+        "provider": delivery_route.provider,
     }
     rejection = pre_effect_error(response, event_id, target.provider)
     if rejection is not None:
@@ -1517,13 +1575,19 @@ def _send_local_target(
             f"delivery state is unknown for event {event_id}; diagnostic {diagnostic}; "
             "do not retry automatically"
         )
-    if response != expected:
+    if response != delivery_expected:
         store.mark(event_id, "UNKNOWN_DELIVERY")
         raise UnknownDeliveryError(
             f"delivery state is unknown for event {event_id}; do not retry automatically"
         )
     store.mark(event_id, "TRANSPORT_ACCEPTED")
-    return expected
+    return {
+        "schema_version": 1,
+        "event_id": event_id,
+        "status": "TRANSPORT_ACCEPTED",
+        "to": target.alias,
+        "provider": target.provider,
+    }
 
 
 def send_local(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
@@ -1857,6 +1921,12 @@ def native_helper_tools(root: Path, source: Route) -> tuple[str, ...]:
     store = NativeHelperStore(root)
     if store.pending_for_helper(source):
         return ("native_register",)
+    try:
+        store.original_for_helper(source, Registry(root).routes())
+    except ChatError:
+        pass
+    else:
+        return ("native_dispatch",)
     if store.needs_bootstrap(source):
         return ("native_bootstrap",)
     return ()
@@ -1887,12 +1957,118 @@ def native_desktop_mcp_host() -> bool:
     return False
 
 
+def _native_account_digest(route: Route) -> str:
+    """Bind lifecycle operations to the selected provider account without refresh."""
+
+    if route.profile_root is None:
+        raise ChatError("Codex account identity is unavailable")
+    candidate = shutil.which("codex")
+    if candidate is None:
+        raise ChatError("Codex account identity is unavailable")
+    try:
+        binary = Path(candidate).resolve(strict=True)
+    except OSError as error:
+        raise ChatError("Codex account identity is unavailable") from error
+    return native_account_digest(binary=binary, environment={"CODEX_HOME": route.profile_root})
+
+
+def _native_hook_hash(event_name: str, group: dict[str, object]) -> str:
+    """Match Codex's trusted-hook identity for one exact group."""
+
+    identity = {"event_name": event_name, **group}
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _native_create_hook_group() -> dict[str, object]:
+    return {
+        "matcher": "mcp__cross_agent_chat__native_bootstrap",
+        "hooks": [
+            {
+                "type": "mcp_tool",
+                "server": "codex_app",
+                "tool": "create_thread",
+                "input": {
+                    "prompt": "${tool_response.structuredContent.create_thread.prompt}",
+                    "target": "${tool_response.structuredContent.create_thread.target}",
+                    "model": "${tool_response.structuredContent.create_thread.model}",
+                    "thinking": "${tool_response.structuredContent.create_thread.thinking}",
+                    "title": "${tool_response.structuredContent.create_thread.title}",
+                },
+                "timeout": 30,
+                "statusMessage": "Starting Cross Agent Chat helper",
+            }
+        ],
+    }
+
+
+def _native_dispatch_hook_group() -> dict[str, object]:
+    return {
+        "matcher": "mcp__cross_agent_chat__native_dispatch",
+        "hooks": [
+            {
+                "type": "mcp_tool",
+                "server": "codex_app",
+                "tool": "send_message_to_thread",
+                "input": {
+                    "threadId": "${tool_response._meta.native_args.threadId}",
+                    "prompt": "${tool_response._meta.native_args.prompt}",
+                },
+                "timeout": 30,
+                "statusMessage": "Delivering Cross Agent Chat message",
+            }
+        ],
+    }
+
+
+def _native_hook_ready(source: Route, expected: dict[str, object]) -> bool:
+    """Require the exact enabled hook and the provider-written trust hash."""
+
+    if source.profile_root is None:
+        return False
+    profile = Path(source.profile_root)
+    hooks_path = profile / "hooks.json"
+    config_path = profile / "config.toml"
+    try:
+        hooks_raw = json.loads(hooks_path.read_text(encoding="utf-8"))
+        config_raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return False
+    if not isinstance(hooks_raw, dict) or not isinstance(config_raw, dict):
+        return False
+    features = config_raw.get("features")
+    state_root = config_raw.get("hooks")
+    if (
+        not isinstance(features, dict)
+        or features.get("hooks") is not True
+        or not isinstance(state_root, dict)
+        or not isinstance(state_root.get("state"), dict)
+    ):
+        return False
+    hooks = hooks_raw.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    groups = hooks.get("PostToolUse")
+    if not isinstance(groups, list):
+        return False
+    matches = [index for index, group in enumerate(groups) if group == expected]
+    if len(matches) != 1:
+        return False
+    key = f"{hooks_path.resolve(strict=False)}:post_tool_use:{matches[0]}:0"
+    trusted = state_root["state"].get(key)
+    return isinstance(trusted, dict) and trusted.get("trusted_hash") == _native_hook_hash(
+        "post_tool_use", expected
+    )
+
+
 def native_bootstrap(root: Path, source: Route) -> dict[str, object]:
     """Reserve one helper create and return only trusted-hook template arguments."""
 
-    if "native_bootstrap" not in native_helper_tools(root, source):
+    if "native_bootstrap" not in native_helper_tools(root, source) or not _native_hook_ready(
+        source, _native_create_hook_group()
+    ):
         raise ChatError("native helper bootstrap is unavailable")
-    binding, nonce = NativeHelperStore(root).reserve(source)
+    binding, nonce = NativeHelperStore(root).reserve(source, _native_account_digest(source))
     return {
         "content": [{"type": "text", "text": "Starting the native delivery helper."}],
         "structuredContent": {
@@ -1918,8 +2094,57 @@ def native_register(root: Path, helper: Route, token: str) -> dict[str, object]:
     original = store.original_for_nonce(token, Registry(root).routes())
     if not _route_current(root, original) or not _route_current(root, helper):
         raise ChatError("native helper registration is unavailable")
-    store.register(helper, token, original)
+    store.register(helper, token, original, _native_account_digest(helper))
     return {"content": [{"type": "text", "text": "Native helper is ready."}]}
+
+
+def native_dispatch(root: Path, helper: Route, event_id: str) -> dict[str, object]:
+    """Claim one helper-originated native send to its bound original task."""
+
+    identifier = valid_uuid(event_id, "event id")
+    if not _native_hook_ready(helper, _native_dispatch_hook_group()):
+        raise ChatError("native helper dispatch is unavailable")
+    store = NativeHelperStore(root)
+    original = store.original_for_helper(helper, Registry(root).routes())
+    if not _route_current(root, helper) or not _route_current(root, original):
+        raise ChatError("native helper dispatch is unavailable")
+    bound_account = next(
+        item.account_sha256
+        for item in store.bindings()
+        if (
+            item.helper_session_id == helper.session_id
+            and item.helper_generation == helper.generation
+        )
+    )
+    if (
+        _native_account_digest(helper) != bound_account
+        or _native_account_digest(original) != bound_account
+    ):
+        raise ChatError("native helper dispatch is unavailable")
+    response = request_socket(
+        socket_path(root, helper),
+        {
+            "schema_version": SCHEMA_VERSION,
+            "operation": "native_dispatch",
+            "generation": helper.generation,
+            "event_id": identifier,
+        },
+    )
+    if (
+        set(response) != {"schema_version", "status", "generation", "event_id", "message"}
+        or response.get("schema_version") != SCHEMA_VERSION
+        or response.get("status") != "NATIVE_DISPATCH"
+        or response.get("generation") != helper.generation
+        or response.get("event_id") != identifier
+        or not isinstance(response.get("message"), str)
+    ):
+        raise ChatError("native helper dispatch is unavailable")
+    body = bounded_message(cast(str, response["message"]))
+    NativeDispatchStore(root).claim(helper, original, identifier, body)
+    return {
+        "content": [{"type": "text", "text": "Native delivery was submitted."}],
+        "_meta": {"native_args": {"threadId": original.session_id, "prompt": body}},
+    }
 
 
 def event_status(root: Path, source: Route, event_id: str) -> dict[str, object]:

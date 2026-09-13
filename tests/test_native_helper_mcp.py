@@ -76,6 +76,7 @@ def test_verified_desktop_catalog_adds_internal_names_without_list_metadata(
     assert {tool["name"] for tool in tools} == PUBLIC_TOOLS | {
         "native_bootstrap",
         "native_register",
+        "native_dispatch",
     }
     schemas = {tool["name"]: tool["inputSchema"] for tool in tools}
     assert schemas["native_bootstrap"] == {
@@ -151,10 +152,11 @@ def test_native_helper_visibility_tracks_unknown_binding_state(
     registry = Registry(state_root)
     registry.upsert(original)
     monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_native_account_digest", lambda *_args: "a" * 64)
 
     assert runtime.native_helper_tools(state_root, original) == ("native_bootstrap",)
 
-    binding, nonce = NativeHelperStore(state_root).reserve(original)
+    binding, nonce = NativeHelperStore(state_root).reserve(original, "a" * 64)
     assert binding.state == "UNKNOWN"
     assert runtime.native_helper_tools(state_root, original) == ()
 
@@ -170,7 +172,7 @@ def test_native_helper_visibility_tracks_unknown_binding_state(
     assert runtime.native_helper_tools(state_root, helper) == ("native_register",)
 
     runtime.native_register(state_root, helper, nonce)
-    assert runtime.native_helper_tools(state_root, helper) == ()
+    assert runtime.native_helper_tools(state_root, helper) == ("native_dispatch",)
     assert runtime.native_helper_tools(state_root, original) == ()
 
 
@@ -219,6 +221,7 @@ def test_internal_bootstrap_mcp_call_preserves_structured_result(
         },
     }
     monkeypatch.delenv("CROSS_AGENT_CHAT_PRESENCE", raising=False)
+    monkeypatch.setattr("cross_agent_chat.cli.native_desktop_mcp_host", lambda: True)
     monkeypatch.setattr("cross_agent_chat.cli.authenticate_mcp_sender", lambda *_args: object())
     monkeypatch.setattr("cross_agent_chat.cli.native_bootstrap", lambda *_args: expected)
     monkeypatch.setattr(
@@ -253,6 +256,7 @@ def test_failed_internal_mcp_call_is_tool_error_and_does_not_become_jsonrpc_erro
 ) -> None:
     thread_id = "00000000-0000-4000-8000-000000000007"
     monkeypatch.delenv("CROSS_AGENT_CHAT_PRESENCE", raising=False)
+    monkeypatch.setattr("cross_agent_chat.cli.native_desktop_mcp_host", lambda: True)
     monkeypatch.setattr("cross_agent_chat.cli.authenticate_mcp_sender", lambda *_args: object())
     monkeypatch.setattr(
         "cross_agent_chat.cli.native_bootstrap",
@@ -296,6 +300,9 @@ def test_mcp_bootstrap_register_duplicate_journey_is_single_and_nonrecursive(
     Registry(state_root).upsert(original)
     routes = {original.session_id: original}
     monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_native_account_digest", lambda *_args: "a" * 64)
+    monkeypatch.setattr(runtime, "_native_hook_ready", lambda *_args: True)
+    monkeypatch.setattr("cross_agent_chat.cli.native_desktop_mcp_host", lambda: True)
 
     def authenticate(_root: Path, provider: str, _parent_pid: int, thread_id: str | None) -> Route:
         assert provider == "codex"
@@ -352,7 +359,7 @@ def test_mcp_bootstrap_register_duplicate_journey_is_single_and_nonrecursive(
     assert register_response["result"] == {
         "content": [{"type": "text", "text": "Native helper is ready."}]
     }
-    assert runtime.native_helper_tools(state_root, helper) == ()
+    assert runtime.native_helper_tools(state_root, helper) == ("native_dispatch",)
 
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(bootstrap_request) + "\n"))
     mcp("codex", "studio", str(state_root))
@@ -371,6 +378,8 @@ def test_native_bootstrap_is_one_effect_and_returns_projectless_create_args(
     original = route(tmp_path, session_id="00000000-0000-4000-8000-000000000003")
     Registry(state_root).upsert(original)
     monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_native_account_digest", lambda *_args: "a" * 64)
+    monkeypatch.setattr(runtime, "_native_hook_ready", lambda *_args: True)
 
     result = runtime.native_bootstrap(state_root, original)
     structured_content = cast(dict[str, object], result["structuredContent"])
@@ -400,7 +409,8 @@ def test_failed_registration_preserves_unknown_binding(
     registry.upsert(original)
     registry.upsert(wrong_helper)
     monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
-    _, nonce = NativeHelperStore(state_root).reserve(original)
+    monkeypatch.setattr(runtime, "_native_account_digest", lambda *_args: "a" * 64)
+    _, nonce = NativeHelperStore(state_root).reserve(original, "a" * 64)
 
     with pytest.raises(ChatError, match="context"):
         runtime.native_register(state_root, wrong_helper, nonce)
