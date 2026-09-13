@@ -433,6 +433,8 @@ def _hook_command(
         return f'{native_queue}{binary} _unregister --provider {provider} --pid "$PPID" >/dev/null'
     if provider == "codex" and event == "Stop":
         return f'{native_queue}{binary} _codex-stop --pid "$PPID"'
+    if provider == "codex" and event == "UserPromptSubmit":
+        return f'{binary} _native-startup --device {shlex.quote(device)} --pid "$PPID"'
     raise SettingsError("unsupported provider hook")
 
 
@@ -473,7 +475,7 @@ def _owned_hook(value: object) -> bool:
     return (
         len(tokens) >= 2
         and Path(tokens[0]).name == SERVER_NAME
-        and tokens[1] in {"_register", "_unregister", "_codex-stop"}
+        and tokens[1] in {"_register", "_unregister", "_codex-stop", "_native-startup"}
     )
 
 
@@ -568,16 +570,14 @@ def _native_helper_dispatch_hook_group() -> dict[str, object]:
     }
 
 
-def _native_helper_startup_hook_group() -> dict[str, object]:
+def _native_helper_startup_hook_group(executable: Path, device: str) -> dict[str, object]:
     """Request one helper bootstrap on an ordinary Desktop prompt."""
 
     return {
         "hooks": [
             {
-                "type": "mcp_tool",
-                "server": SERVER_NAME,
-                "tool": "native_bootstrap",
-                "input": {},
+                "type": "command",
+                "command": _hook_command(executable, "codex", device, "UserPromptSubmit"),
                 "timeout": 30,
                 "statusMessage": "Preparing Cross Agent Chat delivery",
             }
@@ -585,7 +585,7 @@ def _native_helper_startup_hook_group() -> dict[str, object]:
     }
 
 
-def _merge_native_helper_hooks(config: dict[str, object]) -> None:
+def _merge_native_helper_hooks(config: dict[str, object], executable: Path, device: str) -> None:
     """Replace exactly CAC's three native hook definitions without touching peers."""
 
     hooks = config.get("hooks")
@@ -597,7 +597,7 @@ def _merge_native_helper_hooks(config: dict[str, object]) -> None:
     else:
         raise SettingsError("provider hooks must be an object")
     for event, owned in (
-        ("UserPromptSubmit", [_native_helper_startup_hook_group()]),
+        ("UserPromptSubmit", [_native_helper_startup_hook_group(executable, device)]),
         (
             "PostToolUse",
             [_native_helper_create_hook_group(), _native_helper_dispatch_hook_group()],
@@ -1466,7 +1466,7 @@ class Installer:
                     codex_native_queue=codex_native_queue,
                 ),
             )
-        _merge_native_helper_hooks(codex_hooks)
+        _merge_native_helper_hooks(codex_hooks, self.executable, self.device)
         raw_hook_map = codex_hooks.get("hooks")
         if not isinstance(raw_hook_map, dict):
             raise SettingsError("Codex hooks must be an object")
@@ -2464,7 +2464,9 @@ class Installer:
                 for item in cast(list[object], native_hooks["PostToolUse"])
                 if _owned_hook(item)
             ]
-            return startup == [_native_helper_startup_hook_group()] and post == [
+            return startup == [
+                _native_helper_startup_hook_group(self.executable, self.device)
+            ] and post == [
                 _native_helper_create_hook_group(),
                 _native_helper_dispatch_hook_group(),
             ]

@@ -763,18 +763,24 @@ def unknown_delivery_diagnostic(
     return diagnostic
 
 
-def _delivery_mode(route: Route, courier: CodexCourier | None) -> DeliveryMode:
+def _delivery_mode(
+    route: Route, courier: CodexCourier | None, *, native_helper: bool = False
+) -> DeliveryMode:
     if route.provider == "claude":
         return "claude_native_cross_session"
     return (
         "codex_experimental_queue"
-        if courier is not None and courier.native_queue
+        if native_helper or (courier is not None and courier.native_queue)
         else "codex_stop_bound"
     )
 
 
 def courier_health(
-    route: Route, courier: CodexCourier | None = None, *, include_delivery_mode: bool = False
+    route: Route,
+    courier: CodexCourier | None = None,
+    *,
+    include_delivery_mode: bool = False,
+    native_helper: bool = False,
 ) -> dict[str, object]:
     alias = route.alias
     if route.provider == "claude":
@@ -797,7 +803,7 @@ def courier_health(
         "alias": alias,
     }
     if include_delivery_mode:
-        response["delivery_mode"] = _delivery_mode(route, courier)
+        response["delivery_mode"] = _delivery_mode(route, courier, native_helper=native_helper)
     return response
 
 
@@ -834,13 +840,10 @@ def courier_server(
     helper_queue = False
     if provider == "codex" and NativeHelperStore(root).is_helper_lineage(route):
         try:
-            identity, executable = recipient_owner_identity("codex", route.pid, route.profile_root)
+            identity, _ = recipient_owner_identity("codex", route.pid, route.profile_root)
         except (ChatError, OSError):
             identity = ""
-            executable = Path()
-        helper_queue = identity == route.owner_identity and executable == Path(
-            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
-        )
+        helper_queue = identity == route.owner_identity and native_desktop_process(route.pid)
     native_enabled = (
         os.environ.get("CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE") == "experimental" or helper_queue
     )
@@ -862,7 +865,12 @@ def courier_server(
                 route.session_id,
             )
     courier = (
-        CodexCourier(alias=route.alias, generation=route.generation, native_queue=native_queue)
+        CodexCourier(
+            alias=route.alias,
+            generation=route.generation,
+            native_queue=native_queue,
+            native_helper=helper_queue,
+        )
         if provider == "codex"
         else None
     )
@@ -925,6 +933,12 @@ def courier_server(
                                 route,
                                 courier,
                                 include_delivery_mode=request.get("include_delivery_mode") is True,
+                                native_helper=(
+                                    NativeHelperStore(root).helper_for_original(
+                                        route, Registry(root).routes()
+                                    )
+                                    is not None
+                                ),
                             ),
                         )
                 elif operation == "shutdown":
@@ -963,7 +977,7 @@ def courier_server(
                     ):
                         continue
                     try:
-                        message = courier.claim_native_dispatch(event_id)
+                        message = courier.native_dispatch_message(event_id)
                     except ChatError as error:
                         emit_frame_safely(
                             connection,
@@ -985,6 +999,27 @@ def courier_server(
                                 "message": message,
                             },
                         )
+                elif operation == "native_dispatch_ack":
+                    event_id = request.get("event_id")
+                    if (
+                        route.provider != "codex"
+                        or courier is None
+                        or not isinstance(event_id, str)
+                    ):
+                        continue
+                    try:
+                        courier.acknowledge([event_id])
+                    except ChatError:
+                        continue
+                    emit_frame_safely(
+                        connection,
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            "status": "NATIVE_DISPATCH_ACKED",
+                            "generation": route.generation,
+                            "event_id": event_id,
+                        },
+                    )
                 elif operation == "peek":
                     if courier is None:
                         continue
@@ -1787,23 +1822,32 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         ]
         if len(routes) != 1:
             raise ChatError("remote target changed before transport acceptance")
+        delivery_route = routes[0]
+        if delivery_route.provider == "codex":
+            helper = NativeHelperStore(root).helper_for_original(
+                delivery_route, Registry(root).routes()
+            )
+            if helper is not None:
+                if not _route_current(root, helper):
+                    raise ChatError("native helper is unavailable")
+                delivery_route = helper
         response = request_socket(
-            socket_path(root, routes[0]),
+            socket_path(root, delivery_route),
             {
                 "schema_version": SCHEMA_VERSION,
                 "operation": "accept",
-                "generation": generation,
+                "generation": delivery_route.generation,
                 "event_id": event_id,
                 "message": message,
             },
             timeout=ACCEPT_TIMEOUT_SECONDS,
         )
-        expected: dict[str, object] = {
+        delivery_expected: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "event_id": event_id,
             "status": "TRANSPORT_ACCEPTED",
-            "to": target.alias,
-            "provider": target.provider,
+            "to": delivery_route.alias,
+            "provider": delivery_route.provider,
         }
         if pre_effect_error(response, event_id, target.provider) is not None:
             return {
@@ -1815,9 +1859,15 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
             }
         if unknown_delivery_diagnostic(response, event_id, target.provider) is not None:
             return response
-        if response != expected:
+        if response != delivery_expected:
             raise UnknownDeliveryError("remote delivery state is unknown")
-        return expected
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "event_id": event_id,
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": target.provider,
+        }
     except UnknownDeliveryError:
         raise
     except ChatError:
@@ -1927,15 +1977,60 @@ def native_helper_tools(root: Path, source: Route) -> tuple[str, ...]:
         pass
     else:
         return ("native_dispatch",)
+    original_bindings = [
+        item
+        for item in store.bindings()
+        if (
+            item.original_session_id == source.session_id
+            and item.original_generation == source.generation
+        )
+    ]
+    if original_bindings and any(item.state == "UNKNOWN" for item in original_bindings):
+        return ()
+    if original_bindings and store.helper_for_original(source, Registry(root).routes()) is None:
+        return ("native_bootstrap",)
     if store.needs_bootstrap(source):
         return ("native_bootstrap",)
     return ()
 
 
-def native_desktop_mcp_host() -> bool:
-    """Recognize a Desktop-hosted MCP process without trusting a model field."""
+def native_startup(root: Path, device: str, pid: int) -> dict[str, object]:
+    """Offer one original Desktop task the internal bootstrap tool on its first prompt."""
 
-    pid = os.getppid()
+    raw = hook_input("UserPromptSubmit")
+    candidates = [
+        route
+        for route in Registry(root).routes()
+        if route.provider == "codex"
+        and route.device == valid_device(device)
+        and route.session_id == raw["session_id"]
+        and route.pid == pid
+        and route.cwd == raw["cwd"]
+    ]
+    if len(candidates) != 1 or not _route_current(root, candidates[0]):
+        return {}
+    try:
+        identity, _ = recipient_owner_identity(
+            "codex", candidates[0].pid, candidates[0].profile_root
+        )
+    except (ChatError, OSError):
+        return {}
+    if identity != candidates[0].owner_identity or not native_desktop_process(candidates[0].pid):
+        return {}
+    if native_helper_tools(root, candidates[0]) != ("native_bootstrap",):
+        return {}
+    return {
+        "additionalContext": (
+            "Cross Agent Chat needs its native delivery helper. Call native_bootstrap once now."
+        )
+    }
+
+
+def native_desktop_process(pid: int) -> bool:
+    """Recognize an app-owned Codex child by its bounded Desktop ancestor chain."""
+
+    if pid <= 0:
+        return False
     for _ in range(8):
         try:
             _, executable = recipient_owner_identity("codex", pid)
@@ -1957,19 +2052,37 @@ def native_desktop_mcp_host() -> bool:
     return False
 
 
-def _native_account_digest(route: Route) -> str:
-    """Bind lifecycle operations to the selected provider account without refresh."""
+def native_desktop_mcp_host() -> bool:
+    """Recognize a Desktop-hosted MCP process without trusting a model field."""
+
+    return native_desktop_process(os.getppid())
+
+
+def _native_account_binary(route: Route) -> Path:
+    """Select only the bundled app-server client of the bound Desktop process."""
 
     if route.profile_root is None:
         raise ChatError("Codex account identity is unavailable")
-    candidate = shutil.which("codex")
-    if candidate is None:
-        raise ChatError("Codex account identity is unavailable")
     try:
-        binary = Path(candidate).resolve(strict=True)
+        identity, _ = recipient_owner_identity("codex", route.pid, route.profile_root)
+    except (ChatError, OSError) as error:
+        raise ChatError("Codex account identity is unavailable") from error
+    if identity != route.owner_identity or not native_desktop_process(route.pid):
+        raise ChatError("Codex account identity is unavailable")
+    bundled = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+    try:
+        return bundled.resolve(strict=True)
     except OSError as error:
         raise ChatError("Codex account identity is unavailable") from error
-    return native_account_digest(binary=binary, environment={"CODEX_HOME": route.profile_root})
+
+
+def _native_account_digest(route: Route) -> str:
+    """Bind lifecycle operations to the selected provider account without refresh."""
+
+    assert route.profile_root is not None
+    return native_account_digest(
+        binary=_native_account_binary(route), environment={"CODEX_HOME": route.profile_root}
+    )
 
 
 def _native_hook_hash(event_name: str, group: dict[str, object]) -> str:
@@ -2068,7 +2181,9 @@ def native_bootstrap(root: Path, source: Route) -> dict[str, object]:
         source, _native_create_hook_group()
     ):
         raise ChatError("native helper bootstrap is unavailable")
-    binding, nonce = NativeHelperStore(root).reserve(source, _native_account_digest(source))
+    binding, nonce = NativeHelperStore(root).reserve(
+        source, _native_account_digest(source), Registry(root).routes()
+    )
     return {
         "content": [{"type": "text", "text": "Starting the native delivery helper."}],
         "structuredContent": {
@@ -2121,6 +2236,9 @@ def native_dispatch(root: Path, helper: Route, event_id: str) -> dict[str, objec
         or _native_account_digest(original) != bound_account
     ):
         raise ChatError("native helper dispatch is unavailable")
+    dispatch_store = NativeDispatchStore(root)
+    if dispatch_store.has_event(identifier):
+        raise ChatError("native helper dispatch is unavailable")
     response = request_socket(
         socket_path(root, helper),
         {
@@ -2140,7 +2258,23 @@ def native_dispatch(root: Path, helper: Route, event_id: str) -> dict[str, objec
     ):
         raise ChatError("native helper dispatch is unavailable")
     body = bounded_message(cast(str, response["message"]))
-    NativeDispatchStore(root).claim(helper, original, identifier, body)
+    dispatch_store.claim(helper, original, identifier, body)
+    acknowledgement = request_socket(
+        socket_path(root, helper),
+        {
+            "schema_version": SCHEMA_VERSION,
+            "operation": "native_dispatch_ack",
+            "generation": helper.generation,
+            "event_id": identifier,
+        },
+    )
+    if acknowledgement != {
+        "schema_version": SCHEMA_VERSION,
+        "status": "NATIVE_DISPATCH_ACKED",
+        "generation": helper.generation,
+        "event_id": identifier,
+    }:
+        raise ChatError("native helper dispatch is unavailable")
     return {
         "content": [{"type": "text", "text": "Native delivery was submitted."}],
         "_meta": {"native_args": {"threadId": original.session_id, "prompt": body}},

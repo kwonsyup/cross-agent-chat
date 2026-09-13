@@ -1308,6 +1308,93 @@ def test_remote_receive_requires_source_authorization_before_provider_effect(
     assert response["provider"] == "codex"
 
 
+def test_remote_receive_routes_registered_codex_original_to_its_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    original = Route.create(
+        provider="codex",
+        session_id="00000000-0000-4000-8000-000000000001",
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        generation="00000000-0000-4000-8000-000000000011",
+        owner_identity="a" * 64,
+        profile_root=str(profile),
+    )
+    from cross_agent_chat.native_helper import NativeHelperStore
+
+    store = NativeHelperStore(tmp_path)
+    binding, nonce = store.reserve(original, "a" * 64)
+    helper_root = tmp_path / binding.helper_directory
+    helper_root.mkdir()
+    helper = Route.create(
+        provider="codex",
+        session_id="00000000-0000-4000-8000-000000000002",
+        device="target",
+        cwd=str(helper_root),
+        pid=os.getpid(),
+        generation="00000000-0000-4000-8000-000000000012",
+        owner_identity="a" * 64,
+        profile_root=str(profile),
+    )
+    store.register(helper, nonce, original, "a" * 64)
+    Registry(tmp_path).upsert(original)
+    Registry(tmp_path).upsert(helper)
+    public_target = Target(
+        alias=original.alias,
+        provider="codex",
+        device=original.device,
+        project=original.project,
+        generation=original.generation,
+        session_key=session_key("codex", original.session_id),
+        remote=False,
+        session_id=original.session_id,
+        cwd=original.cwd,
+        pid=original.pid,
+    )
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=str(uuid4()),
+        target_alias=original.alias,
+        generation=original.generation,
+        message="hello",
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_tailnet",
+        lambda _address, payload, **_: (
+            {key: value for key, value in payload.items() if key != "operation"}
+            | {"status": "AUTHORIZED"}
+        ),
+    )
+
+    def accept(path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        assert path == runtime.socket_path(tmp_path, helper)
+        assert payload["generation"] == helper.generation
+        return {
+            "schema_version": 1,
+            "event_id": event_id,
+            "status": "TRANSPORT_ACCEPTED",
+            "to": helper.alias,
+            "provider": "codex",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", accept)
+
+    assert receive_remote(tmp_path, envelope, "100.64.0.11") == {
+        "schema_version": 1,
+        "event_id": event_id,
+        "status": "TRANSPORT_ACCEPTED",
+        "to": original.alias,
+        "provider": "codex",
+    }
+
+
 def test_tailnet_client_keeps_write_side_open_for_serve_proxy() -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))

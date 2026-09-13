@@ -28,6 +28,7 @@ from cross_agent_chat.runtime import (
     native_desktop_mcp_host,
     native_dispatch,
     native_register,
+    native_startup,
     peers,
     presence_is_enabled,
     register,
@@ -399,6 +400,10 @@ def parser() -> argparse.ArgumentParser:
     stop_parser = commands.add_parser("_codex-stop")
     stop_parser.add_argument("--pid", type=int, required=True)
     stop_parser.add_argument("--state-root")
+    native_startup_parser = commands.add_parser("_native-startup")
+    native_startup_parser.add_argument("--device", required=True)
+    native_startup_parser.add_argument("--pid", type=int, required=True)
+    native_startup_parser.add_argument("--state-root")
     courier = commands.add_parser("_courier")
     courier.add_argument("--provider", choices=("claude", "codex"), required=True)
     courier.add_argument("--state-root", required=True)
@@ -479,6 +484,12 @@ def run(arguments: argparse.Namespace) -> int:
         unregister(arguments.provider, arguments.pid, arguments.state_root)
     elif command == "_codex-stop":
         codex_stop(arguments.pid, arguments.state_root)
+    elif command == "_native-startup":
+        print(
+            json.dumps(
+                native_startup(state_root(arguments.state_root), arguments.device, arguments.pid)
+            )
+        )
     elif command == "_courier":
         courier_server(
             provider=arguments.provider,

@@ -98,11 +98,19 @@ def native_account_digest(*, binary: Path, environment: dict[str, str]) -> str:
         write({"method": "initialized"})
         write({"id": 1, "method": "account/read", "params": {"refreshToken": False}})
         response = read(1)
-        account = response.get("result") if response is not None else None
+        result = response.get("result") if response is not None else None
+        account = result.get("account") if isinstance(result, dict) else None
         email = account.get("email") if isinstance(account, dict) else None
-        if not isinstance(email, str) or not email:
+        if (
+            not isinstance(result, dict)
+            or result.get("requiresOpenaiAuth") is not True
+            or not isinstance(account, dict)
+            or account.get("type") != "chatgpt"
+            or not isinstance(email, str)
+            or not email
+        ):
             raise ChatError("Codex account identity is unavailable")
-        return hashlib.sha256(email.encode("utf-8")).hexdigest()
+        return hashlib.sha256(f"cross-agent-chat:codex-account:v1\0{email}".encode()).hexdigest()
     except (OSError, ValueError) as error:
         raise ChatError("Codex account identity is unavailable") from error
     finally:
@@ -356,6 +364,7 @@ class CodexCourier:
         generation: str,
         capacity: int = DEFAULT_CAPACITY,
         native_queue: tuple[Path, dict[str, str], str] | None = None,
+        native_helper: bool = False,
     ) -> None:
         if capacity <= 0 or capacity > DEFAULT_CAPACITY:
             raise ChatError("Codex courier capacity is invalid")
@@ -363,6 +372,7 @@ class CodexCourier:
         self.generation = valid_uuid(generation, "courier generation")
         self.capacity = capacity
         self.native_queue = native_queue
+        self.native_helper = native_helper
         self._pending: OrderedDict[str, str] = OrderedDict()
 
     def accept(self, event_id: str, message: str) -> dict[str, object]:
@@ -383,8 +393,12 @@ class CodexCourier:
                 thread_id=thread_id,
                 event_id=identifier,
                 message=(
-                    "Cross Agent Chat has one protected delivery event. "
-                    f"Call native_dispatch with event_id {identifier}."
+                    (
+                        "Cross Agent Chat has one protected delivery event. "
+                        f"Call native_dispatch with event_id {identifier}."
+                    )
+                    if self.native_helper
+                    else body
                 ),
             )
             return {
@@ -439,12 +453,12 @@ class CodexCourier:
         for event_id in event_ids:
             del self._pending[event_id]
 
-    def claim_native_dispatch(self, event_id: str) -> str:
-        """Consume one opaque event only after a native dispatch claim starts."""
+    def native_dispatch_message(self, event_id: str) -> str:
+        """Read one opaque event while its durable native claim is prepared."""
 
         identifier = valid_uuid(event_id, "event id")
         try:
-            return self._pending.pop(identifier)
+            return self._pending[identifier]
         except KeyError as error:
             raise ChatError("native helper dispatch is unavailable") from error
 

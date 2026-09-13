@@ -201,16 +201,30 @@ class NativeHelperStore:
             raise ChatError("native helper state is invalid")
         return [NativeHelperBinding.from_dict(item) for item in raw]
 
-    def reserve(self, original: Route, account_sha256: str) -> tuple[NativeHelperBinding, str]:
+    def reserve(
+        self, original: Route, account_sha256: str, routes: list[Route] | None = None
+    ) -> tuple[NativeHelperBinding, str]:
         """Reserve one unknown native create without freezing other original routes."""
 
         with state_lock(self.root, "native-helpers"):
             existing = self.bindings()
-            if any(
-                item.original_session_id == original.session_id
-                and item.original_generation == original.generation
+            matches = [
+                item
                 for item in existing
-            ):
+                if item.original_session_id == original.session_id
+                and item.original_generation == original.generation
+            ]
+            live_helpers = [
+                route
+                for item in matches
+                if item.state == "REGISTERED"
+                for route in ([] if routes is None else routes)
+                if route.session_id == item.helper_session_id
+                and route.generation == item.helper_generation
+                and route.process_is_live()
+                and route.cwd_is_available()
+            ]
+            if any(item.state == "UNKNOWN" for item in matches) or live_helpers:
                 raise ChatError("native helper bootstrap is unavailable")
             nonce = str(uuid4())
             helper_directory = f"cac-native-helper-{uuid4()}"
@@ -453,3 +467,9 @@ class NativeDispatchStore:
                 raise ChatError("native dispatch is unavailable")
             atomic_json(self.path, [item.to_dict() for item in [*existing, dispatch]])
         return dispatch
+
+    def has_event(self, event_id: str) -> bool:
+        """Whether a possible native effect has already been durably claimed."""
+
+        identifier = valid_uuid(event_id, "event id")
+        return any(item.event_id == identifier for item in self.dispatches())
