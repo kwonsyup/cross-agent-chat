@@ -278,6 +278,28 @@ def test_native_queue_hides_body_only_for_helper_lineage(monkeypatch: pytest.Mon
     assert queued[0] == body
     assert body not in queued[1]
     assert helper_event in queued[1]
+    assert ordinary.pending_ids() == []
+    assert helper.pending_ids() == [helper_event]
+
+
+@pytest.mark.parametrize("error", [ChatError("rejected"), UnknownDeliveryError("unknown")])
+def test_ordinary_native_queue_failure_never_leaves_a_stop_body(
+    monkeypatch: pytest.MonkeyPatch, error: ChatError
+) -> None:
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.queue_native_input",
+        lambda **_kwargs: (_ for _ in ()).throw(error),
+    )
+    courier = CodexCourier(
+        alias="codex@studio:api:123456789abc",
+        generation=str(uuid4()),
+        native_queue=(Path("/fake-codex"), {"CODEX_HOME": "/profile"}, str(uuid4())),
+    )
+
+    with pytest.raises(type(error)):
+        courier.accept(str(uuid4()), "untrusted peer body")
+
+    assert courier.pending_ids() == []
 
 
 @pytest.mark.parametrize(
@@ -459,7 +481,7 @@ def test_active_stop_neither_emits_nor_consumes() -> None:
     assert courier.pending_ids() == [event_id]
 
 
-def test_stop_flushes_before_acknowledging() -> None:
+def test_stop_acknowledges_before_emitting() -> None:
     courier = CodexCourier(alias="codex@studio:api:123456789abc", generation=str(uuid4()))
     event_id = str(uuid4())
     courier.accept(event_id, "message")
@@ -471,11 +493,11 @@ def test_stop_flushes_before_acknowledging() -> None:
 
     deliver_at_stop(courier, stop_hook_active=False, emit=emit)
 
-    assert observed_pending == [[event_id]]
+    assert observed_pending == [[]]
     assert courier.pending_ids() == []
 
 
-def test_emit_failure_retains_message_for_at_least_once_delivery() -> None:
+def test_emit_failure_keeps_at_most_once_stop_delivery() -> None:
     courier = CodexCourier(alias="codex@studio:api:123456789abc", generation=str(uuid4()))
     event_id = str(uuid4())
     courier.accept(event_id, "message")
@@ -486,7 +508,7 @@ def test_emit_failure_retains_message_for_at_least_once_delivery() -> None:
     with pytest.raises(OSError, match="closed stdout"):
         deliver_at_stop(courier, stop_hook_active=False, emit=fail_emit)
 
-    assert courier.pending_ids() == [event_id]
+    assert courier.pending_ids() == []
 
 
 def test_peer_content_is_explicitly_untrusted() -> None:

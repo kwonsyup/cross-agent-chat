@@ -378,14 +378,17 @@ class CodexCourier:
     def accept(self, event_id: str, message: str) -> dict[str, object]:
         identifier = valid_uuid(event_id, "event id")
         body = bounded_message(message)
-        if identifier in self._pending:
-            if self._pending[identifier] != body:
-                raise UnknownDeliveryError("Codex courier event conflicts with a pending message")
-        elif len(self._pending) >= self.capacity:
-            raise ChatError("Codex courier queue is full")
-        else:
-            self._pending[identifier] = body
         if self.native_queue is not None:
+            if self.native_helper:
+                if identifier in self._pending:
+                    if self._pending[identifier] != body:
+                        raise UnknownDeliveryError(
+                            "Codex courier event conflicts with a pending message"
+                        )
+                elif len(self._pending) >= self.capacity:
+                    raise ChatError("Codex courier queue is full")
+                else:
+                    self._pending[identifier] = body
             binary, environment, thread_id = self.native_queue
             queue_native_input(
                 binary=binary,
@@ -408,6 +411,13 @@ class CodexCourier:
                 "to": self.alias,
                 "provider": "codex",
             }
+        if identifier in self._pending:
+            if self._pending[identifier] != body:
+                raise UnknownDeliveryError("Codex courier event conflicts with a pending message")
+        elif len(self._pending) >= self.capacity:
+            raise ChatError("Codex courier queue is full")
+        else:
+            self._pending[identifier] = body
         return {
             "schema_version": 1,
             "event_id": identifier,
@@ -494,5 +504,5 @@ def deliver_at_stop(
     if not messages:
         emit({})
         return
-    emit({"decision": "block", "reason": hook_context(messages)})
     courier.acknowledge([item["event_id"] for item in messages])
+    emit({"decision": "block", "reason": hook_context(messages)})

@@ -48,7 +48,7 @@ from cross_agent_chat.claude_runtime import (
 )
 from cross_agent_chat.codex import (
     CodexCourier,
-    deliver_at_stop,
+    hook_context,
     native_account_digest,
     native_thread_titles,
 )
@@ -2361,16 +2361,8 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
             raise ChatError("Codex courier response is invalid")
         messages.append({"event_id": valid_uuid(event_id, "event id"), "message": message})
 
-    snapshot = CodexCourier(alias=route.alias, generation=route.generation)
-    for item in messages:
-        snapshot.accept(item["event_id"], item["message"])
-
-    def emit(payload: dict[str, object]) -> None:
-        print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
-
-    deliver_at_stop(snapshot, stop_hook_active=False, emit=emit)
     try:
-        request_socket(
+        acknowledged = request_socket(
             socket_path(root, route),
             {
                 "schema_version": 1,
@@ -2380,7 +2372,23 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
             },
         )
     except ChatError:
+        print("{}", flush=True)
         return
+    if acknowledged != {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ACKNOWLEDGED",
+        "event_ids": [item["event_id"] for item in messages],
+    }:
+        print("{}", flush=True)
+        return
+    print(
+        json.dumps(
+            {"decision": "block", "reason": hook_context(messages)},
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
 
 def authenticate_mcp_sender(
