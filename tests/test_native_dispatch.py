@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 
 from cross_agent_chat import runtime
-from cross_agent_chat.core import ChatError, Registry, Route
+from cross_agent_chat.core import SCHEMA_VERSION, ChatError, Registry, Route
 from cross_agent_chat.native_helper import NativeDispatchStore, NativeHelperStore
 
 ACCOUNT_DIGEST = "a" * 64
@@ -83,7 +83,7 @@ def patch_dispatch_environment(
 
 def dispatch_response(fixture: DispatchFixture, message: str) -> dict[str, object]:
     return {
-        "schema_version": runtime.SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION,
         "status": "NATIVE_DISPATCH",
         "generation": fixture.helper.generation,
         "event_id": fixture.event_id,
@@ -93,7 +93,7 @@ def dispatch_response(fixture: DispatchFixture, message: str) -> dict[str, objec
 
 def ack_response(fixture: DispatchFixture) -> dict[str, object]:
     return {
-        "schema_version": runtime.SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION,
         "status": "NATIVE_DISPATCH_ACKED",
         "generation": fixture.helper.generation,
         "event_id": fixture.event_id,

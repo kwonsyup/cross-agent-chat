@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import sys
 import textwrap
 from pathlib import Path
 from uuid import uuid4
@@ -26,7 +26,7 @@ def fake_codex_binary(tmp_path: Path, mode: str = "valid") -> tuple[Path, Path, 
     trace = tmp_path / "stdio.jsonl"
     binary = tmp_path / "fake-codex"
     binary.write_text(
-        f"#!{os.sys.executable}\n"
+        f"#!{sys.executable}\n"
         + textwrap.dedent(
             """
             import json, os, sys
