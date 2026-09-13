@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from cross_agent_chat.core import ChatError, Route
+from cross_agent_chat import runtime
+from cross_agent_chat.core import ChatError, Registry, Route
 from cross_agent_chat.native_helper import NativeHelperStore
 
 
@@ -150,3 +151,49 @@ def test_helper_lineage_stays_ineligible_after_helper_generation_restarts(tmp_pa
 
     assert store.is_helper_lineage(restarted)
     assert not store.needs_bootstrap(restarted)
+
+
+def test_dead_registered_helper_is_replaced_before_recreation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = route(
+        tmp_path,
+        session="00000000-0000-4000-8000-000000000001",
+        generation="00000000-0000-4000-8000-000000000011",
+        pid=101,
+    )
+    store = NativeHelperStore(tmp_path / "state")
+    binding, nonce = store.reserve(original, "a" * 64, [original])
+    helper_root = tmp_path / binding.helper_directory
+    helper_root.mkdir()
+    helper = route(
+        helper_root,
+        session="00000000-0000-4000-8000-000000000002",
+        generation="00000000-0000-4000-8000-000000000012",
+        pid=102,
+        profile_root=tmp_path / "profile",
+    )
+    store.register(helper, nonce, original, "a" * 64)
+    dead_helper = Route.create(
+        provider="codex",
+        session_id=helper.session_id,
+        device=helper.device,
+        cwd=helper.cwd,
+        pid=999999,
+        generation=helper.generation,
+        owner_identity=helper.owner_identity,
+        profile_root=helper.profile_root,
+    )
+    registry = Registry(tmp_path / "state")
+    registry.upsert(original)
+    registry.upsert(dead_helper)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+
+    assert store.helper_for_original(original, [original, dead_helper]) is None
+    assert runtime.native_helper_tools(tmp_path / "state", original) == ("native_bootstrap",)
+    replacement, _ = store.reserve(original, "a" * 64, [original, dead_helper])
+
+    assert replacement.state == "UNKNOWN"
+    retired, pending = store.bindings()
+    assert retired.state == "RETIRED"
+    assert pending == replacement

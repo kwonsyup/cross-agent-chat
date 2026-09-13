@@ -20,7 +20,7 @@ from cross_agent_chat.core import (
     valid_uuid,
 )
 
-NativeHelperState = Literal["UNKNOWN", "REGISTERED"]
+NativeHelperState = Literal["UNKNOWN", "REGISTERED", "RETIRED"]
 NativeDispatchState = Literal["UNKNOWN"]
 
 
@@ -63,7 +63,7 @@ class NativeHelperBinding:
             character not in "0123456789abcdef" for character in self.account_sha256
         ):
             raise ChatError("native helper binding is invalid")
-        if self.state == "REGISTERED":
+        if self.state in {"REGISTERED", "RETIRED"}:
             if self.helper_session_id is None or self.helper_generation is None:
                 raise ChatError("native helper binding is invalid")
             valid_uuid(self.helper_session_id, "helper session id")
@@ -121,6 +121,25 @@ class NativeHelperBinding:
             helper_generation=helper.generation,
         )
 
+    def retire(self) -> NativeHelperBinding:
+        """Preserve a definitively dead helper relation before a new reservation."""
+
+        if self.state != "REGISTERED":
+            raise ChatError("native helper binding is invalid")
+        return NativeHelperBinding(
+            original_session_id=self.original_session_id,
+            original_generation=self.original_generation,
+            original_device=self.original_device,
+            original_cwd=self.original_cwd,
+            original_profile_root=self.original_profile_root,
+            account_sha256=self.account_sha256,
+            helper_directory=self.helper_directory,
+            nonce_sha256=self.nonce_sha256,
+            state="RETIRED",
+            helper_session_id=self.helper_session_id,
+            helper_generation=self.helper_generation,
+        )
+
     def to_dict(self) -> dict[str, str]:
         """Serialize only private route relations and the nonce digest."""
 
@@ -135,7 +154,7 @@ class NativeHelperBinding:
             "nonce_sha256": self.nonce_sha256,
             "state": self.state,
         }
-        if self.state == "REGISTERED":
+        if self.state in {"REGISTERED", "RETIRED"}:
             assert self.helper_session_id is not None and self.helper_generation is not None
             result["helper_session_id"] = self.helper_session_id
             result["helper_generation"] = self.helper_generation
@@ -165,7 +184,7 @@ class NativeHelperBinding:
         ):
             raise ChatError("native helper binding is invalid")
         state = raw["state"]
-        if state not in {"UNKNOWN", "REGISTERED"}:
+        if state not in {"UNKNOWN", "REGISTERED", "RETIRED"}:
             raise ChatError("native helper binding is invalid")
         return cls(
             original_session_id=cast(str, raw["original_session_id"]),
@@ -231,7 +250,11 @@ class NativeHelperStore:
             while any(item.helper_directory == helper_directory for item in existing):
                 helper_directory = f"cac-native-helper-{uuid4()}"
             binding = NativeHelperBinding.reserve(original, nonce, helper_directory, account_sha256)
-            atomic_json(self.path, [item.to_dict() for item in [*existing, binding]])
+            retired = [
+                item.retire() if item in matches and item.state == "REGISTERED" else item
+                for item in existing
+            ]
+            atomic_json(self.path, [item.to_dict() for item in [*retired, binding]])
             return binding, nonce
 
     def needs_bootstrap(self, route: Route) -> bool:
@@ -356,6 +379,8 @@ class NativeHelperStore:
             and route.device == original.device
             and route.profile_root == original.profile_root
             and Path(route.cwd).name == binding.helper_directory
+            and route.process_is_live()
+            and route.cwd_is_available()
         ]
         if len(helpers) != 1:
             return None
