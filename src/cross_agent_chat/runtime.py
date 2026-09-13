@@ -72,11 +72,16 @@ from cross_agent_chat.core import (
     valid_uuid,
 )
 from cross_agent_chat.devin import (
+    DEVIN_CAPABILITY_FIELD,
+    DevinCapabilityStore,
+    DevinCapabilityTool,
+    build_pretool_callback,
     build_stop_callback_payload,
     build_user_prompt_callback_payload,
     devin_binary,
     devin_profile_root,
     parse_hook_input,
+    parse_pretool_input,
 )
 from cross_agent_chat.native_helper import NativeDispatchStore, NativeHelperStore
 from cross_agent_chat.remote import parse_remote_envelope
@@ -736,6 +741,68 @@ def unregister_devin(pid: int, state_root_value: str | None) -> None:
                 "generation": route.generation,
             },
         )
+
+
+def devin_pretool(state_root_value: str | None) -> None:
+    """Bind one exact Devin MCP call to the hook session that authorized it."""
+
+    if not presence_is_enabled():
+        return
+    event = parse_pretool_input(sys.stdin.read(MAX_FRAME_BYTES + 1))
+    prefix = "mcp__cross-agent-chat__"
+    if not event.tool_name.startswith(prefix):
+        return
+    tool_name = event.tool_name.removeprefix(prefix)
+    if tool_name not in {"chat_peers", "chat_send", "chat_status"}:
+        return
+    root = state_root(state_root_value)
+    route = _devin_route(root, event.session_id, os.getppid())
+    if route is None or not _route_current(root, route):
+        return
+    arguments = {
+        key: value for key, value in event.tool_input.items() if key != DEVIN_CAPABILITY_FIELD
+    }
+    typed_tool = cast(DevinCapabilityTool, tool_name)
+    token = DevinCapabilityStore(root).issue(
+        route,
+        prompt_id=event.prompt_id,
+        tool_name=typed_tool,
+        arguments=arguments,
+    )
+    payload = build_pretool_callback(
+        replace(event, tool_input=arguments), token
+    )
+    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
+
+
+def authenticate_devin_capability(
+    root: Path,
+    *,
+    parent_pid: int,
+    tool_name: str,
+    arguments: dict[str, object],
+) -> Route:
+    token = arguments.get(DEVIN_CAPABILITY_FIELD)
+    if not isinstance(token, str):
+        raise ChatError("Devin sender capability is required")
+    original_arguments = {
+        key: value for key, value in arguments.items() if key != DEVIN_CAPABILITY_FIELD
+    }
+    if tool_name not in {"chat_peers", "chat_send", "chat_status"}:
+        raise ChatError("Devin sender capability tool is invalid")
+    capability = DevinCapabilityStore(root).consume(
+        token,
+        tool_name=cast(DevinCapabilityTool, tool_name),
+        arguments=original_arguments,
+    )
+    route = _devin_route(root, capability.session_id, parent_pid)
+    if (
+        route is None
+        or route.generation != capability.generation
+        or not _route_current(root, route)
+    ):
+        raise ChatError("Devin sender capability route is unavailable")
+    return route
 
 
 def _devin_messages(root: Path, route: Route) -> list[dict[str, str]]:
@@ -2131,6 +2198,12 @@ def sender_readiness(
         source = authenticate_mcp_sender(root, provider, parent_pid, thread_id)
     except ChatError as error:
         return {"status": "unavailable", "reason": str(error)}
+    return sender_readiness_for_route(root, source)
+
+
+def sender_readiness_for_route(root: Path, source: Route) -> dict[str, str]:
+    """Check one already-authenticated source route without PID re-resolution."""
+
     if not _route_current(root, source):
         return {"status": "unavailable", "reason": "registered sender route is not current"}
     try:

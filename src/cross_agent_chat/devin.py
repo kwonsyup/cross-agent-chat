@@ -8,15 +8,26 @@ does not retry or persist delivery state.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import secrets
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal, cast
 
-from cross_agent_chat.core import MAX_MESSAGE_BYTES, ChatError, bounded_message, valid_uuid
+from cross_agent_chat.core import (
+    MAX_MESSAGE_BYTES,
+    ChatError,
+    Route,
+    atomic_json,
+    bounded_message,
+    require_private_file,
+    state_lock,
+    valid_uuid,
+)
 
 DevinHookName = Literal[
     "PreToolUse",
@@ -34,6 +45,9 @@ DEVIN_HOOK_INPUT_MAX_BYTES: Final = MAX_MESSAGE_BYTES
 DEVIN_APP_BINARY: Final = Path(
     "/Applications/Devin.app/Contents/Resources/app/extensions/windsurf/devin/bin/devin"
 )
+DEVIN_CAPABILITY_FIELD: Final = "_cac_capability"
+DEVIN_CAPABILITY_MAX_ACTIVE: Final = 64
+DevinCapabilityTool = Literal["chat_peers", "chat_send", "chat_status"]
 
 
 def devin_binary() -> Path:
@@ -57,6 +71,142 @@ def devin_profile_root(home: Path | None = None) -> Path:
 
     base = Path.home() if home is None else home
     return (base / ".config" / "devin").resolve(strict=False)
+
+
+def capability_arguments_digest(arguments: dict[str, object]) -> str:
+    encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class DevinCapability:
+    token_digest: str
+    session_id: str
+    generation: str
+    prompt_id: str
+    tool_name: DevinCapabilityTool
+    arguments_digest: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "token_digest": self.token_digest,
+            "session_id": self.session_id,
+            "generation": self.generation,
+            "prompt_id": self.prompt_id,
+            "tool_name": self.tool_name,
+            "arguments_digest": self.arguments_digest,
+        }
+
+    @classmethod
+    def from_object(cls, value: object) -> DevinCapability:
+        if not isinstance(value, dict) or set(value) != {
+            "token_digest",
+            "session_id",
+            "generation",
+            "prompt_id",
+            "tool_name",
+            "arguments_digest",
+        }:
+            raise ChatError("Devin capability state is invalid")
+        raw = cast(dict[object, object], value)
+        if not all(isinstance(item, str) for item in raw.values()):
+            raise ChatError("Devin capability state is invalid")
+        tool = raw["tool_name"]
+        if tool not in {"chat_peers", "chat_send", "chat_status"}:
+            raise ChatError("Devin capability state is invalid")
+        token_digest = cast(str, raw["token_digest"])
+        arguments_digest = cast(str, raw["arguments_digest"])
+        if (
+            len(token_digest) != 64
+            or len(arguments_digest) != 64
+            or any(character not in "0123456789abcdef" for character in token_digest)
+            or any(character not in "0123456789abcdef" for character in arguments_digest)
+        ):
+            raise ChatError("Devin capability state is invalid")
+        valid_uuid(cast(str, raw["session_id"]), "Devin capability session id")
+        valid_uuid(cast(str, raw["generation"]), "Devin capability generation")
+        valid_uuid(cast(str, raw["prompt_id"]), "Devin capability prompt id")
+        return cls(
+            token_digest=token_digest,
+            session_id=cast(str, raw["session_id"]),
+            generation=cast(str, raw["generation"]),
+            prompt_id=cast(str, raw["prompt_id"]),
+            tool_name=tool,
+            arguments_digest=arguments_digest,
+        )
+
+
+class DevinCapabilityStore:
+    """Private one-use capabilities; stores no message bodies or credentials."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.path = root / "devin-capabilities.json"
+
+    def capabilities(self) -> list[DevinCapability]:
+        if not self.path.exists():
+            return []
+        require_private_file(self.path)
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ChatError("Devin capability state is invalid") from error
+        if not isinstance(raw, list):
+            raise ChatError("Devin capability state is invalid")
+        capabilities = [DevinCapability.from_object(item) for item in raw]
+        if len({item.token_digest for item in capabilities}) != len(capabilities):
+            raise ChatError("Devin capability state contains duplicate tokens")
+        return capabilities
+
+    def issue(
+        self,
+        route: Route,
+        *,
+        prompt_id: str,
+        tool_name: DevinCapabilityTool,
+        arguments: dict[str, object],
+    ) -> str:
+        if route.provider != "devin":
+            raise ChatError("Devin capability route is invalid")
+        valid_uuid(prompt_id, "Devin capability prompt id")
+        token = secrets.token_hex(32)
+        capability = DevinCapability(
+            token_digest=hashlib.sha256(token.encode("ascii")).hexdigest(),
+            session_id=route.session_id,
+            generation=route.generation,
+            prompt_id=prompt_id,
+            tool_name=tool_name,
+            arguments_digest=capability_arguments_digest(arguments),
+        )
+        with state_lock(self.root, "devin-capabilities"):
+            existing = self.capabilities()
+            if len(existing) >= DEVIN_CAPABILITY_MAX_ACTIVE:
+                raise ChatError("Devin capability state is full")
+            atomic_json(self.path, [item.to_dict() for item in [*existing, capability]])
+        return token
+
+    def consume(
+        self,
+        token: str,
+        *,
+        tool_name: DevinCapabilityTool,
+        arguments: dict[str, object],
+    ) -> DevinCapability:
+        if len(token) != 64 or any(character not in "0123456789abcdef" for character in token):
+            raise ChatError("Devin sender capability is invalid")
+        token_digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+        with state_lock(self.root, "devin-capabilities"):
+            existing = self.capabilities()
+            matches = [item for item in existing if item.token_digest == token_digest]
+            if len(matches) != 1:
+                raise ChatError("Devin sender capability is unavailable")
+            capability = matches[0]
+            retained = [item for item in existing if item != capability]
+            atomic_json(self.path, [item.to_dict() for item in retained])
+        arguments_digest = capability_arguments_digest(arguments)
+        if capability.tool_name != tool_name or capability.arguments_digest != arguments_digest:
+            raise ChatError("Devin sender capability does not match the tool call")
+        return capability
 # ``bounded_message`` in the shared core reserves this encoded JSON budget for
 # a message.  Keep the same budget here before adding the callback envelope.
 _ENCODED_MESSAGE_MAX_BYTES: Final = 2 * MAX_MESSAGE_BYTES + 2
@@ -87,6 +237,14 @@ class DevinHookEvent:
     session_id: str
     prompt_id: str | None
     stop_hook_active: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class DevinPreToolEvent:
+    session_id: str
+    prompt_id: str
+    tool_name: str
+    tool_input: dict[str, object]
 
 
 def _as_string_mapping(value: object) -> dict[str, object]:
@@ -169,6 +327,47 @@ def parse_hook_input(text: str, *, expected_event: DevinHookName | None = None) 
         prompt_id=prompt_id,
         stop_hook_active=stop_hook_active,
     )
+
+
+def parse_pretool_input(text: str) -> DevinPreToolEvent:
+    parse_hook_input(text, expected_event="PreToolUse")
+    try:
+        decoded: object = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ChatError("Devin hook input is not JSON") from error
+    fields = _as_string_mapping(decoded)
+    session_value = fields.get("session_id")
+    prompt_value = fields.get("prompt_id")
+    if not isinstance(session_value, str) or not isinstance(prompt_value, str):
+        raise ChatError("Devin PreToolUse input lacks session identity")
+    session_id = valid_uuid(session_value, "session id")
+    prompt_id = valid_uuid(prompt_value, "prompt id")
+    tool_name = fields.get("tool_name")
+    tool_input = fields.get("tool_input")
+    if not isinstance(tool_name, str) or not isinstance(tool_input, dict):
+        raise ChatError("Devin PreToolUse input is invalid")
+    input_fields = cast(dict[object, object], tool_input)
+    if not all(isinstance(key, str) for key in input_fields):
+        raise ChatError("Devin PreToolUse input is invalid")
+    return DevinPreToolEvent(
+        session_id=session_id,
+        prompt_id=prompt_id,
+        tool_name=tool_name,
+        tool_input={cast(str, key): value for key, value in input_fields.items()},
+    )
+
+
+def build_pretool_callback(event: DevinPreToolEvent, token: str) -> dict[str, object]:
+    if len(token) != 64 or any(character not in "0123456789abcdef" for character in token):
+        raise ChatError("Devin sender capability is invalid")
+    updated = dict(event.tool_input)
+    updated[DEVIN_CAPABILITY_FIELD] = token
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": updated,
+        }
+    }
 
 
 def _stop_reason(event_id: str, source_text: str) -> str:

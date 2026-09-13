@@ -455,6 +455,8 @@ def _hook_command(
         return f'{binary} _devin-stop --pid "$PPID"'
     if provider == "devin" and event == "UserPromptSubmit":
         return f'{binary} _devin-prompt --pid "$PPID"'
+    if provider == "devin" and event == "PreToolUse":
+        return f'{binary} _devin-pretool'
     raise SettingsError("unsupported provider hook")
 
 
@@ -495,7 +497,15 @@ def _owned_hook(value: object) -> bool:
     return (
         len(tokens) >= 2
         and Path(tokens[0]).name == SERVER_NAME
-        and tokens[1] in {"_register", "_unregister", "_codex-stop", "_devin-stop", "_devin-prompt"}
+        and tokens[1]
+        in {
+            "_register",
+            "_unregister",
+            "_codex-stop",
+            "_devin-stop",
+            "_devin-prompt",
+            "_devin-pretool",
+        }
     )
 
 
@@ -528,7 +538,7 @@ def _hook_group(
     timeout = 10 if (provider, event) == ("claude", "SessionStart") else 5
     if event in {"SessionEnd", "Stop"}:
         timeout = 3
-    return {
+    group: dict[str, object] = {
         "hooks": [
             {
                 "type": "command",
@@ -543,6 +553,9 @@ def _hook_group(
             }
         ]
     }
+    if provider == "devin" and event == "PreToolUse":
+        group["matcher"] = "^mcp__cross-agent-chat__(chat_peers|chat_send|chat_status)$"
+    return group
 
 
 def _native_helper_create_hook_group() -> dict[str, object]:
@@ -1607,7 +1620,13 @@ class Installer:
                 raise SettingsError("Devin mcpServers must be an object")
             devin_servers[SERVER_NAME] = _mcp_route(self.executable, "devin", self.device)
             devin_hooks = _json_object(self.devin_hooks)
-            for event in ("SessionStart", "SessionEnd", "Stop", "UserPromptSubmit"):
+            for event in (
+                "SessionStart",
+                "SessionEnd",
+                "Stop",
+                "UserPromptSubmit",
+                "PreToolUse",
+            ):
                 _merge_devin_hook(
                     devin_hooks,
                     event,
@@ -2597,7 +2616,13 @@ class Installer:
                 ):
                     return False
                 devin_hooks = _json_object(self.devin_hooks)
-                for event in ("SessionStart", "SessionEnd", "Stop", "UserPromptSubmit"):
+                for event in (
+                    "SessionStart",
+                    "SessionEnd",
+                    "Stop",
+                    "UserPromptSubmit",
+                    "PreToolUse",
+                ):
                     groups = devin_hooks.get(event)
                     if not isinstance(groups, list) or [
                         item for item in groups if _owned_hook(item)

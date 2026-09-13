@@ -4,6 +4,7 @@ import io
 import json
 import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
@@ -12,12 +13,17 @@ import pytest
 from cross_agent_chat import runtime
 from cross_agent_chat.core import MAX_MESSAGE_BYTES, ChatError
 from cross_agent_chat.devin import (
+    DEVIN_CAPABILITY_FIELD,
     DEVIN_HOOK_INPUT_MAX_BYTES,
     DEVIN_STOP_CALLBACK_MAX_BYTES,
+    DevinCapabilityStore,
     DevinHookEvent,
+    build_pretool_callback,
     build_stop_callback_payload,
+    capability_arguments_digest,
     inject_stop_callback_once,
     parse_hook_input,
+    parse_pretool_input,
 )
 
 
@@ -418,6 +424,165 @@ def test_devin_hook_ack_failure_emits_no_provider_output(
     with pytest.raises(ChatError, match="ack unavailable"):
         runtime.devin_user_prompt(123, str(tmp_path))
     assert capsys.readouterr().out == ""
+
+
+def test_pretool_capability_binds_exact_call_and_is_one_use(tmp_path: Path) -> None:
+    from cross_agent_chat.core import Route
+
+    route = Route.create(
+        provider="devin",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=123,
+    )
+    arguments = {"to": "devin@remote:project", "message": "bounded"}
+    prompt_id = str(uuid4())
+    store = DevinCapabilityStore(tmp_path / "state")
+    token = store.issue(
+        route,
+        prompt_id=prompt_id,
+        tool_name="chat_send",
+        arguments=arguments,
+    )
+
+    capability = store.consume(
+        token,
+        tool_name="chat_send",
+        arguments=arguments,
+    )
+
+    assert capability.session_id == route.session_id
+    assert capability.generation == route.generation
+    assert capability.prompt_id == prompt_id
+    assert capability.arguments_digest == capability_arguments_digest(arguments)
+    with pytest.raises(ChatError, match="unavailable"):
+        store.consume(token, tool_name="chat_send", arguments=arguments)
+
+
+def test_pretool_capability_mismatch_is_consumed_before_rejection(tmp_path: Path) -> None:
+    from cross_agent_chat.core import Route
+
+    route = Route.create(
+        provider="devin",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=123,
+    )
+    store = DevinCapabilityStore(tmp_path / "state")
+    token = store.issue(
+        route,
+        prompt_id=str(uuid4()),
+        tool_name="chat_peers",
+        arguments={},
+    )
+
+    with pytest.raises(ChatError, match="does not match"):
+        store.consume(token, tool_name="chat_status", arguments={})
+    with pytest.raises(ChatError, match="unavailable"):
+        store.consume(token, tool_name="chat_peers", arguments={})
+
+
+def test_pretool_capability_concurrent_consume_has_one_winner(tmp_path: Path) -> None:
+    from cross_agent_chat.core import Route
+
+    route = Route.create(
+        provider="devin",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=123,
+    )
+    store = DevinCapabilityStore(tmp_path / "state")
+    token = store.issue(
+        route,
+        prompt_id=str(uuid4()),
+        tool_name="chat_peers",
+        arguments={},
+    )
+
+    def consume() -> str:
+        try:
+            store.consume(token, tool_name="chat_peers", arguments={})
+        except ChatError as error:
+            return str(error)
+        return "winner"
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        outcomes = list(workers.map(lambda _item: consume(), range(2)))
+
+    assert outcomes.count("winner") == 1
+    assert outcomes.count("Devin sender capability is unavailable") == 1
+
+
+def test_devin_pretool_overwrites_model_capability_field(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from cross_agent_chat.core import Route
+
+    session_id = str(uuid4())
+    prompt_id = str(uuid4())
+    route = Route.create(
+        provider="devin",
+        session_id=session_id,
+        device="studio",
+        cwd=str(tmp_path),
+        pid=123,
+    )
+    state = tmp_path / "state"
+    monkeypatch.setattr(runtime, "state_root", lambda _value: state)
+    monkeypatch.setattr(runtime, "_devin_route", lambda *_args: route)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime.os, "getppid", lambda: 123)
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "prompt_id": prompt_id,
+        "tool_name": "mcp__cross-agent-chat__chat_peers",
+        "tool_input": {DEVIN_CAPABILITY_FIELD: "model-supplied", "extra": "kept"},
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+
+    runtime.devin_pretool(str(state))
+
+    output = json.loads(capsys.readouterr().out)
+    updated = output["hookSpecificOutput"]["updatedInput"]
+    assert updated["extra"] == "kept"
+    assert isinstance(updated[DEVIN_CAPABILITY_FIELD], str)
+    assert updated[DEVIN_CAPABILITY_FIELD] != "model-supplied"
+    parsed = parse_pretool_input(json.dumps(payload))
+    assert parsed.tool_name.endswith("chat_peers")
+    assert build_pretool_callback(parsed, updated[DEVIN_CAPABILITY_FIELD])
+
+
+def test_devin_mcp_public_tools_require_pretool_capability(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from cross_agent_chat.cli import mcp
+
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "chat_peers",
+                        "arguments": {},
+                    },
+                }
+            )
+            + "\n"
+        ),
+    )
+
+    mcp("devin", "studio", str(tmp_path / "state"))
+
+    response = json.loads(capsys.readouterr().out)
+    assert response["error"]["message"] == "Devin sender capability is required"
 
 
 def test_devin_originates_local_send_with_exact_source_alias(

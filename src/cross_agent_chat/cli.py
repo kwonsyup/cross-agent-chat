@@ -20,9 +20,11 @@ from cross_agent_chat.install import (
 )
 from cross_agent_chat.mcp_server import normalize_send_arguments
 from cross_agent_chat.runtime import (
+    authenticate_devin_capability,
     authenticate_mcp_sender,
     codex_stop,
     courier_server,
+    devin_pretool,
     devin_stop,
     devin_user_prompt,
     event_status,
@@ -36,6 +38,7 @@ from cross_agent_chat.runtime import (
     register_devin,
     send,
     sender_readiness,
+    sender_readiness_for_route,
     state_root,
     unregister,
     unregister_devin,
@@ -270,10 +273,28 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                     _fail("MCP tool call is invalid")
                 internal_call = name in {"native_bootstrap", "native_register", "native_dispatch"}
                 typed_arguments = cast(dict[str, object], arguments)
+                devin_source = None
+                if provider == "devin" and name in {"chat_peers", "chat_send", "chat_status"}:
+                    assert root is not None
+                    devin_source = authenticate_devin_capability(
+                        root,
+                        parent_pid=os.getppid(),
+                        tool_name=name,
+                        arguments=typed_arguments,
+                    )
+                    typed_arguments = {
+                        key: value
+                        for key, value in typed_arguments.items()
+                        if key != "_cac_capability"
+                    }
                 if name == "chat_peers" and not typed_arguments:
                     assert root is not None
                     result = peers(root, include_delivery_mode=True)
-                    result["sender"] = sender_readiness(root, provider, os.getppid(), thread_id)
+                    result["sender"] = (
+                        sender_readiness_for_route(root, devin_source)
+                        if devin_source is not None
+                        else sender_readiness(root, provider, os.getppid(), thread_id)
+                    )
                 elif name == "chat_send":
                     target, message = normalize_send_arguments(typed_arguments)
                     if provider == "codex":
@@ -284,7 +305,11 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                             _fail("Codex host thread identity is required")
                         thread_id = raw_thread
                     assert root is not None
-                    source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+                    source = (
+                        devin_source
+                        if devin_source is not None
+                        else authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+                    )
                     result = send(root, source, target, message)
                 elif name == "chat_status":
                     if set(typed_arguments) != {"event_id"} or not isinstance(
@@ -294,7 +319,11 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                     if provider == "codex" and thread_id is None:
                         _fail("Codex host thread identity is required")
                     assert root is not None
-                    source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+                    source = (
+                        devin_source
+                        if devin_source is not None
+                        else authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+                    )
                     result = event_status(root, source, typed_arguments["event_id"])
                 elif name == "native_bootstrap" and provider == "codex" and not typed_arguments:
                     if thread_id is None:
@@ -412,6 +441,8 @@ def parser() -> argparse.ArgumentParser:
     devin_prompt_parser = commands.add_parser("_devin-prompt")
     devin_prompt_parser.add_argument("--pid", type=int, required=True)
     devin_prompt_parser.add_argument("--state-root")
+    devin_pretool_parser = commands.add_parser("_devin-pretool")
+    devin_pretool_parser.add_argument("--state-root")
     courier = commands.add_parser("_courier")
     courier.add_argument("--provider", choices=("claude", "codex", "devin"), required=True)
     courier.add_argument("--state-root", required=True)
@@ -502,6 +533,8 @@ def run(arguments: argparse.Namespace) -> int:
         devin_stop(arguments.pid, arguments.state_root)
     elif command == "_devin-prompt":
         devin_user_prompt(arguments.pid, arguments.state_root)
+    elif command == "_devin-pretool":
+        devin_pretool(arguments.state_root)
     elif command == "_courier":
         courier_server(
             provider=arguments.provider,
