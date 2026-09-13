@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
 import json
 from collections.abc import Callable
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
+from cross_agent_chat import runtime
 from cross_agent_chat.core import MAX_MESSAGE_BYTES, ChatError
 from cross_agent_chat.devin import (
     DEVIN_HOOK_INPUT_MAX_BYTES,
@@ -236,3 +239,114 @@ def test_injected_consumer_rejects_non_stop_event() -> None:
         inject_stop_callback_once(
             event, event_id=str(uuid4()), source_text="source", consume=lambda _payload: None
         )
+
+
+def test_devin_stop_hook_emits_one_bounded_callback_and_acknowledges_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    session_id = str(uuid4())
+    route = object()
+    messages = [{"event_id": str(uuid4()), "message": "exact inbound"}]
+    monkeypatch.setattr(runtime, "state_root", lambda _value: tmp_path)
+    monkeypatch.setattr(runtime, "_devin_route", lambda *_args: route)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_devin_messages", lambda *_args: messages)
+    acknowledged: list[list[dict[str, str]]] = []
+    monkeypatch.setattr(
+        runtime, "_ack_devin", lambda _root, _route, value: acknowledged.append(value)
+    )
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO(json.dumps({
+            "hook_event_name": "Stop",
+            "session_id": session_id,
+            "prompt_id": str(uuid4()),
+            "stop_hook_active": False,
+        }))
+    )
+
+    runtime.devin_stop(123, str(tmp_path))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["decision"] == "block"
+    assert "exact inbound" in payload["reason"]
+    assert acknowledged == [messages]
+
+
+def test_devin_user_prompt_hook_injects_context_before_one_ack(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    route = object()
+    messages = [{"event_id": str(uuid4()), "message": "prompt inbound"}]
+    monkeypatch.setattr(runtime, "state_root", lambda _value: tmp_path)
+    monkeypatch.setattr(runtime, "_devin_route", lambda *_args: route)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_devin_messages", lambda *_args: messages)
+    acknowledgements = 0
+
+    def acknowledge(_root: Path, _route: object, _messages: list[dict[str, str]]) -> None:
+        nonlocal acknowledgements
+        acknowledgements += 1
+
+    monkeypatch.setattr(runtime, "_ack_devin", acknowledge)
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO(json.dumps({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": str(uuid4()),
+            "prompt": "next user prompt",
+        }))
+    )
+
+    runtime.devin_user_prompt(123, str(tmp_path))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    assert "prompt inbound" in payload["hookSpecificOutput"]["additionalContext"]
+    assert acknowledgements == 1
+
+
+def test_devin_sender_auth_requires_exact_provider_process_and_session() -> None:
+    from cross_agent_chat.core import Route, authenticate_sender
+
+    route = Route.create(
+        provider="devin",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(Path.cwd()),
+        pid=456,
+        owner_identity="a" * 64,
+        profile_root=str(Path.cwd()),
+    )
+
+    assert authenticate_sender([route], "devin", 456, None) == route
+    with pytest.raises(ChatError, match="exact Devin"):
+        authenticate_sender([route], "devin", 457, None)
+    with pytest.raises(ChatError, match="exact Claude"):
+        authenticate_sender([route], "claude", 456, None)
+
+
+def test_devin_local_transport_uses_process_memory_inbox_once(tmp_path: Path) -> None:
+    from cross_agent_chat.codex import CodexCourier
+    from cross_agent_chat.core import Route
+
+    route = Route.create(
+        provider="devin",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=456,
+    )
+    courier = CodexCourier(alias=route.alias, generation=route.generation, provider="devin")
+    event_id = str(uuid4())
+
+    accepted = runtime.courier_accept(route, courier, event_id, "bounded source fact")
+
+    assert accepted == {
+        "schema_version": 1,
+        "event_id": event_id,
+        "status": "TRANSPORT_ACCEPTED",
+        "to": route.alias,
+        "provider": "devin",
+    }
+    with pytest.raises(ChatError, match="conflicts"):
+        courier.accept(event_id, "different source fact")
+    assert courier.pending_ids() == [event_id]

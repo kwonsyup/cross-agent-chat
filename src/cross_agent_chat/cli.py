@@ -23,6 +23,8 @@ from cross_agent_chat.runtime import (
     authenticate_mcp_sender,
     codex_stop,
     courier_server,
+    devin_stop,
+    devin_user_prompt,
     event_status,
     native_bootstrap,
     native_desktop_mcp_host,
@@ -31,10 +33,12 @@ from cross_agent_chat.runtime import (
     peers,
     presence_is_enabled,
     register,
+    register_devin,
     send,
     sender_readiness,
     state_root,
     unregister,
+    unregister_devin,
 )
 from cross_agent_chat.tailnet import known_tailnet_address
 from cross_agent_chat.tailnet_broker import broker_server
@@ -74,6 +78,7 @@ def _installer(device: str | None, *, codex_native_queue: bool | None = None) ->
         codex_home=codex_home,
         claude_config_dir=claude_config_dir,
         codex_native_queue=codex_native_queue,
+        devin_project=Path.cwd(),
     )
 
 
@@ -175,8 +180,8 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                             {
                                 "name": "chat_peers",
                                 "description": (
-                                    "Discover exact live Claude and "
-                                    "Codex recipients for requested "
+                                    "Discover exact live Claude, Codex, and "
+                                    "Devin recipients for requested "
                                     "communication. Resolve across "
                                     "devices and ask for clarification "
                                     "when multiple peers match. Do not "
@@ -224,11 +229,11 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                                     "TRANSPORT_ACCEPTED means custody, "
                                     "not consumption; UNKNOWN_DELIVERY "
                                     "must not be retried through any "
-                                    "transport. Incoming Claude delivery "
+                                    "transport. Incoming provider delivery "
                                     "may display its local helper as the "
                                     "delivery principal; it is distinct "
                                     "from the original CAC source metadata. "
-                                    "Stop-bound recipients "
+                                    "Stop or prompt-bound recipients "
                                     "wait for a normal turn; "
                                     "experimental queues are not "
                                     "universal support. Do not "
@@ -388,19 +393,27 @@ def parser() -> argparse.ArgumentParser:
     resolve_parser.add_argument("event_id")
 
     register_parser = commands.add_parser("_register")
-    register_parser.add_argument("--provider", choices=("claude", "codex"), required=True)
+    register_parser.add_argument("--provider", choices=("claude", "codex", "devin"), required=True)
     register_parser.add_argument("--device", required=True)
     register_parser.add_argument("--pid", type=int, required=True)
     register_parser.add_argument("--state-root")
     unregister_parser = commands.add_parser("_unregister")
-    unregister_parser.add_argument("--provider", choices=("claude", "codex"), required=True)
+    unregister_parser.add_argument(
+        "--provider", choices=("claude", "codex", "devin"), required=True
+    )
     unregister_parser.add_argument("--pid", type=int, required=True)
     unregister_parser.add_argument("--state-root")
     stop_parser = commands.add_parser("_codex-stop")
     stop_parser.add_argument("--pid", type=int, required=True)
     stop_parser.add_argument("--state-root")
+    devin_stop_parser = commands.add_parser("_devin-stop")
+    devin_stop_parser.add_argument("--pid", type=int, required=True)
+    devin_stop_parser.add_argument("--state-root")
+    devin_prompt_parser = commands.add_parser("_devin-prompt")
+    devin_prompt_parser.add_argument("--pid", type=int, required=True)
+    devin_prompt_parser.add_argument("--state-root")
     courier = commands.add_parser("_courier")
-    courier.add_argument("--provider", choices=("claude", "codex"), required=True)
+    courier.add_argument("--provider", choices=("claude", "codex", "devin"), required=True)
     courier.add_argument("--state-root", required=True)
     courier.add_argument("--session-id", required=True)
     courier.add_argument("--cwd", required=True)
@@ -409,7 +422,7 @@ def parser() -> argparse.ArgumentParser:
     broker = commands.add_parser("_broker")
     broker.add_argument("--state-root")
     mcp_parser = commands.add_parser("_mcp")
-    mcp_parser.add_argument("--provider", choices=("claude", "codex"), required=True)
+    mcp_parser.add_argument("--provider", choices=("claude", "codex", "devin"), required=True)
     mcp_parser.add_argument("--device", required=True)
     mcp_parser.add_argument("--state-root")
     pretool = commands.add_parser("_pretool")
@@ -474,11 +487,21 @@ def run(arguments: argparse.Namespace) -> int:
         IntentStore(state_root()).mark(arguments.event_id, "RESOLVED_BY_OWNER")
         print(f"Resolved event {arguments.event_id}. A later fresh send is now allowed.")
     elif command == "_register":
-        register(arguments.provider, arguments.device, arguments.pid, arguments.state_root)
+        if arguments.provider == "devin":
+            register_devin(arguments.device, arguments.pid, arguments.state_root)
+        else:
+            register(arguments.provider, arguments.device, arguments.pid, arguments.state_root)
     elif command == "_unregister":
-        unregister(arguments.provider, arguments.pid, arguments.state_root)
+        if arguments.provider == "devin":
+            unregister_devin(arguments.pid, arguments.state_root)
+        else:
+            unregister(arguments.provider, arguments.pid, arguments.state_root)
     elif command == "_codex-stop":
         codex_stop(arguments.pid, arguments.state_root)
+    elif command == "_devin-stop":
+        devin_stop(arguments.pid, arguments.state_root)
+    elif command == "_devin-prompt":
+        devin_user_prompt(arguments.pid, arguments.state_root)
     elif command == "_courier":
         courier_server(
             provider=arguments.provider,
@@ -524,6 +547,7 @@ def run(arguments: argparse.Namespace) -> int:
             tailnet_address=known_tailnet_address(),
             codex_home=codex_home,
             claude_config_dir=claude_config_dir,
+            devin_project=Path.cwd(),
         )
         installer.install_staged(arguments.staged_runtime, arguments.stable_entrypoint)
         print(f"Cross Agent Chat is ready on {device}. Start fresh Claude/Codex sessions.")

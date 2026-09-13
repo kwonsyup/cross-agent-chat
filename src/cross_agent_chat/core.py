@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Final, Literal, NoReturn, cast
 from uuid import UUID, uuid4
 
-Provider = Literal["claude", "codex"]
+Provider = Literal["claude", "codex", "devin"]
 IntentStatus = Literal[
     "PENDING",
     "REMOTE_AUTHORIZED",
@@ -181,7 +181,7 @@ class Route:
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
             fail("route schema is unsupported")
-        if self.provider not in {"claude", "codex"}:
+        if self.provider not in {"claude", "codex", "devin"}:
             fail("route provider is invalid")
         valid_uuid(self.session_id, "session id")
         valid_uuid(self.generation, "route generation")
@@ -218,7 +218,7 @@ class Route:
         owner_identity: str | None = None,
         profile_root: str | None = None,
     ) -> Route:
-        if provider not in {"claude", "codex"}:
+        if provider not in {"claude", "codex", "devin"}:
             fail("route provider is invalid")
         typed_provider = cast(Provider, provider)
         canonical = canonical_cwd(cwd)
@@ -267,7 +267,7 @@ class Route:
         if (
             not isinstance(values["schema_version"], int)
             or isinstance(values["schema_version"], bool)
-            or values["provider"] not in {"claude", "codex"}
+            or values["provider"] not in {"claude", "codex", "devin"}
             or not all(
                 isinstance(values[key], str)
                 for key in (
@@ -769,10 +769,10 @@ class IntentStore:
 def authenticate_sender(
     routes: list[Route], provider: str, parent_pid: int, host_thread_id: str | None
 ) -> Route:
-    if provider == "claude":
-        matches = [item for item in routes if item.provider == "claude" and item.pid == parent_pid]
+    if provider in {"claude", "devin"}:
+        matches = [item for item in routes if item.provider == provider and item.pid == parent_pid]
         if len(matches) != 1:
-            fail("exact Claude sender is unavailable")
+            fail(f"exact {provider.capitalize()} sender is unavailable")
         return matches[0]
     if provider == "codex":
         if host_thread_id is None:

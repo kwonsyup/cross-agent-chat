@@ -16,6 +16,7 @@ from typing import Final, cast
 
 from cross_agent_chat.core import (
     ChatError,
+    Provider,
     UnknownDeliveryError,
     bounded_message,
     valid_name,
@@ -356,6 +357,7 @@ class CodexCourier:
         generation: str,
         capacity: int = DEFAULT_CAPACITY,
         native_queue: tuple[Path, dict[str, str], str] | None = None,
+        provider: Provider = "codex",
     ) -> None:
         if capacity <= 0 or capacity > DEFAULT_CAPACITY:
             raise ChatError("Codex courier capacity is invalid")
@@ -363,6 +365,7 @@ class CodexCourier:
         self.generation = valid_uuid(generation, "courier generation")
         self.capacity = capacity
         self.native_queue = native_queue
+        self.provider = provider
         self._pending: OrderedDict[str, str] = OrderedDict()
 
     def accept(self, event_id: str, message: str) -> dict[str, object]:
@@ -392,14 +395,14 @@ class CodexCourier:
                 "event_id": identifier,
                 "status": "TRANSPORT_ACCEPTED",
                 "to": self.alias,
-                "provider": "codex",
+                "provider": self.provider,
             }
         return {
             "schema_version": 1,
             "event_id": identifier,
             "status": "TRANSPORT_ACCEPTED",
             "to": self.alias,
-            "provider": "codex",
+            "provider": self.provider,
         }
 
     def peek(self) -> list[dict[str, str]]:
