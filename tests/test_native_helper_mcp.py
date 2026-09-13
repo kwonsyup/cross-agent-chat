@@ -205,15 +205,15 @@ def test_internal_bootstrap_call_requires_host_thread_identity(
     assert response["result"]["content"][0]["text"] == "Codex host thread identity is required"
 
 
-def test_internal_bootstrap_mcp_call_preserves_structured_result(
+def test_internal_bootstrap_mcp_call_preserves_private_create_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     thread_id = "00000000-0000-4000-8000-000000000006"
     expected = {
-        "content": [{"type": "text", "text": "Starting the native delivery helper."}],
-        "structuredContent": {
+        "content": [{"type": "text", "text": "Native delivery helper setup was submitted."}],
+        "_meta": {
             "create_thread": {
                 "target": {"type": "projectless", "directoryName": "cac-native-helper-test"},
                 "model": "gpt-5.6-luna",
@@ -324,7 +324,7 @@ def test_mcp_bootstrap_register_duplicate_journey_is_single_and_nonrecursive(
     mcp("codex", "studio", str(state_root))
     bootstrap_response = json.loads(capsys.readouterr().out)
     bootstrap_result = bootstrap_response["result"]
-    create_thread = bootstrap_result["structuredContent"]["create_thread"]
+    create_thread = bootstrap_result["_meta"]["create_thread"]
     helper_directory = create_thread["target"]["directoryName"]
     prompt = create_thread["prompt"]
     token_match = re.search(r"token ([0-9a-f-]{36})", prompt)
@@ -371,7 +371,7 @@ def test_mcp_bootstrap_register_duplicate_journey_is_single_and_nonrecursive(
     assert bindings[0].state == "REGISTERED"
 
 
-def test_native_bootstrap_is_one_effect_and_returns_projectless_create_args(
+def test_native_bootstrap_is_one_effect_and_returns_private_projectless_create_args(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_root = tmp_path / "state"
@@ -382,8 +382,12 @@ def test_native_bootstrap_is_one_effect_and_returns_projectless_create_args(
     monkeypatch.setattr(runtime, "_native_hook_ready", lambda *_args: True)
 
     result = runtime.native_bootstrap(state_root, original)
-    structured_content = cast(dict[str, object], result["structuredContent"])
-    create_thread = cast(dict[str, object], structured_content["create_thread"])
+    assert result["content"] == [
+        {"type": "text", "text": "Native delivery helper setup was submitted."}
+    ]
+    assert "structuredContent" not in result
+    metadata = cast(dict[str, object], result["_meta"])
+    create_thread = cast(dict[str, object], metadata["create_thread"])
     target = cast(dict[str, object], create_thread["target"])
     assert target["type"] == "projectless"
     assert cast(str, target["directoryName"]).startswith("cac-native-helper-")

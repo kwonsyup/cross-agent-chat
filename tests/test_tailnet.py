@@ -1395,6 +1395,62 @@ def test_remote_receive_routes_registered_codex_original_to_its_helper(
     }
 
 
+def test_remote_claude_receipt_uses_fresh_discovery_alias_after_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        generation=str(uuid4()),
+    )
+    Registry(tmp_path).upsert(target)
+    fresh_alias = target.alias + " Fresh"
+    public_target = Target(
+        alias=fresh_alias,
+        provider="claude",
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=session_key("claude", target.session_id),
+        remote=False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=str(uuid4()),
+        target_alias=fresh_alias,
+        generation=target.generation,
+        message="fresh independent work",
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_tailnet",
+        lambda _address, payload, **_: (
+            {key: value for key, value in payload.items() if key != "operation"}
+            | {"status": "AUTHORIZED"}
+        ),
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda _path, payload, **_: {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": fresh_alias,
+            "provider": "claude",
+        },
+    )
+
+    assert receive_remote(tmp_path, envelope, "100.64.0.11")["status"] == "TRANSPORT_ACCEPTED"
+
+
 def test_tailnet_client_keeps_write_side_open_for_serve_proxy() -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))

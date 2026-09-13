@@ -16,6 +16,7 @@ import tomllib
 from collections.abc import MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -38,6 +39,7 @@ from cross_agent_chat.install import (
     SetupRollbackError,
     _hook_command,
     _hook_trust_hash,
+    _native_helper_create_hook_group,
     _owned_hook,
     _owned_hook_native_queue,
     _package_tree_digest,
@@ -60,6 +62,20 @@ def test_claude_session_start_discards_registration_output() -> None:
     command = _hook_command(Path("/opt/cross-agent-chat"), "claude", "studio", "SessionStart")
 
     assert command.endswith('--pid "$PPID" >/dev/null')
+
+
+def test_native_helper_create_hook_reads_private_mcp_metadata() -> None:
+    hook = _native_helper_create_hook_group()
+    hooks = cast(list[object], hook["hooks"])
+    input_value = cast(dict[str, object], cast(dict[str, object], hooks[0])["input"])
+
+    assert input_value == {
+        "prompt": "${tool_response._meta.create_thread.prompt}",
+        "target": "${tool_response._meta.create_thread.target}",
+        "model": "${tool_response._meta.create_thread.model}",
+        "thinking": "${tool_response._meta.create_thread.thinking}",
+        "title": "${tool_response._meta.create_thread.title}",
+    }
 
 
 def _seed_durable_intents(installer: Installer) -> bytes:

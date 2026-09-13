@@ -1596,7 +1596,7 @@ def _send_local_target(
         "schema_version": 1,
         "event_id": event_id,
         "status": "TRANSPORT_ACCEPTED",
-        "to": delivery_route.alias,
+        "to": target.alias if delivery_route is target_route else delivery_route.alias,
         "provider": delivery_route.provider,
     }
     rejection = pre_effect_error(response, event_id, target.provider)
@@ -1847,7 +1847,7 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
             "schema_version": SCHEMA_VERSION,
             "event_id": event_id,
             "status": "TRANSPORT_ACCEPTED",
-            "to": delivery_route.alias,
+            "to": target.alias if delivery_route is routes[0] else delivery_route.alias,
             "provider": delivery_route.provider,
         }
         if pre_effect_error(response, event_id, target.provider) is not None:
@@ -2116,11 +2116,11 @@ def _native_create_hook_group() -> dict[str, object]:
                 "server": "codex_app",
                 "tool": "create_thread",
                 "input": {
-                    "prompt": "${tool_response.structuredContent.create_thread.prompt}",
-                    "target": "${tool_response.structuredContent.create_thread.target}",
-                    "model": "${tool_response.structuredContent.create_thread.model}",
-                    "thinking": "${tool_response.structuredContent.create_thread.thinking}",
-                    "title": "${tool_response.structuredContent.create_thread.title}",
+                    "prompt": "${tool_response._meta.create_thread.prompt}",
+                    "target": "${tool_response._meta.create_thread.target}",
+                    "model": "${tool_response._meta.create_thread.model}",
+                    "thinking": "${tool_response._meta.create_thread.thinking}",
+                    "title": "${tool_response._meta.create_thread.title}",
                 },
                 "timeout": 30,
                 "statusMessage": "Starting Cross Agent Chat helper",
@@ -2199,8 +2199,8 @@ def native_bootstrap(root: Path, source: Route) -> dict[str, object]:
         source, _native_account_digest(source), Registry(root).routes()
     )
     return {
-        "content": [{"type": "text", "text": "Starting the native delivery helper."}],
-        "structuredContent": {
+        "content": [{"type": "text", "text": "Native delivery helper setup was submitted."}],
+        "_meta": {
             "create_thread": {
                 "prompt": (
                     "You are the Cross Agent Chat native delivery helper. "

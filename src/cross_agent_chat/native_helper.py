@@ -290,7 +290,15 @@ class NativeHelperStore:
     def is_helper_lineage(self, route: Route) -> bool:
         """Whether a route owns a reserved helper directory, across restarts."""
 
-        return any(Path(route.cwd).name == item.helper_directory for item in self.bindings())
+        directory = Path(route.cwd).name
+        for item in self.bindings():
+            if directory == item.helper_directory:
+                return True
+            prefix = item.helper_directory + "-"
+            suffix = directory.removeprefix(prefix)
+            if directory.startswith(prefix) and suffix.isdecimal() and int(suffix) > 0:
+                return True
+        return False
 
     def pending_for_helper(self, route: Route) -> bool:
         """Whether a same-profile non-original task may be offered registration."""

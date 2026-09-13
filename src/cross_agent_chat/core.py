@@ -653,11 +653,12 @@ class IntentStore:
         valid_uuid(target_generation, "target generation")
         with state_lock(self.root, "intents"):
             existing = self.intents()
+            if any(item.event_id == identifier for item in existing):
+                fail("event id is unavailable")
             unresolved = [
                 item
                 for item in existing
-                if item.target_key == target_key
-                and item.status in {"PENDING", "REMOTE_AUTHORIZED", "UNKNOWN_DELIVERY"}
+                if item.target_key == target_key and item.status in {"PENDING", "REMOTE_AUTHORIZED"}
             ]
             if unresolved:
                 fail("target has an unresolved delivery intent")

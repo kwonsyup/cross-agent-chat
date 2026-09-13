@@ -658,7 +658,9 @@ def test_intent_store_never_persists_message_body(tmp_path: Path) -> None:
     assert "body" not in persisted
 
 
-def test_pending_or_unknown_intent_blocks_duplicate_send(tmp_path: Path) -> None:
+def test_pending_intent_blocks_a_second_send_but_unknown_quarantines_only_its_event(
+    tmp_path: Path,
+) -> None:
     source = route(tmp_path, project="source")
     target = route(tmp_path)
     store = IntentStore(tmp_path / "state")
@@ -670,13 +672,41 @@ def test_pending_or_unknown_intent_blocks_duplicate_send(tmp_path: Path) -> None
     other = IntentStore(tmp_path / "other-state")
     event_id = other.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
     other.mark(event_id, "UNKNOWN_DELIVERY")
-    with pytest.raises(ChatError, match="unresolved"):
-        other.begin(source, target, source_alias=source.alias, payload_digest="b" * 64)
+    fresh_event = other.begin(source, target, source_alias=source.alias, payload_digest="b" * 64)
 
-    other.mark(event_id, "RESOLVED_BY_OWNER")
-    assert (
-        other.begin(source, target, source_alias=source.alias, payload_digest="b" * 64) != event_id
+    assert fresh_event != event_id
+    assert other.intent_for_source(
+        event_id=event_id,
+        source_key=session_key(source.provider, source.session_id),
+        source_generation=source.generation,
     )
+
+
+def test_unknown_event_id_cannot_be_reused_for_a_fresh_delivery(tmp_path: Path) -> None:
+    source = route(tmp_path, project="source")
+    target = route(tmp_path)
+    store = IntentStore(tmp_path / "state")
+    event_id = str(uuid4())
+    store.begin(
+        source,
+        target,
+        source_alias=source.alias,
+        payload_digest="a" * 64,
+        event_id=event_id,
+    )
+    store.mark(event_id, "UNKNOWN_DELIVERY")
+    before = store.path.read_bytes()
+
+    with pytest.raises(ChatError, match="event id is unavailable"):
+        store.begin(
+            source,
+            target,
+            source_alias=source.alias,
+            payload_digest="b" * 64,
+            event_id=event_id,
+        )
+
+    assert store.path.read_bytes() == before
 
 
 def test_pre_effect_rejection_does_not_block_fresh_intent(tmp_path: Path) -> None:
@@ -780,6 +810,91 @@ def test_local_send_by_exact_handle_skips_remote_discovery_and_title_metadata(
     )
 
     assert send(root, source, local.session_key, "hello")["status"] == "TRANSPORT_ACCEPTED"
+
+
+def test_new_local_send_after_unknown_keeps_old_event_quarantined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = route(tmp_path, project="source", pid=os.getpid())
+    target = route(tmp_path, project="target", pid=os.getpid())
+    Registry(root).upsert(source)
+    Registry(root).upsert(target)
+    store = IntentStore(root)
+    old_event = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    store.mark(old_event, "UNKNOWN_DELIVERY")
+    resolved = Target(
+        alias=target.alias,
+        provider=target.provider,
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=session_key(target.provider, target.session_id),
+        remote=False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [resolved])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda _path, payload, **_: {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": "codex",
+        },
+    )
+
+    result = send(root, source, resolved.session_key, "independent new request")
+    new_event = result["event_id"]
+    assert isinstance(new_event, str)
+
+    assert new_event != old_event
+    states = {item.event_id: item.status for item in store.intents()}
+    assert states[old_event] == "UNKNOWN_DELIVERY"
+    assert states[new_event] == "TRANSPORT_ACCEPTED"
+
+
+def test_local_claude_receipt_uses_fresh_discovery_alias_after_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = route(tmp_path, project="source", pid=os.getpid())
+    target = route(tmp_path, provider="claude", project="target", pid=os.getpid())
+    Registry(root).upsert(source)
+    Registry(root).upsert(target)
+    fresh_alias = target.alias + " Fresh"
+    resolved = Target(
+        alias=fresh_alias,
+        provider="claude",
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=session_key(target.provider, target.session_id),
+        remote=False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [resolved])
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda _path, payload, **_: {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": fresh_alias,
+            "provider": "claude",
+        },
+    )
+
+    assert (
+        send(root, source, resolved.session_key, "fresh independent work")["status"]
+        == "TRANSPORT_ACCEPTED"
+    )
 
 
 def test_alias_send_rejects_incomplete_global_discovery(

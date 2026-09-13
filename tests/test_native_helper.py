@@ -153,6 +153,43 @@ def test_helper_lineage_stays_ineligible_after_helper_generation_restarts(tmp_pa
     assert not store.needs_bootstrap(restarted)
 
 
+def test_provider_collision_suffix_is_helper_lineage_but_cannot_register(
+    tmp_path: Path,
+) -> None:
+    original = route(
+        tmp_path,
+        session="00000000-0000-4000-8000-000000000001",
+        generation="00000000-0000-4000-8000-000000000011",
+        pid=101,
+    )
+    store = NativeHelperStore(tmp_path / "state")
+    binding, nonce = store.reserve(original, "a" * 64)
+    collision_root = tmp_path / f"{binding.helper_directory}-2"
+    collision_root.mkdir()
+    collision = route(
+        collision_root,
+        session="00000000-0000-4000-8000-000000000002",
+        generation="00000000-0000-4000-8000-000000000012",
+        pid=102,
+        profile_root=tmp_path / "profile",
+    )
+    unrelated_root = tmp_path / "ordinary-project-2"
+    unrelated_root.mkdir()
+    unrelated = route(
+        unrelated_root,
+        session="00000000-0000-4000-8000-000000000003",
+        generation="00000000-0000-4000-8000-000000000013",
+        pid=103,
+        profile_root=tmp_path / "profile",
+    )
+
+    assert store.is_helper_lineage(collision)
+    assert not store.needs_bootstrap(collision)
+    assert not store.is_helper_lineage(unrelated)
+    with pytest.raises(ChatError, match="context"):
+        store.register(collision, nonce, original, "a" * 64)
+
+
 def test_dead_registered_helper_is_replaced_before_recreation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
