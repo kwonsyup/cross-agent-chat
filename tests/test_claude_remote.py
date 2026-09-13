@@ -313,6 +313,7 @@ def test_pretool_gate_accepts_bounded_one_line_summary_variants(summary: str) ->
         ("sendmessage_type_mismatch", {"type": "request"}),
         ("sendmessage_type_mismatch", {"type": "notify"}),
         ("sendmessage_summary_mismatch", {"summary": "two\nlines"}),
+        ("sendmessage_summary_mismatch", {"summary": "carriage\rreturn"}),
         ("sendmessage_summary_mismatch", {"summary": "x" * 201}),
         ("sendmessage_summary_mismatch", {"summary": "split\u2028line"}),
         ("sendmessage_summary_mismatch", {"summary": "bad\ud800 surrogate"}),
@@ -941,7 +942,11 @@ def test_sendmessage_receipt_accepts_display_only_summary_variants(
     [
         {"type": "request"},
         {"summary": "two\nlines"},
+        {"summary": "carriage\rreturn"},
         {"summary": "x" * 201},
+        {"summary": "split\u2028line"},
+        {"summary": 7},
+        {"summary": None},
         {"notify_when_idle": True},
     ],
 )

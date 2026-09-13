@@ -71,7 +71,7 @@ TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z
 # The provider schema declares `summary` an optional one-line UI preview of at
 # most 200 characters; it is display text, never routing or authority data.
 SUMMARY_MAX_CHARACTERS: Final = 200
-SUMMARY_REJECT_RE: Final = re.compile(r"[\x00-\x08\x0a-\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]")
+SUMMARY_REJECT_RE: Final = re.compile(r"[\x00-\x08\x0a-\x0d\x0e-\x1f\x7f-\x9f\u2028\u2029]")
 REQUIRED_TOOL_INPUT_KEYS: Final = frozenset({"to", "message", "recipient", "content", "type"})
 OPTIONAL_TOOL_INPUT_KEYS: Final = frozenset({"summary"})
 ClaudeUnknownPhase = Literal[
@@ -377,7 +377,7 @@ def run_pretool_gate(expected_path: str, content_hmac_key: str) -> bool:
                 0o600,
             )
             with os.fdopen(descriptor, "wb") as handle:
-                handle.write(DENIAL_MARKERS[denial or "pretool_gate_denied"])
+                handle.write(DENIAL_MARKERS.get(denial or "pretool_gate_denied", b"denied\n"))
                 handle.flush()
                 os.fsync(handle.fileno())
         except OSError:
