@@ -252,6 +252,34 @@ def test_queue_is_idempotent_for_exact_repeats_and_rejects_conflicts() -> None:
         courier.accept(str(uuid4()), "three")
 
 
+def test_native_queue_hides_body_only_for_helper_lineage(monkeypatch: pytest.MonkeyPatch) -> None:
+    queued: list[str] = []
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.queue_native_input",
+        lambda **kwargs: queued.append(str(kwargs["message"])),
+    )
+    queue = (Path("/fake-codex"), {"CODEX_HOME": "/profile"}, str(uuid4()))
+    ordinary = CodexCourier(
+        alias="codex@studio:api:123456789abc",
+        generation=str(uuid4()),
+        native_queue=queue,
+    )
+    helper = CodexCourier(
+        alias="codex@studio:api:abcdef123456",
+        generation=str(uuid4()),
+        native_queue=queue,
+        native_helper=True,
+    )
+    body = "untrusted private peer body"
+    ordinary.accept(str(uuid4()), body)
+    helper_event = str(uuid4())
+    helper.accept(helper_event, body)
+
+    assert queued[0] == body
+    assert body not in queued[1]
+    assert helper_event in queued[1]
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_error", "queue_count"),
     [

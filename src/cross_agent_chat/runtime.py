@@ -837,8 +837,9 @@ def courier_server(
     finally:
         os.umask(old_umask)
     native_queue: tuple[Path, dict[str, str], str] | None = None
+    helper_lineage = provider == "codex" and NativeHelperStore(root).is_helper_lineage(route)
     helper_queue = False
-    if provider == "codex" and NativeHelperStore(root).is_helper_lineage(route):
+    if helper_lineage:
         try:
             identity, _ = recipient_owner_identity("codex", route.pid, route.profile_root)
         except (ChatError, OSError):
@@ -869,7 +870,7 @@ def courier_server(
             alias=route.alias,
             generation=route.generation,
             native_queue=native_queue,
-            native_helper=helper_queue,
+            native_helper=helper_lineage,
         )
         if provider == "codex"
         else None
@@ -2326,6 +2327,9 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
         print("{}", flush=True)
         return
     route = routes[0]
+    if NativeHelperStore(root).is_helper_lineage(route):
+        print("{}", flush=True)
+        return
     peek = request_socket(
         socket_path(root, route),
         {"schema_version": 1, "operation": "peek", "generation": route.generation},

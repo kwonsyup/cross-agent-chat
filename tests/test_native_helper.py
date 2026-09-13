@@ -210,4 +210,7 @@ def test_dead_registered_helper_is_replaced_before_recreation(
     monkeypatch.setattr(Route, "process_is_live", lambda item: item.pid == replacement_helper.pid)
 
     assert registered.state == "REGISTERED"
-    assert store.helper_for_original(original, [original, dead_helper, replacement_helper]) == replacement_helper
+    assert (
+        store.helper_for_original(original, [original, dead_helper, replacement_helper])
+        == replacement_helper
+    )

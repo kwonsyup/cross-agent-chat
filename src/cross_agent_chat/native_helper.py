@@ -45,6 +45,7 @@ class NativeHelperBinding:
         valid_uuid(self.original_generation, "original generation")
         valid_device(self.original_device)
         stored_cwd(self.original_cwd)
+        stored_cwd(self.original_profile_root)
         if Path(
             self.helper_directory
         ).name != self.helper_directory or not self.helper_directory.startswith(
@@ -218,7 +219,27 @@ class NativeHelperStore:
             raise ChatError("native helper state is invalid") from error
         if not isinstance(raw, list):
             raise ChatError("native helper state is invalid")
-        return [NativeHelperBinding.from_dict(item) for item in raw]
+        bindings = [NativeHelperBinding.from_dict(item) for item in raw]
+        active_originals = [
+            (item.original_session_id, item.original_generation)
+            for item in bindings
+            if item.state in {"UNKNOWN", "REGISTERED"}
+        ]
+        directories = [item.helper_directory for item in bindings]
+        nonces = [item.nonce_sha256 for item in bindings]
+        helpers = [
+            (item.helper_session_id, item.helper_generation)
+            for item in bindings
+            if item.state in {"REGISTERED", "RETIRED"}
+        ]
+        if (
+            len(active_originals) != len(set(active_originals))
+            or len(directories) != len(set(directories))
+            or len(nonces) != len(set(nonces))
+            or len(helpers) != len(set(helpers))
+        ):
+            raise ChatError("native helper state is invalid")
+        return bindings
 
     def reserve(
         self, original: Route, account_sha256: str, routes: list[Route] | None = None
