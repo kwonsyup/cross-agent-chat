@@ -780,6 +780,7 @@ def courier_health(
     courier: CodexCourier | None = None,
     *,
     include_delivery_mode: bool = False,
+    include_direct_delivery_mode: bool = False,
     native_helper: bool = False,
 ) -> dict[str, object]:
     alias = route.alias
@@ -804,6 +805,8 @@ def courier_health(
     }
     if include_delivery_mode:
         response["delivery_mode"] = _delivery_mode(route, courier, native_helper=native_helper)
+    if include_direct_delivery_mode:
+        response["direct_delivery_mode"] = _delivery_mode(route, courier)
     return response
 
 
@@ -934,6 +937,9 @@ def courier_server(
                                 route,
                                 courier,
                                 include_delivery_mode=request.get("include_delivery_mode") is True,
+                                include_direct_delivery_mode=(
+                                    request.get("include_direct_delivery_mode") is True
+                                ),
                                 native_helper=(
                                     NativeHelperStore(root).helper_for_original(
                                         route, Registry(root).routes()
@@ -2343,16 +2349,38 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
     if NativeHelperStore(root).is_helper_lineage(route):
         print("{}", flush=True)
         return
-    health = request_socket(
-        socket_path(root, route),
-        {
-            "schema_version": SCHEMA_VERSION,
-            "operation": "health",
-            "generation": route.generation,
-            "include_delivery_mode": True,
-        },
-    )
-    if health.get("delivery_mode") == "codex_experimental_queue":
+    try:
+        health = request_socket(
+            socket_path(root, route),
+            {
+                "schema_version": SCHEMA_VERSION,
+                "operation": "health",
+                "generation": route.generation,
+                "include_delivery_mode": True,
+                "include_direct_delivery_mode": True,
+            },
+        )
+    except ChatError:
+        print("{}", flush=True)
+        return
+    base_health = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "READY",
+        "generation": route.generation,
+        "alias": route.alias,
+    }
+    allowed = {
+        frozenset(base_health),
+        frozenset((*base_health, "delivery_mode")),
+        frozenset((*base_health, "delivery_mode", "direct_delivery_mode")),
+    }
+    if frozenset(health) not in allowed or any(
+        health.get(key) != value for key, value in base_health.items()
+    ):
+        print("{}", flush=True)
+        return
+    direct_mode = health.get("direct_delivery_mode", health.get("delivery_mode"))
+    if direct_mode != "codex_stop_bound":
         print("{}", flush=True)
         return
     peek = request_socket(

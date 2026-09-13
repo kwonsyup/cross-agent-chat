@@ -512,7 +512,7 @@ def deliver_at_stop(
     stop_hook_active: bool,
     emit: Callable[[dict[str, object]], None],
 ) -> None:
-    """Flush a natural Stop continuation before acknowledging its queue entries."""
+    """Acknowledge a natural Stop continuation before emitting its provider output."""
     if stop_hook_active:
         emit({})
         return
