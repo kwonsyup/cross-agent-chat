@@ -743,6 +743,8 @@ def unknown_delivery_diagnostic(
             "claude_sendmessage_target_mismatch",
             "claude_sendmessage_message_mismatch",
             "claude_sendmessage_control_mismatch",
+            "claude_sendmessage_type_mismatch",
+            "claude_sendmessage_summary_mismatch",
             "claude_helper_stream_invalid",
             "claude_helper_timeout",
             "claude_helper_execution_failed",

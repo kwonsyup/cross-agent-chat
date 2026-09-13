@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Final, Literal, NoReturn, TypedDict, cast
@@ -68,6 +69,12 @@ CLAUDE_CONTEXT_ENV_KEYS: Final = (
 )
 BOUND_CLAUDE_BINARY_ENV: Final = "CROSS_AGENT_CHAT_CLAUDE_BINARY"
 TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z")
+# The provider schema declares `summary` an optional one-line UI preview of at
+# most 200 characters; it is display text, never routing or authority data.
+SUMMARY_MAX_CHARACTERS: Final = 200
+SUMMARY_REJECT_RE: Final = re.compile(r"[\x00-\x08\x0a-\x0d\x0e-\x1f\x7f-\x9f\u2028\u2029]")
+REQUIRED_TOOL_INPUT_KEYS: Final = frozenset({"to", "message", "recipient", "content", "type"})
+OPTIONAL_TOOL_INPUT_KEYS: Final = frozenset({"summary"})
 ClaudeUnknownPhase = Literal[
     "pretool_gate_unobserved",
     "pretool_gate_unreadable",
@@ -78,7 +85,8 @@ ClaudeUnknownPhase = Literal[
     "sendmessage_payload_mismatch",
     "sendmessage_target_mismatch",
     "sendmessage_message_mismatch",
-    "sendmessage_control_mismatch",
+    "sendmessage_type_mismatch",
+    "sendmessage_summary_mismatch",
     "helper_stream_invalid",
     "helper_timeout",
     "helper_execution_failed",
@@ -264,6 +272,22 @@ def discover_target_ref(session_name: str) -> str:
     return refs[0]
 
 
+def _valid_summary(value: object) -> bool:
+    """Whether a SendMessage `summary` is bounded one-line display text."""
+    if not isinstance(value, str) or len(value) > SUMMARY_MAX_CHARACTERS:
+        return False
+    if SUMMARY_REJECT_RE.search(value) is not None:
+        return False
+    try:
+        value.encode()
+    except UnicodeEncodeError:
+        return False
+    return all(
+        character == "\t" or not unicodedata.category(character).startswith(("C", "Zl", "Zp"))
+        for character in value
+    )
+
+
 def _pretool_denial(
     expected: dict[str, object], payload: object, content_hmac_key: str
 ) -> ClaudeUnknownPhase | None:
@@ -282,16 +306,13 @@ def _pretool_denial(
     ):
         return "sendmessage_payload_mismatch"
     tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, dict) or set(tool_input) != {
-        "to",
-        "message",
-        "recipient",
-        "content",
-        "type",
-        "summary",
-    }:
+    if (
+        not isinstance(tool_input, dict)
+        or not tool_input.keys() >= REQUIRED_TOOL_INPUT_KEYS
+        or not set(tool_input) <= REQUIRED_TOOL_INPUT_KEYS | OPTIONAL_TOOL_INPUT_KEYS
+    ):
         return "sendmessage_payload_mismatch"
-    if not all(isinstance(tool_input.get(key), str) for key in tool_input):
+    if not all(isinstance(tool_input.get(key), str) for key in REQUIRED_TOOL_INPUT_KEYS):
         return "sendmessage_payload_mismatch"
     message = cast(str, tool_input["message"])
     try:
@@ -303,8 +324,10 @@ def _pretool_denial(
         return "sendmessage_target_mismatch"
     if not hmac.compare_digest(digest, actual):
         return "sendmessage_message_mismatch"
-    if tool_input["type"] != "message" or tool_input["summary"] != "Cross Agent Chat":
-        return "sendmessage_control_mismatch"
+    if tool_input["type"] != "message":
+        return "sendmessage_type_mismatch"
+    if "summary" in tool_input and not _valid_summary(tool_input["summary"]):
+        return "sendmessage_summary_mismatch"
     return None
 
 
@@ -358,7 +381,7 @@ def run_pretool_gate(expected_path: str, content_hmac_key: str) -> bool:
                 0o600,
             )
             with os.fdopen(descriptor, "wb") as handle:
-                handle.write(DENIAL_MARKERS[denial or "pretool_gate_denied"])
+                handle.write(DENIAL_MARKERS.get(denial or "pretool_gate_denied", b"denied\n"))
                 handle.flush()
                 os.fsync(handle.fileno())
         except OSError:
@@ -411,13 +434,14 @@ def parse_sendmessage_receipt(text: str, target_ref: str, message: str) -> str:
     if (
         not isinstance(tool_id, str)
         or not isinstance(tool_input, dict)
-        or set(tool_input) != {"to", "message", "recipient", "content", "type", "summary"}
-        or not all(isinstance(tool_input.get(key), str) for key in tool_input)
+        or not tool_input.keys() >= REQUIRED_TOOL_INPUT_KEYS
+        or not set(tool_input) <= REQUIRED_TOOL_INPUT_KEYS | OPTIONAL_TOOL_INPUT_KEYS
+        or not all(isinstance(tool_input.get(key), str) for key in REQUIRED_TOOL_INPUT_KEYS)
         or tool_input.get("to") != target_ref
         or tool_input.get("recipient") != target_ref
         or tool_input.get("message") != message
         or tool_input.get("type") != "message"
-        or tool_input.get("summary") != "Cross Agent Chat"
+        or ("summary" in tool_input and not _valid_summary(tool_input["summary"]))
         or len(matches) != 1
         or matches[0].get("is_error") is True
     ):
@@ -454,7 +478,8 @@ DENIAL_MARKERS: Final[dict[ClaudeUnknownPhase, bytes]] = {
     "sendmessage_payload_mismatch": b"sendmessage_payload_mismatch\n",
     "sendmessage_target_mismatch": b"sendmessage_target_mismatch\n",
     "sendmessage_message_mismatch": b"sendmessage_message_mismatch\n",
-    "sendmessage_control_mismatch": b"sendmessage_control_mismatch\n",
+    "sendmessage_type_mismatch": b"sendmessage_type_mismatch\n",
+    "sendmessage_summary_mismatch": b"sendmessage_summary_mismatch\n",
 }
 
 
