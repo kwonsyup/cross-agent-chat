@@ -65,6 +65,7 @@ from cross_agent_chat.core import (
     valid_name,
     valid_uuid,
 )
+from cross_agent_chat.native_helper import NativeHelperStore
 from cross_agent_chat.remote import parse_remote_envelope
 from cross_agent_chat.tailnet import TAILNET_PORT, tailnet_nodes, valid_tailnet_address
 from cross_agent_chat.transport import remote_envelope
@@ -1842,6 +1843,83 @@ def sender_readiness(
     if response.get("status") != "READY" or response.get("generation") != source.generation:
         return {"status": "unavailable", "reason": "sender courier is not ready"}
     return {"status": "ready"}
+
+
+def native_helper_tools(root: Path, source: Route) -> tuple[str, ...]:
+    """Return lifecycle-only tools for an exact eligible Codex app route."""
+
+    if (
+        source.provider != "codex"
+        or source.profile_root is None
+        or not _route_current(root, source)
+    ):
+        return ()
+    store = NativeHelperStore(root)
+    if store.pending_for_helper(source):
+        return ("native_register",)
+    if store.needs_bootstrap(source):
+        return ("native_bootstrap",)
+    return ()
+
+
+def native_desktop_mcp_host() -> bool:
+    """Recognize a Desktop-hosted MCP process without trusting a model field."""
+
+    pid = os.getppid()
+    for _ in range(8):
+        try:
+            _, executable = recipient_owner_identity("codex", pid)
+            parent = subprocess.run(
+                ["/bin/ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                check=False,
+            )
+        except (ChatError, OSError, subprocess.SubprocessError):
+            return False
+        if executable == Path("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"):
+            return True
+        raw_parent = parent.stdout.strip()
+        if parent.returncode != 0 or not raw_parent.isdigit() or int(raw_parent) == pid:
+            return False
+        pid = int(raw_parent)
+    return False
+
+
+def native_bootstrap(root: Path, source: Route) -> dict[str, object]:
+    """Reserve one helper create and return only trusted-hook template arguments."""
+
+    if "native_bootstrap" not in native_helper_tools(root, source):
+        raise ChatError("native helper bootstrap is unavailable")
+    binding, nonce = NativeHelperStore(root).reserve(source)
+    return {
+        "content": [{"type": "text", "text": "Starting the native delivery helper."}],
+        "structuredContent": {
+            "create_thread": {
+                "prompt": (
+                    "You are the Cross Agent Chat native delivery helper. "
+                    f"Call native_register once with token {nonce}, then wait for inbound work. "
+                    "Do not inspect memory, source files, or unrelated tasks."
+                ),
+                "target": {"type": "projectless", "directoryName": binding.helper_directory},
+                "model": "gpt-5.6-luna",
+                "thinking": "high",
+                "title": "Cross Agent Chat helper",
+            }
+        },
+    }
+
+
+def native_register(root: Path, helper: Route, token: str) -> dict[str, object]:
+    """Bind one app-created helper to its exact current original route."""
+
+    store = NativeHelperStore(root)
+    original = store.original_for_nonce(token, Registry(root).routes())
+    if not _route_current(root, original) or not _route_current(root, helper):
+        raise ChatError("native helper registration is unavailable")
+    store.register(helper, token, original)
+    return {"content": [{"type": "text", "text": "Native helper is ready."}]}
 
 
 def event_status(root: Path, source: Route, event_id: str) -> dict[str, object]:

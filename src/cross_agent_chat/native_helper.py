@@ -1,0 +1,256 @@
+"""Private, body-free bindings between original Codex tasks and native helpers."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal, cast
+from uuid import uuid4
+
+from cross_agent_chat.core import ChatError, Route, atomic_json, state_lock, valid_uuid
+
+NativeHelperState = Literal["UNKNOWN", "REGISTERED"]
+
+
+@dataclass(frozen=True, slots=True)
+class NativeHelperBinding:
+    """One original Codex task and its private same-profile native helper."""
+
+    original_session_id: str
+    original_generation: str
+    original_device: str
+    original_cwd: str
+    original_profile_root: str
+    helper_directory: str
+    nonce_sha256: str
+    state: NativeHelperState
+    helper_session_id: str | None = None
+    helper_generation: str | None = None
+
+    def __post_init__(self) -> None:
+        valid_uuid(self.original_session_id, "original session id")
+        valid_uuid(self.original_generation, "original generation")
+        if Path(self.helper_directory).name != self.helper_directory:
+            raise ChatError("native helper binding is invalid")
+        if len(self.nonce_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.nonce_sha256
+        ):
+            raise ChatError("native helper binding is invalid")
+        if self.state == "REGISTERED":
+            if self.helper_session_id is None or self.helper_generation is None:
+                raise ChatError("native helper binding is invalid")
+            valid_uuid(self.helper_session_id, "helper session id")
+            valid_uuid(self.helper_generation, "helper generation")
+        elif self.helper_session_id is not None or self.helper_generation is not None:
+            raise ChatError("native helper binding is invalid")
+
+    @classmethod
+    def reserve(cls, original: Route, nonce: str, helper_directory: str) -> NativeHelperBinding:
+        """Create the pre-create unknown record for one current original route."""
+
+        if original.provider != "codex" or original.profile_root is None:
+            raise ChatError("native helper source is unavailable")
+        return cls(
+            original_session_id=original.session_id,
+            original_generation=original.generation,
+            original_device=original.device,
+            original_cwd=original.cwd,
+            original_profile_root=original.profile_root,
+            helper_directory=helper_directory,
+            nonce_sha256=hashlib.sha256(nonce.encode("utf-8")).hexdigest(),
+            state="UNKNOWN",
+        )
+
+    def register(self, helper: Route, nonce: str) -> NativeHelperBinding:
+        """Bind a helper only when its exact local context matches the original."""
+
+        if self.state != "UNKNOWN" or helper.provider != "codex":
+            raise ChatError("native helper registration is unavailable")
+        if (
+            helper.session_id == self.original_session_id
+            or helper.device != self.original_device
+            or helper.profile_root != self.original_profile_root
+        ):
+            raise ChatError("native helper context is invalid")
+        digest = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+        if digest != self.nonce_sha256:
+            raise ChatError("native helper token is invalid")
+        return NativeHelperBinding(
+            original_session_id=self.original_session_id,
+            original_generation=self.original_generation,
+            original_device=self.original_device,
+            original_cwd=self.original_cwd,
+            original_profile_root=self.original_profile_root,
+            helper_directory=self.helper_directory,
+            nonce_sha256=self.nonce_sha256,
+            state="REGISTERED",
+            helper_session_id=helper.session_id,
+            helper_generation=helper.generation,
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        """Serialize only private route relations and the nonce digest."""
+
+        result = {
+            "original_session_id": self.original_session_id,
+            "original_generation": self.original_generation,
+            "original_device": self.original_device,
+            "original_cwd": self.original_cwd,
+            "original_profile_root": self.original_profile_root,
+            "helper_directory": self.helper_directory,
+            "nonce_sha256": self.nonce_sha256,
+            "state": self.state,
+        }
+        if self.state == "REGISTERED":
+            assert self.helper_session_id is not None and self.helper_generation is not None
+            result["helper_session_id"] = self.helper_session_id
+            result["helper_generation"] = self.helper_generation
+        return result
+
+    @classmethod
+    def from_dict(cls, value: object) -> NativeHelperBinding:
+        """Validate one private durable binding record."""
+
+        if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+            raise ChatError("native helper binding is invalid")
+        raw = cast(dict[str, object], value)
+        base = {
+            "original_session_id",
+            "original_generation",
+            "original_device",
+            "original_cwd",
+            "original_profile_root",
+            "helper_directory",
+            "nonce_sha256",
+            "state",
+        }
+        registered = base | {"helper_session_id", "helper_generation"}
+        if (set(raw) != base and set(raw) != registered) or not all(
+            isinstance(raw[key], str) for key in raw
+        ):
+            raise ChatError("native helper binding is invalid")
+        state = raw["state"]
+        if state not in {"UNKNOWN", "REGISTERED"}:
+            raise ChatError("native helper binding is invalid")
+        return cls(
+            original_session_id=cast(str, raw["original_session_id"]),
+            original_generation=cast(str, raw["original_generation"]),
+            original_device=cast(str, raw["original_device"]),
+            original_cwd=cast(str, raw["original_cwd"]),
+            original_profile_root=cast(str, raw["original_profile_root"]),
+            helper_directory=cast(str, raw["helper_directory"]),
+            nonce_sha256=cast(str, raw["nonce_sha256"]),
+            state=state,
+            helper_session_id=cast(str | None, raw.get("helper_session_id")),
+            helper_generation=cast(str | None, raw.get("helper_generation")),
+        )
+
+
+class NativeHelperStore:
+    """Private binding state; unknown creates block only their original route."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.path = root / "native-helpers.json"
+
+    def bindings(self) -> list[NativeHelperBinding]:
+        if not self.path.exists():
+            return []
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ChatError("native helper state is invalid") from error
+        if not isinstance(raw, list):
+            raise ChatError("native helper state is invalid")
+        return [NativeHelperBinding.from_dict(item) for item in raw]
+
+    def reserve(self, original: Route) -> tuple[NativeHelperBinding, str]:
+        """Reserve one unknown native create without freezing other original routes."""
+
+        with state_lock(self.root, "native-helpers"):
+            existing = self.bindings()
+            if any(
+                item.original_session_id == original.session_id
+                and item.original_generation == original.generation
+                for item in existing
+            ):
+                raise ChatError("native helper bootstrap is unavailable")
+            nonce = str(uuid4())
+            helper_directory = f"cac-native-helper-{uuid4()}"
+            binding = NativeHelperBinding.reserve(original, nonce, helper_directory)
+            atomic_json(self.path, [item.to_dict() for item in [*existing, binding]])
+            return binding, nonce
+
+    def needs_bootstrap(self, route: Route) -> bool:
+        """Whether this exact original route has no pending or registered helper."""
+
+        return not any(
+            (
+                item.original_session_id == route.session_id
+                and item.original_generation == route.generation
+            )
+            or (
+                item.state == "REGISTERED"
+                and item.helper_session_id == route.session_id
+                and item.helper_generation == route.generation
+            )
+            for item in self.bindings()
+        )
+
+    def pending_for_helper(self, route: Route) -> bool:
+        """Whether a same-profile non-original task may be offered registration."""
+
+        return any(
+            item.state == "UNKNOWN"
+            and item.original_device == route.device
+            and item.original_profile_root == route.profile_root
+            and Path(route.cwd).name == item.helper_directory
+            for item in self.bindings()
+        )
+
+    def original_for_nonce(self, nonce: str, routes: list[Route]) -> Route:
+        """Resolve the current original route for one private nonce digest."""
+
+        digest = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+        matches = [item for item in self.bindings() if item.nonce_sha256 == digest]
+        if len(matches) != 1:
+            raise ChatError("native helper registration is unavailable")
+        binding = matches[0]
+        current = [
+            route
+            for route in routes
+            if route.provider == "codex"
+            and route.session_id == binding.original_session_id
+            and route.generation == binding.original_generation
+        ]
+        if len(current) != 1:
+            raise ChatError("native helper original route changed")
+        return current[0]
+
+    def register(self, helper: Route, nonce: str, original_current: Route) -> NativeHelperBinding:
+        """Consume one unknown create only while its original route is still exact."""
+
+        with state_lock(self.root, "native-helpers"):
+            existing = self.bindings()
+            matches = [
+                item
+                for item in existing
+                if item.nonce_sha256 == hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+            ]
+            if len(matches) != 1:
+                raise ChatError("native helper registration is unavailable")
+            pending = matches[0]
+            if (
+                original_current.session_id != pending.original_session_id
+                or original_current.generation != pending.original_generation
+                or original_current.provider != "codex"
+            ):
+                raise ChatError("native helper original route changed")
+            registered = pending.register(helper, nonce)
+            atomic_json(
+                self.path,
+                [(registered if item == pending else item).to_dict() for item in existing],
+            )
+            return registered

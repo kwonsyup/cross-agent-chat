@@ -196,15 +196,21 @@ def test_injected_consumer_is_called_once_and_active_stop_is_quiet() -> None:
     consumed: list[dict[str, str]] = []
     consumer: Callable[[dict[str, str]], None] = consumed.append
 
-    assert inject_stop_callback_once(
-        event, event_id=str(uuid4()), source_text="exact source", consume=consumer
-    ) is True
+    assert (
+        inject_stop_callback_once(
+            event, event_id=str(uuid4()), source_text="exact source", consume=consumer
+        )
+        is True
+    )
     assert len(consumed) == 1
 
     active = DevinHookEvent("Stop", event.session_id, event.prompt_id, True)
-    assert inject_stop_callback_once(
-        active, event_id=str(uuid4()), source_text="must not inject", consume=consumer
-    ) is False
+    assert (
+        inject_stop_callback_once(
+            active, event_id=str(uuid4()), source_text="must not inject", consume=consumer
+        )
+        is False
+    )
     assert len(consumed) == 1
 
 

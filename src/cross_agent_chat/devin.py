@@ -168,9 +168,7 @@ def _callback_byte_budget(event_id: str) -> int:
     return _ENCODED_MESSAGE_MAX_BYTES + fixed_overhead
 
 
-DEVIN_STOP_CALLBACK_MAX_BYTES: Final = _callback_byte_budget(
-    "00000000-0000-0000-0000-000000000000"
-)
+DEVIN_STOP_CALLBACK_MAX_BYTES: Final = _callback_byte_budget("00000000-0000-0000-0000-000000000000")
 
 
 def build_stop_callback_payload(event_id: str, source_text: str) -> dict[str, str]:
@@ -178,9 +176,7 @@ def build_stop_callback_payload(event_id: str, source_text: str) -> dict[str, st
 
     identifier = valid_uuid(event_id, "event id")
     message = bounded_message(source_text)
-    encoded_message = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    encoded_message = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(encoded_message) > _ENCODED_MESSAGE_MAX_BYTES:
         raise ChatError("message exceeds the encoded frame budget")
     payload: dict[str, str] = {"decision": "block", "reason": _stop_reason(identifier, message)}

@@ -442,7 +442,15 @@ def _owned_hook(value: object) -> bool:
     hooks = value.get("hooks")
     if not isinstance(hooks, list) or len(hooks) != 1 or not isinstance(hooks[0], dict):
         return False
-    command = hooks[0].get("command")
+    hook = hooks[0]
+    if (
+        value.get("matcher") == "mcp__cross_agent_chat__native_bootstrap"
+        and hook.get("type") == "mcp_tool"
+        and hook.get("server") == "codex_app"
+        and hook.get("tool") == "create_thread"
+    ):
+        return True
+    command = hook.get("command")
     if not isinstance(command, str):
         return False
     try:
@@ -501,6 +509,30 @@ def _hook_group(
                 "timeout": timeout,
             }
         ]
+    }
+
+
+def _native_helper_hook_group() -> dict[str, object]:
+    """Invoke the real app create operation only after internal bootstrap success."""
+
+    return {
+        "matcher": "mcp__cross_agent_chat__native_bootstrap",
+        "hooks": [
+            {
+                "type": "mcp_tool",
+                "server": "codex_app",
+                "tool": "create_thread",
+                "input": {
+                    "prompt": "${tool_response.structuredContent.create_thread.prompt}",
+                    "target": "${tool_response.structuredContent.create_thread.target}",
+                    "model": "${tool_response.structuredContent.create_thread.model}",
+                    "thinking": "${tool_response.structuredContent.create_thread.thinking}",
+                    "title": "${tool_response.structuredContent.create_thread.title}",
+                },
+                "timeout": 30,
+                "statusMessage": "Starting Cross Agent Chat helper",
+            }
+        ],
     }
 
 
@@ -1360,6 +1392,7 @@ class Installer:
                     codex_native_queue=codex_native_queue,
                 ),
             )
+        _merge_hook(codex_hooks, "PostToolUse", _native_helper_hook_group())
         raw_hook_map = codex_hooks.get("hooks")
         if not isinstance(raw_hook_map, dict):
             raise SettingsError("Codex hooks must be an object")

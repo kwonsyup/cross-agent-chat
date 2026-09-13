@@ -24,6 +24,9 @@ from cross_agent_chat.runtime import (
     codex_stop,
     courier_server,
     event_status,
+    native_bootstrap,
+    native_desktop_mcp_host,
+    native_register,
     peers,
     presence_is_enabled,
     register,
@@ -106,7 +109,14 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
             _mcp_response(identifier, error=(-32602, "invalid params"))
             continue
         typed_params = cast(dict[str, object], params)
+        internal_call = False
         try:
+            metadata = typed_params.get("_meta")
+            thread_id: str | None = None
+            if provider == "codex" and isinstance(metadata, dict):
+                raw_thread = metadata.get("threadId")
+                if isinstance(raw_thread, str):
+                    thread_id = raw_thread
             if method == "notifications/initialized":
                 continue
             if method == "initialize":
@@ -120,6 +130,29 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                     },
                 )
             elif method == "tools/list":
+                internal_tools: list[dict[str, object]] = []
+                if presence_enabled and provider == "codex" and native_desktop_mcp_host():
+                    internal_tools = [
+                        {
+                            "name": "native_bootstrap",
+                            "description": "Internal Cross Agent Chat native lifecycle operation.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": False,
+                            },
+                        },
+                        {
+                            "name": "native_register",
+                            "description": "Internal Cross Agent Chat native lifecycle operation.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"token": {"type": "string"}},
+                                "required": ["token"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    ]
                 _mcp_response(
                     identifier,
                     result={
@@ -206,6 +239,7 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                                     "additionalProperties": False,
                                 },
                             },
+                            *internal_tools,
                         ]
                     },
                 )
@@ -216,13 +250,8 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                 arguments = typed_params.get("arguments", {})
                 if not isinstance(name, str) or not isinstance(arguments, dict):
                     _fail("MCP tool call is invalid")
+                internal_call = name in {"native_bootstrap", "native_register"}
                 typed_arguments = cast(dict[str, object], arguments)
-                metadata = typed_params.get("_meta")
-                thread_id: str | None = None
-                if provider == "codex" and isinstance(metadata, dict):
-                    raw_thread = metadata.get("threadId")
-                    if isinstance(raw_thread, str):
-                        thread_id = raw_thread
                 if name == "chat_peers" and not typed_arguments:
                     assert root is not None
                     result = peers(root, include_delivery_mode=True)
@@ -249,23 +278,53 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                     assert root is not None
                     source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
                     result = event_status(root, source, typed_arguments["event_id"])
+                elif name == "native_bootstrap" and provider == "codex" and not typed_arguments:
+                    if thread_id is None:
+                        _fail("Codex host thread identity is required")
+                    assert root is not None
+                    source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+                    result = native_bootstrap(root, source)
+                elif name == "native_register" and provider == "codex":
+                    if (
+                        thread_id is None
+                        or set(typed_arguments) != {"token"}
+                        or not isinstance(typed_arguments["token"], str)
+                    ):
+                        _fail("native helper registration is invalid")
+                    assert root is not None
+                    source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+                    result = native_register(root, source, typed_arguments["token"])
                 else:
                     _fail("MCP tool call is invalid")
-                _mcp_response(
-                    identifier,
-                    result={
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": json.dumps(result, sort_keys=True, separators=(",", ":")),
-                            }
-                        ]
-                    },
-                )
+                if internal_call:
+                    _mcp_response(identifier, result=result)
+                else:
+                    _mcp_response(
+                        identifier,
+                        result={
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json.dumps(
+                                        result, sort_keys=True, separators=(",", ":")
+                                    ),
+                                }
+                            ]
+                        },
+                    )
             else:
                 _mcp_response(identifier, error=(-32601, "method not found"))
         except ChatError as error:
-            _mcp_response(identifier, error=(-32602, str(error)))
+            if internal_call:
+                _mcp_response(
+                    identifier,
+                    result={
+                        "isError": True,
+                        "content": [{"type": "text", "text": str(error)}],
+                    },
+                )
+            else:
+                _mcp_response(identifier, error=(-32602, str(error)))
 
 
 def parser() -> argparse.ArgumentParser:
