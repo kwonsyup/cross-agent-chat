@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3 - 2026-09-13
+
+- Promptly recheck a completed Tailnet listener verification while keeping that listener excluded
+  until verification finishes. This reduces a broker refresh blind window; it does not by itself
+  explain every remote discovery timeout.
+
 ## 0.3.2 - 2026-09-13
 
 - Accept `/` as a canonical workspace display label while retaining the exact working-directory,

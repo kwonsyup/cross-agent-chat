@@ -10,10 +10,10 @@ non-default roots). Local sessions do not need Tailscale; remote sessions need T
 allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
 files, or turn a remote peer into an owner.
 
-Install v0.3.2 beta with:
+Install v0.3.3 beta with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.2/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.3/install.sh | sh
 ```
 
 Installation requires Git because the installer builds from the release tag.
@@ -50,13 +50,13 @@ visible by default.
 
 To have an existing coding agent assist with installation, give it this prompt:
 
-> Install the released `v0.3.2` tag, not an arbitrary PR. Identify active consumers and the
+> Install the released `v0.3.3` tag, not an arbitrary PR. Identify active consumers and the
 > selected Claude/Codex roots and local Devin configuration, obtain approval before shared effects, preserve existing intent
 > records, run `cross-agent-chat doctor --json`, and test only fresh actors.
 
 ## Supported surfaces
 
-v0.3.2 is a macOS beta candidate. Claude Code uses its native cross-session mechanism. Codex
+v0.3.3 is a macOS beta candidate. Claude Code uses its native cross-session mechanism. Codex
 Native uses the built-in Desktop message operation through a trusted, automatically managed helper;
 its body and task-creation arguments remain private to the trusted hook path. Local Devin uses its
 global MCP and lifecycle hooks; a conversation becomes discoverable only after its first user prompt,
