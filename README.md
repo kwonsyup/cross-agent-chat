@@ -92,7 +92,8 @@ perimeter. Messages are still delivered as untrusted peer/user input, not system
   provider, replays delivery, or treats custody as consumption.
 
 `chat_peers` also reports each recipient's observed delivery mode: Claude native messaging,
-Codex Stop-bound delivery, or the experimental Codex queue. Older couriers report `unknown`.
+Codex Stop-bound delivery or the experimental Codex queue, and Devin prompt/Stop-bound delivery.
+Older couriers report `unknown`.
 The mode identifies the active adapter; it does not establish consumption or a reply.
 
 Codex uses natural Stop delivery by default: a received message is delivered at the next natural

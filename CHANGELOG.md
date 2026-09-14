@@ -9,7 +9,7 @@
 - Keep unknown delivery quarantine scoped to its event, preserve fresh independent work, and reject
   reused event IDs. Prevent native queue and Stop-bound duplicate delivery paths.
 - Preserve default and alternate Claude/Codex install identity while upgrading the same record with
-  local Devin ownership. New hooks require normal provider trust; setup never writes trust hashes.
+  local Devin ownership. Codex Native hooks require normal provider trust; setup never writes Codex trust hashes.
 - This beta does not claim busy Codex CLI native ingress, idle Devin delivery, isolated Fusion
   helpers, full five-surface readiness, or final fleet acceptance.
 

@@ -485,10 +485,8 @@ def run(arguments: argparse.Namespace) -> int:
         )
         installer = _installer(arguments.device, codex_native_queue=codex_native_queue)
         installer.install()
-        print(
-            "Cross Agent Chat is ready on "
-            f"{installer.device}. Start a fresh Claude, Codex, or Devin session."
-        )
+        next_step = "Start a fresh Claude or Codex session, or submit a prompt in Devin."
+        print(f"Cross Agent Chat is ready on {installer.device}. {next_step}")
     elif command == "doctor":
         installer = _installer(arguments.device)
         integration_healthy = installer.verify_configuration()
@@ -502,7 +500,7 @@ def run(arguments: argparse.Namespace) -> int:
             ),
             "local_broker": "healthy" if broker_healthy else "unavailable",
             "remote_trust": "tailscale_acl",
-            "next": "start a fresh Claude, Codex, or Devin session"
+            "next": "start a fresh Claude or Codex session, or submit a prompt in Devin"
             if healthy
             else "cross-agent-chat setup",
         }
@@ -612,7 +610,8 @@ def run(arguments: argparse.Namespace) -> int:
         )
         installer.install_staged(arguments.staged_runtime, arguments.stable_entrypoint)
         ready_message = f"Cross Agent Chat is ready on {device}."
-        print(f"{ready_message} Start a fresh Claude, Codex, or Devin session.")
+        next_step = "Start a fresh Claude or Codex session, or submit a prompt in Devin."
+        print(f"{ready_message} {next_step}")
     else:
         _fail("unsupported command")
     return 0

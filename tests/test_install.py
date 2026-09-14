@@ -482,7 +482,7 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "codex_native_queue": "experimental",
         "integration": "healthy",
         "local_broker": "healthy",
-        "next": "start a fresh Claude, Codex, or Devin session",
+        "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
         "version": "0.3.0",
     }
