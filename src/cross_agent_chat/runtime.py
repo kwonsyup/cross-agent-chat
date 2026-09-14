@@ -75,6 +75,7 @@ from cross_agent_chat.devin import (
     DEVIN_CAPABILITY_FIELD,
     DevinCapabilityStore,
     DevinCapabilityTool,
+    DevinHookEvent,
     build_pretool_callback,
     build_stop_callback_payload,
     build_user_prompt_callback_payload,
@@ -680,14 +681,9 @@ def _devin_route(
     return matches[0] if len(matches) == 1 else None
 
 
-def register_devin(device: str, pid: int, state_root_value: str | None) -> Route | None:
-    """Register a local Devin CLI or Native App session from its lifecycle hook."""
+def _register_devin_prompt(device: str, pid: int, root: Path, event: DevinHookEvent) -> Route:
+    """Register the first trusted prompt for one exact local Devin session."""
 
-    if not presence_is_enabled():
-        return None
-    if isinstance(pid, bool) or pid <= 0:
-        raise ChatError("provider process is invalid")
-    event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="SessionStart")
     cwd = devin_hook_cwd()
     owner_identity, _ = recipient_owner_identity("devin", pid)
     route = Route.create(
@@ -699,7 +695,6 @@ def register_devin(device: str, pid: int, state_root_value: str | None) -> Route
         owner_identity=owner_identity,
         profile_root=recipient_profile_root("devin"),
     )
-    root = state_root(state_root_value)
     try:
         with (
             _registration_sigterm_scope(),
@@ -707,6 +702,19 @@ def register_devin(device: str, pid: int, state_root_value: str | None) -> Route
         ):
             registry = Registry(root)
             registry.compact_dead()
+            existing_session = [
+                item
+                for item in registry.routes()
+                if item.provider == "devin" and item.session_id == route.session_id
+            ]
+            if existing_session and any(
+                item.pid != route.pid
+                or item.cwd != route.cwd
+                or item.profile_root != route.profile_root
+                or item.owner_identity != route.owner_identity
+                for item in existing_session
+            ):
+                raise ChatError("exact Devin session route is unavailable")
             registered = registry.upsert_or_reuse_live_owner(route)
             if registered != route:
                 try:
@@ -732,6 +740,20 @@ def register_devin(device: str, pid: int, state_root_value: str | None) -> Route
             route.provider, route.session_id, route.pid, generation=route.generation
         )
         raise
+
+
+def register_devin(device: str, pid: int, state_root_value: str | None) -> Route | None:
+    """Validate a Devin SessionStart without publishing an inactive inbox."""
+
+    if not presence_is_enabled():
+        return None
+    if isinstance(pid, bool) or pid <= 0:
+        raise ChatError("provider process is invalid")
+    parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="SessionStart")
+    devin_hook_cwd()
+    recipient_owner_identity("devin", pid)
+    valid_device(device)
+    return None
 
 
 def unregister_devin(pid: int, state_root_value: str | None) -> None:
@@ -884,13 +906,17 @@ def devin_stop(pid: int, state_root_value: str | None) -> None:
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
 
 
-def devin_user_prompt(pid: int, state_root_value: str | None) -> None:
+def devin_user_prompt(pid: int, state_root_value: str | None, device: str | None = None) -> None:
     if not presence_is_enabled():
         return
     event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="UserPromptSubmit")
     root = state_root(state_root_value)
+    route = (
+        _devin_route(root, event.session_id, pid)
+        if device is None
+        else _register_devin_prompt(valid_device(device), pid, root, event)
+    )
     DevinCapabilityStore(root).revoke_session(event.session_id)
-    route = _devin_route(root, event.session_id, pid)
     if route is None or not _route_current(root, route):
         return
     messages = _devin_messages(root, route)

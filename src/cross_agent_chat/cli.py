@@ -445,6 +445,7 @@ def parser() -> argparse.ArgumentParser:
     devin_stop_parser.add_argument("--pid", type=int, required=True)
     devin_stop_parser.add_argument("--state-root")
     devin_prompt_parser = commands.add_parser("_devin-prompt")
+    devin_prompt_parser.add_argument("--device", required=True)
     devin_prompt_parser.add_argument("--pid", type=int, required=True)
     devin_prompt_parser.add_argument("--state-root")
     devin_pretool_parser = commands.add_parser("_devin-pretool")
@@ -556,7 +557,7 @@ def run(arguments: argparse.Namespace) -> int:
     elif command == "_devin-stop":
         devin_stop(arguments.pid, arguments.state_root)
     elif command == "_devin-prompt":
-        devin_user_prompt(arguments.pid, arguments.state_root)
+        devin_user_prompt(arguments.pid, arguments.state_root, arguments.device)
     elif command == "_devin-pretool":
         devin_pretool(arguments.state_root)
     elif command == "_courier":

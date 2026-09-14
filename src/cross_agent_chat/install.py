@@ -457,7 +457,7 @@ def _hook_command(
     if provider == "devin" and event == "Stop":
         return f'{binary} _devin-stop --pid "$PPID"'
     if provider == "devin" and event == "UserPromptSubmit":
-        return f'{binary} _devin-prompt --pid "$PPID"'
+        return f'{binary} _devin-prompt --device {shlex.quote(device)} --pid "$PPID"'
     if provider == "devin" and event == "PreToolUse":
         return f"{binary} _devin-pretool"
     raise SettingsError("unsupported provider hook")

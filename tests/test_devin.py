@@ -382,6 +382,66 @@ def test_devin_user_prompt_hook_injects_context_before_one_ack(
     assert acknowledgements == 1
 
 
+def test_devin_session_start_validates_without_publishing_route(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
+    monkeypatch.setattr(runtime, "devin_hook_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_args: ("a" * 64, Path("/devin"))
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(_hook("SessionStart", session_id=str(uuid4()))))
+
+    assert runtime.register_devin("studio", 123, str(state)) is None
+    assert Registry(state).routes() == []
+
+
+def test_first_devin_prompt_registers_once_and_reuses_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    session_id = str(uuid4())
+    monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
+    monkeypatch.setattr(runtime, "devin_hook_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_args: ("a" * 64, Path("/devin"))
+    )
+    monkeypatch.setattr(runtime, "recipient_profile_root", lambda *_args: str(tmp_path / "profile"))
+    monkeypatch.setattr(runtime, "_spawn_courier", lambda *_args: None)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(Route, "process_is_live", lambda _route: True)
+    monkeypatch.setattr(runtime, "_devin_messages", lambda *_args: [])
+
+    def bootstrapped(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "status": "BOOTSTRAPPED",
+            "generation": Registry(state).routes()[0].generation,
+        }
+
+    monkeypatch.setattr(runtime, "request_socket", bootstrapped)
+    prompt = _hook("UserPromptSubmit", session_id=session_id)
+    monkeypatch.setattr("sys.stdin", io.StringIO(prompt))
+
+    runtime.devin_user_prompt(123, str(state), "studio")
+    first = Registry(state).routes()
+    assert len(first) == 1
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(prompt))
+    runtime.devin_user_prompt(123, str(state), "studio")
+    repeated = Registry(state).routes()
+    assert len(repeated) == 1
+    assert repeated[0].generation == first[0].generation
+
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.setattr(runtime, "devin_hook_cwd", lambda: str(other))
+    with pytest.raises(ChatError, match="exact Devin session route is unavailable"):
+        monkeypatch.setattr("sys.stdin", io.StringIO(prompt))
+        runtime.devin_user_prompt(123, str(state), "studio")
+
+
 def test_devin_sender_auth_requires_exact_provider_process_and_session() -> None:
     from cross_agent_chat.core import Route, authenticate_sender
 
