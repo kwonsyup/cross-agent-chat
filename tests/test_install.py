@@ -26,7 +26,7 @@ from tomlkit.exceptions import TOMLKitError
 from cross_agent_chat import cli
 from cross_agent_chat.cli import parser
 from cross_agent_chat.codex import CodexCourier
-from cross_agent_chat.core import Registry, Route
+from cross_agent_chat.core import ChatError, Registry, Route
 from cross_agent_chat.install import (
     BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
     BROKER_HEALTH_WAIT_SECONDS,
@@ -245,6 +245,22 @@ def test_devin_prompt_cli_accepts_cached_hook_without_device(
     assert cli.run(parser().parse_args(arguments)) == 0
 
     assert observed == [(123, None, expected_device)]
+
+
+def test_devin_prompt_cli_error_is_nonblocking_without_route_or_output(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "devin_user_prompt",
+        lambda *_args: (_ for _ in ()).throw(ChatError("exact Devin session route is unavailable")),
+    )
+
+    assert cli.main(["_devin-prompt", "--pid", "123"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "exact Devin session route is unavailable" in captured.err
 
 
 def test_devin_upgrade_reuses_existing_claude_codex_install_identity(tmp_path: Path) -> None:
@@ -506,7 +522,7 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "local_broker": "healthy",
         "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
-        "version": "0.3.1",
+        "version": "0.3.2",
     }
 
 
@@ -3344,7 +3360,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.3.1')\n"
+        "    print('cross-agent-chat 0.3.2')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -3370,7 +3386,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.3.1"
+    assert completed.stdout.strip() == "cross-agent-chat 0.3.2"
     assert stage.exists()
 
 
@@ -4812,7 +4828,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.3.1",
+            "version": "0.3.2",
             "module_path": str(module),
         },
     )
@@ -4990,7 +5006,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.3.1",
+            "version": "0.3.2",
             "module_path": str(module),
         }
 

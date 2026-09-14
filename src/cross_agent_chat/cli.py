@@ -618,11 +618,12 @@ def run(arguments: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    arguments = parser().parse_args(argv)
     try:
-        return run(parser().parse_args(argv))
+        return run(arguments)
     except (ChatError, SettingsError, OSError) as error:
         print(f"cross-agent-chat: {error}", file=sys.stderr)
-        return 2
+        return 1 if arguments.command == "_devin-prompt" else 2
 
 
 if __name__ == "__main__":

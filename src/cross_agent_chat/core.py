@@ -233,7 +233,7 @@ class Route:
             fail("route provider is invalid")
         typed_provider = cast(Provider, provider)
         canonical = canonical_cwd(cwd)
-        project = valid_name(Path(canonical).name, "project")
+        project = valid_name(Path(canonical).name or canonical, "project")
         return cls(
             schema_version=SCHEMA_VERSION,
             provider=typed_provider,

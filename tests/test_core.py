@@ -90,6 +90,21 @@ def test_codex_alias_distinguishes_sessions_in_one_project(tmp_path: Path) -> No
     assert first.alias.startswith("codex@studio:project:")
 
 
+@pytest.mark.parametrize("provider", ["claude", "codex", "devin"])
+def test_root_working_directory_has_a_valid_route_label(provider: str) -> None:
+    route = Route.create(
+        provider=provider,
+        session_id=str(uuid4()),
+        device="studio",
+        cwd="/",
+        pid=os.getpid(),
+    )
+
+    assert route.cwd == "/"
+    assert route.project == "/"
+    assert Route.from_object(route.to_dict()) == route
+
+
 def test_claude_alias_uses_provider_device_and_project(tmp_path: Path) -> None:
     item = route(tmp_path, provider="claude")
 
