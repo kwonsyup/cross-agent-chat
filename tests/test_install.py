@@ -889,7 +889,7 @@ def test_hook_ownership_requires_exact_cross_agent_chat_command() -> None:
     assert not _owned_hook({"hooks": [{"command": "other-tool _register --provider claude"}]})
 
 
-def test_setup_installs_owned_background_broker(tmp_path: Path) -> None:
+def test_setup_installs_owned_standard_broker(tmp_path: Path) -> None:
     home = tmp_path / "home"
     executable = Path("/opt/cross-agent-chat")
     installer = Installer(home=home, executable=executable, device="studio")
@@ -904,7 +904,7 @@ def test_setup_installs_owned_background_broker(tmp_path: Path) -> None:
         "ProgramArguments": [str(executable), "_broker"],
         "RunAtLoad": True,
         "KeepAlive": True,
-        "ProcessType": "Background",
+        "ProcessType": "Standard",
     }
 
 
