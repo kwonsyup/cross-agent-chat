@@ -225,6 +225,28 @@ def test_cli_maps_active_provider_profile_roots(
     assert installer.codex_hooks == codex_profile / "hooks.json"
 
 
+@pytest.mark.parametrize(
+    "arguments, expected_device",
+    [
+        (["_devin-prompt", "--pid", "123"], None),
+        (["_devin-prompt", "--pid", "123", "--device", "studio"], "studio"),
+    ],
+)
+def test_devin_prompt_cli_accepts_cached_hook_without_device(
+    monkeypatch: pytest.MonkeyPatch, arguments: list[str], expected_device: str | None
+) -> None:
+    observed: list[tuple[int, str | None, str | None]] = []
+    monkeypatch.setattr(
+        cli,
+        "devin_user_prompt",
+        lambda pid, state, device: observed.append((pid, state, device)),
+    )
+
+    assert cli.run(parser().parse_args(arguments)) == 0
+
+    assert observed == [(123, None, expected_device)]
+
+
 def test_devin_upgrade_reuses_existing_claude_codex_install_identity(tmp_path: Path) -> None:
     home = tmp_path / "home"
     legacy = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
@@ -484,7 +506,7 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "local_broker": "healthy",
         "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
-        "version": "0.3.0",
+        "version": "0.3.1",
     }
 
 
@@ -3322,7 +3344,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.3.0')\n"
+        "    print('cross-agent-chat 0.3.1')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -3348,7 +3370,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.3.0"
+    assert completed.stdout.strip() == "cross-agent-chat 0.3.1"
     assert stage.exists()
 
 
@@ -4790,7 +4812,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.3.0",
+            "version": "0.3.1",
             "module_path": str(module),
         },
     )
@@ -4968,7 +4990,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.3.0",
+            "version": "0.3.1",
             "module_path": str(module),
         }
 
