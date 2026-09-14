@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import selectors
@@ -15,6 +16,7 @@ from typing import Final, cast
 
 from cross_agent_chat.core import (
     ChatError,
+    Provider,
     UnknownDeliveryError,
     bounded_message,
     valid_name,
@@ -28,6 +30,95 @@ MAX_NATIVE_STDOUT_BYTES: Final = 64 * 1024
 NATIVE_METADATA_TIMEOUT_SECONDS: Final = 2.0
 
 
+def native_account_digest(*, binary: Path, environment: dict[str, str]) -> str:
+    """Read the selected account without refresh and retain only its digest."""
+
+    try:
+        process = subprocess.Popen(
+            [str(binary), "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            close_fds=True,
+        )
+    except OSError as error:
+        raise ChatError("Codex account identity is unavailable") from error
+    if process.stdin is None or process.stdout is None:
+        _reap_metadata_process(process)
+        raise ChatError("Codex account identity is unavailable")
+    stdin, stdout = process.stdin, process.stdout
+    selector = selectors.DefaultSelector()
+    selector.register(stdout, selectors.EVENT_READ)
+    buffer = b""
+    deadline = time.monotonic() + NATIVE_METADATA_TIMEOUT_SECONDS
+
+    def write(payload: dict[str, object]) -> None:
+        stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+        stdin.flush()
+
+    def read(identifier: int) -> dict[str, object] | None:
+        nonlocal buffer
+        while time.monotonic() < deadline:
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict) and value.get("id") == identifier:
+                    return cast(dict[str, object], value)
+            if selector.select(max(0.0, deadline - time.monotonic())):
+                chunk = os.read(stdout.fileno(), 65536)
+                if not chunk:
+                    return None
+                buffer += chunk
+        return None
+
+    try:
+        write(
+            {
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "cross-agent-chat", "version": "0.3.0"},
+                    "capabilities": {"experimentalApi": True},
+                },
+            }
+        )
+        initialized = read(0)
+        result = initialized.get("result") if initialized is not None else None
+        reported_home = result.get("codexHome") if isinstance(result, dict) else None
+        expected_home = environment.get("CODEX_HOME")
+        if (
+            not isinstance(reported_home, str)
+            or not isinstance(expected_home, str)
+            or Path(reported_home).resolve() != Path(expected_home).resolve()
+        ):
+            raise ChatError("Codex account identity is unavailable")
+        write({"method": "initialized"})
+        write({"id": 1, "method": "account/read", "params": {"refreshToken": False}})
+        response = read(1)
+        result = response.get("result") if response is not None else None
+        account = result.get("account") if isinstance(result, dict) else None
+        email = account.get("email") if isinstance(account, dict) else None
+        if (
+            not isinstance(result, dict)
+            or result.get("requiresOpenaiAuth") is not True
+            or not isinstance(account, dict)
+            or account.get("type") != "chatgpt"
+            or not isinstance(email, str)
+            or not email
+        ):
+            raise ChatError("Codex account identity is unavailable")
+        return hashlib.sha256(f"cross-agent-chat:codex-account:v1\0{email}".encode()).hexdigest()
+    except (OSError, ValueError) as error:
+        raise ChatError("Codex account identity is unavailable") from error
+    finally:
+        selector.close()
+        _reap_metadata_process(process)
+
+
 def queue_native_input(
     *, binary: Path, environment: dict[str, str], thread_id: str, event_id: str, message: str
 ) -> None:
@@ -39,7 +130,7 @@ def queue_native_input(
         "id": 0,
         "method": "initialize",
         "params": {
-            "clientInfo": {"name": "cross-agent-chat", "version": "0.2.1"},
+            "clientInfo": {"name": "cross-agent-chat", "version": "0.3.0"},
             "capabilities": {"experimentalApi": True},
         },
     }
@@ -223,7 +314,7 @@ def native_thread_titles(
                 "id": 0,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "cross-agent-chat", "version": "0.2.1"},
+                    "clientInfo": {"name": "cross-agent-chat", "version": "0.3.0"},
                     "capabilities": {"experimentalApi": True},
                 },
             }
@@ -274,6 +365,8 @@ class CodexCourier:
         generation: str,
         capacity: int = DEFAULT_CAPACITY,
         native_queue: tuple[Path, dict[str, str], str] | None = None,
+        native_helper: bool = False,
+        provider: Provider = "codex",
     ) -> None:
         if capacity <= 0 or capacity > DEFAULT_CAPACITY:
             raise ChatError("Codex courier capacity is invalid")
@@ -281,46 +374,75 @@ class CodexCourier:
         self.generation = valid_uuid(generation, "courier generation")
         self.capacity = capacity
         self.native_queue = native_queue
+        self.native_helper = native_helper
+        self.provider = provider
         self._pending: OrderedDict[str, str] = OrderedDict()
 
     def accept(self, event_id: str, message: str) -> dict[str, object]:
         identifier = valid_uuid(event_id, "event id")
         body = bounded_message(message)
         if self.native_queue is not None:
+            newly_admitted = False
+            if self.native_helper:
+                if identifier in self._pending:
+                    if self._pending[identifier] != body:
+                        raise UnknownDeliveryError(
+                            "Codex courier event conflicts with a pending message"
+                        )
+                    return {
+                        "schema_version": 1,
+                        "event_id": identifier,
+                        "status": "TRANSPORT_ACCEPTED",
+                        "to": self.alias,
+                        "provider": "codex",
+                    }
+                elif len(self._pending) >= self.capacity:
+                    raise ChatError("Codex courier queue is full")
+                else:
+                    self._pending[identifier] = body
+                    newly_admitted = True
             binary, environment, thread_id = self.native_queue
-            queue_native_input(
-                binary=binary,
-                environment=environment,
-                thread_id=thread_id,
-                event_id=identifier,
-                message=body,
-            )
+            try:
+                queue_native_input(
+                    binary=binary,
+                    environment=environment,
+                    thread_id=thread_id,
+                    event_id=identifier,
+                    message=(
+                        (
+                            "Cross Agent Chat has one protected delivery event. "
+                            f"Call native_dispatch with event_id {identifier}."
+                        )
+                        if self.native_helper
+                        else body
+                    ),
+                )
+            except UnknownDeliveryError:
+                raise
+            except ChatError:
+                if newly_admitted:
+                    del self._pending[identifier]
+                raise
             return {
                 "schema_version": 1,
                 "event_id": identifier,
                 "status": "TRANSPORT_ACCEPTED",
                 "to": self.alias,
-                "provider": "codex",
+                "provider": self.provider,
             }
         if identifier in self._pending:
-            if self._pending[identifier] == body:
-                return {
-                    "schema_version": 1,
-                    "event_id": identifier,
-                    "status": "TRANSPORT_ACCEPTED",
-                    "to": self.alias,
-                    "provider": "codex",
-                }
-            raise UnknownDeliveryError("Codex courier event conflicts with a pending message")
-        if len(self._pending) >= self.capacity:
+            if self._pending[identifier] != body:
+                raise UnknownDeliveryError("Codex courier event conflicts with a pending message")
+        elif len(self._pending) >= self.capacity:
             raise ChatError("Codex courier queue is full")
-        self._pending[identifier] = body
+        else:
+            self._pending[identifier] = body
         return {
             "schema_version": 1,
             "event_id": identifier,
             "status": "TRANSPORT_ACCEPTED",
             "to": self.alias,
-            "provider": "codex",
+            "provider": self.provider,
         }
 
     def peek(self) -> list[dict[str, str]]:
@@ -360,6 +482,15 @@ class CodexCourier:
         for event_id in event_ids:
             del self._pending[event_id]
 
+    def native_dispatch_message(self, event_id: str) -> str:
+        """Read one opaque event while its durable native claim is prepared."""
+
+        identifier = valid_uuid(event_id, "event id")
+        try:
+            return self._pending[identifier]
+        except KeyError as error:
+            raise ChatError("native helper dispatch is unavailable") from error
+
     def pending_ids(self) -> list[str]:
         return list(self._pending)
 
@@ -384,7 +515,7 @@ def deliver_at_stop(
     stop_hook_active: bool,
     emit: Callable[[dict[str, object]], None],
 ) -> None:
-    """Flush a natural Stop continuation before acknowledging its queue entries."""
+    """Acknowledge a natural Stop continuation before emitting its provider output."""
     if stop_hook_active:
         emit({})
         return
@@ -392,5 +523,5 @@ def deliver_at_stop(
     if not messages:
         emit({})
         return
-    emit({"decision": "block", "reason": hook_context(messages)})
     courier.acknowledge([item["event_id"] for item in messages])
+    emit({"decision": "block", "reason": hook_context(messages)})

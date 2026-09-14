@@ -16,7 +16,7 @@ from cross_agent_chat.codex import (
     native_thread_titles,
     queue_native_input,
 )
-from cross_agent_chat.core import ChatError, UnknownDeliveryError
+from cross_agent_chat.core import ChatError, Registry, Route, UnknownDeliveryError
 from cross_agent_chat.runtime import MAX_FRAME_BYTES, codex_stop, register, unregister
 
 
@@ -33,6 +33,152 @@ def test_stop_without_registered_route_is_silent_noop(
     codex_stop(os.getpid(), str(tmp_path / "state"))
 
     assert capsys.readouterr().out == "{}\n"
+
+
+def test_stop_skips_legacy_experimental_native_queue_without_peeking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                }
+            )
+        ),
+    )
+
+    def request(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        assert payload["operation"] == "health"
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+            "delivery_mode": "codex_experimental_queue",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+
+    codex_stop(os.getpid(), str(root))
+
+    assert capsys.readouterr().out == "{}\n"
+
+
+@pytest.mark.parametrize("variant", ["missing", "wrong-generation", "error"])
+def test_stop_requires_exact_stop_bound_health_before_peeking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variant: str,
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+            )
+        ),
+    )
+
+    def request(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        assert payload["operation"] == "health"
+        if variant == "error":
+            raise ChatError("health unavailable")
+        response: dict[str, object] = {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+            "delivery_mode": "codex_stop_bound",
+        }
+        if variant == "missing":
+            del response["delivery_mode"]
+        else:
+            response["generation"] = str(uuid4())
+        return response
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+
+    codex_stop(os.getpid(), str(root))
+
+    assert capsys.readouterr().out == "{}\n"
+
+
+def test_stop_uses_direct_stop_mode_when_helper_routing_mode_is_experimental(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    event_id = str(uuid4())
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+            )
+        ),
+    )
+
+    def request(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        operation = payload["operation"]
+        assert isinstance(operation, str)
+        if operation == "health":
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "generation": route.generation,
+                "alias": route.alias,
+                "delivery_mode": "codex_experimental_queue",
+                "direct_delivery_mode": "codex_stop_bound",
+            }
+        if operation == "peek":
+            return {
+                "schema_version": 1,
+                "status": "PEEKED",
+                "generation": route.generation,
+                "messages": [{"event_id": event_id, "message": "older stop-bound body"}],
+            }
+        assert operation == "ack"
+        return {"schema_version": 1, "status": "ACKNOWLEDGED", "event_ids": [event_id]}
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+
+    codex_stop(os.getpid(), str(root))
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["decision"] == "block"
 
 
 def test_presence_off_hooks_are_noops_before_state_creation(
@@ -138,7 +284,7 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
             "id": 0,
             "method": "initialize",
             "params": {
-                "clientInfo": {"name": "cross-agent-chat", "version": "0.2.1"},
+                "clientInfo": {"name": "cross-agent-chat", "version": "0.3.0"},
                 "capabilities": {"experimentalApi": True},
             },
         }
@@ -250,6 +396,84 @@ def test_queue_is_idempotent_for_exact_repeats_and_rejects_conflicts() -> None:
     courier.accept(str(uuid4()), "two")
     with pytest.raises(ChatError, match="full"):
         courier.accept(str(uuid4()), "three")
+
+
+def test_native_queue_hides_body_only_for_helper_lineage(monkeypatch: pytest.MonkeyPatch) -> None:
+    queued: list[str] = []
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.queue_native_input",
+        lambda **kwargs: queued.append(str(kwargs["message"])),
+    )
+    queue = (Path("/fake-codex"), {"CODEX_HOME": "/profile"}, str(uuid4()))
+    ordinary = CodexCourier(
+        alias="codex@studio:api:123456789abc",
+        generation=str(uuid4()),
+        native_queue=queue,
+    )
+    helper = CodexCourier(
+        alias="codex@studio:api:abcdef123456",
+        generation=str(uuid4()),
+        native_queue=queue,
+        native_helper=True,
+    )
+    body = "untrusted private peer body"
+    ordinary.accept(str(uuid4()), body)
+    helper_event = str(uuid4())
+    helper.accept(helper_event, body)
+
+    assert queued[0] == body
+    assert body not in queued[1]
+    assert helper_event in queued[1]
+    assert ordinary.pending_ids() == []
+    assert helper.pending_ids() == [helper_event]
+
+
+@pytest.mark.parametrize("error", [ChatError("rejected"), UnknownDeliveryError("unknown")])
+def test_ordinary_native_queue_failure_never_leaves_a_stop_body(
+    monkeypatch: pytest.MonkeyPatch, error: ChatError
+) -> None:
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.queue_native_input",
+        lambda **_kwargs: (_ for _ in ()).throw(error),
+    )
+    courier = CodexCourier(
+        alias="codex@studio:api:123456789abc",
+        generation=str(uuid4()),
+        native_queue=(Path("/fake-codex"), {"CODEX_HOME": "/profile"}, str(uuid4())),
+    )
+
+    with pytest.raises(type(error)):
+        courier.accept(str(uuid4()), "untrusted peer body")
+
+    assert courier.pending_ids() == []
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_pending"),
+    [
+        (ChatError("rejected"), []),
+        (UnknownDeliveryError("unknown"), ["event"]),
+    ],
+)
+def test_helper_native_queue_retains_body_only_after_unknown_queue_outcome(
+    monkeypatch: pytest.MonkeyPatch, error: ChatError, expected_pending: list[str]
+) -> None:
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.queue_native_input",
+        lambda **_kwargs: (_ for _ in ()).throw(error),
+    )
+    event_id = str(uuid4())
+    courier = CodexCourier(
+        alias="codex@studio:api:123456789abc",
+        generation=str(uuid4()),
+        native_queue=(Path("/fake-codex"), {"CODEX_HOME": "/profile"}, str(uuid4())),
+        native_helper=True,
+    )
+
+    with pytest.raises(type(error)):
+        courier.accept(event_id, "private helper body")
+
+    assert courier.pending_ids() == ([event_id] if expected_pending else [])
 
 
 @pytest.mark.parametrize(
@@ -431,7 +655,7 @@ def test_active_stop_neither_emits_nor_consumes() -> None:
     assert courier.pending_ids() == [event_id]
 
 
-def test_stop_flushes_before_acknowledging() -> None:
+def test_stop_acknowledges_before_emitting() -> None:
     courier = CodexCourier(alias="codex@studio:api:123456789abc", generation=str(uuid4()))
     event_id = str(uuid4())
     courier.accept(event_id, "message")
@@ -443,11 +667,11 @@ def test_stop_flushes_before_acknowledging() -> None:
 
     deliver_at_stop(courier, stop_hook_active=False, emit=emit)
 
-    assert observed_pending == [[event_id]]
+    assert observed_pending == [[]]
     assert courier.pending_ids() == []
 
 
-def test_emit_failure_retains_message_for_at_least_once_delivery() -> None:
+def test_emit_failure_keeps_at_most_once_stop_delivery() -> None:
     courier = CodexCourier(alias="codex@studio:api:123456789abc", generation=str(uuid4()))
     event_id = str(uuid4())
     courier.accept(event_id, "message")
@@ -458,7 +682,7 @@ def test_emit_failure_retains_message_for_at_least_once_delivery() -> None:
     with pytest.raises(OSError, match="closed stdout"):
         deliver_at_stop(courier, stop_hook_active=False, emit=fail_emit)
 
-    assert courier.pending_ids() == [event_id]
+    assert courier.pending_ids() == []
 
 
 def test_peer_content_is_explicitly_untrusted() -> None:

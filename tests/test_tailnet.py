@@ -78,6 +78,149 @@ def test_tailnet_discovery_returns_only_online_ipv4_nodes() -> None:
     assert parse_tailnet_nodes(payload) == ["100.64.0.11"]
 
 
+def test_legacy_broker_peer_request_filters_new_devin_routes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[bool] = []
+
+    def observed_peers(
+        _root: Path, *, include_remote: bool, internal: bool, include_devin: bool
+    ) -> dict[str, object]:
+        assert include_remote is False
+        assert internal is True
+        calls.append(include_devin)
+        return {"schema_version": 1, "peers": []}
+
+    monkeypatch.setattr(tailnet_broker_module, "peers", observed_peers)
+
+    result = handle_broker_request(
+        tmp_path,
+        {"schema_version": 1, "operation": "peers"},
+        "100.64.0.2",
+    )
+
+    assert result == {"schema_version": 1, "peers": []}
+    assert calls == [False]
+
+
+def test_new_devin_discovery_falls_back_to_legacy_broker_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    peer = {
+        "alias": "codex@remote:api:123456789abc",
+        "provider": "codex",
+        "device": "remote",
+        "project": "api",
+        "status": "available",
+        "generation": str(uuid4()),
+        "session_key": session_key("codex", session_id),
+    }
+    calls: list[dict[str, object]] = []
+
+    def old_broker(
+        _address: str, payload: dict[str, object], *, timeout: float
+    ) -> dict[str, object]:
+        del timeout
+        calls.append(payload)
+        if "include_devin" in payload:
+            raise ChatError("legacy broker rejected unknown field")
+        return {"schema_version": 1, "peers": [peer]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", old_broker)
+
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.2",
+        deadline=time.monotonic() + 2,
+        include_devin=True,
+    )
+
+    assert complete is True
+    assert [target.provider for target in targets] == ["codex"]
+    assert calls == [
+        {"schema_version": 1, "operation": "peers", "include_devin": True},
+        {"schema_version": 1, "operation": "peers"},
+    ]
+
+
+def test_negotiated_devin_roster_preserves_delivery_mode_and_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    peer = {
+        "alias": "devin@remote:api",
+        "provider": "devin",
+        "device": "remote",
+        "project": "api",
+        "status": "available",
+        "generation": str(uuid4()),
+        "session_key": session_key("devin", session_id),
+        "delivery_mode": "devin_stop_or_prompt_bound",
+        "title": "Devin canary",
+    }
+    codex_peer = {
+        "alias": "codex@remote:api:123456789abc",
+        "provider": "codex",
+        "device": "remote",
+        "project": "api",
+        "status": "available",
+        "generation": str(uuid4()),
+        "session_key": session_key("codex", str(uuid4())),
+        "delivery_mode": "codex_stop_bound",
+        "title": "Codex peer",
+    }
+    calls: list[dict[str, object]] = []
+
+    def new_broker(
+        _address: str, payload: dict[str, object], *, timeout: float
+    ) -> dict[str, object]:
+        del timeout
+        calls.append(payload)
+        items = (
+            [peer, codex_peer]
+            if "include_title" in payload
+            else [
+                {key: value for key, value in peer.items() if key != "title"},
+                {key: value for key, value in codex_peer.items() if key != "title"},
+            ]
+        )
+        return {"schema_version": 1, "peers": items}
+
+    monkeypatch.setattr(runtime, "request_tailnet", new_broker)
+
+    targets, complete = runtime._remote_node_targets(
+        "100.64.0.2",
+        deadline=time.monotonic() + 2,
+        include_devin=True,
+        include_delivery_mode=True,
+        include_title=True,
+    )
+
+    assert complete is True
+    assert {target.provider for target in targets} == {"devin", "codex"}
+    devin = next(target for target in targets if target.provider == "devin")
+    codex = next(target for target in targets if target.provider == "codex")
+    assert devin.delivery_mode == "devin_stop_or_prompt_bound"
+    assert devin.title == "Devin canary"
+    assert codex.delivery_mode == "codex_stop_bound"
+    assert codex.title == "Codex peer"
+    assert calls == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
+            "include_devin": True,
+        },
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
+            "include_title": True,
+            "include_devin": True,
+        },
+    ]
+
+
 def _remote_peer(*, provider: str = "codex", title: str | None = None) -> dict[str, object]:
     session = str(uuid4())
     peer: dict[str, object] = {
@@ -1306,6 +1449,149 @@ def test_remote_receive_requires_source_authorization_before_provider_effect(
     response = receive_remote(tmp_path, envelope, "100.64.0.11")
     assert response["status"] == "PRE_EFFECT_REJECTED"
     assert response["provider"] == "codex"
+
+
+def test_remote_receive_routes_registered_codex_original_to_its_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    original = Route.create(
+        provider="codex",
+        session_id="00000000-0000-4000-8000-000000000001",
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        generation="00000000-0000-4000-8000-000000000011",
+        owner_identity="a" * 64,
+        profile_root=str(profile),
+    )
+    from cross_agent_chat.native_helper import NativeHelperStore
+
+    store = NativeHelperStore(tmp_path)
+    binding, nonce = store.reserve(original, "a" * 64)
+    helper_root = tmp_path / binding.helper_directory
+    helper_root.mkdir()
+    helper = Route.create(
+        provider="codex",
+        session_id="00000000-0000-4000-8000-000000000002",
+        device="target",
+        cwd=str(helper_root),
+        pid=os.getpid(),
+        generation="00000000-0000-4000-8000-000000000012",
+        owner_identity="a" * 64,
+        profile_root=str(profile),
+    )
+    store.register(helper, nonce, original, "a" * 64)
+    Registry(tmp_path).upsert(original)
+    Registry(tmp_path).upsert(helper)
+    public_target = Target(
+        alias=original.alias,
+        provider="codex",
+        device=original.device,
+        project=original.project,
+        generation=original.generation,
+        session_key=session_key("codex", original.session_id),
+        remote=False,
+        session_id=original.session_id,
+        cwd=original.cwd,
+        pid=original.pid,
+    )
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=str(uuid4()),
+        target_alias=original.alias,
+        generation=original.generation,
+        message="hello",
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_tailnet",
+        lambda _address, payload, **_: (
+            {key: value for key, value in payload.items() if key != "operation"}
+            | {"status": "AUTHORIZED"}
+        ),
+    )
+
+    def accept(path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        assert path == runtime.socket_path(tmp_path, helper)
+        assert payload["generation"] == helper.generation
+        return {
+            "schema_version": 1,
+            "event_id": event_id,
+            "status": "TRANSPORT_ACCEPTED",
+            "to": helper.alias,
+            "provider": "codex",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", accept)
+
+    assert receive_remote(tmp_path, envelope, "100.64.0.11") == {
+        "schema_version": 1,
+        "event_id": event_id,
+        "status": "TRANSPORT_ACCEPTED",
+        "to": original.alias,
+        "provider": "codex",
+    }
+
+
+def test_remote_claude_receipt_uses_fresh_discovery_alias_after_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        generation=str(uuid4()),
+    )
+    Registry(tmp_path).upsert(target)
+    fresh_alias = target.alias + " Fresh"
+    public_target = Target(
+        alias=fresh_alias,
+        provider="claude",
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=session_key("claude", target.session_id),
+        remote=False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=str(uuid4()),
+        target_alias=fresh_alias,
+        generation=target.generation,
+        message="fresh independent work",
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_tailnet",
+        lambda _address, payload, **_: (
+            {key: value for key, value in payload.items() if key != "operation"}
+            | {"status": "AUTHORIZED"}
+        ),
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda _path, payload, **_: {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": fresh_alias,
+            "provider": "claude",
+        },
+    )
+
+    assert receive_remote(tmp_path, envelope, "100.64.0.11")["status"] == "TRANSPORT_ACCEPTED"
 
 
 def test_tailnet_client_keeps_write_side_open_for_serve_proxy() -> None:

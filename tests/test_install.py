@@ -16,6 +16,7 @@ import tomllib
 from collections.abc import MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -36,6 +37,9 @@ from cross_agent_chat.install import (
     PathSnapshot,
     SettingsError,
     SetupRollbackError,
+    _hook_command,
+    _hook_trust_hash,
+    _native_helper_create_hook_group,
     _owned_hook,
     _owned_hook_native_queue,
     _package_tree_digest,
@@ -45,6 +49,33 @@ from cross_agent_chat.install import (
     discover_executable,
     installed_device,
 )
+
+
+def test_codex_session_start_keeps_provider_hook_output() -> None:
+    command = _hook_command(Path("/opt/cross-agent-chat"), "codex", "studio", "SessionStart")
+
+    assert command.endswith('--pid "$PPID"')
+    assert ">/dev/null" not in command
+
+
+def test_claude_session_start_discards_registration_output() -> None:
+    command = _hook_command(Path("/opt/cross-agent-chat"), "claude", "studio", "SessionStart")
+
+    assert command.endswith('--pid "$PPID" >/dev/null')
+
+
+def test_native_helper_create_hook_reads_private_mcp_metadata() -> None:
+    hook = _native_helper_create_hook_group()
+    hooks = cast(list[object], hook["hooks"])
+    input_value = cast(dict[str, object], cast(dict[str, object], hooks[0])["input"])
+
+    assert input_value == {
+        "prompt": "${tool_response._meta.create_thread.prompt}",
+        "target": "${tool_response._meta.create_thread.target}",
+        "model": "${tool_response._meta.create_thread.model}",
+        "thinking": "${tool_response._meta.create_thread.thinking}",
+        "title": "${tool_response._meta.create_thread.title}",
+    }
 
 
 def _seed_durable_intents(installer: Installer) -> bytes:
@@ -128,7 +159,7 @@ def test_published_install_references_match_package_version() -> None:
         in (root / "install.sh").read_text()
     )
     readme = (root / "README.md").read_text()
-    assert f"Install v{version} with:" in readme
+    assert f"Install v{version} beta with:" in readme
     install_url = (
         f"https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v{version}/install.sh"
     )
@@ -192,6 +223,107 @@ def test_cli_maps_active_provider_profile_roots(
     assert installer.claude_config == claude_profile / ".claude.json"
     assert installer.codex_config == codex_profile / "config.toml"
     assert installer.codex_hooks == codex_profile / "hooks.json"
+
+
+def test_devin_upgrade_reuses_existing_claude_codex_install_identity(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    legacy = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    legacy.setup(verify=lambda: True)
+    integrated = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        devin_global=True,
+    )
+
+    assert integrated.install_state == legacy.install_state
+    assert integrated.install_state == home / ".config/cross-agent-chat/install.json"
+    integrated.setup(verify=lambda: True)
+
+    records = sorted((home / ".config/cross-agent-chat").glob("install*.json"))
+    assert records == [integrated.install_state]
+    metadata = json.loads(integrated.install_state.read_text())
+    assert {"devin_mcp", "devin_hooks"} <= set(metadata["provider_paths"])
+
+
+def test_devin_upgrade_reuses_existing_alternate_profile_identity(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    claude_root = tmp_path / "claude"
+    codex_root = tmp_path / "codex"
+    legacy = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        claude_config_dir=claude_root,
+        codex_home=codex_root,
+    )
+    integrated = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        claude_config_dir=claude_root,
+        codex_home=codex_root,
+        devin_global=True,
+    )
+
+    assert integrated.install_state == legacy.install_state
+    assert integrated.install_state.name.startswith("install-")
+
+
+def test_devin_global_hooks_and_user_mcp_are_owned_and_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        devin_global=True,
+    )
+    assert installer.devin_hooks is not None
+    installer.devin_hooks.parent.mkdir(parents=True)
+    installer.devin_hooks.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"matcher": "", "hooks": [{"type": "command", "command": "keep-me"}]}
+                    ],
+                    "SessionEnd": [],
+                    "Stop": [],
+                    "UserPromptSubmit": [],
+                    "PreToolUse": [],
+                }
+            }
+        )
+    )
+    installer.devin_mcp.parent.mkdir(parents=True, exist_ok=True)
+    installer.devin_mcp.write_text(json.dumps({"mcpServers": {"keep": {"command": "keep-me"}}}))
+
+    installer.setup(verify=lambda: True)
+
+    hooks = json.loads(installer.devin_hooks.read_text())
+    assert any(item["hooks"][0]["command"] == "keep-me" for item in hooks["hooks"]["SessionStart"])
+    assert len([item for item in hooks["hooks"]["SessionStart"] if _owned_hook(item)]) == 1
+    mcp = json.loads(installer.devin_mcp.read_text())
+    assert set(mcp["mcpServers"]) == {"keep", "cross-agent-chat"}
+
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+    installer.uninstall()
+
+    assert (
+        json.loads(installer.devin_hooks.read_text())["hooks"]["SessionStart"][0]["hooks"][0][
+            "command"
+        ]
+        == "keep-me"
+    )
+    hooks_after = json.loads(installer.devin_hooks.read_text())["hooks"]
+    assert all(
+        event not in hooks_after
+        for event in ("SessionEnd", "Stop", "UserPromptSubmit", "PreToolUse")
+    )
+    assert set(json.loads(installer.devin_mcp.read_text())["mcpServers"]) == {"keep"}
 
 
 def test_bare_doctor_uses_the_unique_installed_device_identity(
@@ -350,9 +482,9 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "codex_native_queue": "experimental",
         "integration": "healthy",
         "local_broker": "healthy",
-        "next": "start fresh Claude/Codex sessions",
+        "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
-        "version": "0.2.1",
+        "version": "0.3.0",
     }
 
 
@@ -974,21 +1106,16 @@ def test_uninstall_keeps_shared_runtime_when_another_profile_is_configured(
     assert (default.state / "intents.json").read_bytes() == original
 
 
-def test_setup_trusts_each_owned_codex_hook(tmp_path: Path) -> None:
+def test_setup_never_mints_codex_hook_trust(tmp_path: Path) -> None:
     home = tmp_path / "home"
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
 
     installer.setup()
 
     config = tomllib.loads((home / ".codex" / "config.toml").read_text())
-    trusted = config["hooks"]["state"]
     assert config["mcp_servers"]["cross-agent-chat"]["tool_timeout_sec"] == 270
     assert config["mcp_servers"]["cross-agent-chat"]["default_tools_approval_mode"] == "approve"
-    assert len(trusted) == 3
-    assert all(
-        isinstance(item, dict) and str(item.get("trusted_hash", "")).startswith("sha256:")
-        for item in trusted.values()
-    )
+    assert "hooks" not in config or "state" not in config["hooks"]
 
 
 @pytest.mark.parametrize(
@@ -1662,36 +1789,30 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     )
     installer.setup()
     config = home / ".codex" / "config.toml"
-    parsed = tomllib.loads(config.read_text())
-    trusted = parsed["hooks"]["state"]
-    assert isinstance(trusted, dict)
-    owned: dict[str, str] = {}
-    for key, value in trusted.items():
-        if not str(key).startswith(f"{installer.codex_hooks}:"):
-            continue
-        assert isinstance(value, dict)
-        trusted_hash = value.get("trusted_hash")
-        assert isinstance(trusted_hash, str)
-        owned[str(key)] = trusted_hash
-    assert len(owned) == 3
-
-    stale = "".join(
-        f"[hooks.state.{json.dumps(key)}] # stale owned trust\n"
-        f"# formatting must not block repair\n"
-        f"trusted_hash = {json.dumps(trusted_hash)}\n\n"
-        for key, trusted_hash in owned.items()
+    hooks = json.loads(installer.codex_hooks.read_text())["hooks"]
+    session_end_index = next(
+        index for index, item in enumerate(hooks["SessionEnd"]) if _owned_hook(item)
+    )
+    session_start_index = next(
+        index for index, item in enumerate(hooks["SessionStart"]) if _owned_hook(item)
+    )
+    matching_key = f"{installer.codex_hooks}:session_end:{session_end_index}:0"
+    stale_key = f"{installer.codex_hooks}:session_start:{session_start_index}:0"
+    matching_hash = _hook_trust_hash(
+        _hook_command(Path("/opt/cross-agent-chat"), "codex", "studio", "SessionEnd"),
+        "SessionEnd",
+        3,
     )
     unrelated_key = f"{installer.codex_hooks}:stop:0:0"
     unrelated_hash = "sha256:" + "0" * 64
-    unrelated = (
+    config.write_text(
+        config.read_text()
+        + f"\n[hooks.state.{json.dumps(matching_key)}]\n"
+        + f"trusted_hash = {json.dumps(matching_hash)}\n"
+        + f"\n[hooks.state.{json.dumps(stale_key)}]\n"
+        + f"trusted_hash = {json.dumps('sha256:' + '1' * 64)}\n"
         f"[hooks.state.{json.dumps(unrelated_key)}]\n"
         f"trusted_hash = {json.dumps(unrelated_hash)}\n\n"
-    )
-    config.write_text(
-        config.read_text().replace(
-            "# cross-agent-chat:start",
-            stale + unrelated + "# cross-agent-chat:start",
-        )
     )
 
     installer.setup()
@@ -1699,10 +1820,8 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     repaired = tomllib.loads(config.read_text())
     repaired_trust = repaired["hooks"]["state"]
     assert isinstance(repaired_trust, dict)
-    repaired_owned = [
-        key for key in repaired_trust if str(key).startswith(f"{installer.codex_hooks}:")
-    ]
-    assert set(repaired_owned) == {*owned, unrelated_key}
+    assert repaired_trust[matching_key] == {"trusted_hash": matching_hash}
+    assert stale_key not in repaired_trust
     assert repaired_trust[unrelated_key] == {"trusted_hash": unrelated_hash}
 
     monkeypatch.setattr(installer, "_stop_broker", lambda: None)
@@ -1711,7 +1830,7 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     uninstalled = tomllib.loads(config.read_text())
     uninstalled_trust = uninstalled["hooks"]["state"]
     assert isinstance(uninstalled_trust, dict)
-    assert not set(owned).intersection(uninstalled_trust)
+    assert matching_key not in uninstalled_trust
     assert uninstalled_trust[unrelated_key] == {"trusted_hash": unrelated_hash}
 
 
@@ -3203,7 +3322,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.2.1')\n"
+        "    print('cross-agent-chat 0.3.0')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -3229,7 +3348,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.2.1"
+    assert completed.stdout.strip() == "cross-agent-chat 0.3.0"
     assert stage.exists()
 
 
@@ -4671,7 +4790,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.2.1",
+            "version": "0.3.0",
             "module_path": str(module),
         },
     )
@@ -4849,7 +4968,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.2.1",
+            "version": "0.3.0",
             "module_path": str(module),
         }
 
