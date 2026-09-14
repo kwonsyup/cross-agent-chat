@@ -35,6 +35,7 @@ from cross_agent_chat.tailnet import (
 MAX_BROKER_CONNECTIONS = 16
 MAX_BROKER_CONNECTIONS_PER_PEER = 2
 TAILNET_BIND_RETRY_SECONDS = 5.0
+TAILNET_REFRESH_POLL_SECONDS = 0.1
 
 
 @dataclass(slots=True)
@@ -362,7 +363,9 @@ def broker_server(state_root_value: str | None) -> None:
                     refresh = refresh_workers.submit(broker_bindings)
                     next_refresh_at = None
                 timeout = TAILNET_BIND_RETRY_SECONDS
-                if next_refresh_at is not None:
+                if refresh is not None:
+                    timeout = min(timeout, TAILNET_REFRESH_POLL_SECONDS)
+                elif next_refresh_at is not None:
                     timeout = max(0.0, next_refresh_at - time.monotonic())
                 selectable_servers = [local_server] if refresh is not None else servers
                 readable, _, _ = select.select(selectable_servers, [], [], timeout)

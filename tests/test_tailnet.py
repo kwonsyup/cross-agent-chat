@@ -7,7 +7,7 @@ import select
 import socket
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -934,7 +934,67 @@ def test_broker_keeps_local_listener_and_discovers_tailnet_after_start(
         (("127.0.0.1", 47072), False),
         (("100.64.0.13", 47071), True),
     ]
-    assert select_timeouts == [5.0, 5.0, 5.0, 5.0]
+    assert select_timeouts[-2:] == [0.1, 5.0]
+    local_listener.close.assert_called_once_with()
+    tailnet_listener.close.assert_called_once_with()
+
+
+def test_broker_admits_completed_refresh_on_the_next_pending_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local_listener = mock.Mock()
+    tailnet_listener = mock.Mock()
+    select_timeouts: list[float | None] = []
+    refresh: Future[list[tuple[str, int]]] = Future()
+
+    class ControlledExecutor:
+        def __init__(self, *, max_workers: int, **_kwargs: object) -> None:
+            self.max_workers = max_workers
+
+        def __enter__(self) -> ControlledExecutor:
+            return self
+
+        def __exit__(
+            self,
+            _type: type[BaseException] | None,
+            _value: BaseException | None,
+            _traceback: object,
+        ) -> None:
+            return None
+
+        def submit(self, _function: object) -> Future[list[tuple[str, int]]]:
+            assert self.max_workers == 1
+            return refresh
+
+    def bind(binding: tuple[str, int], *, allow_unavailable: bool = False) -> object:
+        if allow_unavailable:
+            assert binding == ("100.64.0.13", 47071)
+            return tailnet_listener
+        assert binding == ("127.0.0.1", 47072)
+        return local_listener
+
+    def select_after_refresh(
+        readers: list[object], _writers: object, _errors: object, timeout: float | None
+    ) -> tuple[list[object], list[object], list[object]]:
+        select_timeouts.append(timeout)
+        if len(select_timeouts) == 1:
+            assert readers == [local_listener]
+            assert timeout == tailnet_broker_module.TAILNET_REFRESH_POLL_SECONDS
+            refresh.set_result([("127.0.0.1", 47072), ("100.64.0.13", 47071)])
+            return [], [], []
+        assert readers == [local_listener, tailnet_listener]
+        assert timeout is not None
+        assert 0.0 < timeout <= tailnet_broker_module.TAILNET_BIND_RETRY_SECONDS
+        raise RuntimeError("stop fixture")
+
+    monkeypatch.setattr(tailnet_broker_module, "bind_broker_listener", bind)
+    monkeypatch.setattr(tailnet_broker_module, "ThreadPoolExecutor", ControlledExecutor)
+    monkeypatch.setattr(select, "select", select_after_refresh)
+
+    with pytest.raises(RuntimeError, match="stop fixture"):
+        broker_server(str(tmp_path))
+
+    assert select_timeouts[0] == tailnet_broker_module.TAILNET_REFRESH_POLL_SECONDS
     local_listener.close.assert_called_once_with()
     tailnet_listener.close.assert_called_once_with()
 
