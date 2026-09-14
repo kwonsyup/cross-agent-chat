@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0 - 2026-09-13
+
+- Add local Devin CLI and App integration through global MCP and lifecycle hooks. A Devin
+  conversation is discoverable after its first user prompt, preserving inactive conversation privacy.
+- Add trusted Codex Native helper provisioning and Desktop-native message delivery for a bound
+  original task. Helper creation and message arguments stay private to the hook metadata path.
+- Keep unknown delivery quarantine scoped to its event, preserve fresh independent work, and reject
+  reused event IDs. Prevent native queue and Stop-bound duplicate delivery paths.
+- Preserve default and alternate Claude/Codex install identity while upgrading the same record with
+  local Devin ownership. New hooks require normal provider trust; setup never writes trust hashes.
+- This beta does not claim busy Codex CLI native ingress, idle Devin delivery, isolated Fusion
+  helpers, full five-surface readiness, or final fleet acceptance.
+
 ## 0.2.1 - 2026-09-12
 
 - Treat the Claude SendMessage `summary` field as the optional, bounded one-line display preview

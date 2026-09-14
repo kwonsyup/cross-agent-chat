@@ -1,18 +1,19 @@
 # Cross Agent Chat
 
-Chat between authenticated Claude Code and Codex sessions on your Mac or permitted Tailnet.
+Local-first chat between authenticated Claude Code, Codex, and local Devin sessions on your Mac
+or permitted Tailnet.
 
-Before installing, each Mac needs a supported macOS Claude Code or Codex installation with its
+Before installing, each Mac needs a supported macOS Claude Code, Codex, or local Devin installation with its
 own working authenticated provider session. Install Cross Agent Chat separately on every Mac and
 selected provider-profile root that will use it (`CLAUDE_CONFIG_DIR` and `CODEX_HOME` select
 non-default roots). Local sessions do not need Tailscale; remote sessions need Tailnet reachability
 allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
 files, or turn a remote peer into an owner.
 
-Install v0.2.1 with:
+Install v0.3.0 beta with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.2.1/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.0/install.sh | sh
 ```
 
 Installation requires Git because the installer builds from the release tag.
@@ -20,15 +21,16 @@ Installation requires Git because the installer builds from the release tag.
 The installer supplies a Python runtime when the Mac lacks a compatible one. Its default stable
 command is `~/.local/bin/cross-agent-chat`; it stages releases under
 `~/.local/share/cross-agent-chat-runtime`, then writes the selected Claude `settings.json` and
-`.claude.json`, selected Codex `config.toml` and `hooks.json`, per-profile install metadata, and
-the owner-local LaunchAgent broker. Setup can replace the shared broker, so inspect active
+`.claude.json`, selected Codex `config.toml` and `hooks.json`, local Devin global MCP and hook
+settings, per-profile install metadata, and the owner-local LaunchAgent broker. Setup can replace the shared broker, so inspect active
 consumers and selected roots before an install, upgrade, or uninstall. Upgrades preserve existing
 couriers and their route generations. Existing sessions keep their loaded integration; fresh
-Claude or Codex sessions use the updated tools and hooks.
+Claude and Codex sessions use the updated tools and hooks. A local Devin conversation joins the
+peer roster when its first user prompt is submitted.
 
 Start a fresh session, then ask naturally:
 
-> List my live Cross Agent Chat peers and send hello to the Claude session on my other Mac.
+> List my live Cross Agent Chat peers and send hello to the session on my other Mac.
 
 Codex uses Stop-bound delivery by default: accepted input waits for its next natural turn and is
 not an idle-wake guarantee. The experimental queue remains an explicit profile-local opt-in.
@@ -48,48 +50,31 @@ visible by default.
 
 To have an existing coding agent assist with installation, give it this prompt:
 
-> Install the released `v0.2.1` tag, not an arbitrary PR. Identify active consumers and the
-> selected Claude/Codex roots, obtain approval before shared effects, preserve existing intent
+> Install the released `v0.3.0` tag, not an arbitrary PR. Identify active consumers and the
+> selected Claude/Codex roots and local Devin configuration, obtain approval before shared effects, preserve existing intent
 > records, run `cross-agent-chat doctor --json`, and test only fresh actors.
 
 ## Supported surfaces
 
-This maintained table includes dated observations collected after publication. A tagged README
-is a snapshot of the evidence available when that tag was created. The
-[v0.1.6 release notes](https://github.com/kwonsyup/cross-agent-chat/releases/tag/v0.1.6)
-record the subsequent Stop-bound exchange below; the published tag and assets are unchanged.
+v0.3.0 is a macOS beta candidate. Claude Code uses its native cross-session mechanism. Codex
+Native uses the built-in Desktop message operation through a trusted, automatically managed helper;
+its body and task-creation arguments remain private to the trusted hook path. Local Devin uses its
+global MCP and lifecycle hooks; a conversation becomes discoverable only after its first user prompt,
+then receives work at a prompt or Stop boundary through its exact provider identity.
 
-| Surface or mode | Support |
+| Surface | Current behavior |
 |---|---|
-| Claude Code 2.1.263 (historical observation, 2026-09-06; source `317b18e`; not v0.1.5 candidate proof) | iMac interactive startup and same-cwd native-messaging request/reply tested with the configured cross-session inbound `accept` policy |
-| Claude Code 2.1.261 (historical observation) | Interactive and native background sessions; native SendMessage delivery |
-| Claude Code 2.1.268 (observed 2026-09-10, macOS Terminal.app/iTerm2) | Fresh original-session reciprocal request/result with exact `to`/`message` calls; no echo |
-| Claude Code 2.1.270 (observed 2026-09-12, macOS Terminal.app, public v0.2.1) | Fresh original-session reciprocal request/result consumed on both hosts; provider-varied display preview accepted, exact body/type/recipient checks unchanged |
-| Codex CLI 0.154.0, Stop-bound (observed 2026-09-10, public v0.1.6) | Fresh cross-device request accepted during a busy turn, consumed at the natural Stop boundary, and answered once to the original Claude Code 2.1.268 requester, which received and verified the result |
-| Codex CLI 0.153.4 (observed 2026-09-09, isolated authenticated root, Stop-bound) | Bounded original-session cross-device request/result; account relationship was not established |
-| Codex CLI 0.152.1 / 0.153.2 (historical observation), default Stop | Next-turn delivery; accepted work remains pending while genuinely idle |
-| Codex Native, embedded 0.153.1 (historical observation), default Stop | Next-turn delivery; accepted work remains pending while genuinely idle |
-| Explicit experimental Codex native queue | Version-bound idle queue path observed on Native 0.153.1 and CLI 0.152.1/0.153.2; not selected by default |
-| Same Mac | Yes |
-| Tailnet Mac | Yes, subject to your Tailscale ACL |
-| ChatGPT web or Claude web | No |
-| Windows | No claim |
-| Linux | No live-support claim |
+| Claude Code | Native cross-session delivery through the selected Claude configuration. |
+| Codex Native App | Trusted hooks can provision a native helper and use Desktop-native task messaging for a bound original conversation. |
+| Codex CLI | Natural Stop delivery remains supported where the CLI route is registered and current. |
+| Local Devin CLI or App | Global MCP and prompt/Stop hooks support prompt-active conversation discovery and delivery. |
+| Same Mac or permitted Tailnet Mac | Discovery and delivery use the local broker or your Tailscale ACL. |
 
-v0.2.1 is a macOS beta. It treats the Claude SendMessage `summary` field as the optional,
-bounded one-line display preview the provider schema documents, while keeping exact native type,
-both recipient selectors, the canonical message body binding, the one-effect gate, and the
-successful receipt contract. Distinct `sendmessage_type_mismatch` and
-`sendmessage_summary_mismatch` diagnostics are reported; older peers using the combined
-`sendmessage_control_mismatch` phase remain understood. It does not add Desktop built-in
-`send_message_to_thread` routing. The table records the configurations actually observed; rows
-marked historical were tested with earlier candidates. Support remains limited to the listed provider
-versions and delivery modes. The later 0.154.0 Stop-bound result
-does not extend the historical Native or experimental-queue observations to every configured
-session. A separate v0.1.6
-experimental-queue request was consumed, but its return remained `UNKNOWN_DELIVERY`; that
-roundtrip is not accepted, its cause is unresolved, and the event was not replayed. Healthy
-installation checks are not all-mode workflow or unattended-production proof.
+Codex CLI busy original-native ingress is not proven, and an active CLI writer may reject native
+ingress. Devin idle delivery and a safely isolated Fusion helper remain parked provider boundaries.
+Unprompted Devin conversations are intentionally not published. This beta is not full five-surface
+technical readiness or final fleet acceptance. ChatGPT web, Claude web, Windows, and Linux have no
+live-support claim.
 
 ## Trust and delivery
 
@@ -136,7 +121,7 @@ restart the shared broker while preserving existing couriers, pending input, and
 Older runtimes are retained while route registrations remain, so repeated upgrades do not remove
 a live courier's executable. Fresh sessions load the updated integration. Uninstall stops
 couriers; let pending Stop-bound deliveries consume before uninstalling. A temporary profile
-does not isolate the shared service. Neither operation restarts Claude or Codex coding processes.
+does not isolate the shared service. Neither operation restarts Claude, Codex, or Devin coding processes.
 If a failed setup or upgrade finds newer provider settings during rollback, it retains those
 settings and recovery custody for diagnosis before retrying.
 `uninstall`
@@ -163,15 +148,17 @@ Chat does not set it globally or store/retry message bodies.
 doctor, backups, and uninstall stay on that exact root. Existing same-root account switches need
 fresh provider sessions; Cross Agent Chat does not copy credentials or retarget live sessions.
 Use `setup --disable-experimental-codex-native-queue` to return that profile's fresh Codex
-sessions to next-turn delivery.
+sessions to next-turn delivery. Local Devin integration is global at `~/.config/devin`; it preserves
+unrelated MCP and hook entries and becomes active for a conversation after its first user prompt.
 
 ## Architecture
 
 The path is `install → hooks → registration/bootstrap → discovery → exact destination validation
 → provider delivery → separate reply → cleanup/recovery`. Setup merges owned Claude SessionStart/
-SessionEnd and Codex SessionStart/SessionEnd/Stop hooks into the selected provider roots and starts
-one owner-local LaunchAgent broker. A fresh hook registers its provider, process and profile context;
-bootstrap health and later native-provider health are checked separately.
+SessionEnd and Codex SessionStart/SessionEnd/Stop hooks into the selected provider roots, adds the
+local Devin lifecycle and MCP integration, and starts one owner-local LaunchAgent broker. A fresh
+Claude or Codex hook registers its provider, process and profile context; a Devin route waits for
+its first user prompt. Bootstrap health and later native-provider health are checked separately.
 
 The broker discovers live routes. `chat_send` resolves one exact, current destination from an exact
 or unique fuzzy query; ambiguous names and incomplete discovery are rejected before an effect. It
