@@ -150,11 +150,52 @@ def test_native_account_binary_is_the_exact_chatgpt_bundle(
         lambda *_args: (ACCOUNT_DIGEST, Path("/usr/local/bin/codex")),
     )
     monkeypatch.setattr(runtime, "native_desktop_process", lambda _pid: True)
+    expected = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+    fake_bundle = tmp_path / "bundle" / "codex"
+    fake_bundle.parent.mkdir()
+    fake_bundle.write_text("candidate")
+    resolved_bundle = fake_bundle.resolve(strict=True)
 
-    assert (
-        runtime._native_account_binary(route)
-        == Path("/Applications/ChatGPT.app/Contents/Resources/codex").resolve()
+    def resolve(path: Path, *, strict: bool = False) -> Path:
+        assert path == expected
+        assert strict is True
+        return resolved_bundle
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    assert runtime._native_account_binary(route) == resolved_bundle
+
+
+def test_native_account_binary_rejects_missing_exact_chatgpt_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=1,
+        owner_identity=ACCOUNT_DIGEST,
+        profile_root=str(tmp_path / "profile"),
     )
+    Path(route.profile_root or "").mkdir()
+    monkeypatch.setattr(
+        runtime,
+        "recipient_owner_identity",
+        lambda *_args: (ACCOUNT_DIGEST, Path("/usr/local/bin/codex")),
+    )
+    monkeypatch.setattr(runtime, "native_desktop_process", lambda _pid: True)
+    expected = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+
+    def resolve(path: Path, *, strict: bool = False) -> Path:
+        assert path == expected
+        assert strict is True
+        raise FileNotFoundError("missing bundled client")
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    with pytest.raises(ChatError, match="account identity is unavailable"):
+        runtime._native_account_binary(route)
 
 
 def startup_route(root: Path, *, session_id: str | None = None) -> Route:
