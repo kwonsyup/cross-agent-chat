@@ -225,6 +225,51 @@ def test_cli_maps_active_provider_profile_roots(
     assert installer.codex_hooks == codex_profile / "hooks.json"
 
 
+def test_devin_upgrade_reuses_existing_claude_codex_install_identity(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    legacy = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    legacy.setup(verify=lambda: True)
+    integrated = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        devin_global=True,
+    )
+
+    assert integrated.install_state == legacy.install_state
+    assert integrated.install_state == home / ".config/cross-agent-chat/install.json"
+    integrated.setup(verify=lambda: True)
+
+    records = sorted((home / ".config/cross-agent-chat").glob("install*.json"))
+    assert records == [integrated.install_state]
+    metadata = json.loads(integrated.install_state.read_text())
+    assert {"devin_mcp", "devin_hooks"} <= set(metadata["provider_paths"])
+
+
+def test_devin_upgrade_reuses_existing_alternate_profile_identity(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    claude_root = tmp_path / "claude"
+    codex_root = tmp_path / "codex"
+    legacy = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        claude_config_dir=claude_root,
+        codex_home=codex_root,
+    )
+    integrated = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        claude_config_dir=claude_root,
+        codex_home=codex_root,
+        devin_global=True,
+    )
+
+    assert integrated.install_state == legacy.install_state
+    assert integrated.install_state.name.startswith("install-")
+
+
 def test_devin_global_hooks_and_user_mcp_are_owned_and_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

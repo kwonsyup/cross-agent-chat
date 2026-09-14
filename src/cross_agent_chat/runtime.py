@@ -740,8 +740,15 @@ def unregister_devin(pid: int, state_root_value: str | None) -> None:
     event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="SessionEnd")
     root = state_root(state_root_value)
     DevinCapabilityStore(root).revoke_session(event.session_id)
+    session_routes = [
+        item
+        for item in Registry(root).routes()
+        if item.provider == "devin" and item.session_id == event.session_id
+    ]
     route = _devin_route(root, event.session_id, pid)
     if route is None:
+        if not session_routes:
+            return
         raise ChatError("exact Devin session route is unavailable")
     Registry(root).remove(route.provider, route.session_id, route.pid, generation=route.generation)
     with suppress(ChatError):

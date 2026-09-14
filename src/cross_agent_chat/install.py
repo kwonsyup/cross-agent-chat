@@ -1070,11 +1070,7 @@ class Installer:
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
-        default_profile = (
-            self.claude_config_dir is None
-            and self.codex_home == self.home / ".codex"
-            and not self.devin_global
-        )
+        default_profile = self.claude_config_dir is None and self.codex_home == self.home / ".codex"
         install_name = (
             "install.json"
             if default_profile

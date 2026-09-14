@@ -12,7 +12,7 @@ from uuid import uuid4
 import pytest
 
 from cross_agent_chat import runtime
-from cross_agent_chat.core import MAX_MESSAGE_BYTES, ChatError, valid_session_id
+from cross_agent_chat.core import MAX_MESSAGE_BYTES, ChatError, Registry, Route, valid_session_id
 from cross_agent_chat.devin import (
     DEVIN_CAPABILITY_FIELD,
     DEVIN_CAPABILITY_TTL_SECONDS,
@@ -43,6 +43,29 @@ def _hook(event: str, *, session_id: str | None = None, prompt_id: str | None = 
     if event == "Stop":
         payload["stop_hook_active"] = False
     return json.dumps(payload)
+
+
+def test_duplicate_absent_devin_session_end_is_a_noop_but_pid_mismatch_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    session_id = str(uuid4())
+    monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_hook("SessionEnd", session_id=session_id)))
+
+    runtime.unregister_devin(123, str(state))
+
+    route = Route.create(
+        provider="devin",
+        session_id=session_id,
+        device="studio",
+        cwd=str(tmp_path),
+        pid=456,
+    )
+    Registry(state).upsert(route)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_hook("SessionEnd", session_id=session_id)))
+    with pytest.raises(ChatError, match="exact Devin session route is unavailable"):
+        runtime.unregister_devin(123, str(state))
 
 
 def test_parse_native_stop_payload_without_invented_cwd() -> None:
