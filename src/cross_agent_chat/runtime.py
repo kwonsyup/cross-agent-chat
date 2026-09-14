@@ -727,7 +727,12 @@ def _register_devin_prompt(device: str, pid: int, root: Path, event: DevinHookEv
                         },
                         timeout=0.5,
                     )
-                except ChatError:
+                except ChatError as error:
+                    cause = error.__cause__
+                    missing = not socket_path(root, registered).exists()
+                    refused = isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
+                    if not missing and not refused:
+                        return registered
                     registry.upsert(route)
                 else:
                     if _bootstrap_response(bootstrap, registered):
