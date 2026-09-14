@@ -442,6 +442,28 @@ def test_first_devin_prompt_registers_once_and_reuses_generation(
         runtime.devin_user_prompt(123, str(state), "studio")
 
 
+def test_first_devin_prompt_accepts_root_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
+    monkeypatch.setattr(runtime, "devin_hook_cwd", lambda: "/")
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_args: ("a" * 64, Path("/devin"))
+    )
+    monkeypatch.setattr(runtime, "recipient_profile_root", lambda *_args: str(tmp_path / "profile"))
+    monkeypatch.setattr(runtime, "_spawn_courier", lambda *_args: None)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_devin_messages", lambda *_args: [])
+    monkeypatch.setattr("sys.stdin", io.StringIO(_hook("UserPromptSubmit")))
+
+    runtime.devin_user_prompt(123, str(state), "studio")
+
+    route = Registry(state).routes()[0]
+    assert route.cwd == "/"
+    assert route.project == "/"
+
+
 def test_repeated_devin_prompt_keeps_busy_registered_courier_on_bootstrap_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

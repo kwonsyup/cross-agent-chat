@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2 - 2026-09-13
+
+- Accept `/` as a canonical workspace display label while retaining the exact working-directory,
+  provider-process, and owner checks that route a local Devin conversation.
+- Treat a local Devin prompt-hook validation error as nonblocking provider-hook feedback. The hook
+  emits no route, capability, acknowledgement, or delivery effect on that error.
+
 ## 0.3.1 - 2026-09-13
 
 - Keep a cached local Devin `UserPromptSubmit` hook compatible after an upgrade: an existing
