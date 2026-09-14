@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 - 2026-09-13
+
+- Keep a cached local Devin `UserPromptSubmit` hook compatible after an upgrade: an existing
+  registered route still handles a hook command without `--device`; current hooks pass the selected
+  device so a first prompt can register a new conversation.
+
 ## 0.3.0 - 2026-09-13
 
 - Add local Devin CLI and App integration through global MCP and lifecycle hooks. A Devin

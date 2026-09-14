@@ -445,7 +445,7 @@ def parser() -> argparse.ArgumentParser:
     devin_stop_parser.add_argument("--pid", type=int, required=True)
     devin_stop_parser.add_argument("--state-root")
     devin_prompt_parser = commands.add_parser("_devin-prompt")
-    devin_prompt_parser.add_argument("--device", required=True)
+    devin_prompt_parser.add_argument("--device")
     devin_prompt_parser.add_argument("--pid", type=int, required=True)
     devin_prompt_parser.add_argument("--state-root")
     devin_pretool_parser = commands.add_parser("_devin-pretool")
