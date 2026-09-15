@@ -50,7 +50,9 @@ from cross_agent_chat.tailnet_broker import broker_server
 
 MCP_INSTRUCTIONS: Final = (
     "Use Cross Agent Chat only for requested communication. Select a fresh opaque handle from "
-    "chat_peers before chat_send. Classify the current incoming CAC message: an answer or result "
+    "chat_peers before chat_send. When requesting work whose result must return, explicitly ask "
+    "the peer to send its answer back through CAC; that requested response is not a replay or "
+    "unsolicited follow-up. Classify the current incoming CAC message: an answer or result "
     "to your outgoing request is for your local user, so summarize it and do not acknowledge, "
     "echo, or send another message unless it explicitly asks; a new work request that explicitly "
     "asks for a response requires one separate chat_send after refreshing chat_peers and matching "
