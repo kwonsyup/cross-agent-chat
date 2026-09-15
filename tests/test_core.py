@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -1839,9 +1840,30 @@ def test_prebootstrap_accept_is_rejected_before_native_delivery(
     worker.start()
     path = socket_path(root, item)
     deadline = time.monotonic() + 2.0
-    while not path.exists() and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            time.sleep(0.01)
+            continue
+        if (
+            stat.S_ISSOCK(metadata.st_mode)
+            and metadata.st_uid == os.getuid()
+            and stat.S_IMODE(metadata.st_mode) == 0o600
+        ):
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.1)
+            try:
+                probe.connect(str(path))
+            except OSError:
+                pass
+            else:
+                break
+            finally:
+                probe.close()
         time.sleep(0.01)
-    assert path.exists()
+    else:
+        pytest.fail("courier socket did not become safely ready")
     event_id = str(uuid4())
     try:
         assert request_socket(
