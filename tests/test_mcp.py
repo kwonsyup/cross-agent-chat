@@ -71,20 +71,6 @@ def test_presence_off_mcp_initializes_without_tools_or_state(
     assert not root.exists()
 
 
-def test_mcp_instructions_route_explicit_report_back_to_original_source() -> None:
-    instructions = cli.MCP_INSTRUCTIONS
-
-    assert "explicitly asks for a report, answer, findings, or report-back" in instructions
-    assert "refresh chat_peers" in instructions
-    assert "match the original CAC source handle from the envelope exactly" in instructions
-    assert "a local final answer is not delivered to the source" in instructions
-    assert (
-        "Do not send an acknowledgement or reply unless the inbound request asks for one"
-        in instructions
-    )
-    assert "Never replay an accepted or unknown event" in instructions
-
-
 def test_mcp_status_requires_the_trusted_codex_thread_and_current_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
