@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.5 - 2026-09-15
+
+- Emit Native bootstrap context only for a current route whose registered owner, exact bundled
+  executable, and app-owned ancestor all identify Codex Native. Standalone CLI startup no longer
+  receives Native-only bootstrap instructions.
+- Parse the Claude agent roster only for the requested exact target before applying strict
+  validation, so an unrelated malformed or uppercase row cannot reject that target. The selected
+  UUID remains canonical, and selected case collisions or duplicate valid rows still fail closed.
+- Treat a current incoming answer or result as material for the local user, without an
+  acknowledgement, echo, or new send unless that message explicitly asks for one. New incoming
+  work requests continue to require one separately addressed response.
+- This does not establish standalone CLI busy acceptance or mid-command model consumption; those
+  paths require a fresh post-upgrade trial. It also does not establish a completed remote response;
+  the roster issue was observed as a pre-effect sender rejection.
+
 ## 0.3.4 - 2026-09-15
 
 - Run the owned, user-facing launchd broker with the Standard scheduling class to remove the

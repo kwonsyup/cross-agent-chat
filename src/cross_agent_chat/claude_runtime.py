@@ -177,7 +177,26 @@ def parse_claude_agents(text: str) -> list[ClaudeAgent]:
     return agents
 
 
-def claude_agents() -> list[ClaudeAgent]:
+def _parse_targeted_claude_agents(text: str, session_id: str) -> list[ClaudeAgent]:
+    try:
+        raw = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ChatError("Claude agents response is invalid") from error
+    if not isinstance(raw, list):
+        raise ChatError("Claude agents response is invalid")
+    target = session_id.casefold()
+    agents: list[ClaudeAgent] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        candidate = item.get("sessionId")
+        if not isinstance(candidate, str) or candidate.casefold() != target:
+            continue
+        agents.extend(parse_claude_agents(json.dumps([item])))
+    return agents
+
+
+def claude_agents(session_id: str | None = None) -> list[ClaudeAgent]:
     try:
         completed = subprocess.run(
             [str(claude_binary()), "agents", "--json"],
@@ -193,13 +212,16 @@ def claude_agents() -> list[ClaudeAgent]:
         raise ChatError("Claude agents preflight failed") from error
     if completed.returncode != 0:
         raise ChatError("Claude agents preflight failed")
-    return parse_claude_agents(completed.stdout)
+    if session_id is None:
+        return parse_claude_agents(completed.stdout)
+    return _parse_targeted_claude_agents(completed.stdout, session_id)
 
 
 def exact_agent(session_id: str, cwd: str) -> ClaudeAgent:
+    valid_uuid(session_id, "Claude session id")
     matches = [
         agent
-        for agent in claude_agents()
+        for agent in claude_agents(session_id)
         if agent["session_id"] == session_id
         and agent["kind"] in {"interactive", "background"}
         and agent["cwd"] == cwd
