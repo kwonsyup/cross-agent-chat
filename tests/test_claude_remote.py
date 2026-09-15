@@ -200,7 +200,7 @@ def test_claude_agents_skip_an_unrelated_disappeared_workspace(
             "cwd": str(tmp_path.resolve()),
         }
     ]
-    monkeypatch.setattr(claude_runtime, "claude_agents", lambda: agents)
+    monkeypatch.setattr(claude_runtime, "claude_agents", lambda *_: agents)
     with pytest.raises(ChatError, match="exact live supported"):
         claude_runtime.exact_agent(stale_session, str(stale_workspace))
 
@@ -216,6 +216,94 @@ def test_claude_binary_uses_fixed_user_local_fallback(
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
     assert claude_binary() == binary.resolve()
+
+
+def test_exact_agent_ignores_unrelated_noncanonical_roster_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import claude_runtime
+
+    session_id = str(uuid4())
+    payload = json.dumps(
+        [
+            {
+                "sessionId": session_id,
+                "name": "Exact target",
+                "kind": "interactive",
+                "cwd": str(tmp_path),
+            },
+            {
+                "sessionId": str(uuid4()).upper(),
+                "name": "Unrelated uppercase row",
+                "kind": "interactive",
+                "cwd": str(tmp_path),
+            },
+        ]
+    )
+    monkeypatch.setattr(claude_runtime, "claude_binary", lambda: Path("/opt/claude"))
+    monkeypatch.setattr(
+        claude_runtime.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, payload, ""),
+    )
+
+    assert claude_runtime.exact_agent(session_id, str(tmp_path)) == {
+        "session_id": session_id,
+        "name": "Exact target",
+        "kind": "interactive",
+        "cwd": str(tmp_path.resolve()),
+    }
+
+
+def test_exact_agent_rejects_noncanonical_casecollision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import claude_runtime
+
+    session_id = str(uuid4())
+    payload = json.dumps(
+        [
+            {
+                "sessionId": session_id.upper(),
+                "name": "Case collision",
+                "kind": "interactive",
+                "cwd": str(tmp_path),
+            }
+        ]
+    )
+    monkeypatch.setattr(claude_runtime, "claude_binary", lambda: Path("/opt/claude"))
+    monkeypatch.setattr(
+        claude_runtime.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, payload, ""),
+    )
+
+    with pytest.raises(ChatError, match="Claude session id is invalid"):
+        claude_runtime.exact_agent(session_id, str(tmp_path))
+
+
+def test_exact_agent_rejects_duplicate_valid_selected_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import claude_runtime
+
+    session_id = str(uuid4())
+    row = {
+        "sessionId": session_id,
+        "name": "Duplicate target",
+        "kind": "interactive",
+        "cwd": str(tmp_path),
+    }
+    payload = json.dumps([row, row])
+    monkeypatch.setattr(claude_runtime, "claude_binary", lambda: Path("/opt/claude"))
+    monkeypatch.setattr(
+        claude_runtime.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, payload, ""),
+    )
+
+    with pytest.raises(ChatError, match="exact live supported"):
+        claude_runtime.exact_agent(session_id, str(tmp_path))
 
 
 def test_claude_binary_keeps_the_recipient_bound_executable(
@@ -1595,7 +1683,7 @@ def test_supported_claude_kind_preserves_exact_native_target(
 
     session_id = str(uuid4())
     agent = {"session_id": session_id, "name": "Exact target", "kind": kind, "cwd": str(tmp_path)}
-    monkeypatch.setattr(claude_runtime, "claude_agents", lambda: [agent])
+    monkeypatch.setattr(claude_runtime, "claude_agents", lambda *_: [agent])
     assert claude_runtime.exact_agent(session_id, str(tmp_path)) == agent
     with pytest.raises(ChatError):
         claude_runtime.exact_agent(str(uuid4()), str(tmp_path))
