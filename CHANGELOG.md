@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.5 - 2026-09-15
+
+- Emit Native bootstrap context only for a current route whose registered owner, exact bundled
+  executable, and app-owned ancestor all identify Codex Native. Standalone CLI startup no longer
+  receives Native-only bootstrap instructions.
+- This does not establish standalone CLI busy acceptance or mid-command model consumption; those
+  paths require a fresh post-upgrade trial.
+
 ## 0.3.4 - 2026-09-15
 
 - Run the owned, user-facing launchd broker with the Standard scheduling class to remove the

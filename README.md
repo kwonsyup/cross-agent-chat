@@ -10,10 +10,10 @@ non-default roots). Local sessions do not need Tailscale; remote sessions need T
 allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
 files, or turn a remote peer into an owner.
 
-Install v0.3.4 prerelease with:
+Install v0.3.5 prerelease with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.4/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.5/install.sh | sh
 ```
 
 Installation requires Git because the installer builds from the release tag.
@@ -50,13 +50,13 @@ visible by default.
 
 To have an existing coding agent assist with installation, give it this prompt:
 
-> Install the released `v0.3.4` tag, not an arbitrary PR. Identify active consumers and the
+> Install the released `v0.3.5` tag, not an arbitrary PR. Identify active consumers and the
 > selected Claude/Codex roots and local Devin configuration, obtain approval before shared effects, preserve existing intent
 > records, run `cross-agent-chat doctor --json`, and test only fresh actors.
 
 ## Supported surfaces
 
-v0.3.4 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
+v0.3.5 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
 scheduling class to avoid the observed Background scheduling delay. Normal-budget discovery has
 been observed for participating macOS nodes. An aggregate roster can still be incomplete when an
 online non-CAC Tailnet node, such as an iOS node, fails discovery; full remote request/result
@@ -72,7 +72,7 @@ then receives work at a prompt or Stop boundary through its exact provider ident
 |---|---|
 | Claude Code | Native cross-session delivery through the selected Claude configuration. |
 | Codex Native App | Trusted hooks can provision a native helper and use Desktop-native task messaging for a bound original conversation. |
-| Codex CLI | Natural Stop delivery remains supported where the CLI route is registered and current. With the explicit profile-local experimental queue, CLI 0.154.0 has accepted busy input and the original owner has received it at a later native turn; model consumption mid-command remains unproved. |
+| Codex CLI | Natural Stop delivery remains supported where the CLI route is registered and current. A fresh public v0.3.4 idle request/result exchange completed. v0.3.5 confines Native bootstrap instructions to bundled Desktop routes, so standalone CLI startup does not receive a Native-only tool instruction; busy acceptance and later original-owner consumption still require revalidation. |
 | Local Devin CLI or App | Global MCP and prompt/Stop hooks support prompt-active conversation discovery and delivery. |
 | Same Mac or permitted Tailnet Mac | Discovery and delivery use the local broker or your Tailscale ACL. Normal-budget discovery has succeeded for participating macOS nodes; an aggregate roster may remain incomplete for an online non-CAC Tailnet node. |
 
