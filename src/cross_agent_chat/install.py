@@ -1534,7 +1534,7 @@ class Installer:
             "ProgramArguments": [str(self.executable), "_broker"],
             "RunAtLoad": True,
             "KeepAlive": True,
-            "ProcessType": "Background",
+            "ProcessType": "Standard",
         }
         if self.tailnet_address is not None:
             payload["EnvironmentVariables"] = {

@@ -10,10 +10,10 @@ non-default roots). Local sessions do not need Tailscale; remote sessions need T
 allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
 files, or turn a remote peer into an owner.
 
-Install v0.3.3 beta with:
+Install v0.3.4 prerelease with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.3/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.4/install.sh | sh
 ```
 
 Installation requires Git because the installer builds from the release tag.
@@ -50,14 +50,20 @@ visible by default.
 
 To have an existing coding agent assist with installation, give it this prompt:
 
-> Install the released `v0.3.3` tag, not an arbitrary PR. Identify active consumers and the
+> Install the released `v0.3.4` tag, not an arbitrary PR. Identify active consumers and the
 > selected Claude/Codex roots and local Devin configuration, obtain approval before shared effects, preserve existing intent
 > records, run `cross-agent-chat doctor --json`, and test only fresh actors.
 
 ## Supported surfaces
 
-v0.3.3 is a macOS beta candidate. Claude Code uses its native cross-session mechanism. Codex
-Native uses the built-in Desktop message operation through a trusted, automatically managed helper;
+v0.3.4 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
+scheduling class to avoid the observed Background scheduling delay. Normal-budget discovery has
+been observed for participating macOS nodes. An aggregate roster can still be incomplete when an
+online non-CAC Tailnet node, such as an iOS node, fails discovery; full remote request/result
+acceptance remains unproved.
+
+Claude Code uses its native cross-session mechanism. Codex Native uses the built-in Desktop message
+operation through a trusted, automatically managed helper;
 its body and task-creation arguments remain private to the trusted hook path. Local Devin uses its
 global MCP and lifecycle hooks; a conversation becomes discoverable only after its first user prompt,
 then receives work at a prompt or Stop boundary through its exact provider identity.
@@ -66,13 +72,13 @@ then receives work at a prompt or Stop boundary through its exact provider ident
 |---|---|
 | Claude Code | Native cross-session delivery through the selected Claude configuration. |
 | Codex Native App | Trusted hooks can provision a native helper and use Desktop-native task messaging for a bound original conversation. |
-| Codex CLI | Natural Stop delivery remains supported where the CLI route is registered and current. |
+| Codex CLI | Natural Stop delivery remains supported where the CLI route is registered and current. With the explicit profile-local experimental queue, CLI 0.154.0 has accepted busy input and the original owner has received it at a later native turn; model consumption mid-command remains unproved. |
 | Local Devin CLI or App | Global MCP and prompt/Stop hooks support prompt-active conversation discovery and delivery. |
-| Same Mac or permitted Tailnet Mac | Discovery and delivery use the local broker or your Tailscale ACL. |
+| Same Mac or permitted Tailnet Mac | Discovery and delivery use the local broker or your Tailscale ACL. Normal-budget discovery has succeeded for participating macOS nodes; an aggregate roster may remain incomplete for an online non-CAC Tailnet node. |
 
 Codex CLI busy original-native ingress is not proven, and an active CLI writer may reject native
 ingress. Devin idle delivery and a safely isolated Fusion helper remain parked provider boundaries.
-Unprompted Devin conversations are intentionally not published. This beta is not full five-surface
+Unprompted Devin conversations are intentionally not published. This prerelease is not full five-surface
 technical readiness or final fleet acceptance. ChatGPT web, Claude web, Windows, and Linux have no
 live-support claim.
 

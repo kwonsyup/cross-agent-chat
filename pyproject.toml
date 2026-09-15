@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cross-agent-chat"
-version = "0.3.3"
+version = "0.3.4"
 description = "Local-first cross-session chat for Claude Code, Codex, and local Devin."
 readme = "README.md"
 requires-python = ">=3.11"
