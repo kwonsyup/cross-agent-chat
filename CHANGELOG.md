@@ -4,6 +4,9 @@
 
 - Run the owned, user-facing launchd broker with the Standard scheduling class to remove the
   observed Background scheduling delay for requested chat traffic.
+- Tell an agent handling an explicit report or answer request to refresh `chat_peers`, match the
+  exact original CAC source handle, and send one separate `chat_send`. This is guidance only: it
+  does not create an automatic reply or establish a completed live report-back case.
 - This prerelease does not establish reliable remote discovery or delivery. Incomplete Tailnet
   discovery remains an open boundary, as do the existing five-surface readiness limitations.
 

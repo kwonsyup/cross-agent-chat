@@ -57,8 +57,10 @@ To have an existing coding agent assist with installation, give it this prompt:
 ## Supported surfaces
 
 v0.3.4 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
-scheduling class to avoid the observed Background scheduling delay. It does not establish reliable
-remote discovery or delivery; incomplete Tailnet discovery remains an open boundary.
+scheduling class to avoid the observed Background scheduling delay. Normal-budget discovery has
+been observed for participating macOS nodes. An aggregate roster can still be incomplete when an
+online non-CAC Tailnet node, such as an iOS node, fails discovery; full remote request/result
+acceptance remains unproved.
 
 Claude Code uses its native cross-session mechanism. Codex Native uses the built-in Desktop message
 operation through a trusted, automatically managed helper;
@@ -70,9 +72,9 @@ then receives work at a prompt or Stop boundary through its exact provider ident
 |---|---|
 | Claude Code | Native cross-session delivery through the selected Claude configuration. |
 | Codex Native App | Trusted hooks can provision a native helper and use Desktop-native task messaging for a bound original conversation. |
-| Codex CLI | Natural Stop delivery remains supported where the CLI route is registered and current. |
+| Codex CLI | Natural Stop delivery remains supported where the CLI route is registered and current. With the explicit profile-local experimental queue, CLI 0.154.0 has accepted busy input and the original owner has received it at a later native turn; model consumption mid-command remains unproved. |
 | Local Devin CLI or App | Global MCP and prompt/Stop hooks support prompt-active conversation discovery and delivery. |
-| Same Mac or permitted Tailnet Mac | Discovery and delivery use the local broker or your Tailscale ACL. |
+| Same Mac or permitted Tailnet Mac | Discovery and delivery use the local broker or your Tailscale ACL. Normal-budget discovery has succeeded for participating macOS nodes; an aggregate roster may remain incomplete for an online non-CAC Tailnet node. |
 
 Codex CLI busy original-native ingress is not proven, and an active CLI writer may reject native
 ingress. Devin idle delivery and a safely isolated Fusion helper remain parked provider boundaries.
