@@ -2376,13 +2376,7 @@ def native_startup(root: Path, device: str, pid: int) -> dict[str, object]:
     ]
     if len(candidates) != 1 or not _route_current(root, candidates[0]):
         return {}
-    try:
-        identity, _ = recipient_owner_identity(
-            "codex", candidates[0].pid, candidates[0].profile_root
-        )
-    except (ChatError, OSError):
-        return {}
-    if identity != candidates[0].owner_identity or not native_desktop_process(candidates[0].pid):
+    if not _native_desktop_route(candidates[0]):
         return {}
     return native_bootstrap_context(root, candidates[0], "UserPromptSubmit")
 
@@ -2391,7 +2385,8 @@ def native_bootstrap_context(root: Path, source: Route, event_name: str) -> dict
     """Emit the provider-shaped one-time bootstrap instruction for an eligible Desktop route."""
 
     if (
-        event_name not in {"SessionStart", "UserPromptSubmit"}
+        not _native_desktop_route(source)
+        or event_name not in {"SessionStart", "UserPromptSubmit"}
         or native_helper_tools(root, source) != ("native_bootstrap",)
         or not _native_hook_ready(source, _native_create_hook_group())
     ):
@@ -2404,6 +2399,21 @@ def native_bootstrap_context(root: Path, source: Route, event_name: str) -> dict
             ),
         }
     }
+
+
+def _native_desktop_route(route: Route) -> bool:
+    """Recognize a route owned by the bundled Native Codex process."""
+
+    try:
+        identity, executable = recipient_owner_identity("codex", route.pid, route.profile_root)
+    except (ChatError, OSError):
+        return False
+    return (
+        route.provider == "codex"
+        and identity == route.owner_identity
+        and executable == Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+        and native_desktop_process(route.pid)
+    )
 
 
 def native_desktop_process(pid: int) -> bool:

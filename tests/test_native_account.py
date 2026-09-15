@@ -220,6 +220,7 @@ def patch_startup(
     *,
     desktop: bool = True,
     owner_identity: str = ACCOUNT_DIGEST,
+    executable: Path = Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
 ) -> None:
     monkeypatch.setattr(
         runtime,
@@ -232,7 +233,7 @@ def patch_startup(
     monkeypatch.setattr(
         runtime,
         "recipient_owner_identity",
-        lambda *_args: (owner_identity, Path("/usr/local/bin/codex")),
+        lambda *_args: (owner_identity, executable),
     )
 
 
@@ -263,6 +264,11 @@ def test_native_startup_is_noop_for_cli_and_untrusted_original(
 
     patch_startup(monkeypatch, route, desktop=False)
     assert runtime.native_startup(root, "studio", route.pid) == {}
+    assert runtime.native_bootstrap_context(root, route, "SessionStart") == {}
+
+    patch_startup(monkeypatch, route, executable=Path("/usr/local/bin/codex"))
+    assert runtime.native_startup(root, "studio", route.pid) == {}
+    assert runtime.native_bootstrap_context(root, route, "SessionStart") == {}
 
     patch_startup(monkeypatch, route, owner_identity="b" * 64)
     assert runtime.native_startup(root, "studio", route.pid) == {}
