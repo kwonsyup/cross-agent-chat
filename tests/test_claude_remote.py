@@ -242,8 +242,7 @@ def test_exact_agent_ignores_unrelated_noncanonical_roster_row(
     )
     monkeypatch.setattr(claude_runtime, "claude_binary", lambda: Path("/opt/claude"))
     monkeypatch.setattr(
-        claude_runtime.subprocess,
-        "run",
+        "cross_agent_chat.claude_runtime.subprocess.run",
         lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, payload, ""),
     )
 
@@ -273,8 +272,7 @@ def test_exact_agent_rejects_noncanonical_casecollision(
     )
     monkeypatch.setattr(claude_runtime, "claude_binary", lambda: Path("/opt/claude"))
     monkeypatch.setattr(
-        claude_runtime.subprocess,
-        "run",
+        "cross_agent_chat.claude_runtime.subprocess.run",
         lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, payload, ""),
     )
 
@@ -297,8 +295,7 @@ def test_exact_agent_rejects_duplicate_valid_selected_rows(
     payload = json.dumps([row, row])
     monkeypatch.setattr(claude_runtime, "claude_binary", lambda: Path("/opt/claude"))
     monkeypatch.setattr(
-        claude_runtime.subprocess,
-        "run",
+        "cross_agent_chat.claude_runtime.subprocess.run",
         lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, payload, ""),
     )
 
