@@ -425,7 +425,11 @@ def parser() -> argparse.ArgumentParser:
     peers_parser.add_argument("--json", action="store_true")
     resolve_parser = commands.add_parser(
         "resolve",
-        help="acknowledge one confirmed unknown event so a later fresh send is allowed",
+        help=(
+            "record that you accept one unknown event's uncertainty, so this sender may "
+            "start new work toward that target; it does not contact, cancel, or confirm "
+            "anything at the recipient, and never makes re-sending the same task safe"
+        ),
     )
     resolve_parser.add_argument("event_id")
 
@@ -529,8 +533,24 @@ def run(arguments: argparse.Namespace) -> int:
             for peer_item in cast(list[dict[str, str]], peer_result["peers"]):
                 print(f"{peer_item['alias']}\t{peer_item['status']}")
     elif command == "resolve":
-        IntentStore(state_root()).mark(arguments.event_id, "RESOLVED_BY_OWNER")
-        print(f"Resolved event {arguments.event_id}. A later fresh send is now allowed.")
+        store = IntentStore(state_root())
+        matches = [item for item in store.intents() if item.event_id == arguments.event_id]
+        if len(matches) != 1:
+            _fail("intent is unavailable")
+        current = matches[0].status
+        if current != "UNKNOWN_DELIVERY":
+            # Only a genuinely uncertain outcome is the owner's to accept. Resolving a
+            # decided event would launder its real status into an owner disposition.
+            _fail(f"event {arguments.event_id} is {current}, not UNKNOWN_DELIVERY; nothing to resolve")
+        store.mark(arguments.event_id, "RESOLVED_BY_OWNER")
+        print(
+            f"Recorded your acceptance of event {arguments.event_id}, which remains "
+            f"UNKNOWN_DELIVERY in fact: whether the recipient received it is still unknown.\n"
+            "This did not contact the recipient, cancel any work it may already have "
+            "started, or confirm delivery.\n"
+            "This sender may now start new work toward that target. Do not re-send that "
+            "same task under a new event, wording, or transport."
+        )
     elif command == "_register":
         if arguments.provider == "devin":
             register_devin(arguments.device, arguments.pid, arguments.state_root)
