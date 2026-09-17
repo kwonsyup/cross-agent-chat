@@ -1870,10 +1870,15 @@ def wrapped_message(
     try:
         return bounded_message(body)
     except ChatError as error:
-        # The cap applies to the wrapped body, so a message comfortably under
-        # 16 KiB can still fail once the envelope is added. Reporting the raw
-        # limit here tells the sender their message is too long when they can see
-        # that it is not; name the overhead and the budget they actually have.
+        # `bounded_message` rejects emptiness, NUL bytes, an unencodable string
+        # and the encoded-frame budget as well as the size cap. Only the size
+        # cap is worth restating, and only when the WRAPPED body is what crossed
+        # it: a message comfortably under 16 KiB can still fail once the envelope
+        # is added, and reporting the raw limit then tells the sender their
+        # message is too long when they can see that it is not. Every other
+        # reason keeps its own accurate message.
+        if len(body.encode()) <= MAX_MESSAGE_BYTES:
+            raise
         overhead = len(body.encode()) - len(message.encode())
         budget = MAX_MESSAGE_BYTES - overhead
         raise ChatError(

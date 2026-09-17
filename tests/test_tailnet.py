@@ -2344,3 +2344,35 @@ def test_wrapped_message_names_the_exact_budget_at_its_real_boundary() -> None:
     assert str(overhead) in reason
     assert str(largest) in reason
     assert reason != "message exceeds the 16 KiB limit"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        pytest.param("has a \x00 byte", "16 KiB limit", id="nul-byte"),
+        pytest.param("\x01" * 6000, "encoded frame budget", id="frame-budget"),
+    ],
+)
+def test_wrapped_message_does_not_restate_other_failures_as_a_size_problem(
+    message: str, expected: str
+) -> None:
+    """Only the size cap may be restated, and only when the body crossed it.
+
+    `bounded_message` also rejects emptiness, NUL bytes, unencodable strings and
+    the encoded-frame budget. Rewriting all of those as "your message is N bytes
+    and the envelope adds M" states a byte budget as the cause of a failure that
+    has nothing to do with size.
+    """
+    with pytest.raises(ChatError) as caught:
+        wrapped_message(
+            "claude@kwons-imac-pro:Projects:E_KLURO_17-Sep-12PM",
+            "b7" * 32,
+            message,
+            str(uuid4()),
+            "claude",
+        )
+
+    reason = str(caught.value)
+    assert expected in reason
+    assert "envelope adds" not in reason
+    assert "send at most" not in reason
