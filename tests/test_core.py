@@ -22,6 +22,7 @@ import pytest
 
 from cross_agent_chat.core import (
     ChatError,
+    IntentStatus,
     IntentStore,
     Registry,
     Route,
@@ -2574,3 +2575,111 @@ def test_disappeared_courier_closes_intent_as_pre_effect(
     store = IntentStore(root)
     assert [item.status for item in store.intents()] == ["PRE_EFFECT_REJECTED"]
     assert store.begin(source, destination, source_alias=source.alias, payload_digest="b" * 64)
+
+
+def _resolve_cli(home: Path, monkeypatch: pytest.MonkeyPatch, event_id: str) -> tuple[int, str]:
+    """Run `cross-agent-chat resolve EVENT_ID` against a state root under `home`."""
+    from cross_agent_chat import cli
+
+    monkeypatch.setenv("HOME", str(home))
+    code = cli.run(cli.parser().parse_args(["resolve", event_id]))
+    return code, ""
+
+
+def _seeded_intent(home: Path, tmp_path: Path, status: IntentStatus) -> str:
+    store = IntentStore(home / ".local/state/cross-agent-chat")
+    source = route(tmp_path, project="source")
+    target = route(tmp_path)
+    event_id = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    if status != "PENDING":
+        store.mark(event_id, status)
+    return event_id
+
+
+@pytest.mark.parametrize("status", ["PENDING", "REMOTE_AUTHORIZED"])
+def test_resolve_clears_an_intent_abandoned_in_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: IntentStatus,
+) -> None:
+    # Only PENDING/REMOTE_AUTHORIZED gate a fresh send, so resolve must accept them:
+    # a courier killed inside its send window would otherwise block that target forever.
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, status)
+
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
+
+    store = IntentStore(home / ".local/state/cross-agent-chat")
+    assert [item.status for item in store.intents() if item.event_id == event_id] == [
+        "RESOLVED_BY_OWNER"
+    ]
+    output = capsys.readouterr().out
+    assert "no longer blocked" in output
+    assert "still unknown" in output
+    assert "Do not re-send" in output
+    # The target must actually be sendable again.
+    store.begin(
+        route(tmp_path, project="source"),
+        route(tmp_path),
+        source_alias="source",
+        payload_digest="b" * 64,
+    )
+
+
+def test_resolve_accepts_unknown_delivery_without_claiming_it_unblocks_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, "UNKNOWN_DELIVERY")
+
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
+
+    output = capsys.readouterr().out
+    assert "remains UNKNOWN_DELIVERY in fact" in output
+    assert "did not contact the recipient" in output
+    assert "Do not re-send" in output
+    # An UNKNOWN row never gated a send, so resolve must not claim it unblocked one.
+    assert "no longer blocked" not in output
+
+
+@pytest.mark.parametrize("status", ["TRANSPORT_ACCEPTED", "PRE_EFFECT_REJECTED"])
+def test_resolve_refuses_a_decided_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: IntentStatus
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, status)
+
+    with pytest.raises(ChatError, match="already decided"):
+        _resolve_cli(home, monkeypatch, event_id)
+
+    store = IntentStore(home / ".local/state/cross-agent-chat")
+    assert [item.status for item in store.intents() if item.event_id == event_id] == [status]
+
+
+def test_resolve_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, "UNKNOWN_DELIVERY")
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
+    capsys.readouterr()
+
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
+
+    assert "already resolved" in capsys.readouterr().out
+
+
+def test_resolve_refuses_an_unknown_event_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    _seeded_intent(home, tmp_path, "UNKNOWN_DELIVERY")
+
+    with pytest.raises(ChatError, match="intent is unavailable"):
+        _resolve_cli(home, monkeypatch, str(uuid4()))

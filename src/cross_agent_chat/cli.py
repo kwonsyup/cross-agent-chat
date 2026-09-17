@@ -430,9 +430,10 @@ def parser() -> argparse.ArgumentParser:
     resolve_parser = commands.add_parser(
         "resolve",
         help=(
-            "record that you accept one unknown event's uncertainty, so this sender may "
-            "start new work toward that target; it does not contact, cancel, or confirm "
-            "anything at the recipient, and never makes re-sending the same task safe"
+            "record that you accept one undecided event's uncertainty: an UNKNOWN_DELIVERY, "
+            "or a PENDING/REMOTE_AUTHORIZED intent abandoned in flight. It does not contact, "
+            "cancel, or confirm anything at the recipient, and never makes re-sending that "
+            "same task safe"
         ),
     )
     resolve_parser.add_argument("event_id")
@@ -541,20 +542,39 @@ def run(arguments: argparse.Namespace) -> int:
         if len(matches) != 1:
             _fail("intent is unavailable")
         current = matches[0].status
-        if current != "UNKNOWN_DELIVERY":
-            # Only a genuinely uncertain outcome is the owner's to accept. Resolving a
-            # decided event would launder its real status into an owner disposition.
+        if current == "RESOLVED_BY_OWNER":
+            # Idempotent: re-running must not error, and must not restate the record.
+            print(f"Event {arguments.event_id} was already resolved by its owner.")
+            return 0
+        # Only an undecided outcome is the owner's to accept. TRANSPORT_ACCEPTED and
+        # PRE_EFFECT_REJECTED are decided, and resolving one would launder a known
+        # result into an owner disposition.
+        if current not in {"UNKNOWN_DELIVERY", "PENDING", "REMOTE_AUTHORIZED"}:
             _fail(
-                f"event {arguments.event_id} is {current}, not UNKNOWN_DELIVERY; nothing to resolve"
+                f"event {arguments.event_id} is {current}, which is already decided; "
+                "nothing to resolve"
             )
         store.mark(arguments.event_id, "RESOLVED_BY_OWNER")
+        # Only PENDING/REMOTE_AUTHORIZED rows gate a fresh send to the same target,
+        # so only those are unblocked by this command.
+        unblocked = current in {"PENDING", "REMOTE_AUTHORIZED"}
+        was = (
+            "was still in flight and never completed"
+            if unblocked
+            else "remains UNKNOWN_DELIVERY in fact"
+        )
         print(
-            f"Recorded your acceptance of event {arguments.event_id}, which remains "
-            f"UNKNOWN_DELIVERY in fact: whether the recipient received it is still unknown.\n"
+            f"Recorded your acceptance of event {arguments.event_id}, which {was}: "
+            "whether the recipient received it is still unknown.\n"
             "This did not contact the recipient, cancel any work it may already have "
             "started, or confirm delivery.\n"
-            "This sender may now start new work toward that target. Do not re-send that "
-            "same task under a new event, wording, or transport."
+            + (
+                "That target is no longer blocked by this intent, so this sender may "
+                "start new work toward it.\n"
+                if unblocked
+                else ""
+            )
+            + "Do not re-send that same task under a new event, wording, or transport."
         )
     elif command == "_register":
         if arguments.provider == "devin":
