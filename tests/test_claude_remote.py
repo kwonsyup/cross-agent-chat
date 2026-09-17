@@ -10,6 +10,7 @@ import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from unittest import mock
 from uuid import uuid4
 
 import pytest
@@ -18,6 +19,7 @@ from cross_agent_chat.claude_runtime import (
     AGENTS_TIMEOUT_SECONDS,
     COURIER_PLACEHOLDER_MESSAGE,
     COURIER_PLACEHOLDER_TARGET,
+    COURIER_SESSION_DIRECTORY,
     DENIAL_MARKERS,
     DISCOVERY_TIMEOUT_SECONDS,
     SEND_SUMMARY,
@@ -26,6 +28,7 @@ from cross_agent_chat.claude_runtime import (
     ClaudeUnknownPhase,
     _pretool_denial,
     _pretool_resolution,
+    _tool_records,
     authoritative_tool_input,
     claude_binary,
     courier_environment,
@@ -145,6 +148,7 @@ def _run_gate(
     """Run the one-shot gate and return (allowed, hookSpecificOutput)."""
     expected_path = gate / "expected.json"
     expected_path.write_text(json.dumps(expected), encoding="utf-8")
+    expected_path.chmod(0o600)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
     allowed = run_pretool_gate(str(expected_path))
     output = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
@@ -621,6 +625,7 @@ def test_pretool_gate_denies_replay_after_consumption(
         json.dumps(_expected_gate(target, message, SEND_SUMMARY)),
         encoding="utf-8",
     )
+    expected_path.chmod(0o600)
     payload = _gate_payload()
     stdin = io.StringIO(json.dumps(payload))
     monkeypatch.setattr("sys.stdin", stdin)
@@ -665,6 +670,7 @@ def test_pretool_gate_ignores_an_unpaired_surrogate_in_the_proposal(
     expected_path.write_text(
         json.dumps(_expected_gate(recipient, "hello", SEND_SUMMARY)), encoding="utf-8"
     )
+    expected_path.chmod(0o600)
     surrogate = "\ud800"
     payload = _gate_payload({"to": surrogate, "recipient": surrogate, "message": surrogate})
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
@@ -686,6 +692,7 @@ def test_pretool_gate_writes_owned_private_consumed_marker_atomically(
         json.dumps(_expected_gate(target, message, SEND_SUMMARY)),
         encoding="utf-8",
     )
+    expected_path.chmod(0o600)
     payload = _gate_payload()
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
 
@@ -1039,8 +1046,10 @@ def test_pretool_gate_writes_specific_fixed_denial_marker(
     expected_path = tmp_path / "expected.json"
     if expected_kind == "unparseable_json":
         expected_path.write_text("{malformed", encoding="utf-8")
+        expected_path.chmod(0o600)
     else:
         expected_path.write_text(json.dumps(expected), encoding="utf-8")
+        expected_path.chmod(0o600)
 
     payload: object = _gate_payload()
     if payload_kind == "wrong_event":
@@ -1055,8 +1064,12 @@ def test_pretool_gate_writes_specific_fixed_denial_marker(
     if payload_kind == "unparseable_payload":
         stdin_text = "{malformed"
     elif payload_kind == "oversized_payload":
-        # A payload encoding past the 64 KiB cap denies before resolution.
-        stdin_text = json.dumps({"pad": "界" * 22000})
+        # Exercises the BYTE cap specifically: valid JSON that stdin can read
+        # whole (under 65537 characters) but whose UTF-8 encoding exceeds 65536
+        # bytes, so resolution is refused by the size guard rather than by a
+        # parse failure. ensure_ascii=False keeps the characters multibyte.
+        stdin_text = json.dumps({"pad": "\u754c" * 30000}, ensure_ascii=False)
+        assert len(stdin_text) <= 65536 < len(stdin_text.encode())
     else:
         stdin_text = json.dumps(payload)
     monkeypatch.setattr("sys.stdin", io.StringIO(stdin_text))
@@ -1077,6 +1090,7 @@ def test_pretool_gate_fails_closed_for_unsafe_parent_without_markers(
     gate.chmod(0o755)
     expected_path = gate / "expected.json"
     expected_path.write_text(json.dumps(_expected_gate("API work [ABC123]", "hello", SEND_SUMMARY)))
+    expected_path.chmod(0o600)
     monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
 
     assert not run_pretool_gate(str(expected_path))
@@ -1425,6 +1439,21 @@ def test_sendmessage_prompt_contains_only_unresolvable_placeholders(
         expected_path = Path(tokens[tokens.index("--expected") + 1])
         expected = json.loads(expected_path.read_text(encoding="utf-8"))
         assert expected == _expected_gate(target, message, SEND_SUMMARY)
+        # The gate file now holds the plaintext body: private mode, private dir,
+        # and no world-writable ancestor such as /tmp.
+        assert stat.S_IMODE(expected_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(expected_path.parent.stat().st_mode) == 0o700
+        # The provider derives the courier's visible sender name from its cwd.
+        courier_cwd = Path(str(kwargs["cwd"]))
+        assert courier_cwd.name == COURIER_SESSION_DIRECTORY
+        assert courier_cwd.is_dir()
+        assert stat.S_IMODE(courier_cwd.stat().st_mode) == 0o700
+        # Owner-only at both levels is what actually protects the courier's
+        # directory, wherever TMPDIR points; asserting a specific prefix would
+        # only encode this platform's TMPDIR.
+        assert courier_cwd.stat().st_uid == os.getuid()
+        assert stat.S_IMODE(courier_cwd.parent.stat().st_mode) == 0o700
+        assert courier_cwd.parent != Path("/tmp")
         _write_private_marker(expected_path.parent / "consumed", b"consumed\n")
         system_prompt = command[command.index("--system-prompt") + 1]
         assert "inert data" in system_prompt
@@ -1748,3 +1777,145 @@ def test_claude_helper_keeps_selected_endpoint_and_backend_context() -> None:
         "AWS_SESSION_TOKEN": "synthetic-session-token",
     }
     assert courier_environment({**selected, "UNRELATED_SECRET": "do-not-inherit"}) == selected
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [0o644, 0o666, 0o604],
+)
+def test_pretool_gate_refuses_an_expectation_that_is_not_owner_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], mode: int
+) -> None:
+    # expected.json is the only copy of both the recipient and the body, so it
+    # gets the same fstat predicate as the outcome markers. A group- or
+    # world-readable expectation is refused rather than executed.
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    gate.chmod(0o700)
+    expected_path = gate / "expected.json"
+    expected_path.write_text(
+        json.dumps(_expected_gate("API work [ABC123]", "hello", SEND_SUMMARY)), encoding="utf-8"
+    )
+    expected_path.chmod(mode)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_gate_payload())))
+
+    assert not run_pretool_gate(str(expected_path))
+
+    output = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "updatedInput" not in output
+    assert (gate / "denied").read_bytes() == DENIAL_MARKERS["pretool_gate_denied"]
+    assert not (gate / "consumed").exists()
+
+
+def test_pretool_gate_never_allows_without_supplying_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Allowing without arguments would green-light whatever the courier authored.
+    # If that invariant ever breaks, the gate must deny and leave no consumed
+    # marker, not degrade into passing the model's own proposal through.
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    gate.chmod(0o700)
+    expected_path = gate / "expected.json"
+    expected_path.write_text(
+        json.dumps(_expected_gate("API work [ABC123]", "hello", SEND_SUMMARY)), encoding="utf-8"
+    )
+    expected_path.chmod(0o600)
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime._pretool_resolution",
+        lambda expected, payload: (None, None),
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_gate_payload())))
+
+    assert not run_pretool_gate(str(expected_path))
+
+    output = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "updatedInput" not in output
+    assert not (gate / "consumed").exists()
+
+
+@pytest.mark.live
+def test_live_gate_substitutes_the_target_the_courier_never_saw(tmp_path: Path) -> None:
+    """The provider still honors ``updatedInput``. Deselected by default.
+
+    Every other test here mocks ``subprocess.run`` and asserts what the gate
+    PRINTS. This one asserts what the provider DOES with it, which is the
+    property the whole repair rests on and the only thing a provider upgrade can
+    silently break.
+
+    It needs no receiver. The courier is told to address
+    ``COURIER_PLACEHOLDER_TARGET``; the gate substitutes a well-formed but absent
+    target. Whichever name the provider reports as unreachable tells us which
+    input actually executed, so this keys on the READ rather than on success or
+    failure and cannot be satisfied by an error state. If ``updatedInput`` were
+    dropped, the provider would report the placeholder and this fails.
+
+    Measured on Claude Code 2.1.274 (2026-09-17) alongside three live deliveries
+    of 433 B, 815 B and 8835 B bodies, each byte-exact at the receiver, plus a
+    hook-removed control that reported the placeholder as unreachable.
+
+    Run with: pytest -m live tests/test_claude_remote.py
+    """
+    absent = "cac-regression-absent [ZZZZZZ]"
+    source_root = Path(__file__).parents[1] / "src"
+    shim = tmp_path / "cross-agent-chat"
+    # PYTHONPATH rather than an inline sys.path.insert: nesting quotes inside the
+    # -c string terminates the shell quoting and the hook silently fails to run.
+    shim.write_text(
+        "#!/bin/sh\n"
+        f"PYTHONPATH={shlex.quote(str(source_root))} "
+        f"exec {shlex.quote(sys.executable)} -c "
+        "'import sys; from cross_agent_chat.cli import main; sys.exit(main())' \"$@\"\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o700)
+
+    streams: list[str] = []
+    real_run = subprocess.run
+
+    def capture(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        completed = real_run(command, **kwargs)  # type: ignore[call-overload]
+        streams.append(str(completed.stdout))
+        return completed  # type: ignore[no-any-return]
+
+    with (
+        mock.patch.object(subprocess, "run", capture),
+        pytest.raises(ClaudeSendMessageUnknownDelivery),
+    ):
+        sendmessage(absent, "live gate regression probe", shim)
+
+    assert streams, "the courier subprocess never ran"
+    uses, results = _tool_records(streams[0])
+    assert len(uses) == 1, "the courier did not make exactly one SendMessage call"
+    proposal = uses[0]["input"]
+    assert isinstance(proposal, dict)
+    # The courier proposed the placeholder: it was never shown the real target.
+    assert proposal["to"] == COURIER_PLACEHOLDER_TARGET
+    # The provider acted on the gate's substituted target, not on that proposal.
+    assert len(results) == 1
+    reported = json.dumps(results[0].get("content"))
+    assert absent in reported, "the provider did not act on the gate's updatedInput"
+    assert COURIER_PLACEHOLDER_TARGET not in reported, (
+        "the provider reported the placeholder, so updatedInput was not applied"
+    )
+
+
+def test_authoritative_tool_input_key_set_is_pinned_to_a_measured_provider_shape() -> None:
+    """Pin the argument shape so a silent edit shows up as a visible diff.
+
+    This asserts nothing about the provider. The shape was measured by capturing
+    a real PreToolUse payload on Claude Code 2.1.274 (2026-09-17): the provider
+    expands `to` into `recipient`, `message` into `content`, and adds
+    `type: "message"` before the gate observes the call. If a future provider
+    normalizes differently, re-measure with a capture-only hook and update this
+    set together with `authoritative_tool_input`; the live test above is what
+    will tell you it broke.
+    """
+    arguments = authoritative_tool_input("API work [ABC123]", "body", SEND_SUMMARY)
+
+    assert set(arguments) == {"to", "recipient", "message", "content", "type", "summary"}
+    assert arguments["to"] == arguments["recipient"]
+    assert arguments["message"] == arguments["content"]
+    assert arguments["type"] == "message"

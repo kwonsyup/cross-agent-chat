@@ -70,6 +70,8 @@ TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z
 # most 200 characters; it is display text, never routing or authority data.
 SUMMARY_MAX_CHARACTERS: Final = 200
 SEND_SUMMARY: Final = "Cross Agent Chat"
+# The expectation holds one bounded message plus a short target and summary.
+MAX_GATE_EXPECTATION_BYTES: Final = 128 * 1024
 # The provider derives the courier session's visible sender name from its working
 # directory, so it runs in an empty directory named for the product.
 COURIER_SESSION_DIRECTORY: Final = "cross-agent-chat"
@@ -372,6 +374,34 @@ def pretool_decision(expected: dict[str, object], payload: object) -> bool:
     return _pretool_denial(expected, payload) is None
 
 
+def _read_gate_expectation(path: Path) -> str:
+    """Read the gate expectation through an fstat-validated descriptor.
+
+    This file now names both the recipient and the exact body, so it is the
+    highest-authority input the gate has. It gets the same regular-file, owner
+    and 0600 predicate the outcome markers already get, checked on the open
+    descriptor rather than on the path, so the symlink test above cannot be
+    raced between the check and the read.
+    """
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ChatError("pre-tool expectation is unsafe")
+        if metadata.st_size > MAX_GATE_EXPECTATION_BYTES:
+            raise ChatError("pre-tool expectation is unsafe")
+        raw = os.read(descriptor, MAX_GATE_EXPECTATION_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(raw) > MAX_GATE_EXPECTATION_BYTES:
+        raise ChatError("pre-tool expectation is unsafe")
+    return raw.decode()
+
+
 def run_pretool_gate(expected_path: str) -> bool:
     gate_parent: Path | None = None
     arguments: dict[str, str] | None = None
@@ -388,11 +418,15 @@ def run_pretool_gate(expected_path: str) -> bool:
         ):
             raise ChatError("pre-tool gate directory is unsafe")
         gate_parent = path.parent
-        expected_raw = json.loads(path.read_text(encoding="utf-8"))
+        expected_raw = json.loads(_read_gate_expectation(path))
         payload_text = sys.stdin.read(65537)
         payload = json.loads(payload_text)
         if isinstance(expected_raw, dict) and len(payload_text.encode()) <= 65536:
             denial, arguments = _pretool_resolution(cast(dict[str, object], expected_raw), payload)
+        if denial is None and arguments is None:
+            # Allowing without arguments would green-light whatever the courier
+            # model authored, which is the exact failure this gate prevents.
+            denial = "sendmessage_payload_mismatch"
         allowed = denial is None
         if allowed:
             consumed = path.parent / "consumed"
@@ -615,11 +649,14 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
         f"{placeholder}. Do not use any other tool. Stop immediately after it returns."
     )
     try:
+        # No explicit dir: tempfile honors TMPDIR, which on macOS is the
+        # per-user 0700 directory. The gate file holds the plaintext body, so it
+        # must not sit under a world-writable ancestor like /tmp.
         temporary_context = tempfile.TemporaryDirectory(
-            prefix="cross-agent-chat-gate.", dir="/tmp", ignore_cleanup_errors=True
+            prefix="cross-agent-chat-gate.", ignore_cleanup_errors=True
         )
         courier_context = tempfile.TemporaryDirectory(
-            prefix="cross-agent-chat-cwd.", dir="/tmp", ignore_cleanup_errors=True
+            prefix="cross-agent-chat-cwd.", ignore_cleanup_errors=True
         )
     except OSError as error:
         raise ChatError("Claude SendMessage courier setup failed") from error
@@ -636,8 +673,13 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
             Path(courier_parent).chmod(0o700)
             courier_cwd.mkdir(mode=0o700)
             expected_path = gate / "expected.json"
-            expected_path.write_text(json.dumps(expected, separators=(",", ":")), encoding="utf-8")
-            expected_path.chmod(0o600)
+            descriptor = os.open(
+                expected_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(expected, separators=(",", ":")))
             hook = " ".join(
                 shlex.quote(part)
                 for part in (

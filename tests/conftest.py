@@ -143,7 +143,15 @@ def _fixture_socket_root(request: pytest.FixtureRequest) -> Path:
 def _isolate_founder_surfaces(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, tmp_path: Path
 ) -> None:
-    """Keep provider profiles, sockets, subprocesses, and network fixture-owned."""
+    """Keep provider profiles, sockets, subprocesses, and network fixture-owned.
+
+    Tests marked ``live`` are exempt: they exist precisely to observe what the
+    real provider does with the gate's output, which no fixture can simulate.
+    They are deselected by default (see ``addopts``) and must be asked for with
+    ``-m live``. Nothing else may take this exemption.
+    """
+    if request.node.get_closest_marker("live") is not None:
+        return
     home = tmp_path / "home"
     codex_home = home / ".codex"
     temporary = tmp_path / "tmp"

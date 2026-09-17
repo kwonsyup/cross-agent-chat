@@ -48,9 +48,12 @@ include = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "--strict-config --strict-markers"
+addopts = "--strict-config --strict-markers -m 'not live'"
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "live: spawns a real provider subprocess; run with -m live after a provider upgrade",
+]
 
 [tool.ruff]
 line-length = 100
