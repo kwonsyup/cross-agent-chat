@@ -103,6 +103,10 @@ ClaudeUnknownPhase = Literal[
 ]
 
 
+class ClaudeSendMessageRefused(ChatError):
+    """The provider reported a decided non-delivery before any effect."""
+
+
 class ClaudeSendMessageUnknownDelivery(UnknownDeliveryError):
     """A body-free local phase for an otherwise unknown Claude delivery."""
 
@@ -530,6 +534,15 @@ def parse_sendmessage_receipt(text: str) -> str:
         result = json.loads(cast(str, text_blocks[0]["text"]))
     except json.JSONDecodeError as error:
         raise ChatError("Claude SendMessage receipt is invalid") from error
+    if isinstance(result, dict) and set(result) == {"success", "message"}:
+        reason = result.get("message")
+        if result.get("success") is False and isinstance(reason, str):
+            # The provider answered that it did not deliver, and it carries no
+            # message id, so nothing was created. Exactly one SendMessage ran and
+            # the gate was consumed exactly once, both established above. That is
+            # a decided refusal before any effect, and reporting it as uncertain
+            # would freeze an event that provably delivered nothing.
+            raise ClaudeSendMessageRefused(reason)
     if (
         not isinstance(result, dict)
         or set(result) != {"success", "message", "msg_id"}
@@ -757,5 +770,7 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
             _unknown(_unconsumed_gate_phase(gate, completed.stdout))
         try:
             parse_sendmessage_receipt(completed.stdout)
+        except ClaudeSendMessageRefused:
+            raise
         except ChatError as error:
             raise ClaudeSendMessageUnknownDelivery("receipt_invalid") from error

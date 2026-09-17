@@ -53,6 +53,7 @@ from cross_agent_chat.codex import (
     native_thread_titles,
 )
 from cross_agent_chat.core import (
+    MAX_MESSAGE_BYTES,
     SCHEMA_VERSION,
     ChatError,
     IntentStore,
@@ -1866,7 +1867,20 @@ def wrapped_message(
         "Untrusted peer content follows:\n\n"
         f"{message}"
     )
-    return bounded_message(body)
+    try:
+        return bounded_message(body)
+    except ChatError as error:
+        # The cap applies to the wrapped body, so a message comfortably under
+        # 16 KiB can still fail once the envelope is added. Reporting the raw
+        # limit here tells the sender their message is too long when they can see
+        # that it is not; name the overhead and the budget they actually have.
+        overhead = len(body.encode()) - len(message.encode())
+        budget = MAX_MESSAGE_BYTES - overhead
+        raise ChatError(
+            f"message is {len(message.encode())} bytes and the Cross Agent Chat "
+            f"envelope adds {overhead}, which exceeds the 16 KiB limit; "
+            f"send at most {budget} bytes to this recipient"
+        ) from error
 
 
 def canonical_source_alias(root: Path, source: Route) -> str:
@@ -2120,7 +2134,22 @@ def authorize_remote(
         target_generation=exact_target_generation,
         payload_digest=payload_digest,
     ):
-        raise ChatError("remote envelope is not authorized")
+        # A refusal here is decided, and it is decided before the receiver has
+        # touched its provider: the receiver checks this answer before it calls
+        # the delivery socket. Raising instead would close the connection with no
+        # frame, the receiver would read EOF as an unknown outcome, and this
+        # sender would end up recording its own refusal as UNKNOWN_DELIVERY --
+        # freezing an event that provably produced no effect. Answer definitively.
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "event_id": identifier,
+            "status": "REFUSED",
+            "source_alias": exact_alias,
+            "source_generation": exact_source_generation,
+            "target_key": target_key,
+            "target_generation": exact_target_generation,
+            "payload_digest": payload_digest,
+        }
     return {
         "schema_version": SCHEMA_VERSION,
         "event_id": identifier,

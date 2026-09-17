@@ -24,6 +24,7 @@ from cross_agent_chat.claude_runtime import (
     DISCOVERY_TIMEOUT_SECONDS,
     SEND_SUMMARY,
     SEND_TIMEOUT_SECONDS,
+    ClaudeSendMessageRefused,
     ClaudeSendMessageUnknownDelivery,
     ClaudeUnknownPhase,
     _pretool_denial,
@@ -1882,9 +1883,14 @@ def test_live_gate_substitutes_the_target_the_courier_never_saw(tmp_path: Path) 
 
     with (
         mock.patch.object(subprocess, "run", capture),
-        pytest.raises(ClaudeSendMessageUnknownDelivery),
+        # The provider answers that the substituted target is unreachable, which
+        # is a decided non-delivery, not an uncertain one. This also exercises
+        # that classification against the real provider rather than a fixture.
+        pytest.raises(ClaudeSendMessageRefused) as refused,
     ):
         sendmessage(absent, "live gate regression probe", shim)
+
+    assert absent in str(refused.value)
 
     assert streams, "the courier subprocess never ran"
     uses, results = _tool_records(streams[0])
@@ -1919,3 +1925,73 @@ def test_authoritative_tool_input_key_set_is_pinned_to_a_measured_provider_shape
     assert arguments["to"] == arguments["recipient"]
     assert arguments["message"] == arguments["content"]
     assert arguments["type"] == "message"
+
+
+def _sendmessage_refusal_stream(result_text: str) -> str:
+    """Provider stream logging one SendMessage use whose result is a refusal."""
+    use = {
+        "type": "tool_use",
+        "id": "tool-1",
+        "name": "SendMessage",
+        "input": authoritative_tool_input(
+            COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+        ),
+    }
+    result = {
+        "type": "tool_result",
+        "tool_use_id": "tool-1",
+        "content": [{"type": "text", "text": result_text}],
+    }
+    return "\n".join(
+        [
+            json.dumps({"type": "assistant", "message": {"content": [use]}}),
+            json.dumps({"type": "user", "message": {"content": [result]}}),
+        ]
+    )
+
+
+def test_receipt_treats_a_reported_non_delivery_as_decided_not_unknown() -> None:
+    # Exactly one SendMessage ran and the gate was consumed exactly once, both
+    # established before this parse. The provider then answered that it did not
+    # deliver and carried no message id, so nothing was created. Reporting that
+    # as UNKNOWN froze an event that provably delivered nothing, which is what
+    # drove the hand relays in the field reports.
+    stream = _sendmessage_refusal_stream(
+        json.dumps(
+            {
+                "success": False,
+                "message": "No agent named 'Gone [ABC123]' is reachable.",
+            }
+        )
+    )
+
+    with pytest.raises(ClaudeSendMessageRefused) as caught:
+        parse_sendmessage_receipt(stream)
+
+    assert "is reachable" in str(caught.value)
+    # It must be a deterministic rejection, never an unknown-delivery outcome.
+    assert not isinstance(caught.value, UnknownDeliveryError)
+
+
+@pytest.mark.parametrize(
+    "result_text",
+    [
+        pytest.param(
+            json.dumps({"success": False, "message": "gone", "msg_id": str(uuid4())}),
+            id="refusal-carrying-a-message-id",
+        ),
+        pytest.param(json.dumps({"success": False}), id="refusal-without-a-reason"),
+        pytest.param(json.dumps({"success": "no", "message": "gone"}), id="non-boolean-success"),
+        pytest.param(json.dumps(["not", "a", "dict"]), id="non-dict-result"),
+    ],
+)
+def test_receipt_keeps_an_ambiguous_outcome_uncertain(result_text: str) -> None:
+    # Only the exact refusal contract is decided. Anything else -- including a
+    # failure that still carries a message id, meaning something was created --
+    # must stay uncertain rather than be promoted to a definite non-delivery.
+    stream = _sendmessage_refusal_stream(result_text)
+
+    with pytest.raises(ChatError) as caught:
+        parse_sendmessage_receipt(stream)
+
+    assert not isinstance(caught.value, ClaudeSendMessageRefused)
