@@ -699,6 +699,12 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
                     ]
                 }
             }
+            # The tool restriction below is load-bearing for privacy, not just
+            # for determinism: the gate file in this courier's own process tree
+            # holds the plaintext message body. The courier has no Read, no Bash,
+            # no MCP and no slash commands, so the model inside it cannot open
+            # that file. Adding a file-reading tool here would expose every
+            # message body CAC delivers.
             command = [
                 str(claude_binary()),
                 "-p",
