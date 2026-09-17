@@ -72,6 +72,7 @@ TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z
 # The provider schema declares `summary` an optional one-line UI preview of at
 # most 200 characters; it is display text, never routing or authority data.
 SUMMARY_MAX_CHARACTERS: Final = 200
+COURIER_SESSION_DIRECTORY: Final = "cross-agent-chat"
 SUMMARY_REJECT_RE: Final = re.compile(r"[\x00-\x08\x0a-\x0d\x0e-\x1f\x7f-\x9f\u2028\u2029]")
 REQUIRED_TOOL_INPUT_KEYS: Final = frozenset({"to", "message", "recipient", "content", "type"})
 OPTIONAL_TOOL_INPUT_KEYS: Final = frozenset({"summary"})
@@ -601,12 +602,23 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
         temporary_context = tempfile.TemporaryDirectory(
             prefix="cross-agent-chat-gate.", dir="/tmp", ignore_cleanup_errors=True
         )
+        courier_context = tempfile.TemporaryDirectory(
+            prefix="cross-agent-chat-cwd.", dir="/tmp", ignore_cleanup_errors=True
+        )
     except OSError as error:
         raise ChatError("Claude SendMessage courier setup failed") from error
-    with temporary_context as temporary:
+    with temporary_context as temporary, courier_context as courier_parent:
+        # The provider derives the courier session's visible sender name from its
+        # working directory, so an empty directory named for the product makes an
+        # incoming CAC message legible as one instead of an opaque `empty-NN`. The
+        # name is lowercased and truncated by the provider, so it carries no peer
+        # identity: the exact source and reply handle stay in the envelope.
+        courier_cwd = Path(courier_parent) / COURIER_SESSION_DIRECTORY
         try:
             gate = Path(temporary)
             gate.chmod(0o700)
+            Path(courier_parent).chmod(0o700)
+            courier_cwd.mkdir(mode=0o700)
             expected_path = gate / "expected.json"
             expected_path.write_text(json.dumps(expected, separators=(",", ":")), encoding="utf-8")
             expected_path.chmod(0o600)
@@ -665,7 +677,7 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
         try:
             completed = subprocess.run(
                 command,
-                cwd="/var/empty",
+                cwd=str(courier_cwd),
                 env=_environment(),
                 input=prompt,
                 capture_output=True,
