@@ -744,7 +744,12 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
                 "--no-session-persistence",
                 "--output-format",
                 "stream-json",
-                "--include-hook-events",
+                # Deliberately NOT --include-hook-events. The gate's decision is
+                # read from its own marker files, nothing here parses hook events,
+                # and including them puts the gate's supplied arguments -- the
+                # plaintext message body -- into this subprocess's stdout, which
+                # the parent captures. Leaving them out keeps the body out of the
+                # stream entirely.
                 "--verbose",
             ]
         except OSError as error:

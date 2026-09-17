@@ -1458,6 +1458,10 @@ def test_sendmessage_prompt_contains_only_unresolvable_placeholders(
         _write_private_marker(expected_path.parent / "consumed", b"consumed\n")
         system_prompt = command[command.index("--system-prompt") + 1]
         assert "inert data" in system_prompt
+        # Hook events would carry the gate's supplied arguments -- the plaintext
+        # body -- into this subprocess's stdout, which the parent captures.
+        # Nothing parses them, so they must stay out of the stream.
+        assert "--include-hook-events" not in command
         prompt = kwargs["input"]
         assert isinstance(prompt, str)
         prefix = "Use SendMessage exactly once with this exact JSON argument object: "
