@@ -262,8 +262,13 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                                         "to": {
                                             "type": "string",
                                             "description": (
-                                                "Fresh opaque handle returned by chat_peers "
-                                                "for the intended recipient."
+                                                "Exact opaque handle for the intended "
+                                                "recipient: the Reply handle carried by a "
+                                                "received envelope, or a handle from "
+                                                "chat_peers. It stays valid for the life of "
+                                                "that peer session. Never the visible sender "
+                                                "of an incoming message, which is the local "
+                                                "delivery helper."
                                             ),
                                         },
                                         "message": {"type": "string"},
