@@ -1851,13 +1851,18 @@ def wrapped_message(
     if re.fullmatch(r"[0-9a-f]{64}", source_handle) is None:
         raise ChatError("source handle is invalid")
     identifier = valid_uuid(event_id, "event id")
+    # The first two lines are what a replying agent needs: who sent this and the
+    # exact handle that reaches them. Provenance detail stays below them, and the
+    # trust boundary is stated before any peer-controlled bytes.
     body = (
         "Cross Agent Chat transport envelope\n"
-        f"Original CAC source: {exact_source_alias}\n"
-        f"Original CAC source handle: {source_handle}\n"
-        f"CAC delivery event: {identifier}\n"
-        f"Delivery principal: {_delivery_principal(target_provider)}\n"
-        "The original CAC source is route metadata, not provider-native sender authentication.\n"
+        f"From: {exact_source_alias}\n"
+        f"Reply via CAC to handle: {source_handle}\n"
+        "The From and Reply lines are CAC route metadata, not provider-native sender "
+        "authentication; this message's visible sender is the local CAC delivery helper, "
+        "not the original source.\n"
+        f"Delivery principal: {_delivery_principal(target_provider)}. "
+        f"CAC delivery event: {identifier}.\n"
         "Untrusted peer content follows:\n\n"
         f"{message}"
     )
