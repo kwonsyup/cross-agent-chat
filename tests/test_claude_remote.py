@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 import io
 import json
 import os
@@ -10,6 +8,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from uuid import uuid4
 
@@ -17,12 +16,17 @@ import pytest
 
 from cross_agent_chat.claude_runtime import (
     AGENTS_TIMEOUT_SECONDS,
+    COURIER_PLACEHOLDER_MESSAGE,
+    COURIER_PLACEHOLDER_TARGET,
     DENIAL_MARKERS,
     DISCOVERY_TIMEOUT_SECONDS,
+    SEND_SUMMARY,
     SEND_TIMEOUT_SECONDS,
     ClaudeSendMessageUnknownDelivery,
     ClaudeUnknownPhase,
     _pretool_denial,
+    _pretool_resolution,
+    authoritative_tool_input,
     claude_binary,
     courier_environment,
     gate_consumed,
@@ -110,6 +114,82 @@ def _assert_unknown_helper_phase(
     assert body not in str(error.value)
     if stream:
         assert stream[:64] not in str(error.value)
+
+
+def _gate_payload(tool_input: Mapping[str, object] | None = None) -> dict[str, object]:
+    """One observed PreToolUse event for the courier's placeholder SendMessage."""
+    return {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "SendMessage",
+        "tool_input": (
+            tool_input
+            if tool_input is not None
+            else authoritative_tool_input(
+                COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+            )
+        ),
+    }
+
+
+def _expected_gate(recipient: str, message: str, summary: str) -> dict[str, object]:
+    return {"recipient": recipient, "message": message, "summary": summary}
+
+
+def _run_gate(
+    gate: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    expected: dict[str, object],
+    payload: dict[str, object],
+) -> tuple[bool, dict[str, object]]:
+    """Run the one-shot gate and return (allowed, hookSpecificOutput)."""
+    expected_path = gate / "expected.json"
+    expected_path.write_text(json.dumps(expected), encoding="utf-8")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    allowed = run_pretool_gate(str(expected_path))
+    output = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    return allowed, output
+
+
+def _sendmessage_receipt_stream(
+    tool_input: Mapping[str, object], message_id: str | None = None
+) -> str:
+    """Provider stream logging one SendMessage use plus its successful result."""
+    msg_id = message_id or str(uuid4())
+    use = {"type": "tool_use", "id": "tool-1", "name": "SendMessage", "input": tool_input}
+    result = {
+        "type": "tool_result",
+        "tool_use_id": "tool-1",
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps({"success": True, "message": "sent", "msg_id": msg_id}),
+            }
+        ],
+    }
+    return "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+
+
+def _assert_sendmessage_delivered(
+    monkeypatch: pytest.MonkeyPatch, tool_input: dict[str, object]
+) -> None:
+    """Assert one delivery completes whatever the logged proposal contained."""
+    stream = _sendmessage_receipt_stream(tool_input)
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        settings = json.loads(command[command.index("--settings") + 1])
+        hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        tokens = shlex.split(hook)
+        expected_path = Path(tokens[tokens.index("--expected") + 1])
+        _write_private_marker(expected_path.parent / "consumed", b"consumed\n")
+        return subprocess.CompletedProcess(command, 0, stream, "")
+
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
+    monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
+
+    sendmessage("API work [ABC123]", "private body that must not be echoed", Path("/usr/bin/false"))
 
 
 def test_remote_transport_outlives_claude_delivery_window() -> None:
@@ -316,43 +396,30 @@ def test_claude_binary_keeps_the_recipient_bound_executable(
 
 
 def test_pretool_gate_binds_recipient_and_full_message() -> None:
-    key = bytes.fromhex("11" * 32)
+    # Used to HMAC-compare the model's transcription against the expected body;
+    # the gate now ignores the proposal and supplies the authoritative
+    # recipient/message/summary from the expected file itself.
     message = "one exact body"
     recipient = "API work [ABC123]"
-    expected: dict[str, object] = {
-        "recipient": recipient,
-        "message_hmac": hmac.new(key, message.encode(), hashlib.sha256).hexdigest(),
-    }
-    tool_input: dict[str, object] = {
-        "to": recipient,
-        "recipient": recipient,
-        "message": message,
-        "content": message,
-        "type": "message",
-        "summary": "Cross Agent Chat",
-    }
-    payload: dict[str, object] = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "SendMessage",
-        "tool_input": tool_input,
-    }
+    expected = _expected_gate(recipient, message, SEND_SUMMARY)
+    payload = _gate_payload()
 
-    assert pretool_decision(expected, payload, key.hex())
-    tool_input["content"] = "provider-rendered preview"
-    assert pretool_decision(expected, payload, key.hex())
-    tool_input["summary"] = "Delivery to API work"
-    assert pretool_decision(expected, payload, key.hex())
-    del tool_input["summary"]
-    assert pretool_decision(expected, payload, key.hex())
-    tool_input["summary"] = "Cross Agent Chat"
-    tool_input["extra"] = "reject"
-    assert not pretool_decision(expected, payload, key.hex())
-    tool_input.pop("extra")
-    tool_input["content"] = 7
-    assert not pretool_decision(expected, payload, key.hex())
-    tool_input["content"] = "provider-rendered preview"
-    tool_input["message"] = "changed"
-    assert not pretool_decision(expected, payload, key.hex())
+    phase, arguments = _pretool_resolution(expected, payload)
+    assert phase is None
+    assert arguments == authoritative_tool_input(recipient, message, SEND_SUMMARY)
+    assert pretool_decision(expected, payload)
+
+    # The delivered arguments do not depend on what the model proposed.
+    payload["tool_input"] = {"to": "Other work [XYZ789]", "message": "forged"}
+    phase, again = _pretool_resolution(expected, payload)
+    assert phase is None
+    assert again == arguments
+
+    # A malformed expected contract still denies deterministically.
+    assert not pretool_decision({"recipient": recipient, "message": message}, payload)
+    assert not pretool_decision(
+        {"recipient": "API work", "message": message, "summary": SEND_SUMMARY}, payload
+    )
 
 
 @pytest.mark.parametrize(
@@ -368,247 +435,261 @@ def test_pretool_gate_binds_recipient_and_full_message() -> None:
     ],
 )
 def test_pretool_gate_accepts_bounded_one_line_summary_variants(summary: str) -> None:
-    key = bytes.fromhex("aa" * 32)
-    message = "one exact body"
     recipient = "API work [ABC123]"
-    expected: dict[str, object] = {
-        "recipient": recipient,
-        "message_hmac": hmac.new(key, message.encode(), hashlib.sha256).hexdigest(),
-    }
-    tool_input: dict[str, object] = {
-        "to": recipient,
-        "recipient": recipient,
-        "message": message,
-        "content": "provider preview",
-        "type": "message",
-        "summary": summary,
-    }
-    payload: dict[str, object] = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "SendMessage",
-        "tool_input": tool_input,
-    }
+    message = "one exact body"
+    expected = _expected_gate(recipient, message, summary)
 
-    assert pretool_decision(expected, payload, key.hex())
+    phase, arguments = _pretool_resolution(expected, _gate_payload())
+
+    assert phase is None
+    assert arguments == authoritative_tool_input(recipient, message, summary)
 
 
+# Used to deny `type`/`summary` violations inside the model-transcribed input;
+# the proposal is never inspected now, so summary validation moved to the
+# sender-declared `expected` file and every violation is a payload mismatch.
 @pytest.mark.parametrize(
-    ("denial", "tool_input_change"),
+    "summary",
     [
-        ("sendmessage_type_mismatch", {"type": "request"}),
-        ("sendmessage_type_mismatch", {"type": "notify"}),
-        ("sendmessage_summary_mismatch", {"summary": "two\nlines"}),
-        ("sendmessage_summary_mismatch", {"summary": "carriage\rreturn"}),
-        ("sendmessage_summary_mismatch", {"summary": "x" * 201}),
-        ("sendmessage_summary_mismatch", {"summary": "split\u2028line"}),
-        ("sendmessage_summary_mismatch", {"summary": "para\u2029graph"}),
-        ("sendmessage_summary_mismatch", {"summary": "vertical\x0btab"}),
-        ("sendmessage_summary_mismatch", {"summary": "form\x0cfeed"}),
-        ("sendmessage_summary_mismatch", {"summary": "nel\x85break"}),
-        ("sendmessage_summary_mismatch", {"summary": "del\x7fete"}),
-        ("sendmessage_summary_mismatch", {"summary": "bidi\u202eoverride"}),
-        ("sendmessage_summary_mismatch", {"summary": "zero\u200bwidth"}),
-        ("sendmessage_summary_mismatch", {"summary": "\ufeffbom"}),
-        ("sendmessage_summary_mismatch", {"summary": "private\ue000use"}),
-        ("sendmessage_summary_mismatch", {"summary": "bad\ud800 surrogate"}),
-        ("sendmessage_summary_mismatch", {"summary": 7}),
-        ("sendmessage_payload_mismatch", {"type": "message", "extra": "field"}),
-        ("sendmessage_payload_mismatch", {"notify_when_idle": True}),
+        "two\nlines",
+        "carriage\rreturn",
+        "x" * 201,
+        "split\u2028line",
+        "para\u2029graph",
+        "vertical\x0btab",
+        "form\x0cfeed",
+        "nel\x85break",
+        "del\x7fete",
+        "bidi\u202eoverride",
+        "zero\u200bwidth",
+        "\ufeffbom",
+        "private\ue000use",
+        "bad\ud800 surrogate",
+        7,
+        None,
     ],
 )
-def test_pretool_gate_separates_type_and_summary_denials(
-    denial: ClaudeUnknownPhase, tool_input_change: dict[str, object]
+def test_pretool_gate_denies_invalid_expected_summary(summary: object) -> None:
+    expected = _expected_gate("API work [ABC123]", "one exact body", summary)  # type: ignore[arg-type]
+
+    assert _pretool_denial(expected, _gate_payload()) == "sendmessage_payload_mismatch"
+
+
+# Used to deny malformed model-transcribed fields (`type`, `summary`, extras);
+# the gate replaces the whole input, so none of these proposal shapes matter.
+@pytest.mark.parametrize(
+    "tool_input_change",
+    [
+        {"type": "request"},
+        {"type": "notify"},
+        {"summary": "two\nlines"},
+        {"summary": 7},
+        {"extra": "field"},
+        {"notify_when_idle": True},
+        {"to": "Other work [XYZ789]"},
+        {"recipient": "Other work [XYZ789]"},
+        {"message": "forged body"},
+        {"content": 7},
+    ],
+)
+def test_pretool_gate_ignores_everything_the_model_proposed(
+    tool_input_change: dict[str, object],
 ) -> None:
-    key = bytes.fromhex("bb" * 32)
-    message = "one exact body"
     recipient = "API work [ABC123]"
-    expected: dict[str, object] = {
-        "recipient": recipient,
-        "message_hmac": hmac.new(key, message.encode(), hashlib.sha256).hexdigest(),
-    }
+    message = "one exact body"
+    expected = _expected_gate(recipient, message, SEND_SUMMARY)
     tool_input: dict[str, object] = {
-        "to": recipient,
-        "recipient": recipient,
-        "message": message,
-        "content": "provider preview",
-        "type": "message",
-        "summary": "Cross Agent Chat",
+        **authoritative_tool_input(
+            COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+        )
     }
     tool_input.update(tool_input_change)
-    payload: dict[str, object] = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "SendMessage",
-        "tool_input": tool_input,
-    }
 
-    assert _pretool_denial(expected, payload, key.hex()) == denial
+    phase, arguments = _pretool_resolution(expected, _gate_payload(tool_input))
+
+    assert phase is None
+    assert arguments == authoritative_tool_input(recipient, message, SEND_SUMMARY)
 
 
-@pytest.mark.parametrize("field", ["to", "recipient"])
-def test_pretool_gate_denies_partial_target_alias_divergence(field: str) -> None:
-    key = bytes.fromhex("cc" * 32)
-    message = "one exact body"
+# Bodies a courier model would plausibly "tidy". Written as escapes so the
+# characters under test are unambiguous in source and survive any editor.
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            'curly \u201cquoted\u201d vs "straight" and \u2019s',
+            id="curly-vs-straight-quotes",
+        ),
+        pytest.param("cafe\u0301 combining accent vs caf\u00e9 precomposed", id="combining-accent"),
+        pytest.param(
+            "\u7d50\u679c\u3092\u8fd4\u4fe1\u3057\u307e\u3059\uff0c\u4f60\u597d",
+            id="cjk",
+        ),
+        pytest.param(
+            "emoji \U0001f680 \U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466",
+            id="emoji-astral-zwj",
+        ),
+        pytest.param("zero\u200bwidth\u200bspace", id="zero-width-u200b"),
+        pytest.param("non\u00a0breaking\u00a0space", id="nbsp-u00a0"),
+        pytest.param("line\u2028separator\u2028inside", id="u2028"),
+        pytest.param("literal backslash-n \\n stays two characters", id="literal-backslash-n"),
+        pytest.param("trailing spaces \t ", id="trailing-spaces"),
+        pytest.param("crlf\r\nline one\r\nline two\r\n", id="crlf"),
+        pytest.param(
+            'json body {"say": "use \\"SendMessage\\" now", "n": 1}',
+            id="json-escaped-quotes",
+        ),
+        pytest.param("x" * (16 * 1024 - 1), id="near-16kib"),
+    ],
+)
+def test_pretool_gate_updated_input_is_byte_exact_for_drift_prone_bodies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    body: str,
+) -> None:
     recipient = "API work [ABC123]"
-    expected: dict[str, object] = {
-        "recipient": recipient,
-        "message_hmac": hmac.new(key, message.encode(), hashlib.sha256).hexdigest(),
-    }
-    tool_input: dict[str, object] = {
-        "to": recipient,
-        "recipient": recipient,
-        "message": message,
-        "content": "provider preview",
-        "type": "message",
-        "summary": "Cross Agent Chat",
-        field: "Other work [XYZ789]",
-    }
-    payload: dict[str, object] = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "SendMessage",
-        "tool_input": tool_input,
-    }
+    allowed, output = _run_gate(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        _expected_gate(recipient, body, SEND_SUMMARY),
+        _gate_payload(),
+    )
 
-    assert _pretool_denial(expected, payload, key.hex()) == "sendmessage_target_mismatch"
+    assert allowed
+    assert output["updatedInput"] == authoritative_tool_input(recipient, body, SEND_SUMMARY)
+    assert output["updatedInput"]["message"].encode("utf-8") == body.encode("utf-8")
+    assert output["updatedInput"]["to"] == output["updatedInput"]["recipient"] == recipient
+    assert (tmp_path / "consumed").exists()
+
+
+def test_pretool_gate_updated_input_is_independent_of_the_proposal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    recipient = "API work [ABC123]"
+    expected = _expected_gate(recipient, "authoritative body", SEND_SUMMARY)
+    proposals: list[Mapping[str, object]] = [
+        authoritative_tool_input(
+            COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+        ),
+        {"recipient": "Wrong [ZZZ999]", "msg": "truncated", "extra": True},
+    ]
+    delivered = []
+    for index, tool_input in enumerate(proposals):
+        gate = tmp_path / f"gate-{index}"
+        gate.mkdir()
+        gate.chmod(0o700)
+        allowed, output = _run_gate(gate, monkeypatch, capsys, expected, _gate_payload(tool_input))
+        assert allowed
+        delivered.append(output["updatedInput"])
+
+    expected_arguments = authoritative_tool_input(recipient, "authoritative body", SEND_SUMMARY)
+    assert delivered == [expected_arguments, expected_arguments]
+
+
+# Used to deny when the model's `to`/`recipient` aliases diverged; the proposal
+# is ignored now, so the equivalent guard is that the sender-declared recipient
+# must be an exact `name [TOKEN]` target reference.
+@pytest.mark.parametrize(
+    "recipient",
+    [
+        "API work",
+        "API work [ABC12]",
+        "API work [ABC1234]",
+        "[ABC123]",
+        "API work [ABC123] extra",
+        7,
+        None,
+    ],
+)
+def test_pretool_gate_denies_malformed_expected_target_ref(
+    recipient: object,
+) -> None:
+    expected = _expected_gate(recipient, "one exact body", SEND_SUMMARY)  # type: ignore[arg-type]
+
+    assert _pretool_denial(expected, _gate_payload()) == "sendmessage_payload_mismatch"
 
 
 def test_pretool_gate_denies_replay_after_consumption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    key = "dd" * 32
     target = "API work [ABC123]"
     message = "hello"
     expected_path = tmp_path / "expected.json"
     expected_path.write_text(
-        json.dumps(
-            {
-                "recipient": target,
-                "message_hmac": hmac.new(
-                    bytes.fromhex(key), message.encode(), hashlib.sha256
-                ).hexdigest(),
-            }
-        ),
+        json.dumps(_expected_gate(target, message, SEND_SUMMARY)),
         encoding="utf-8",
     )
-    payload = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "SendMessage",
-        "tool_input": {
-            "to": target,
-            "recipient": target,
-            "message": message,
-            "content": "preview",
-            "type": "message",
-            "summary": "Cross Agent Chat",
-        },
-    }
+    payload = _gate_payload()
     stdin = io.StringIO(json.dumps(payload))
     monkeypatch.setattr("sys.stdin", stdin)
 
-    assert run_pretool_gate(str(expected_path), key)
+    assert run_pretool_gate(str(expected_path))
     assert (tmp_path / "consumed").exists()
 
     stdin.seek(0)
-    assert not run_pretool_gate(str(expected_path), key)
+    assert not run_pretool_gate(str(expected_path))
     assert (tmp_path / "denied").read_bytes() == DENIAL_MARKERS["pretool_gate_denied"]
-    decisions = [
-        json.loads(line)["hookSpecificOutput"]["permissionDecision"]
-        for line in capsys.readouterr().out.splitlines()
+    outputs = [
+        json.loads(line)["hookSpecificOutput"] for line in capsys.readouterr().out.splitlines()
     ]
-    assert decisions == ["allow", "deny"]
+    assert [output["permissionDecision"] for output in outputs] == ["allow", "deny"]
+    # updatedInput is emitted only on allow, never on deny.
+    assert "updatedInput" in outputs[0]
+    assert "updatedInput" not in outputs[1]
 
 
 def test_pretool_gate_uses_full_unicode_body_not_cosmetic_preview() -> None:
-    key = bytes.fromhex("22" * 32)
+    # Used to assert the model's transcription HMAC-matched the full body; the
+    # gate now supplies the body itself, so updatedInput must carry it verbatim.
     message = "e\u0301 family 👨‍👩‍👧‍👦 " + "wide界" * 20
     recipient = "API work [ABC123]"
-    expected: dict[str, object] = {
-        "recipient": recipient,
-        "message_hmac": hmac.new(key, message.encode(), hashlib.sha256).hexdigest(),
-    }
-    tool_input: dict[str, object] = {
-        "to": recipient,
-        "recipient": recipient,
-        "message": message,
-        "content": "provider preview with different display width",
-        "type": "message",
-        "summary": "Cross Agent Chat",
-    }
-    payload: dict[str, object] = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "SendMessage",
-        "tool_input": tool_input,
-    }
+    expected = _expected_gate(recipient, message, SEND_SUMMARY)
 
-    assert pretool_decision(expected, payload, key.hex())
-    tool_input["message"] = message[:-1] + "x"
-    assert not pretool_decision(expected, payload, key.hex())
+    phase, arguments = _pretool_resolution(expected, _gate_payload())
+
+    assert phase is None
+    assert arguments == authoritative_tool_input(recipient, message, SEND_SUMMARY)
+    assert arguments["message"].encode("utf-8") == message.encode("utf-8")
 
 
-def test_pretool_gate_denies_an_unpaired_surrogate_without_consuming(
+# Used to deny with sendmessage_message_mismatch when the model's proposed body
+# contained an unpaired surrogate; the proposal is never inspected or delivered
+# now, so the gate allows and substitutes the authoritative arguments.
+def test_pretool_gate_ignores_an_unpaired_surrogate_in_the_proposal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    key = "33" * 32
     recipient = "API work [ABC123]"
-    expected = tmp_path / "expected.json"
-    expected.write_text(
-        json.dumps({"recipient": recipient, "message_hmac": "0" * 64}), encoding="utf-8"
+    expected_path = tmp_path / "expected.json"
+    expected_path.write_text(
+        json.dumps(_expected_gate(recipient, "hello", SEND_SUMMARY)), encoding="utf-8"
     )
-    payload = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "SendMessage",
-        "tool_input": {
-            "to": recipient,
-            "recipient": recipient,
-            "message": "\ud800",
-            "content": "preview",
-            "type": "message",
-            "summary": "Cross Agent Chat",
-        },
-    }
+    surrogate = "\ud800"
+    payload = _gate_payload({"to": surrogate, "recipient": surrogate, "message": surrogate})
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
 
-    assert not run_pretool_gate(str(expected), key)
-    assert not (tmp_path / "consumed").exists()
-    denied = tmp_path / "denied"
-    assert denied.read_bytes() == DENIAL_MARKERS["sendmessage_message_mismatch"]
-    assert stat.S_IMODE(denied.stat().st_mode) == 0o600
-    response = json.loads(capsys.readouterr().out)
-    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert run_pretool_gate(str(expected_path))
+    assert (tmp_path / "consumed").exists()
+    output = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert output["permissionDecision"] == "allow"
+    assert output["updatedInput"] == authoritative_tool_input(recipient, "hello", SEND_SUMMARY)
 
 
 def test_pretool_gate_writes_owned_private_consumed_marker_atomically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    key = "44" * 32
     target = "API work [ABC123]"
     message = "hello"
     expected_path = tmp_path / "expected.json"
     expected_path.write_text(
-        json.dumps(
-            {
-                "recipient": target,
-                "message_hmac": hmac.new(
-                    bytes.fromhex(key), message.encode(), hashlib.sha256
-                ).hexdigest(),
-            }
-        ),
+        json.dumps(_expected_gate(target, message, SEND_SUMMARY)),
         encoding="utf-8",
     )
-    payload = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "SendMessage",
-        "tool_input": {
-            "to": target,
-            "recipient": target,
-            "message": message,
-            "content": "preview",
-            "type": "message",
-            "summary": "Cross Agent Chat",
-        },
-    }
+    payload = _gate_payload()
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
 
-    assert run_pretool_gate(str(expected_path), key)
+    assert run_pretool_gate(str(expected_path))
     consumed = tmp_path / "consumed"
     assert consumed.read_bytes() == b"consumed\n"
     assert stat.S_ISREG(consumed.stat().st_mode)
@@ -616,6 +697,9 @@ def test_pretool_gate_writes_owned_private_consumed_marker_atomically(
     assert stat.S_IMODE(consumed.stat().st_mode) == 0o600
     response = json.loads(capsys.readouterr().out)
     assert response["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert response["hookSpecificOutput"]["updatedInput"] == authoritative_tool_input(
+        target, message, SEND_SUMMARY
+    )
 
 
 @pytest.mark.parametrize(
@@ -868,31 +952,15 @@ def test_sendmessage_helper_stream_failures_are_body_free_and_enum_bound(
     _assert_unknown_helper_phase(monkeypatch, stream, phase)
 
 
-def test_sendmessage_helper_target_mismatch_is_unknown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stream = _sendmessage_stream(
-        "API work [ABC123]",
-        "private body that must not be echoed",
-        tool_input={
-            "to": "Other work [XYZ789]",
-            "recipient": "Other work [XYZ789]",
-            "message": "private body that must not be echoed",
-            "content": "provider preview",
-            "type": "message",
-            "summary": "Cross Agent Chat",
-        },
-    )
-    _assert_unknown_helper_phase(monkeypatch, stream, "pretool_gate_unobserved")
-
-
-def test_sendmessage_helper_full_message_hmac_mismatch_is_unknown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stream = _sendmessage_stream(
-        "API work [ABC123]",
-        "private body that must not be echoed",
-        tool_input={
+# These used to assert that a divergent target, an altered body, or an
+# unexpected field in the model's proposal produced an unknown delivery; the
+# gate now replaces the whole tool input, so none of the logged proposal's
+# contents can affect the delivered arguments.
+@pytest.mark.parametrize(
+    "tool_input",
+    [
+        authoritative_tool_input("Other work [XYZ789]", "forged body", SEND_SUMMARY),
+        {
             "to": "API work [ABC123]",
             "recipient": "API work [ABC123]",
             "message": "altered private body",
@@ -900,17 +968,7 @@ def test_sendmessage_helper_full_message_hmac_mismatch_is_unknown(
             "type": "message",
             "summary": "Cross Agent Chat",
         },
-    )
-    _assert_unknown_helper_phase(monkeypatch, stream, "pretool_gate_unobserved")
-
-
-def test_sendmessage_helper_unexpected_field_is_unknown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stream = _sendmessage_stream(
-        "API work [ABC123]",
-        "private body that must not be echoed",
-        tool_input={
+        {
             "to": "API work [ABC123]",
             "recipient": "API work [ABC123]",
             "message": "private body that must not be echoed",
@@ -919,68 +977,96 @@ def test_sendmessage_helper_unexpected_field_is_unknown(
             "summary": "Cross Agent Chat",
             "unexpected": "reject",
         },
-    )
-    _assert_unknown_helper_phase(monkeypatch, stream, "pretool_gate_unobserved")
+        {"recipient": "Wrong [ZZZ999]", "msg": "truncated", "extra": True},
+    ],
+)
+def test_sendmessage_ignores_the_courier_proposal(
+    monkeypatch: pytest.MonkeyPatch, tool_input: dict[str, object]
+) -> None:
+    _assert_sendmessage_delivered(monkeypatch, tool_input)
 
 
+# The gate no longer inspects the model's proposal, so the old per-field
+# denials (target/message/type/summary mismatch) collapse into one contract
+# check: sendmessage_payload_mismatch for an invalid expected file or a
+# non-SendMessage event, pretool_gate_denied for unreadable/malformed inputs.
 @pytest.mark.parametrize(
-    "denial",
+    ("denial", "expected_kind", "payload_kind"),
     [
-        "sendmessage_payload_mismatch",
-        "sendmessage_target_mismatch",
-        "sendmessage_message_mismatch",
-        "sendmessage_type_mismatch",
-        "sendmessage_summary_mismatch",
+        # The pre-repair HMAC schema is now a malformed expected file.
+        ("sendmessage_payload_mismatch", "legacy_hmac_schema", None),
+        ("sendmessage_payload_mismatch", "missing_summary", None),
+        ("sendmessage_payload_mismatch", "extra_key", None),
+        ("sendmessage_payload_mismatch", "bad_target_ref", None),
+        ("sendmessage_payload_mismatch", "invalid_summary", None),
+        ("sendmessage_payload_mismatch", "non_string_message", None),
+        ("sendmessage_payload_mismatch", None, "wrong_event"),
+        ("sendmessage_payload_mismatch", None, "wrong_tool"),
+        ("sendmessage_payload_mismatch", None, "non_dict_tool_input"),
+        ("sendmessage_payload_mismatch", None, "non_dict_payload"),
+        ("pretool_gate_denied", "unparseable_json", None),
+        ("pretool_gate_denied", "non_dict_expected", None),
+        ("pretool_gate_denied", None, "unparseable_payload"),
+        ("pretool_gate_denied", None, "oversized_payload"),
     ],
 )
 def test_pretool_gate_writes_specific_fixed_denial_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     denial: ClaudeUnknownPhase,
+    expected_kind: str | None,
+    payload_kind: str | None,
 ) -> None:
-    key = "66" * 32
     target = "API work [ABC123]"
     message = "private body"
-    expected_path = tmp_path / "expected.json"
-    expected_path.write_text(
-        json.dumps(
-            {
-                "recipient": target,
-                "message_hmac": hmac.new(
-                    bytes.fromhex(key), message.encode(), hashlib.sha256
-                ).hexdigest(),
-            }
-        ),
-        encoding="utf-8",
-    )
-    tool_input: dict[str, object] = {
-        "to": target,
-        "recipient": target,
-        "message": message,
-        "content": "preview",
-        "type": "message",
-        "summary": "Cross Agent Chat",
-    }
-    if denial == "sendmessage_payload_mismatch":
-        del tool_input["content"]
-    elif denial == "sendmessage_target_mismatch":
-        tool_input["to"] = "Other work [XYZ789]"
-        tool_input["recipient"] = "Other work [XYZ789]"
-    elif denial == "sendmessage_message_mismatch":
-        tool_input["message"] = "altered private body"
-    elif denial == "sendmessage_type_mismatch":
-        tool_input["type"] = "request"
-    else:
-        tool_input["summary"] = "one line\nsecond line"
-    payload = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "SendMessage",
-        "tool_input": tool_input,
-    }
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    expected: object = _expected_gate(target, message, SEND_SUMMARY)
+    if expected_kind == "legacy_hmac_schema":
+        expected = {"recipient": target, "message_hmac": "0" * 64}
+    elif expected_kind == "missing_summary":
+        expected = {"recipient": target, "message": message}
+    elif expected_kind == "extra_key":
+        expected = {**expected, "extra": "reject"}  # type: ignore[dict-item]
+    elif expected_kind == "bad_target_ref":
+        expected = _expected_gate("API work", message, SEND_SUMMARY)
+    elif expected_kind == "invalid_summary":
+        expected = _expected_gate(target, message, "one line\nsecond line")
+    elif expected_kind == "non_string_message":
+        expected = _expected_gate(target, 7, SEND_SUMMARY)  # type: ignore[arg-type]
+    elif expected_kind == "non_dict_expected":
+        expected = ["not", "a", "dict"]
 
-    assert not run_pretool_gate(str(expected_path), key)
+    expected_path = tmp_path / "expected.json"
+    if expected_kind == "unparseable_json":
+        expected_path.write_text("{malformed", encoding="utf-8")
+    else:
+        expected_path.write_text(json.dumps(expected), encoding="utf-8")
+
+    payload: object = _gate_payload()
+    if payload_kind == "wrong_event":
+        payload = {**payload, "hook_event_name": "PostToolUse"}  # type: ignore[dict-item]
+    elif payload_kind == "wrong_tool":
+        payload = {**payload, "tool_name": "ListAgents"}  # type: ignore[dict-item]
+    elif payload_kind == "non_dict_tool_input":
+        payload = {**payload, "tool_input": "SendMessage"}  # type: ignore[dict-item]
+    elif payload_kind == "non_dict_payload":
+        payload = ["not", "a", "dict"]
+
+    if payload_kind == "unparseable_payload":
+        stdin_text = "{malformed"
+    elif payload_kind == "oversized_payload":
+        # A payload encoding past the 64 KiB cap denies before resolution.
+        stdin_text = json.dumps({"pad": "界" * 22000})
+    else:
+        stdin_text = json.dumps(payload)
+    monkeypatch.setattr("sys.stdin", io.StringIO(stdin_text))
+
+    assert not run_pretool_gate(str(expected_path))
     assert (tmp_path / "denied").read_bytes() == DENIAL_MARKERS[denial]
+    assert not (tmp_path / "consumed").exists()
+    output = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "updatedInput" not in output
 
 
 def test_pretool_gate_fails_closed_for_unsafe_parent_without_markers(
@@ -990,13 +1076,15 @@ def test_pretool_gate_fails_closed_for_unsafe_parent_without_markers(
     gate.mkdir()
     gate.chmod(0o755)
     expected_path = gate / "expected.json"
-    expected_path.write_text(json.dumps({"recipient": "x", "message_hmac": "0" * 64}))
+    expected_path.write_text(json.dumps(_expected_gate("API work [ABC123]", "hello", SEND_SUMMARY)))
     monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
 
-    assert not run_pretool_gate(str(expected_path), "55" * 32)
+    assert not run_pretool_gate(str(expected_path))
     assert not (gate / "consumed").exists()
     assert not (gate / "denied").exists()
-    assert json.loads(capsys.readouterr().out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    output = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "updatedInput" not in output
 
 
 def test_remote_envelope_is_exact_and_generation_bound() -> None:
@@ -1023,22 +1111,16 @@ def test_remote_envelope_is_exact_and_generation_bound() -> None:
 
 
 def test_sendmessage_receipt_requires_exact_success_contract() -> None:
-    tool_id = "tool-1"
     message_id = str(uuid4())
-    target = "API work [ABC123]"
-    message = "hello"
+    # The provider stream logs the courier's placeholder proposal, which the
+    # gate replaced before execution; the receipt never inspects it.
     use = {
         "type": "tool_use",
-        "id": tool_id,
+        "id": "tool-1",
         "name": "SendMessage",
-        "input": {
-            "to": target,
-            "recipient": target,
-            "message": message,
-            "content": "provider-rendered preview",
-            "type": "message",
-            "summary": "Cross Agent Chat",
-        },
+        "input": authoritative_tool_input(
+            COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+        ),
     }
     text_block: dict[str, object] = {
         "type": "text",
@@ -1046,17 +1128,17 @@ def test_sendmessage_receipt_requires_exact_success_contract() -> None:
     }
     result: dict[str, object] = {
         "type": "tool_result",
-        "tool_use_id": tool_id,
+        "tool_use_id": "tool-1",
         "content": [text_block],
     }
     stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
 
-    assert parse_sendmessage_receipt(stream, target, message) == message_id
+    assert parse_sendmessage_receipt(stream) == message_id
 
     result["is_error"] = True
     rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="receipt"):
-        parse_sendmessage_receipt(rejected, target, message)
+        parse_sendmessage_receipt(rejected)
 
     result["is_error"] = False
     text_block["text"] = json.dumps(
@@ -1064,13 +1146,43 @@ def test_sendmessage_receipt_requires_exact_success_contract() -> None:
     )
     rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="receipt"):
-        parse_sendmessage_receipt(rejected, target, message)
+        parse_sendmessage_receipt(rejected)
     text_block["text"] = json.dumps({"success": True, "msg_id": message_id})
     rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="receipt"):
-        parse_sendmessage_receipt(rejected, target, message)
+        parse_sendmessage_receipt(rejected)
+    text_block["text"] = "sent ok"
+    rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+    with pytest.raises(ChatError, match="receipt"):
+        parse_sendmessage_receipt(rejected)
+    text_block["text"] = json.dumps({"success": True, "message": "sent", "msg_id": "not-a-uuid"})
+    rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+    with pytest.raises(ChatError, match="invalid"):
+        parse_sendmessage_receipt(rejected)
 
 
+@pytest.mark.parametrize("uses", [0, 2])
+def test_sendmessage_receipt_requires_exactly_one_sendmessage_use(uses: int) -> None:
+    blocks = [
+        {
+            "type": "tool_use",
+            "id": f"tool-{index}",
+            "name": "SendMessage",
+            "input": authoritative_tool_input(
+                COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+            ),
+        }
+        for index in range(uses)
+    ]
+    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in blocks)
+
+    with pytest.raises(ChatError, match="receipt"):
+        parse_sendmessage_receipt(stream)
+
+
+# Used to verify the logged proposal's display-only `summary` was accepted; the
+# receipt no longer inspects tool_use.input at all, so any logged summary — or
+# none — still validates against the successful result alone.
 @pytest.mark.parametrize(
     "summary",
     ["Cross Agent Chat", "Different one-line preview", "회신 미리보기"],
@@ -1078,43 +1190,22 @@ def test_sendmessage_receipt_requires_exact_success_contract() -> None:
 def test_sendmessage_receipt_accepts_display_only_summary_variants(
     summary: str,
 ) -> None:
-    tool_id = "tool-1"
     message_id = str(uuid4())
-    target = "API work [ABC123]"
-    message = "hello"
     tool_input: dict[str, object] = {
-        "to": target,
-        "recipient": target,
-        "message": message,
-        "content": "provider-rendered preview",
-        "type": "message",
-        "summary": summary,
+        **authoritative_tool_input(COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, summary)
     }
-    use = {
-        "type": "tool_use",
-        "id": tool_id,
-        "name": "SendMessage",
-        "input": tool_input,
-    }
-    result: dict[str, object] = {
-        "type": "tool_result",
-        "tool_use_id": tool_id,
-        "content": [
-            {
-                "type": "text",
-                "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
-            }
-        ],
-    }
-    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+    stream = _sendmessage_receipt_stream(tool_input, message_id)
 
-    assert parse_sendmessage_receipt(stream, target, message) == message_id
+    assert parse_sendmessage_receipt(stream) == message_id
 
     del tool_input["summary"]
-    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
-    assert parse_sendmessage_receipt(stream, target, message) == message_id
+    stream = _sendmessage_receipt_stream(tool_input, message_id)
+    assert parse_sendmessage_receipt(stream) == message_id
 
 
+# Used to reject proposals carrying control/`summary` violations; the logged
+# tool_use.input is the model's obsolete proposal, so the receipt returns the
+# msg_id regardless of what it contains.
 @pytest.mark.parametrize(
     "tool_input_change",
     [
@@ -1134,39 +1225,19 @@ def test_sendmessage_receipt_accepts_display_only_summary_variants(
         {"notify_when_idle": True},
     ],
 )
-def test_sendmessage_receipt_rejects_control_and_summary_violations(
+def test_sendmessage_receipt_ignores_proposal_field_violations(
     tool_input_change: dict[str, object],
 ) -> None:
     message_id = str(uuid4())
-    target = "API work [ABC123]"
-    use = {
-        "type": "tool_use",
-        "id": "tool-1",
-        "name": "SendMessage",
-        "input": {
-            "to": target,
-            "recipient": target,
-            "message": "hello",
-            "content": "provider preview",
-            "type": "message",
-            "summary": "Cross Agent Chat",
-            **tool_input_change,
-        },
+    tool_input: dict[str, object] = {
+        **authoritative_tool_input(
+            COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+        )
     }
-    result = {
-        "type": "tool_result",
-        "tool_use_id": "tool-1",
-        "content": [
-            {
-                "type": "text",
-                "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
-            }
-        ],
-    }
-    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+    tool_input.update(tool_input_change)
+    stream = _sendmessage_receipt_stream(tool_input, message_id)
 
-    with pytest.raises(ChatError, match="receipt"):
-        parse_sendmessage_receipt(stream, target, "hello")
+    assert parse_sendmessage_receipt(stream) == message_id
 
 
 @pytest.mark.parametrize(
@@ -1194,19 +1265,13 @@ def test_sendmessage_receipt_rejects_result_contract_violations(
     tool_id: object, result_override: dict[str, object] | None, expected_results: str
 ) -> None:
     message_id = str(uuid4())
-    target = "API work [ABC123]"
     use = {
         "type": "tool_use",
         "id": tool_id,
         "name": "SendMessage",
-        "input": {
-            "to": target,
-            "recipient": target,
-            "message": "hello",
-            "content": "provider preview",
-            "type": "message",
-            "summary": "Cross Agent Chat",
-        },
+        "input": authoritative_tool_input(
+            COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+        ),
     }
     result: dict[str, object] = {
         "type": "tool_result",
@@ -1228,39 +1293,22 @@ def test_sendmessage_receipt_rejects_result_contract_violations(
     stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in [use, *results])
 
     with pytest.raises(ChatError, match="receipt"):
-        parse_sendmessage_receipt(stream, target, "hello")
+        parse_sendmessage_receipt(stream)
 
 
-def test_sendmessage_receipt_rejects_full_body_alteration_despite_same_preview() -> None:
+# Used to reject when the logged tool_use.input body differed from the expected
+# message; the provider records the model's obsolete proposal, so the receipt
+# now validates delivery independent of the logged target and body.
+def test_sendmessage_receipt_accepts_placeholder_proposal() -> None:
     message_id = str(uuid4())
-    target = "API work [ABC123]"
-    use = {
-        "type": "tool_use",
-        "id": "tool-1",
-        "name": "SendMessage",
-        "input": {
-            "to": target,
-            "recipient": target,
-            "message": "altered full body",
-            "content": "same preview",
-            "type": "message",
-            "summary": "Cross Agent Chat",
-        },
-    }
-    result = {
-        "type": "tool_result",
-        "tool_use_id": "tool-1",
-        "content": [
-            {
-                "type": "text",
-                "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
-            }
-        ],
-    }
-    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+    stream = _sendmessage_receipt_stream(
+        authoritative_tool_input(
+            COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+        ),
+        message_id,
+    )
 
-    with pytest.raises(ChatError, match="receipt"):
-        parse_sendmessage_receipt(stream, target, "original full body")
+    assert parse_sendmessage_receipt(stream) == message_id
 
 
 def test_sendmessage_without_gate_receipt_is_unknown(
@@ -1343,30 +1391,12 @@ def test_sendmessage_accepts_exact_success_receipt(monkeypatch: pytest.MonkeyPat
         tokens = shlex.split(hook)
         expected_path = Path(tokens[tokens.index("--expected") + 1])
         _write_private_marker(expected_path.parent / "consumed", b"consumed\n")
-        use = {
-            "type": "tool_use",
-            "id": "tool-1",
-            "name": "SendMessage",
-            "input": {
-                "to": "API work [ABC123]",
-                "recipient": "API work [ABC123]",
-                "message": "hello",
-                "content": "provider-rendered preview",
-                "type": "message",
-                "summary": "Cross Agent Chat",
-            },
-        }
-        result = {
-            "type": "tool_result",
-            "tool_use_id": "tool-1",
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
-                }
-            ],
-        }
-        stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+        stream = _sendmessage_receipt_stream(
+            authoritative_tool_input(
+                COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+            ),
+            message_id,
+        )
         return subprocess.CompletedProcess(command, 0, stream, "")
 
     monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
@@ -1377,7 +1407,10 @@ def test_sendmessage_accepts_exact_success_receipt(monkeypatch: pytest.MonkeyPat
     sendmessage("API work [ABC123]", "hello", Path("/usr/bin/false"))
 
 
-def test_sendmessage_prompt_uses_canonical_json_for_complex_inert_data(
+# Used to assert the courier prompt embedded the canonical JSON of the real
+# target and body; the courier now receives only unresolvable placeholders, so
+# the real values must appear in the gate's expected file and nowhere else.
+def test_sendmessage_prompt_contains_only_unresolvable_placeholders(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     message_id = str(uuid4())
@@ -1388,7 +1421,10 @@ def test_sendmessage_prompt_uses_canonical_json_for_complex_inert_data(
         settings = json.loads(command[command.index("--settings") + 1])
         hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         tokens = shlex.split(hook)
+        assert "--content-hmac-key" not in tokens
         expected_path = Path(tokens[tokens.index("--expected") + 1])
+        expected = json.loads(expected_path.read_text(encoding="utf-8"))
+        assert expected == _expected_gate(target, message, SEND_SUMMARY)
         _write_private_marker(expected_path.parent / "consumed", b"consumed\n")
         system_prompt = command[command.index("--system-prompt") + 1]
         assert "inert data" in system_prompt
@@ -1398,31 +1434,19 @@ def test_sendmessage_prompt_uses_canonical_json_for_complex_inert_data(
         suffix = ". Do not use any other tool. Stop immediately after it returns."
         assert prompt.startswith(prefix) and prompt.endswith(suffix)
         arguments = json.loads(prompt[len(prefix) : -len(suffix)])
-        assert arguments == {"to": target, "message": message, "summary": "Cross Agent Chat"}
-        use = {
-            "type": "tool_use",
-            "id": "tool-1",
-            "name": "SendMessage",
-            "input": {
-                "to": target,
-                "recipient": target,
-                "message": message,
-                "content": "provider preview",
-                "type": "message",
-                "summary": "Cross Agent Chat",
-            },
+        assert arguments == {
+            "to": COURIER_PLACEHOLDER_TARGET,
+            "message": COURIER_PLACEHOLDER_MESSAGE,
+            "summary": SEND_SUMMARY,
         }
-        result = {
-            "type": "tool_result",
-            "tool_use_id": "tool-1",
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps({"success": True, "message": "sent", "msg_id": message_id}),
-                }
-            ],
-        }
-        stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+        assert target not in prompt
+        assert message not in prompt
+        stream = _sendmessage_receipt_stream(
+            authoritative_tool_input(
+                COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+            ),
+            message_id,
+        )
         return subprocess.CompletedProcess(command, 0, stream, "")
 
     monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)

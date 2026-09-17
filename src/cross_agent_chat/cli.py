@@ -479,7 +479,6 @@ def parser() -> argparse.ArgumentParser:
     mcp_parser.add_argument("--state-root")
     pretool = commands.add_parser("_pretool")
     pretool.add_argument("--expected", required=True)
-    pretool.add_argument("--content-hmac-key", required=True)
     staged_install = commands.add_parser("_install-staged")
     staged_install.add_argument("--staged-runtime", type=Path, required=True)
     staged_install.add_argument("--stable-entrypoint", type=Path, required=True)
@@ -609,7 +608,7 @@ def run(arguments: argparse.Namespace) -> int:
     elif command == "_pretool":
         from cross_agent_chat.claude_runtime import run_pretool_gate
 
-        return 0 if run_pretool_gate(arguments.expected, arguments.content_hmac_key) else 2
+        return 0 if run_pretool_gate(arguments.expected) else 2
     elif command == "_install-staged":
         home = Path.home()
         codex_home = (

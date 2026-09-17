@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 import re
-import secrets
 import shlex
 import shutil
 import stat
@@ -72,10 +69,18 @@ TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z
 # The provider schema declares `summary` an optional one-line UI preview of at
 # most 200 characters; it is display text, never routing or authority data.
 SUMMARY_MAX_CHARACTERS: Final = 200
+SEND_SUMMARY: Final = "Cross Agent Chat"
+# The provider derives the courier session's visible sender name from its working
+# directory, so it runs in an empty directory named for the product.
 COURIER_SESSION_DIRECTORY: Final = "cross-agent-chat"
+# The courier model is never shown the real target or body. It makes one
+# schema-valid placeholder call, and the PreToolUse gate replaces the whole
+# input with the authoritative arguments. The placeholder target is
+# deliberately unresolvable, so a send that escapes the gate fails instead of
+# delivering unverified content to a real session.
+COURIER_PLACEHOLDER_TARGET: Final = "cross-agent-chat-courier [000000]"
+COURIER_PLACEHOLDER_MESSAGE: Final = "placeholder"
 SUMMARY_REJECT_RE: Final = re.compile(r"[\x00-\x08\x0a-\x0d\x0e-\x1f\x7f-\x9f\u2028\u2029]")
-REQUIRED_TOOL_INPUT_KEYS: Final = frozenset({"to", "message", "recipient", "content", "type"})
-OPTIONAL_TOOL_INPUT_KEYS: Final = frozenset({"summary"})
 ClaudeUnknownPhase = Literal[
     "pretool_gate_unobserved",
     "pretool_gate_unreadable",
@@ -311,55 +316,65 @@ def _valid_summary(value: object) -> bool:
     )
 
 
-def _pretool_denial(
-    expected: dict[str, object], payload: object, content_hmac_key: str
-) -> ClaudeUnknownPhase | None:
-    if set(expected) != {"recipient", "message_hmac"}:
-        return "sendmessage_payload_mismatch"
+def authoritative_tool_input(recipient: str, message: str, summary: str) -> dict[str, str]:
+    """Build the exact SendMessage argument object Cross Agent Chat intends to send.
+
+    The provider normalizes ``to``/``message`` into ``recipient``/``content`` and
+    adds ``type`` before PreToolUse observes the call, so the gate supplies that
+    same normalized shape. Every value here comes from the original sender; no
+    model contributes to it.
+    """
+    return {
+        "to": recipient,
+        "recipient": recipient,
+        "message": message,
+        "content": message,
+        "type": "message",
+        "summary": summary,
+    }
+
+
+def _pretool_resolution(
+    expected: dict[str, object], payload: object
+) -> tuple[ClaudeUnknownPhase | None, dict[str, str] | None]:
+    """Resolve one PreToolUse call into the exact arguments to execute.
+
+    Returns ``(None, arguments)`` when the observed call is the courier's single
+    SendMessage invocation, and ``(phase, None)`` for a deterministic pre-effect
+    denial. The helper model's own argument transcription is never inspected and
+    never reaches the provider: it is replaced wholesale by ``updatedInput``.
+    """
+    if set(expected) != {"recipient", "message", "summary"}:
+        return "sendmessage_payload_mismatch", None
     recipient = expected.get("recipient")
-    digest = expected.get("message_hmac")
+    message = expected.get("message")
+    summary = expected.get("summary")
     if (
         not isinstance(recipient, str)
-        or not isinstance(digest, str)
-        or re.fullmatch(r"[0-9a-f]{64}", content_hmac_key) is None
-        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or not isinstance(message, str)
+        or not isinstance(summary, str)
+        or TARGET_REF_RE.fullmatch(recipient) is None
+        or not _valid_summary(summary)
         or not isinstance(payload, dict)
         or payload.get("hook_event_name") != "PreToolUse"
         or payload.get("tool_name") != "SendMessage"
+        or not isinstance(payload.get("tool_input"), dict)
     ):
-        return "sendmessage_payload_mismatch"
-    tool_input = payload.get("tool_input")
-    if (
-        not isinstance(tool_input, dict)
-        or not tool_input.keys() >= REQUIRED_TOOL_INPUT_KEYS
-        or not set(tool_input) <= REQUIRED_TOOL_INPUT_KEYS | OPTIONAL_TOOL_INPUT_KEYS
-    ):
-        return "sendmessage_payload_mismatch"
-    if not all(isinstance(tool_input.get(key), str) for key in REQUIRED_TOOL_INPUT_KEYS):
-        return "sendmessage_payload_mismatch"
-    message = cast(str, tool_input["message"])
-    try:
-        encoded_message = message.encode()
-    except UnicodeEncodeError:
-        return "sendmessage_message_mismatch"
-    actual = hmac.new(bytes.fromhex(content_hmac_key), encoded_message, hashlib.sha256).hexdigest()
-    if tool_input["to"] != recipient or tool_input["recipient"] != recipient:
-        return "sendmessage_target_mismatch"
-    if not hmac.compare_digest(digest, actual):
-        return "sendmessage_message_mismatch"
-    if tool_input["type"] != "message":
-        return "sendmessage_type_mismatch"
-    if "summary" in tool_input and not _valid_summary(tool_input["summary"]):
-        return "sendmessage_summary_mismatch"
-    return None
+        return "sendmessage_payload_mismatch", None
+    return None, authoritative_tool_input(recipient, message, summary)
 
 
-def pretool_decision(expected: dict[str, object], payload: object, content_hmac_key: str) -> bool:
-    return _pretool_denial(expected, payload, content_hmac_key) is None
+def _pretool_denial(expected: dict[str, object], payload: object) -> ClaudeUnknownPhase | None:
+    return _pretool_resolution(expected, payload)[0]
 
 
-def run_pretool_gate(expected_path: str, content_hmac_key: str) -> bool:
+def pretool_decision(expected: dict[str, object], payload: object) -> bool:
+    return _pretool_denial(expected, payload) is None
+
+
+def run_pretool_gate(expected_path: str) -> bool:
     gate_parent: Path | None = None
+    arguments: dict[str, str] | None = None
     denial: ClaudeUnknownPhase | None = "pretool_gate_denied"
     try:
         path = Path(expected_path)
@@ -377,9 +392,7 @@ def run_pretool_gate(expected_path: str, content_hmac_key: str) -> bool:
         payload_text = sys.stdin.read(65537)
         payload = json.loads(payload_text)
         if isinstance(expected_raw, dict) and len(payload_text.encode()) <= 65536:
-            denial = _pretool_denial(
-                cast(dict[str, object], expected_raw), payload, content_hmac_key
-            )
+            denial, arguments = _pretool_resolution(cast(dict[str, object], expected_raw), payload)
         allowed = denial is None
         if allowed:
             consumed = path.parent / "consumed"
@@ -394,6 +407,7 @@ def run_pretool_gate(expected_path: str, content_hmac_key: str) -> bool:
                 os.fsync(handle.fileno())
     except (OSError, UnicodeError, json.JSONDecodeError, ChatError):
         allowed = False
+        arguments = None
         denial = "pretool_gate_denied"
     if not allowed and gate_parent is not None:
         try:
@@ -409,17 +423,20 @@ def run_pretool_gate(expected_path: str, content_hmac_key: str) -> bool:
                 os.fsync(handle.fileno())
         except OSError:
             pass
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow" if allowed else "deny",
-            "permissionDecisionReason": (
-                "Exact Cross Agent Chat action"
-                if allowed
-                else "Cross Agent Chat rejected a mismatched action"
-            ),
-        }
+    hook_output: dict[str, object] = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow" if allowed else "deny",
+        "permissionDecisionReason": (
+            "Exact Cross Agent Chat action"
+            if allowed
+            else "Cross Agent Chat rejected a mismatched action"
+        ),
     }
+    if allowed and arguments is not None:
+        # The provider replaces the whole tool input with this object before the
+        # tool runs, so the courier model never authors the delivered payload.
+        hook_output["updatedInput"] = arguments
+    output = {"hookSpecificOutput": hook_output}
     print(json.dumps(output, separators=(",", ":")), flush=True)
     return allowed
 
@@ -443,8 +460,16 @@ def _tool_records(text: str) -> tuple[list[dict[str, object]], list[dict[str, ob
     return uses, results
 
 
-def parse_sendmessage_receipt(text: str, target_ref: str, message: str) -> str:
-    """Validate one exact successful native SendMessage tool receipt."""
+def parse_sendmessage_receipt(text: str) -> str:
+    """Validate one exact successful native SendMessage tool receipt.
+
+    The stream records the courier model's *proposed* ``tool_use`` input, which
+    the PreToolUse gate replaces before execution, so the logged input is not
+    the delivered payload and is deliberately not compared here. Exact target
+    and content are guaranteed upstream by ``authoritative_tool_input``; what
+    remains to establish is that exactly one SendMessage ran and the provider
+    accepted it.
+    """
     try:
         uses, results = _tool_records(text)
     except json.JSONDecodeError as error:
@@ -452,22 +477,8 @@ def parse_sendmessage_receipt(text: str, target_ref: str, message: str) -> str:
     if len(uses) != 1 or uses[0].get("name") != "SendMessage":
         raise ChatError("Claude SendMessage receipt is invalid")
     tool_id = uses[0].get("id")
-    tool_input = uses[0].get("input")
     matches = [item for item in results if item.get("tool_use_id") == tool_id]
-    if (
-        not isinstance(tool_id, str)
-        or not isinstance(tool_input, dict)
-        or not tool_input.keys() >= REQUIRED_TOOL_INPUT_KEYS
-        or not set(tool_input) <= REQUIRED_TOOL_INPUT_KEYS | OPTIONAL_TOOL_INPUT_KEYS
-        or not all(isinstance(tool_input.get(key), str) for key in REQUIRED_TOOL_INPUT_KEYS)
-        or tool_input.get("to") != target_ref
-        or tool_input.get("recipient") != target_ref
-        or tool_input.get("message") != message
-        or tool_input.get("type") != "message"
-        or ("summary" in tool_input and not _valid_summary(tool_input["summary"]))
-        or len(matches) != 1
-        or matches[0].get("is_error") is True
-    ):
+    if not isinstance(tool_id, str) or len(matches) != 1 or matches[0].get("is_error") is True:
         raise ChatError("Claude SendMessage receipt is invalid")
     content = matches[0].get("content")
     if not isinstance(content, list):
@@ -584,19 +595,24 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
     bounded_message(message)
     if TARGET_REF_RE.fullmatch(target_ref) is None:
         raise ChatError("Claude target reference is invalid")
-    key = secrets.token_hex(32)
     expected = {
         "recipient": target_ref,
-        "message_hmac": hmac.new(bytes.fromhex(key), message.encode(), hashlib.sha256).hexdigest(),
+        "message": message,
+        "summary": SEND_SUMMARY,
     }
-    arguments = json.dumps(
-        {"to": target_ref, "message": message, "summary": "Cross Agent Chat"},
-        ensure_ascii=False,
+    # The courier only has to make the call; the gate supplies its arguments, so
+    # the message body is never handed to a model to reproduce.
+    placeholder = json.dumps(
+        {
+            "to": COURIER_PLACEHOLDER_TARGET,
+            "message": COURIER_PLACEHOLDER_MESSAGE,
+            "summary": SEND_SUMMARY,
+        },
         separators=(",", ":"),
     )
     prompt = (
         "Use SendMessage exactly once with this exact JSON argument object: "
-        f"{arguments}. Do not use any other tool. Stop immediately after it returns."
+        f"{placeholder}. Do not use any other tool. Stop immediately after it returns."
     )
     try:
         temporary_context = tempfile.TemporaryDirectory(
@@ -629,8 +645,6 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
                     "_pretool",
                     "--expected",
                     str(expected_path),
-                    "--content-hmac-key",
-                    key,
                 )
             )
             settings = {
@@ -694,6 +708,6 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
         if not gate_consumed(gate):
             _unknown(_unconsumed_gate_phase(gate, completed.stdout))
         try:
-            parse_sendmessage_receipt(completed.stdout, target_ref, message)
+            parse_sendmessage_receipt(completed.stdout)
         except ChatError as error:
             raise ClaudeSendMessageUnknownDelivery("receipt_invalid") from error
