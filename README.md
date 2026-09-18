@@ -10,10 +10,10 @@ non-default roots). Local sessions do not need Tailscale; remote sessions need T
 allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
 files, or turn a remote peer into an owner.
 
-Install v0.3.5 prerelease with:
+Install v0.3.6 prerelease with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.5/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.6/install.sh | sh
 ```
 
 Installation requires Git because the installer builds from the release tag.
@@ -57,13 +57,13 @@ visible by default.
 
 To have an existing coding agent assist with installation, give it this prompt:
 
-> Install the released `v0.3.5` tag, not an arbitrary PR. Identify active consumers and the
+> Install the released `v0.3.6` tag, not an arbitrary PR. Identify active consumers and the
 > selected Claude/Codex roots and local Devin configuration, obtain approval before shared effects, preserve existing intent
 > records, run `cross-agent-chat doctor --json`, and test only fresh actors.
 
 ## Supported surfaces
 
-v0.3.5 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
+v0.3.6 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
 scheduling class to avoid the observed Background scheduling delay. Normal-budget discovery has
 been observed for participating macOS nodes. An aggregate roster can still be incomplete when an
 online non-CAC Tailnet node, such as an iOS node, fails discovery; full remote request/result

@@ -405,9 +405,12 @@ def _read_gate_expectation(path: Path) -> str:
     highest-authority input the gate has. It gets the same regular-file, owner
     and 0600 predicate the outcome markers already get, checked on the open
     descriptor rather than on the path, so the symlink test above cannot be
-    raced between the check and the read.
+    raced between the check and the read. O_NOFOLLOW rejects a symlink but not a
+    FIFO, so O_NONBLOCK matches the markers here too: a same-uid process that won
+    the race to place a FIFO at this path would otherwise stall the hook until
+    its timeout.
     """
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     try:
         metadata = os.fstat(descriptor)
         if (
@@ -735,9 +738,11 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
             # The tool restriction below is load-bearing for privacy, not just
             # for determinism: the gate file in this courier's own process tree
             # holds the plaintext message body. The courier has no Read, no Bash,
-            # no MCP and no slash commands, so the model inside it cannot open
+            # no MCP and no slash commands, so the MODEL inside it cannot open
             # that file. Adding a file-reading tool here would expose every
-            # message body CAC delivers.
+            # message body CAC delivers. This bounds the model, not the host: any
+            # same-uid process can still read the file, which is why its
+            # directory is 0700 and its lifetime is one send.
             command = [
                 str(claude_binary()),
                 "-p",

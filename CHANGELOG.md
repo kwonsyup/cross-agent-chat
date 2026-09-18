@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.3.6 - 2026-09-17
+
+- Supply the Claude courier's `SendMessage` arguments from the delivery gate instead of asking a
+  helper model to reproduce an already-decided target and body. The courier now receives only
+  unresolvable placeholders, so a byte of model drift can no longer produce
+  `sendmessage_message_mismatch`, and a gate that fails open sends a placeholder to a session that
+  does not exist rather than delivering unverified content. The gate also constrains the proposal's
+  key set, so whether the provider replaces or merges the supplied arguments cannot affect what is
+  delivered.
+- Answer a refused remote authorization with a definite `REFUSED` frame instead of closing the
+  connection with no response. A sender's own decided refusal was returning to it as
+  `UNKNOWN_DELIVERY`, freezing an event that produced no effect. Older peers compare the frame
+  against the exact authorization they expect and already treat a mismatch as a pre-effect
+  rejection, so mixed versions degrade to the previous behaviour in both directions.
+- Treat a provider answer of exactly `{"success": false, "message": ...}` with no message id as a
+  decided non-delivery rather than an unknown outcome. This generalizes one measured instance, an
+  unreachable target, to that exact response shape; it is an assumption about the provider, not an
+  established fact, and the `live` test exists to re-measure it after a provider upgrade. Any other
+  failure shape, including one carrying a message id, stays uncertain.
+- Name the Cross Agent Chat delivery helper honestly in a recipient's inbox. The visible sender was
+  derived from the courier's working directory, which is why messages appeared to come from
+  `empty-NN`. The exact original source and a directly usable reply handle now lead the envelope,
+  and the tool guidance no longer asks for a fresh `chat_peers` call before every send.
+- Restrict `resolve` to genuinely undecided events, make it idempotent, and refuse an in-flight
+  intent that is too young to be an orphan, so resolving one cannot open a duplicate-delivery
+  window. Its output no longer reads as a receipt: it states that nothing was contacted, cancelled
+  or confirmed, and claims to unblock a target only when it does.
+- Report the real budget when the transport envelope, not the message, crosses the size limit, and
+  keep every other rejection reason accurate instead of restating it as a size problem.
+- Keep delivered message bodies out of the courier's output stream, and read the gate's expectation
+  through an owner-only, regular-file, non-blocking descriptor.
+- This release does not establish original-idle Devin receipt, remote Native-to-Native delivery, or
+  a completed two-session reply journey on installed bytes. Those remain open.
+
 ## 0.3.5 - 2026-09-15
 
 - Emit Native bootstrap context only for a current route whose registered owner, exact bundled

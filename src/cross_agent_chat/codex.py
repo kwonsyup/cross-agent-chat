@@ -81,7 +81,7 @@ def native_account_digest(*, binary: Path, environment: dict[str, str]) -> str:
                 "id": 0,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "cross-agent-chat", "version": "0.3.5"},
+                    "clientInfo": {"name": "cross-agent-chat", "version": "0.3.6"},
                     "capabilities": {"experimentalApi": True},
                 },
             }
@@ -130,7 +130,7 @@ def queue_native_input(
         "id": 0,
         "method": "initialize",
         "params": {
-            "clientInfo": {"name": "cross-agent-chat", "version": "0.3.5"},
+            "clientInfo": {"name": "cross-agent-chat", "version": "0.3.6"},
             "capabilities": {"experimentalApi": True},
         },
     }
@@ -314,7 +314,7 @@ def native_thread_titles(
                 "id": 0,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "cross-agent-chat", "version": "0.3.5"},
+                    "clientInfo": {"name": "cross-agent-chat", "version": "0.3.6"},
                     "capabilities": {"experimentalApi": True},
                 },
             }
