@@ -22,6 +22,7 @@ import pytest
 
 from cross_agent_chat.core import (
     ChatError,
+    Intent,
     IntentStatus,
     IntentStore,
     Registry,
@@ -2708,9 +2709,9 @@ def test_resolve_refuses_an_intent_that_may_still_be_in_flight(
 
     Unblocking the target while its send is still running lets the owner start
     the same work again and have both arrive. Every send is bounded, so a young
-    row may still belong to a running operation and only an aged one can be
-    proven an orphan. Refusing the young case is what makes the success text's
-    "was still in flight and never completed" true rather than assumed.
+    row may still belong to a running operation; only an aged one is treated as
+    a probable orphan. Age is a heuristic, not proof, which is why a result
+    recorded later still replaces the owner disposition.
     """
     home = tmp_path / "home"
     home.mkdir()
@@ -2735,3 +2736,86 @@ def test_resolve_still_accepts_an_unknown_event_at_any_age(
     assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
 
     assert "remains UNKNOWN_DELIVERY in fact" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("status", ["UNKNOWN_DELIVERY", "PENDING", "REMOTE_AUTHORIZED"])
+@pytest.mark.parametrize("decided", ["TRANSPORT_ACCEPTED", "PRE_EFFECT_REJECTED"])
+def test_resolve_does_not_overwrite_a_result_recorded_after_its_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: IntentStatus,
+    decided: IntentStatus,
+) -> None:
+    """The eligibility check and the owner disposition must be one transition.
+
+    A send that finishes between resolve's read and its write records a decided
+    result. Writing RESOLVED_BY_OWNER from the stale read would erase that
+    result, which is exactly what the "already decided" refusal exists to stop.
+    """
+    import fcntl
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = home / ".local/state/cross-agent-chat"
+    event_id = _seeded_intent(home, tmp_path, status, age_seconds=1200)
+    original = IntentStore.intents
+    finishing: list[threading.Thread] = []
+
+    def intents_then_finish_the_send(self: IntentStore) -> list[Intent]:
+        # The running send records its result at resolve's first read. If that
+        # read is unlocked the writer gets in before resolve writes; if it is
+        # locked the writer waits for the lock, as a real concurrent send does.
+        observed = original(self)
+        monkeypatch.setattr(IntentStore, "intents", original)
+        with open(root / ".intents.lock", "w", encoding="utf-8") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                held = True
+            else:
+                held = False
+                fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+        finish = threading.Thread(target=IntentStore(root).mark, args=(event_id, decided))
+        finish.start()
+        if held:
+            finishing.append(finish)
+        else:
+            finish.join()
+        return observed
+
+    monkeypatch.setattr(IntentStore, "intents", intents_then_finish_the_send)
+
+    try:
+        _resolve_cli(home, monkeypatch, event_id)
+    except ChatError as error:
+        assert "already decided" in str(error)
+    for finish in finishing:
+        finish.join(timeout=10)
+        assert not finish.is_alive()
+
+    assert [item.status for item in IntentStore(root).intents() if item.event_id == event_id] == [
+        decided
+    ]
+
+
+@pytest.mark.parametrize(
+    "decided", ["TRANSPORT_ACCEPTED", "PRE_EFFECT_REJECTED", "UNKNOWN_DELIVERY"]
+)
+def test_a_late_result_replaces_the_owner_disposition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decided: IntentStatus
+) -> None:
+    """Policy: RESOLVED_BY_OWNER labels an undecided record; it is not a result.
+
+    Elapsed age does not prove a send is dead -- a suspended host can resume and
+    record its outcome after the owner resolved it. That late evidence is kept
+    rather than discarded to preserve a final-looking label.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, "PENDING", age_seconds=1200)
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
+    store = IntentStore(home / ".local/state/cross-agent-chat")
+
+    store.mark(event_id, decided)
+
+    assert [item.status for item in store.intents() if item.event_id == event_id] == [decided]

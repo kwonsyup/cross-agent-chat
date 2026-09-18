@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.6 - 2026-09-17
+## 0.3.6 - 2026-09-18
 
 - Supply the Claude courier's `SendMessage` arguments from the delivery gate instead of asking a
   helper model to reproduce an already-decided target and body. The courier now receives only
@@ -24,9 +24,12 @@
   `empty-NN`. The exact original source and a directly usable reply handle now lead the envelope,
   and the tool guidance no longer asks for a fresh `chat_peers` call before every send.
 - Restrict `resolve` to genuinely undecided events, make it idempotent, and refuse an in-flight
-  intent that is too young to be an orphan, so resolving one cannot open a duplicate-delivery
-  window. Its output no longer reads as a receipt: it states that nothing was contacted, cancelled
-  or confirmed, and claims to unblock a target only when it does.
+  intent that is too young to be treated as an orphan, so resolving one does not open a
+  duplicate-delivery window. The eligibility check and the owner disposition are one transition
+  under the intent lock, so a result recorded concurrently is refused as decided rather than
+  overwritten. Age is a heuristic, not proof that a send is dead: a result recorded after an owner
+  disposition replaces it. The output no longer reads as a receipt: it states that nothing was
+  contacted, cancelled or confirmed, and claims to unblock a target only when it does.
 - Report the real budget when the transport envelope, not the message, crosses the size limit, and
   keep every other rejection reason accurate instead of restating it as a size problem.
 - Keep delivered message bodies out of the courier's output stream, and read the gate's expectation

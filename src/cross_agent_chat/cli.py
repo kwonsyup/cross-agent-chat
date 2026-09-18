@@ -11,10 +11,8 @@ from typing import Final, NoReturn, cast
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import (
-    ABANDONED_INTENT_SECONDS,
     ChatError,
     IntentStore,
-    intent_age_seconds,
 )
 from cross_agent_chat.install import (
     Installer,
@@ -548,42 +546,16 @@ def run(arguments: argparse.Namespace) -> int:
             for peer_item in cast(list[dict[str, str]], peer_result["peers"]):
                 print(f"{peer_item['alias']}\t{peer_item['status']}")
     elif command == "resolve":
-        store = IntentStore(state_root())
-        matches = [item for item in store.intents() if item.event_id == arguments.event_id]
-        if len(matches) != 1:
-            _fail("intent is unavailable")
-        current = matches[0].status
+        current = IntentStore(state_root()).resolve_by_owner(arguments.event_id)
         if current == "RESOLVED_BY_OWNER":
             # Idempotent: re-running must not error, and must not restate the record.
             print(f"Event {arguments.event_id} was already resolved by its owner.")
             return 0
-        # Only an undecided outcome is the owner's to accept. TRANSPORT_ACCEPTED and
-        # PRE_EFFECT_REJECTED are decided, and resolving one would launder a known
-        # result into an owner disposition.
-        if current not in {"UNKNOWN_DELIVERY", "PENDING", "REMOTE_AUTHORIZED"}:
-            _fail(
-                f"event {arguments.event_id} is {current}, which is already decided; "
-                "nothing to resolve"
-            )
-        if current in {"PENDING", "REMOTE_AUTHORIZED"}:
-            # A row this young may still belong to a running operation. Resolving
-            # it would unblock the target while that send is live, so the owner
-            # could start the same work again and have both arrive. Every send is
-            # bounded, so once the budget has elapsed the row can only be an
-            # orphan -- a live operation would have marked it by now.
-            age = intent_age_seconds(matches[0].timestamp)
-            if age < ABANDONED_INTENT_SECONDS:
-                _fail(
-                    f"event {arguments.event_id} is {current} and only "
-                    f"{int(age)}s old, so it may still be in flight; wait until it "
-                    f"is at least {int(ABANDONED_INTENT_SECONDS)}s old, then resolve"
-                )
-        store.mark(arguments.event_id, "RESOLVED_BY_OWNER")
         # Only PENDING/REMOTE_AUTHORIZED rows gate a fresh send to the same target,
         # so only those are unblocked by this command.
         unblocked = current in {"PENDING", "REMOTE_AUTHORIZED"}
         was = (
-            "was still in flight and never completed"
+            "was still in flight with no recorded result"
             if unblocked
             else "remains UNKNOWN_DELIVERY in fact"
         )
