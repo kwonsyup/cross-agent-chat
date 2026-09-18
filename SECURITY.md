@@ -34,6 +34,13 @@ between devices. Delivered message bodies can appear in provider transcripts. Pe
 Cross Agent Chat state contains route metadata, generations, identity hashes, event IDs,
 payload digests, statuses, and timestamps, but not message bodies.
 
+Delivering to a Claude recipient writes the message body to one transient file so the local
+delivery gate can supply it to the provider instead of asking a helper model to reproduce it.
+That file is created exclusively at mode 0600 in a fresh owner-only directory under `TMPDIR`,
+is readable only by your own user, and is removed when that single send finishes. It is not
+part of persistent Cross Agent Chat state. A process killed abruptly can leave the file behind
+until the directory is cleared.
+
 Uninstall removes Cross Agent Chat-owned integrations and transient route state, but retains
 content-free delivery intents, including accepted and unresolved records, for owner inspection.
 It never resolves, replays, or erases those intents merely because the integration was removed.

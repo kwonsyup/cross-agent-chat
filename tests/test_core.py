@@ -22,6 +22,8 @@ import pytest
 
 from cross_agent_chat.core import (
     ChatError,
+    Intent,
+    IntentStatus,
     IntentStore,
     Registry,
     Route,
@@ -2574,3 +2576,246 @@ def test_disappeared_courier_closes_intent_as_pre_effect(
     store = IntentStore(root)
     assert [item.status for item in store.intents()] == ["PRE_EFFECT_REJECTED"]
     assert store.begin(source, destination, source_alias=source.alias, payload_digest="b" * 64)
+
+
+def _resolve_cli(home: Path, monkeypatch: pytest.MonkeyPatch, event_id: str) -> tuple[int, str]:
+    """Run `cross-agent-chat resolve EVENT_ID` against a state root under `home`."""
+    from cross_agent_chat import cli
+
+    monkeypatch.setenv("HOME", str(home))
+    code = cli.run(cli.parser().parse_args(["resolve", event_id]))
+    return code, ""
+
+
+def _seeded_intent(
+    home: Path, tmp_path: Path, status: IntentStatus, *, age_seconds: float = 0.0
+) -> str:
+    store = IntentStore(home / ".local/state/cross-agent-chat")
+    source = route(tmp_path, project="source")
+    target = route(tmp_path)
+    event_id = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    if status != "PENDING":
+        store.mark(event_id, status)
+    if age_seconds:
+        _backdate_intent(store, event_id, age_seconds)
+    return event_id
+
+
+def _backdate_intent(store: IntentStore, event_id: str, age_seconds: float) -> None:
+    """Age one row past the orphan heuristic; age alone does not prove the send is dead."""
+    raw = json.loads(store.path.read_text(encoding="utf-8"))
+    stale = (datetime.now(UTC) - timedelta(seconds=age_seconds)).isoformat()
+    for item in raw:
+        if item["event_id"] == event_id:
+            item["timestamp"] = stale
+    store.path.write_text(json.dumps(raw), encoding="utf-8")
+    store.path.chmod(0o600)
+
+
+@pytest.mark.parametrize("status", ["PENDING", "REMOTE_AUTHORIZED"])
+def test_resolve_clears_an_intent_abandoned_in_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: IntentStatus,
+) -> None:
+    # Only PENDING/REMOTE_AUTHORIZED gate a fresh send, so resolve must accept them:
+    # a courier killed inside its send window would otherwise block that target forever.
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, status, age_seconds=1200)
+
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
+
+    store = IntentStore(home / ".local/state/cross-agent-chat")
+    assert [item.status for item in store.intents() if item.event_id == event_id] == [
+        "RESOLVED_BY_OWNER"
+    ]
+    output = capsys.readouterr().out
+    assert "no longer blocked" in output
+    assert "still unknown" in output
+    assert "Do not re-send" in output
+    # The target must actually be sendable again.
+    store.begin(
+        route(tmp_path, project="source"),
+        route(tmp_path),
+        source_alias="source",
+        payload_digest="b" * 64,
+    )
+
+
+def test_resolve_accepts_unknown_delivery_without_claiming_it_unblocks_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, "UNKNOWN_DELIVERY")
+
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
+
+    output = capsys.readouterr().out
+    assert "remains UNKNOWN_DELIVERY in fact" in output
+    assert "did not contact the recipient" in output
+    assert "Do not re-send" in output
+    # An UNKNOWN row never gated a send, so resolve must not claim it unblocked one.
+    assert "no longer blocked" not in output
+
+
+@pytest.mark.parametrize("status", ["TRANSPORT_ACCEPTED", "PRE_EFFECT_REJECTED"])
+def test_resolve_refuses_a_decided_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: IntentStatus
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, status)
+
+    with pytest.raises(ChatError, match="already decided"):
+        _resolve_cli(home, monkeypatch, event_id)
+
+    store = IntentStore(home / ".local/state/cross-agent-chat")
+    assert [item.status for item in store.intents() if item.event_id == event_id] == [status]
+
+
+def test_resolve_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, "UNKNOWN_DELIVERY")
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
+    capsys.readouterr()
+
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
+
+    assert "already resolved" in capsys.readouterr().out
+
+
+def test_resolve_refuses_an_unknown_event_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    _seeded_intent(home, tmp_path, "UNKNOWN_DELIVERY")
+
+    with pytest.raises(ChatError, match="intent is unavailable"):
+        _resolve_cli(home, monkeypatch, str(uuid4()))
+
+
+@pytest.mark.parametrize("status", ["PENDING", "REMOTE_AUTHORIZED"])
+def test_resolve_refuses_an_intent_that_may_still_be_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: IntentStatus
+) -> None:
+    """Resolving a live send would open a duplicate-delivery window.
+
+    Unblocking the target while its send is still running lets the owner start
+    the same work again and have both arrive. Every send is bounded, so a young
+    row may still belong to a running operation; only an aged one is treated as
+    a probable orphan. Age is a heuristic, not proof, which is why a result
+    recorded later still replaces the owner disposition.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, status)
+
+    with pytest.raises(ChatError, match="may still be in flight"):
+        _resolve_cli(home, monkeypatch, event_id)
+
+    store = IntentStore(home / ".local/state/cross-agent-chat")
+    assert [item.status for item in store.intents() if item.event_id == event_id] == [status]
+
+
+def test_resolve_still_accepts_an_unknown_event_at_any_age(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # UNKNOWN_DELIVERY is already terminal for its operation, so there is no live
+    # send to collide with and no reason to make the owner wait.
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, "UNKNOWN_DELIVERY")
+
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
+
+    assert "remains UNKNOWN_DELIVERY in fact" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("status", ["UNKNOWN_DELIVERY", "PENDING", "REMOTE_AUTHORIZED"])
+@pytest.mark.parametrize("decided", ["TRANSPORT_ACCEPTED", "PRE_EFFECT_REJECTED"])
+def test_resolve_does_not_overwrite_a_result_recorded_after_its_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: IntentStatus,
+    decided: IntentStatus,
+) -> None:
+    """The eligibility check and the owner disposition must be one transition.
+
+    A send that finishes between resolve's read and its write records a decided
+    result. Writing RESOLVED_BY_OWNER from the stale read would erase that
+    result, which is exactly what the "already decided" refusal exists to stop.
+    """
+    import fcntl
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = home / ".local/state/cross-agent-chat"
+    event_id = _seeded_intent(home, tmp_path, status, age_seconds=1200)
+    original = IntentStore.intents
+    finishing: list[threading.Thread] = []
+
+    def intents_then_finish_the_send(self: IntentStore) -> list[Intent]:
+        # The running send records its result at resolve's first read. If that
+        # read is unlocked the writer gets in before resolve writes; if it is
+        # locked the writer waits for the lock, as a real concurrent send does.
+        observed = original(self)
+        monkeypatch.setattr(IntentStore, "intents", original)
+        with open(root / ".intents.lock", "w", encoding="utf-8") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                held = True
+            else:
+                held = False
+                fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+        finish = threading.Thread(target=IntentStore(root).mark, args=(event_id, decided))
+        finish.start()
+        if held:
+            finishing.append(finish)
+        else:
+            finish.join()
+        return observed
+
+    monkeypatch.setattr(IntentStore, "intents", intents_then_finish_the_send)
+
+    try:
+        _resolve_cli(home, monkeypatch, event_id)
+    except ChatError as error:
+        assert "already decided" in str(error)
+    for finish in finishing:
+        finish.join(timeout=10)
+        assert not finish.is_alive()
+
+    assert [item.status for item in IntentStore(root).intents() if item.event_id == event_id] == [
+        decided
+    ]
+
+
+@pytest.mark.parametrize(
+    "decided", ["TRANSPORT_ACCEPTED", "PRE_EFFECT_REJECTED", "UNKNOWN_DELIVERY"]
+)
+def test_a_late_result_replaces_the_owner_disposition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decided: IntentStatus
+) -> None:
+    """Policy: RESOLVED_BY_OWNER labels an undecided record; it is not a result.
+
+    Elapsed age does not prove a send is dead -- a suspended host can resume and
+    record its outcome after the owner resolved it. That late evidence is kept
+    rather than discarded to preserve a final-looking label.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, "PENDING", age_seconds=1200)
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
+    store = IntentStore(home / ".local/state/cross-agent-chat")
+
+    store.mark(event_id, decided)
+
+    assert [item.status for item in store.intents() if item.event_id == event_id] == [decided]

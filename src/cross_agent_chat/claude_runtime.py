@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 import re
-import secrets
 import shlex
 import shutil
 import stat
@@ -72,9 +69,26 @@ TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z
 # The provider schema declares `summary` an optional one-line UI preview of at
 # most 200 characters; it is display text, never routing or authority data.
 SUMMARY_MAX_CHARACTERS: Final = 200
+SEND_SUMMARY: Final = "Cross Agent Chat"
+# The expectation holds one bounded message plus a short target and summary.
+MAX_GATE_EXPECTATION_BYTES: Final = 128 * 1024
+# The provider derives the courier session's visible sender name from its working
+# directory, so it runs in an empty directory named for the product.
+COURIER_SESSION_DIRECTORY: Final = "cross-agent-chat"
+# The courier model is never shown the real target or body. It makes one
+# schema-valid placeholder call, and the PreToolUse gate replaces the whole
+# input with the authoritative arguments. The placeholder target is
+# deliberately unresolvable, so a send that escapes the gate fails instead of
+# delivering unverified content to a real session.
+COURIER_PLACEHOLDER_TARGET: Final = "cross-agent-chat-courier [000000]"
+COURIER_PLACEHOLDER_MESSAGE: Final = "placeholder"
+# The exact normalized key set the provider presents for SendMessage, measured
+# on Claude Code 2.1.274. Both the supplied arguments and any accepted proposal
+# stay inside it.
+SENDMESSAGE_TOOL_INPUT_KEYS: Final = frozenset(
+    {"to", "recipient", "message", "content", "type", "summary"}
+)
 SUMMARY_REJECT_RE: Final = re.compile(r"[\x00-\x08\x0a-\x0d\x0e-\x1f\x7f-\x9f\u2028\u2029]")
-REQUIRED_TOOL_INPUT_KEYS: Final = frozenset({"to", "message", "recipient", "content", "type"})
-OPTIONAL_TOOL_INPUT_KEYS: Final = frozenset({"summary"})
 ClaudeUnknownPhase = Literal[
     "pretool_gate_unobserved",
     "pretool_gate_unreadable",
@@ -93,6 +107,10 @@ ClaudeUnknownPhase = Literal[
     "helper_exit_nonzero",
     "receipt_invalid",
 ]
+
+
+class ClaudeSendMessageRefused(ChatError):
+    """The provider reported a decided non-delivery before any effect."""
 
 
 class ClaudeSendMessageUnknownDelivery(UnknownDeliveryError):
@@ -310,55 +328,110 @@ def _valid_summary(value: object) -> bool:
     )
 
 
-def _pretool_denial(
-    expected: dict[str, object], payload: object, content_hmac_key: str
-) -> ClaudeUnknownPhase | None:
-    if set(expected) != {"recipient", "message_hmac"}:
-        return "sendmessage_payload_mismatch"
+def authoritative_tool_input(recipient: str, message: str, summary: str) -> dict[str, str]:
+    """Build the exact SendMessage argument object Cross Agent Chat intends to send.
+
+    The provider normalizes ``to``/``message`` into ``recipient``/``content`` and
+    adds ``type`` before PreToolUse observes the call, so the gate supplies that
+    same normalized shape. Every value here comes from the original sender; no
+    model contributes to it.
+    """
+    return {
+        "to": recipient,
+        "recipient": recipient,
+        "message": message,
+        "content": message,
+        "type": "message",
+        "summary": summary,
+    }
+
+
+def _pretool_resolution(
+    expected: dict[str, object], payload: object
+) -> tuple[ClaudeUnknownPhase | None, dict[str, str] | None]:
+    """Resolve one PreToolUse call into the exact arguments to execute.
+
+    Returns ``(None, arguments)`` when the observed call is the courier's single
+    SendMessage invocation, and ``(phase, None)`` for a deterministic pre-effect
+    denial. The helper model's own argument transcription is never inspected and
+    never reaches the provider: it is replaced wholesale by ``updatedInput``.
+    """
+    if set(expected) != {"recipient", "message", "summary"}:
+        return "sendmessage_payload_mismatch", None
     recipient = expected.get("recipient")
-    digest = expected.get("message_hmac")
+    message = expected.get("message")
+    summary = expected.get("summary")
     if (
         not isinstance(recipient, str)
-        or not isinstance(digest, str)
-        or re.fullmatch(r"[0-9a-f]{64}", content_hmac_key) is None
-        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or not isinstance(message, str)
+        or not isinstance(summary, str)
+        or TARGET_REF_RE.fullmatch(recipient) is None
+        or not _valid_summary(summary)
         or not isinstance(payload, dict)
         or payload.get("hook_event_name") != "PreToolUse"
         or payload.get("tool_name") != "SendMessage"
+        or not isinstance(payload.get("tool_input"), dict)
     ):
-        return "sendmessage_payload_mismatch"
-    tool_input = payload.get("tool_input")
-    if (
-        not isinstance(tool_input, dict)
-        or not tool_input.keys() >= REQUIRED_TOOL_INPUT_KEYS
-        or not set(tool_input) <= REQUIRED_TOOL_INPUT_KEYS | OPTIONAL_TOOL_INPUT_KEYS
-    ):
-        return "sendmessage_payload_mismatch"
-    if not all(isinstance(tool_input.get(key), str) for key in REQUIRED_TOOL_INPUT_KEYS):
-        return "sendmessage_payload_mismatch"
-    message = cast(str, tool_input["message"])
+        return "sendmessage_payload_mismatch", None
+    # The supplied arguments are expected to REPLACE the proposal wholesale. If a
+    # provider ever merged them instead, any proposed key this object does not
+    # also supply would survive onto a real delivery. Constraining the proposal's
+    # key set makes that question irrelevant rather than assumed -- it depends on
+    # no model-authored content, and it keeps holding across provider upgrades,
+    # which a measurement of today's behaviour would not.
+    if not set(cast(dict[str, object], payload["tool_input"])) <= SENDMESSAGE_TOOL_INPUT_KEYS:
+        return "sendmessage_payload_mismatch", None
+    # The gate is the authority on delivered content, so it re-applies the
+    # product's own bound rather than trusting whoever wrote the expectation.
     try:
-        encoded_message = message.encode()
-    except UnicodeEncodeError:
-        return "sendmessage_message_mismatch"
-    actual = hmac.new(bytes.fromhex(content_hmac_key), encoded_message, hashlib.sha256).hexdigest()
-    if tool_input["to"] != recipient or tool_input["recipient"] != recipient:
-        return "sendmessage_target_mismatch"
-    if not hmac.compare_digest(digest, actual):
-        return "sendmessage_message_mismatch"
-    if tool_input["type"] != "message":
-        return "sendmessage_type_mismatch"
-    if "summary" in tool_input and not _valid_summary(tool_input["summary"]):
-        return "sendmessage_summary_mismatch"
-    return None
+        bounded_message(message)
+    except ChatError:
+        return "sendmessage_payload_mismatch", None
+    return None, authoritative_tool_input(recipient, message, summary)
 
 
-def pretool_decision(expected: dict[str, object], payload: object, content_hmac_key: str) -> bool:
-    return _pretool_denial(expected, payload, content_hmac_key) is None
+def _pretool_denial(expected: dict[str, object], payload: object) -> ClaudeUnknownPhase | None:
+    return _pretool_resolution(expected, payload)[0]
 
 
-def run_pretool_gate(expected_path: str, content_hmac_key: str) -> bool:
+def pretool_decision(expected: dict[str, object], payload: object) -> bool:
+    return _pretool_denial(expected, payload) is None
+
+
+def _read_gate_expectation(path: Path) -> str:
+    """Read the gate expectation through an fstat-validated descriptor.
+
+    This file now names both the recipient and the exact body, so it is the
+    highest-authority input the gate has. It gets the same regular-file, owner
+    and 0600 predicate the outcome markers already get, checked on the open
+    descriptor rather than on the path, so the symlink test above cannot be
+    raced between the check and the read. O_NOFOLLOW rejects a symlink but not a
+    FIFO, so O_NONBLOCK matches the markers here too: a same-uid process that won
+    the race to place a FIFO at this path would otherwise stall the hook until
+    its timeout.
+    """
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ChatError("pre-tool expectation is unsafe")
+        if metadata.st_size > MAX_GATE_EXPECTATION_BYTES:
+            raise ChatError("pre-tool expectation is unsafe")
+        raw = os.read(descriptor, MAX_GATE_EXPECTATION_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(raw) > MAX_GATE_EXPECTATION_BYTES:
+        raise ChatError("pre-tool expectation is unsafe")
+    return raw.decode()
+
+
+def run_pretool_gate(expected_path: str) -> bool:
     gate_parent: Path | None = None
+    arguments: dict[str, str] | None = None
     denial: ClaudeUnknownPhase | None = "pretool_gate_denied"
     try:
         path = Path(expected_path)
@@ -372,13 +445,15 @@ def run_pretool_gate(expected_path: str, content_hmac_key: str) -> bool:
         ):
             raise ChatError("pre-tool gate directory is unsafe")
         gate_parent = path.parent
-        expected_raw = json.loads(path.read_text(encoding="utf-8"))
+        expected_raw = json.loads(_read_gate_expectation(path))
         payload_text = sys.stdin.read(65537)
         payload = json.loads(payload_text)
         if isinstance(expected_raw, dict) and len(payload_text.encode()) <= 65536:
-            denial = _pretool_denial(
-                cast(dict[str, object], expected_raw), payload, content_hmac_key
-            )
+            denial, arguments = _pretool_resolution(cast(dict[str, object], expected_raw), payload)
+        if denial is None and arguments is None:
+            # Allowing without arguments would green-light whatever the courier
+            # model authored, which is the exact failure this gate prevents.
+            denial = "sendmessage_payload_mismatch"
         allowed = denial is None
         if allowed:
             consumed = path.parent / "consumed"
@@ -393,6 +468,7 @@ def run_pretool_gate(expected_path: str, content_hmac_key: str) -> bool:
                 os.fsync(handle.fileno())
     except (OSError, UnicodeError, json.JSONDecodeError, ChatError):
         allowed = False
+        arguments = None
         denial = "pretool_gate_denied"
     if not allowed and gate_parent is not None:
         try:
@@ -408,17 +484,20 @@ def run_pretool_gate(expected_path: str, content_hmac_key: str) -> bool:
                 os.fsync(handle.fileno())
         except OSError:
             pass
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow" if allowed else "deny",
-            "permissionDecisionReason": (
-                "Exact Cross Agent Chat action"
-                if allowed
-                else "Cross Agent Chat rejected a mismatched action"
-            ),
-        }
+    hook_output: dict[str, object] = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow" if allowed else "deny",
+        "permissionDecisionReason": (
+            "Exact Cross Agent Chat action"
+            if allowed
+            else "Cross Agent Chat rejected a mismatched action"
+        ),
     }
+    if allowed and arguments is not None:
+        # The provider replaces the whole tool input with this object before the
+        # tool runs, so the courier model never authors the delivered payload.
+        hook_output["updatedInput"] = arguments
+    output = {"hookSpecificOutput": hook_output}
     print(json.dumps(output, separators=(",", ":")), flush=True)
     return allowed
 
@@ -442,8 +521,16 @@ def _tool_records(text: str) -> tuple[list[dict[str, object]], list[dict[str, ob
     return uses, results
 
 
-def parse_sendmessage_receipt(text: str, target_ref: str, message: str) -> str:
-    """Validate one exact successful native SendMessage tool receipt."""
+def parse_sendmessage_receipt(text: str) -> str:
+    """Validate one exact successful native SendMessage tool receipt.
+
+    The stream records the courier model's *proposed* ``tool_use`` input, which
+    the PreToolUse gate replaces before execution, so the logged input is not
+    the delivered payload and is deliberately not compared here. Exact target
+    and content are guaranteed upstream by ``authoritative_tool_input``; what
+    remains to establish is that exactly one SendMessage ran and the provider
+    accepted it.
+    """
     try:
         uses, results = _tool_records(text)
     except json.JSONDecodeError as error:
@@ -451,22 +538,8 @@ def parse_sendmessage_receipt(text: str, target_ref: str, message: str) -> str:
     if len(uses) != 1 or uses[0].get("name") != "SendMessage":
         raise ChatError("Claude SendMessage receipt is invalid")
     tool_id = uses[0].get("id")
-    tool_input = uses[0].get("input")
     matches = [item for item in results if item.get("tool_use_id") == tool_id]
-    if (
-        not isinstance(tool_id, str)
-        or not isinstance(tool_input, dict)
-        or not tool_input.keys() >= REQUIRED_TOOL_INPUT_KEYS
-        or not set(tool_input) <= REQUIRED_TOOL_INPUT_KEYS | OPTIONAL_TOOL_INPUT_KEYS
-        or not all(isinstance(tool_input.get(key), str) for key in REQUIRED_TOOL_INPUT_KEYS)
-        or tool_input.get("to") != target_ref
-        or tool_input.get("recipient") != target_ref
-        or tool_input.get("message") != message
-        or tool_input.get("type") != "message"
-        or ("summary" in tool_input and not _valid_summary(tool_input["summary"]))
-        or len(matches) != 1
-        or matches[0].get("is_error") is True
-    ):
+    if not isinstance(tool_id, str) or len(matches) != 1 or matches[0].get("is_error") is True:
         raise ChatError("Claude SendMessage receipt is invalid")
     content = matches[0].get("content")
     if not isinstance(content, list):
@@ -484,6 +557,15 @@ def parse_sendmessage_receipt(text: str, target_ref: str, message: str) -> str:
         result = json.loads(cast(str, text_blocks[0]["text"]))
     except json.JSONDecodeError as error:
         raise ChatError("Claude SendMessage receipt is invalid") from error
+    if isinstance(result, dict) and set(result) == {"success", "message"}:
+        reason = result.get("message")
+        if result.get("success") is False and isinstance(reason, str):
+            # The provider answered that it did not deliver, and it carries no
+            # message id, so nothing was created. Exactly one SendMessage ran and
+            # the gate was consumed exactly once, both established above. That is
+            # a decided refusal before any effect, and reporting it as uncertain
+            # would freeze an event that provably delivered nothing.
+            raise ClaudeSendMessageRefused(reason)
     if (
         not isinstance(result, dict)
         or set(result) != {"success", "message", "msg_id"}
@@ -583,33 +665,57 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
     bounded_message(message)
     if TARGET_REF_RE.fullmatch(target_ref) is None:
         raise ChatError("Claude target reference is invalid")
-    key = secrets.token_hex(32)
     expected = {
         "recipient": target_ref,
-        "message_hmac": hmac.new(bytes.fromhex(key), message.encode(), hashlib.sha256).hexdigest(),
+        "message": message,
+        "summary": SEND_SUMMARY,
     }
-    arguments = json.dumps(
-        {"to": target_ref, "message": message, "summary": "Cross Agent Chat"},
-        ensure_ascii=False,
+    # The courier only has to make the call; the gate supplies its arguments, so
+    # the message body is never handed to a model to reproduce.
+    placeholder = json.dumps(
+        {
+            "to": COURIER_PLACEHOLDER_TARGET,
+            "message": COURIER_PLACEHOLDER_MESSAGE,
+            "summary": SEND_SUMMARY,
+        },
         separators=(",", ":"),
     )
     prompt = (
         "Use SendMessage exactly once with this exact JSON argument object: "
-        f"{arguments}. Do not use any other tool. Stop immediately after it returns."
+        f"{placeholder}. Do not use any other tool. Stop immediately after it returns."
     )
     try:
+        # No explicit dir: tempfile honors TMPDIR, which on macOS is the
+        # per-user 0700 directory. The gate file holds the plaintext body, so it
+        # must not sit under a world-writable ancestor like /tmp.
         temporary_context = tempfile.TemporaryDirectory(
-            prefix="cross-agent-chat-gate.", dir="/tmp", ignore_cleanup_errors=True
+            prefix="cross-agent-chat-gate.", ignore_cleanup_errors=True
+        )
+        courier_context = tempfile.TemporaryDirectory(
+            prefix="cross-agent-chat-cwd.", ignore_cleanup_errors=True
         )
     except OSError as error:
         raise ChatError("Claude SendMessage courier setup failed") from error
-    with temporary_context as temporary:
+    with temporary_context as temporary, courier_context as courier_parent:
+        # The provider derives the courier session's visible sender name from its
+        # working directory, so an empty directory named for the product makes an
+        # incoming CAC message legible as one instead of an opaque `empty-NN`. The
+        # name is lowercased and truncated by the provider, so it carries no peer
+        # identity: the exact source and reply handle stay in the envelope.
+        courier_cwd = Path(courier_parent) / COURIER_SESSION_DIRECTORY
         try:
             gate = Path(temporary)
             gate.chmod(0o700)
+            Path(courier_parent).chmod(0o700)
+            courier_cwd.mkdir(mode=0o700)
             expected_path = gate / "expected.json"
-            expected_path.write_text(json.dumps(expected, separators=(",", ":")), encoding="utf-8")
-            expected_path.chmod(0o600)
+            descriptor = os.open(
+                expected_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(expected, separators=(",", ":")))
             hook = " ".join(
                 shlex.quote(part)
                 for part in (
@@ -617,8 +723,6 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
                     "_pretool",
                     "--expected",
                     str(expected_path),
-                    "--content-hmac-key",
-                    key,
                 )
             )
             settings = {
@@ -631,6 +735,14 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
                     ]
                 }
             }
+            # The tool restriction below is load-bearing for privacy, not just
+            # for determinism: the gate file in this courier's own process tree
+            # holds the plaintext message body. The courier has no Read, no Bash,
+            # no MCP and no slash commands, so the MODEL inside it cannot open
+            # that file. Adding a file-reading tool here would expose every
+            # message body CAC delivers. This bounds the model, not the host: any
+            # same-uid process can still read the file, which is why its
+            # directory is 0700 and its lifetime is one send.
             command = [
                 str(claude_binary()),
                 "-p",
@@ -657,7 +769,12 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
                 "--no-session-persistence",
                 "--output-format",
                 "stream-json",
-                "--include-hook-events",
+                # Deliberately NOT --include-hook-events. The gate's decision is
+                # read from its own marker files, nothing here parses hook events,
+                # and including them puts the gate's supplied arguments -- the
+                # plaintext message body -- into this subprocess's stdout, which
+                # the parent captures. Leaving them out keeps the body out of the
+                # stream entirely.
                 "--verbose",
             ]
         except OSError as error:
@@ -665,7 +782,7 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
         try:
             completed = subprocess.run(
                 command,
-                cwd="/var/empty",
+                cwd=str(courier_cwd),
                 env=_environment(),
                 input=prompt,
                 capture_output=True,
@@ -682,6 +799,8 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
         if not gate_consumed(gate):
             _unknown(_unconsumed_gate_phase(gate, completed.stdout))
         try:
-            parse_sendmessage_receipt(completed.stdout, target_ref, message)
+            parse_sendmessage_receipt(completed.stdout)
+        except ClaudeSendMessageRefused:
+            raise
         except ChatError as error:
             raise ClaudeSendMessageUnknownDelivery("receipt_invalid") from error

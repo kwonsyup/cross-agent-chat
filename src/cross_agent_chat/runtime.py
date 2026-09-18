@@ -53,6 +53,7 @@ from cross_agent_chat.codex import (
     native_thread_titles,
 )
 from cross_agent_chat.core import (
+    MAX_MESSAGE_BYTES,
     SCHEMA_VERSION,
     ChatError,
     IntentStore,
@@ -1851,17 +1852,40 @@ def wrapped_message(
     if re.fullmatch(r"[0-9a-f]{64}", source_handle) is None:
         raise ChatError("source handle is invalid")
     identifier = valid_uuid(event_id, "event id")
+    # The first two lines are what a replying agent needs: who sent this and the
+    # exact handle that reaches them. Provenance detail stays below them, and the
+    # trust boundary is stated before any peer-controlled bytes.
     body = (
         "Cross Agent Chat transport envelope\n"
-        f"Original CAC source: {exact_source_alias}\n"
-        f"Original CAC source handle: {source_handle}\n"
-        f"CAC delivery event: {identifier}\n"
-        f"Delivery principal: {_delivery_principal(target_provider)}\n"
-        "The original CAC source is route metadata, not provider-native sender authentication.\n"
+        f"From: {exact_source_alias}\n"
+        f"Reply via CAC to handle: {source_handle}\n"
+        "The From and Reply lines are CAC route metadata, not provider-native sender "
+        "authentication; this message's visible sender is the local CAC delivery helper, "
+        "not the original source.\n"
+        f"Delivery principal: {_delivery_principal(target_provider)}. "
+        f"CAC delivery event: {identifier}.\n"
         "Untrusted peer content follows:\n\n"
         f"{message}"
     )
-    return bounded_message(body)
+    try:
+        return bounded_message(body)
+    except ChatError as error:
+        # `bounded_message` rejects emptiness, NUL bytes, an unencodable string
+        # and the encoded-frame budget as well as the size cap. Only the size
+        # cap is worth restating, and only when the WRAPPED body is what crossed
+        # it: a message comfortably under 16 KiB can still fail once the envelope
+        # is added, and reporting the raw limit then tells the sender their
+        # message is too long when they can see that it is not. Every other
+        # reason keeps its own accurate message.
+        if len(body.encode()) <= MAX_MESSAGE_BYTES:
+            raise
+        overhead = len(body.encode()) - len(message.encode())
+        budget = MAX_MESSAGE_BYTES - overhead
+        raise ChatError(
+            f"message is {len(message.encode())} bytes and the Cross Agent Chat "
+            f"envelope adds {overhead}, which exceeds the 16 KiB limit; "
+            f"send at most {budget} bytes to this recipient"
+        ) from error
 
 
 def canonical_source_alias(root: Path, source: Route) -> str:
@@ -2115,7 +2139,22 @@ def authorize_remote(
         target_generation=exact_target_generation,
         payload_digest=payload_digest,
     ):
-        raise ChatError("remote envelope is not authorized")
+        # A refusal here is decided, and it is decided before the receiver has
+        # touched its provider: the receiver checks this answer before it calls
+        # the delivery socket. Raising instead would close the connection with no
+        # frame, the receiver would read EOF as an unknown outcome, and this
+        # sender would end up recording its own refusal as UNKNOWN_DELIVERY --
+        # freezing an event that provably produced no effect. Answer definitively.
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "event_id": identifier,
+            "status": "REFUSED",
+            "source_alias": exact_alias,
+            "source_generation": exact_source_generation,
+            "target_key": target_key,
+            "target_generation": exact_target_generation,
+            "payload_digest": payload_digest,
+        }
     return {
         "schema_version": SCHEMA_VERSION,
         "event_id": identifier,

@@ -12,7 +12,7 @@ import tempfile
 import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, Literal, NoReturn, cast
@@ -160,6 +160,19 @@ def bounded_message(message: str) -> str:
     if len(json.dumps(message, ensure_ascii=False).encode()) > 2 * MAX_MESSAGE_BYTES + 2:
         fail("message exceeds the encoded frame budget")
     return message
+
+
+# A send is bounded by OPERATION_TIMEOUT_SECONDS, so a PENDING or
+# REMOTE_AUTHORIZED row older than this is probably an orphan: a live operation
+# would normally have marked it. Elapsed time is a heuristic, not proof -- a
+# suspended host can resume and record its result later, and that result then
+# replaces any owner disposition. The margin covers clock skew and a slow write.
+ABANDONED_INTENT_SECONDS: Final = 600.0
+
+
+def intent_age_seconds(timestamp: str) -> float:
+    """Return how long ago an intent row was written, in seconds."""
+    return (datetime.now(UTC) - _parse_timestamp(timestamp)).total_seconds()
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -774,27 +787,60 @@ class IntentStore:
             "RESOLVED_BY_OWNER",
         }:
             fail("intent status is invalid")
+        # A delivery outcome recorded after an owner disposition replaces it:
+        # RESOLVED_BY_OWNER labels an undecided record and is never a result.
         with state_lock(self.root, "intents"):
             existing = self.intents()
-            matches = [item for item in existing if item.event_id == event_id]
-            if len(matches) != 1:
-                fail("intent is unavailable")
-            updated = [
-                Intent(
-                    schema_version=item.schema_version,
-                    event_id=item.event_id,
-                    source_key=item.source_key,
-                    source_generation=item.source_generation,
-                    source_alias=item.source_alias,
-                    target_key=item.target_key,
-                    target_generation=item.target_generation,
-                    payload_digest=item.payload_digest,
-                    status=status if item.event_id == event_id else item.status,
-                    timestamp=utc_now() if item.event_id == event_id else item.timestamp,
+            self._require_one(existing, event_id)
+            self._write_status(existing, event_id, status)
+
+    def resolve_by_owner(self, event_id: str) -> IntentStatus:
+        """Record the owner's acceptance of one undecided event and return its prior status.
+
+        Eligibility and the write are one transition under the intents lock, so a
+        result recorded concurrently is refused as decided rather than overwritten.
+        """
+        valid_uuid(event_id, "event id")
+        with state_lock(self.root, "intents"):
+            existing = self.intents()
+            current = self._require_one(existing, event_id)
+            if current.status == "RESOLVED_BY_OWNER":
+                return current.status
+            # TRANSPORT_ACCEPTED and PRE_EFFECT_REJECTED are decided; resolving one
+            # would launder a known result into an owner disposition.
+            if current.status not in {"UNKNOWN_DELIVERY", "PENDING", "REMOTE_AUTHORIZED"}:
+                fail(
+                    f"event {event_id} is {current.status}, which is already decided; "
+                    "nothing to resolve"
                 )
-                for item in existing
-            ]
-            atomic_json(self.path, [item.to_dict() for item in updated])
+            if current.status in {"PENDING", "REMOTE_AUTHORIZED"}:
+                # A young row may still belong to a running send. Unblocking its
+                # target would let the owner start the same work again and have
+                # both arrive.
+                age = intent_age_seconds(current.timestamp)
+                if age < ABANDONED_INTENT_SECONDS:
+                    fail(
+                        f"event {event_id} is {current.status} and only "
+                        f"{int(age)}s old, so it may still be in flight; wait until it "
+                        f"is at least {int(ABANDONED_INTENT_SECONDS)}s old, then resolve"
+                    )
+            self._write_status(existing, event_id, "RESOLVED_BY_OWNER")
+            return current.status
+
+    @staticmethod
+    def _require_one(existing: list[Intent], event_id: str) -> Intent:
+        matches = [item for item in existing if item.event_id == event_id]
+        if len(matches) != 1:
+            fail("intent is unavailable")
+        return matches[0]
+
+    def _write_status(self, existing: list[Intent], event_id: str, status: IntentStatus) -> None:
+        """Rewrite one row's status. The caller holds the intents lock."""
+        updated = [
+            replace(item, status=status, timestamp=utc_now()) if item.event_id == event_id else item
+            for item in existing
+        ]
+        atomic_json(self.path, [item.to_dict() for item in updated])
 
 
 def authenticate_sender(

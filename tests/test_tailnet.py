@@ -19,11 +19,13 @@ import cross_agent_chat.tailnet_broker as tailnet_broker_module
 from cross_agent_chat import __version__, runtime
 from cross_agent_chat.cli import parser
 from cross_agent_chat.core import (
+    MAX_MESSAGE_BYTES,
     ChatError,
     IntentStore,
     Registry,
     Route,
     UnknownDeliveryError,
+    bounded_message,
     session_key,
 )
 from cross_agent_chat.runtime import (
@@ -34,6 +36,7 @@ from cross_agent_chat.runtime import (
     remote_targets,
     request_tailnet,
     send,
+    wrapped_message,
 )
 from cross_agent_chat.tailnet import (
     local_tailnet_address,
@@ -1453,16 +1456,21 @@ def test_remote_authorization_binds_source_target_and_payload(tmp_path: Path) ->
         == "AUTHORIZED"
     )
 
-    with pytest.raises(ChatError, match="not authorized"):
-        authorize_remote(
-            tmp_path,
-            event_id=event_id,
-            source_alias=source.alias,
-            source_generation=source.generation,
-            target_key=target_key,
-            target_generation=target_generation,
-            payload_digest="a" * 64,
-        )
+    # A second claim is refused, and the refusal is ANSWERED rather than raised.
+    # Raising closed the connection with no frame, so the peer read EOF as an
+    # unknown outcome and this sender recorded its own decided refusal as
+    # UNKNOWN_DELIVERY, freezing an event that provably produced no effect.
+    refusal = authorize_remote(
+        tmp_path,
+        event_id=event_id,
+        source_alias=source.alias,
+        source_generation=source.generation,
+        target_key=target_key,
+        target_generation=target_generation,
+        payload_digest="a" * 64,
+    )
+    assert refusal["status"] == "REFUSED"
+    assert refusal["event_id"] == event_id
 
     assert IntentStore(tmp_path).intents()[0].status == "REMOTE_AUTHORIZED"
 
@@ -2232,3 +2240,168 @@ def test_broker_receive_preserves_proven_rejection_and_post_write_uncertainty(
             }
         ]
         assert effects == []
+
+
+def test_a_real_authorization_refusal_reaches_the_receiver_as_a_decided_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sender's own refusal must not come back to it as UNKNOWN_DELIVERY.
+
+    Uses the frame `authorize_remote` actually produces rather than a hand-built
+    one, so the two halves are bound: refusing by raising closed the connection
+    with no frame, the receiver read EOF as uncertain, and the sender recorded a
+    refusal it had itself decided as an unknown outcome -- freezing an event that
+    provably produced no effect.
+    """
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="source",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(target)
+    event_id = str(uuid4())
+    target_key = session_key(target.provider, target.session_id)
+    IntentStore(tmp_path).begin_identity(
+        source_key=session_key(source.provider, source.session_id),
+        source_generation=source.generation,
+        source_alias=source.alias,
+        target_key=target_key,
+        target_generation=target.generation,
+        payload_digest="a" * 64,
+        event_id=event_id,
+    )
+    claim = {
+        "event_id": event_id,
+        "source_alias": source.alias,
+        "source_generation": source.generation,
+        "target_key": target_key,
+        "target_generation": target.generation,
+        "payload_digest": "a" * 64,
+    }
+    assert authorize_remote(tmp_path, **claim)["status"] == "AUTHORIZED"
+    refusal = authorize_remote(tmp_path, **claim)
+    assert refusal["status"] == "REFUSED"
+
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias=source.alias,
+        source_generation=source.generation,
+        target_alias=target.alias,
+        generation=target.generation,
+        message="hello",
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", lambda *_a, **_k: refusal)
+
+    def provider_boundary(
+        _path: Path, payload: dict[str, object], **_: object
+    ) -> dict[str, object]:
+        if payload.get("operation") == "health":
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "generation": target.generation,
+                "alias": target.alias,
+            }
+        pytest.fail("provider delivery ran after a decided authorization refusal")
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", provider_boundary)
+
+    response = receive_remote(tmp_path, envelope, "100.64.0.11")
+
+    assert response["status"] == "PRE_EFFECT_REJECTED"
+
+
+def test_wrapped_message_names_the_exact_budget_at_its_real_boundary() -> None:
+    """Pin the true maximum and the first rejection, not the nominal 16 KiB.
+
+    The cap applies to the WRAPPED body, so the largest sendable message is
+    smaller than the limit by however much the envelope costs. Nothing pinned
+    that number, so envelope edits moved it silently.
+    """
+    alias = "claude@kwons-imac-pro:Projects:E_KLURO_17-Sep-12PM"
+    handle = "b7" * 32
+    event_id = str(uuid4())
+    overhead = len(wrapped_message(alias, handle, "", event_id, "claude").encode())
+    largest = MAX_MESSAGE_BYTES - overhead
+
+    accepted = wrapped_message(alias, handle, "x" * largest, event_id, "claude")
+    assert len(accepted.encode()) == MAX_MESSAGE_BYTES
+
+    with pytest.raises(ChatError) as caught:
+        wrapped_message(alias, handle, "x" * (largest + 1), event_id, "claude")
+
+    reason = str(caught.value)
+    # The sender can see their message is under 16 KiB, so the raw limit alone
+    # is not an actionable error: it must name the overhead and the real budget.
+    assert str(overhead) in reason
+    assert str(largest) in reason
+    assert reason != "message exceeds the 16 KiB limit"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        pytest.param("has a \x00 byte", "16 KiB limit", id="nul-byte"),
+        pytest.param("\x01" * 6000, "encoded frame budget", id="frame-budget"),
+    ],
+)
+def test_wrapped_message_does_not_restate_other_failures_as_a_size_problem(
+    message: str, expected: str
+) -> None:
+    """Only the size cap may be restated, and only when the body crossed it.
+
+    `bounded_message` also rejects emptiness, NUL bytes, unencodable strings and
+    the encoded-frame budget. Rewriting all of those as "your message is N bytes
+    and the envelope adds M" states a byte budget as the cause of a failure that
+    has nothing to do with size.
+    """
+    with pytest.raises(ChatError) as caught:
+        wrapped_message(
+            "claude@kwons-imac-pro:Projects:E_KLURO_17-Sep-12PM",
+            "b7" * 32,
+            message,
+            str(uuid4()),
+            "claude",
+        )
+
+    reason = str(caught.value)
+    assert expected in reason
+    assert "envelope adds" not in reason
+    assert "send at most" not in reason
+
+
+def test_wrapped_message_keeps_the_frame_budget_reason_when_the_envelope_causes_it() -> None:
+    """The one window where WRAPPING causes a non-size failure.
+
+    A control-character body can pass `bounded_message` on its own and still push
+    the wrapped body past the encoded-frame budget once the envelope is added.
+    That is the only reachable trigger for the re-raise branch where the envelope
+    is genuinely at fault, and it must not be restated as a size problem: the
+    body is well inside 16 KiB, so a byte budget would describe the wrong cause.
+    """
+    message = "\x01" * 5392
+    # Precondition: the message alone is acceptable. Only wrapping breaks it.
+    assert bounded_message(message) == message
+
+    with pytest.raises(ChatError) as caught:
+        wrapped_message(
+            "claude@kwons-imac-pro:Projects:E_KLURO_17-Sep-12PM",
+            "b7" * 32,
+            message,
+            str(uuid4()),
+            "claude",
+        )
+
+    reason = str(caught.value)
+    assert "encoded frame budget" in reason
+    assert "envelope adds" not in reason
+    assert "16 KiB" not in reason

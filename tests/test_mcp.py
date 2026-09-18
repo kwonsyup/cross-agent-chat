@@ -163,3 +163,35 @@ def test_mcp_status_requires_the_trusted_codex_thread_and_current_generation(
 
     denied = json.loads(capsys.readouterr().out)
     assert denied["error"] == {"code": -32602, "message": "event is unavailable"}
+
+
+def test_chat_send_target_description_does_not_demand_a_fresh_discovery_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The per-parameter text is what a model reads most closely.
+
+    MCP_INSTRUCTIONS stopped requiring a `chat_peers` call before every send, but
+    the `to` schema still said "Fresh opaque handle returned by chat_peers", which
+    reimposed the ritual and hid the fact that an envelope's Reply handle is a
+    valid target. Guidance has to agree with itself or the stricter line wins.
+    """
+    root = tmp_path / "state"
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+    ]
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO("".join(f"{json.dumps(item)}\n" for item in requests))
+    )
+
+    mcp("codex", "studio", str(root))
+
+    responses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    tools = {tool["name"]: tool for tool in responses[1]["result"]["tools"]}
+    target = tools["chat_send"]["inputSchema"]["properties"]["to"]["description"]
+
+    assert "Fresh" not in target
+    assert "Reply handle" in target
+    assert "life of that peer session" in target
+    # It must also steer away from the visible sender, which is the helper.
+    assert "delivery helper" in target

@@ -10,10 +10,10 @@ non-default roots). Local sessions do not need Tailscale; remote sessions need T
 allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
 files, or turn a remote peer into an owner.
 
-Install v0.3.5 prerelease with:
+Install v0.3.6 prerelease with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.5/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.6/install.sh | sh
 ```
 
 Installation requires Git because the installer builds from the release tag.
@@ -42,7 +42,14 @@ Use the opaque exact `handle` returned by `chat_peers` to select a recipient. Di
 checked across devices; multiple matches or incomplete discovery require an exact handle.
 `chat_peers` reports the invoking sender's readiness separately from each recipient's delivery mode.
 An incomplete roster may be refreshed with another read-only `chat_peers` call; that does not
-authorize resending an accepted or unknown message.
+authorize resending an accepted or unknown message. An exact handle stays valid for the life of
+that peer session, so `chat_peers` is for discovery and for when an exact handle stops resolving,
+not a required step before every send.
+
+A delivered Cross Agent Chat message arrives through your provider's own inbox, so its visible
+sender is this host's Cross Agent Chat delivery helper, not the peer. Reply to the `Reply via CAC
+to handle:` value in the message's envelope; replying to the visible sender address reaches the
+helper, which is already gone.
 
 Disposable worker launchers can set `CROSS_AGENT_CHAT_PRESENCE=off`. That worker remains out
 of Cross Agent Chat's peer roster and creates no route or courier; ordinary sessions remain
@@ -50,13 +57,13 @@ visible by default.
 
 To have an existing coding agent assist with installation, give it this prompt:
 
-> Install the released `v0.3.5` tag, not an arbitrary PR. Identify active consumers and the
+> Install the released `v0.3.6` tag, not an arbitrary PR. Identify active consumers and the
 > selected Claude/Codex roots and local Devin configuration, obtain approval before shared effects, preserve existing intent
 > records, run `cross-agent-chat doctor --json`, and test only fresh actors.
 
 ## Supported surfaces
 
-v0.3.5 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
+v0.3.6 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
 scheduling class to avoid the observed Background scheduling delay. Normal-budget discovery has
 been observed for participating macOS nodes. An aggregate roster can still be incomplete when an
 online non-CAC Tailnet node, such as an iOS node, fails discovery; full remote request/result

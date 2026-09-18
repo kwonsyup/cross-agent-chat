@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cross-agent-chat"
-version = "0.3.5"
+version = "0.3.6"
 description = "Local-first cross-session chat for Claude Code, Codex, and local Devin."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -48,9 +48,12 @@ include = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "--strict-config --strict-markers"
+addopts = "--strict-config --strict-markers -m 'not live'"
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "live: spawns a real provider subprocess; run with -m live after a provider upgrade",
+]
 
 [tool.ruff]
 line-length = 100
