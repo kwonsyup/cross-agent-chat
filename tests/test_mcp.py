@@ -195,3 +195,12 @@ def test_chat_send_target_description_does_not_demand_a_fresh_discovery_call(
     assert "life of that peer session" in target
     # It must also steer away from the visible sender, which is the helper.
     assert "delivery helper" in target
+
+
+def test_instructions_tell_a_sender_to_finish_its_turn_instead_of_waiting() -> None:
+    # A requester that sleeps or polls inside its turn holds off the very boundary at which
+    # Stop-bound providers deliver its answer; a fresh Codex CLI requester waited 11 minutes.
+    from cross_agent_chat import cli
+
+    assert "finish your turn" in cli.MCP_INSTRUCTIONS
+    assert "do not sleep, wait, or poll chat_status" in cli.MCP_INSTRUCTIONS

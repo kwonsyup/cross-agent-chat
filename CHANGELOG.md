@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.7 - 2026-09-18
+
+- Tell a sender that a requested answer arrives later in its conversation as a new CAC message,
+  so it should finish its turn instead of sleeping, waiting, or polling `chat_status`. In a fresh
+  installed v0.3.6 trial a Codex CLI requester held its turn open for about eleven minutes, and
+  the answer, already accepted for it about 30 seconds after the request, reached it only when that
+  turn ended. Delivery itself is unchanged.
+- This release does not establish original-idle Devin receipt: a Devin requester that finishes its
+  turn still receives the answer at its next prompt or Stop boundary.
+
 ## 0.3.6 - 2026-09-18
 
 - Supply the Claude courier's `SendMessage` arguments from the delivery gate instead of asking a
