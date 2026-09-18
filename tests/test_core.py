@@ -2602,7 +2602,7 @@ def _seeded_intent(
 
 
 def _backdate_intent(store: IntentStore, event_id: str, age_seconds: float) -> None:
-    """Age one row so it can only be an orphan, not a live operation."""
+    """Age one row past the orphan heuristic; age alone does not prove the send is dead."""
     raw = json.loads(store.path.read_text(encoding="utf-8"))
     stale = (datetime.now(UTC) - timedelta(seconds=age_seconds)).isoformat()
     for item in raw:
