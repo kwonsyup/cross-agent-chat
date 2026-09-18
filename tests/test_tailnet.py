@@ -25,6 +25,7 @@ from cross_agent_chat.core import (
     Registry,
     Route,
     UnknownDeliveryError,
+    bounded_message,
     session_key,
 )
 from cross_agent_chat.runtime import (
@@ -2376,3 +2377,31 @@ def test_wrapped_message_does_not_restate_other_failures_as_a_size_problem(
     assert expected in reason
     assert "envelope adds" not in reason
     assert "send at most" not in reason
+
+
+def test_wrapped_message_keeps_the_frame_budget_reason_when_the_envelope_causes_it() -> None:
+    """The one window where WRAPPING causes a non-size failure.
+
+    A control-character body can pass `bounded_message` on its own and still push
+    the wrapped body past the encoded-frame budget once the envelope is added.
+    That is the only reachable trigger for the re-raise branch where the envelope
+    is genuinely at fault, and it must not be restated as a size problem: the
+    body is well inside 16 KiB, so a byte budget would describe the wrong cause.
+    """
+    message = "\x01" * 5392
+    # Precondition: the message alone is acceptable. Only wrapping breaks it.
+    assert bounded_message(message) == message
+
+    with pytest.raises(ChatError) as caught:
+        wrapped_message(
+            "claude@kwons-imac-pro:Projects:E_KLURO_17-Sep-12PM",
+            "b7" * 32,
+            message,
+            str(uuid4()),
+            "claude",
+        )
+
+    reason = str(caught.value)
+    assert "encoded frame budget" in reason
+    assert "envelope adds" not in reason
+    assert "16 KiB" not in reason

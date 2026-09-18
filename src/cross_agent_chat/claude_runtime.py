@@ -82,6 +82,12 @@ COURIER_SESSION_DIRECTORY: Final = "cross-agent-chat"
 # delivering unverified content to a real session.
 COURIER_PLACEHOLDER_TARGET: Final = "cross-agent-chat-courier [000000]"
 COURIER_PLACEHOLDER_MESSAGE: Final = "placeholder"
+# The exact normalized key set the provider presents for SendMessage, measured
+# on Claude Code 2.1.274. Both the supplied arguments and any accepted proposal
+# stay inside it.
+SENDMESSAGE_TOOL_INPUT_KEYS: Final = frozenset(
+    {"to", "recipient", "message", "content", "type", "summary"}
+)
 SUMMARY_REJECT_RE: Final = re.compile(r"[\x00-\x08\x0a-\x0d\x0e-\x1f\x7f-\x9f\u2028\u2029]")
 ClaudeUnknownPhase = Literal[
     "pretool_gate_unobserved",
@@ -366,6 +372,20 @@ def _pretool_resolution(
         or payload.get("tool_name") != "SendMessage"
         or not isinstance(payload.get("tool_input"), dict)
     ):
+        return "sendmessage_payload_mismatch", None
+    # The supplied arguments are expected to REPLACE the proposal wholesale. If a
+    # provider ever merged them instead, any proposed key this object does not
+    # also supply would survive onto a real delivery. Constraining the proposal's
+    # key set makes that question irrelevant rather than assumed -- it depends on
+    # no model-authored content, and it keeps holding across provider upgrades,
+    # which a measurement of today's behaviour would not.
+    if not set(cast(dict[str, object], payload["tool_input"])) <= SENDMESSAGE_TOOL_INPUT_KEYS:
+        return "sendmessage_payload_mismatch", None
+    # The gate is the authority on delivered content, so it re-applies the
+    # product's own bound rather than trusting whoever wrote the expectation.
+    try:
+        bounded_message(message)
+    except ChatError:
         return "sendmessage_payload_mismatch", None
     return None, authoritative_tool_input(recipient, message, summary)
 

@@ -480,8 +480,9 @@ def test_pretool_gate_denies_invalid_expected_summary(summary: object) -> None:
     assert _pretool_denial(expected, _gate_payload()) == "sendmessage_payload_mismatch"
 
 
-# Used to deny malformed model-transcribed fields (`type`, `summary`, extras);
-# the gate replaces the whole input, so none of these proposal shapes matter.
+# Used to deny malformed model-transcribed fields; the gate now replaces every
+# VALUE, so no proposed value matters. The KEY SET is still constrained, because
+# a provider that merged rather than replaced would let an unsupplied key through.
 @pytest.mark.parametrize(
     "tool_input_change",
     [
@@ -489,8 +490,6 @@ def test_pretool_gate_denies_invalid_expected_summary(summary: object) -> None:
         {"type": "notify"},
         {"summary": "two\nlines"},
         {"summary": 7},
-        {"extra": "field"},
-        {"notify_when_idle": True},
         {"to": "Other work [XYZ789]"},
         {"recipient": "Other work [XYZ789]"},
         {"message": "forged body"},
@@ -578,7 +577,16 @@ def test_pretool_gate_updated_input_is_independent_of_the_proposal(
         authoritative_tool_input(
             COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
         ),
-        {"recipient": "Wrong [ZZZ999]", "msg": "truncated", "extra": True},
+        # Same key set, every value wrong: the gate must still deliver the
+        # sender's arguments. Out-of-set keys are denied, covered separately.
+        {
+            "to": "Wrong [ZZZ999]",
+            "recipient": "Wrong [ZZZ999]",
+            "message": "truncated",
+            "content": "",
+            "type": "notify",
+            "summary": "forged",
+        },
     ]
     delivered = []
     for index, tool_input in enumerate(proposals):
@@ -985,7 +993,16 @@ def test_sendmessage_helper_stream_failures_are_body_free_and_enum_bound(
             "summary": "Cross Agent Chat",
             "unexpected": "reject",
         },
-        {"recipient": "Wrong [ZZZ999]", "msg": "truncated", "extra": True},
+        # Same key set, every value wrong: the gate must still deliver the
+        # sender's arguments. Out-of-set keys are denied, covered separately.
+        {
+            "to": "Wrong [ZZZ999]",
+            "recipient": "Wrong [ZZZ999]",
+            "message": "truncated",
+            "content": "",
+            "type": "notify",
+            "summary": "forged",
+        },
     ],
 )
 def test_sendmessage_ignores_the_courier_proposal(
@@ -1999,3 +2016,46 @@ def test_receipt_keeps_an_ambiguous_outcome_uncertain(result_text: str) -> None:
         parse_sendmessage_receipt(stream)
 
     assert not isinstance(caught.value, ClaudeSendMessageRefused)
+
+
+@pytest.mark.parametrize(
+    "tool_input_change",
+    [
+        pytest.param({"extra": "field"}, id="unknown-key"),
+        pytest.param({"notify_when_idle": True}, id="unsupplied-schema-key"),
+    ],
+)
+def test_pretool_gate_denies_a_proposal_carrying_a_key_it_does_not_supply(
+    tool_input_change: dict[str, object],
+) -> None:
+    """The supplied arguments are expected to replace the proposal wholesale.
+
+    Nothing here can observe whether a provider replaces or merges: every key the
+    gate supplies wins either way, so only an UNSUPPLIED key would reveal the
+    difference -- and under merge it would ride along onto a real delivery.
+    Constraining the proposal's key set makes that question irrelevant instead of
+    assumed, and it keeps holding across provider upgrades.
+    """
+    expected = _expected_gate("API work [ABC123]", "one exact body", SEND_SUMMARY)
+    tool_input: dict[str, object] = {
+        **authoritative_tool_input(
+            COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+        )
+    }
+    tool_input.update(tool_input_change)
+
+    phase, arguments = _pretool_resolution(expected, _gate_payload(tool_input))
+
+    assert phase == "sendmessage_payload_mismatch"
+    assert arguments is None
+
+
+def test_pretool_gate_denies_an_expectation_over_the_product_message_bound() -> None:
+    # The gate is the authority on delivered content, so it re-applies the
+    # product's own bound rather than trusting whoever wrote the expectation.
+    expected = _expected_gate("API work [ABC123]", "x" * (16 * 1024 + 1), SEND_SUMMARY)
+
+    phase, arguments = _pretool_resolution(expected, _gate_payload())
+
+    assert phase == "sendmessage_payload_mismatch"
+    assert arguments is None
