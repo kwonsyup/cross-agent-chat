@@ -440,7 +440,7 @@ def test_remote_delivery_wraps_reply_with_authenticated_sender_handle(
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(runtime, "local_targets", lambda _: [])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([target], True))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([target], True))
 
     def accept(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         captured.update(payload)

@@ -1719,7 +1719,11 @@ def _remote_node_targets(
 
 
 def _remote_discovery(
-    *, include_delivery_mode: bool = False, include_title: bool = False, include_devin: bool = True
+    *,
+    include_delivery_mode: bool = False,
+    include_title: bool = False,
+    include_devin: bool = True,
+    handle: str | None = None,
 ) -> tuple[list[Target], bool]:
     addresses = tailnet_nodes()
     if not addresses:
@@ -1743,12 +1747,22 @@ def _remote_discovery(
         )
         for address in addresses
     ]
+    pending = set(futures)
     try:
         for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
-            outcome = future.result()
-            discovered, node_complete = outcome
+            pending.discard(future)
+            discovered, node_complete = future.result()
             targets.extend(discovered)
             complete = complete and node_complete
+            # An attested exact handle cannot be unattested by the remaining
+            # answers; only a second attestation could still refuse the send.
+            if handle is not None and any(target.session_key == handle for target in discovered):
+                break
+        for future in pending:
+            if handle is not None and future.done():
+                discovered, node_complete = future.result()
+                targets.extend(discovered)
+                complete = complete and node_complete
     except FuturesTimeoutError:
         complete = False
     finally:
@@ -2020,7 +2034,11 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
     if len(exact_local_handles) == 1:
         target = exact_local_handles[0]
         return _send_local_target(root, source, target, message, deadline=deadline)
-    remote, remote_complete = _remote_discovery()
+    remote, remote_complete = (
+        _remote_discovery(handle=target_query)
+        if re.fullmatch(r"[0-9a-f]{64}", target_query) is not None
+        else _remote_discovery()
+    )
     exact_remote_handles = [target for target in remote if target.session_key == target_query]
     if len(exact_remote_handles) == 1:
         target = exact_remote_handles[0]

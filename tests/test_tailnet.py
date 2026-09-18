@@ -1791,6 +1791,77 @@ def test_remote_send_uses_tailnet_broker_without_ssh_configuration(
     assert "hello" not in (tmp_path / "intents.json").read_text()
 
 
+def test_exact_remote_handle_send_ignores_unrelated_unresponsive_peer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = "100.64.0.11"
+    neighbor = "100.64.0.12"
+    generation = str(uuid4())
+    handle = session_key("claude", str(uuid4()))
+    peer = {
+        "alias": "claude@studio:api:api-a1",
+        "provider": "claude",
+        "device": "studio",
+        "project": "api",
+        "status": "available",
+        "generation": generation,
+        "session_key": handle,
+    }
+    neighbor_release = threading.Event()
+    neighbor_requests = 0
+    neighbor_timeouts: list[float] = []
+    delivered_at: list[float] = []
+
+    def request(
+        address: str, payload: dict[str, object], *, timeout: float = 2.0
+    ) -> dict[str, object]:
+        nonlocal neighbor_requests
+        if payload.get("operation") == "peers":
+            if address == neighbor:
+                neighbor_requests += 1
+                neighbor_timeouts.append(timeout)
+                if neighbor_requests == 1:
+                    # The node accepts the connection but never answers: hold
+                    # the worker inside its own budget, never past it.
+                    neighbor_release.wait(min(timeout, 1.5))
+                raise ChatError("neighbor never answered")
+            return {"schema_version": 1, "peers": [peer]}
+        delivered_at.append(time.monotonic())
+        envelope = json.loads(str(payload["envelope"]))
+        return {
+            "schema_version": 1,
+            "event_id": envelope["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": peer["alias"],
+            "provider": "claude",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [neighbor, owner])
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="imac",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(source)
+
+    started = time.monotonic()
+    try:
+        result = send(tmp_path, source, handle, "hello")
+    finally:
+        neighbor_release.set()
+
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+    assert result["to"] == peer["alias"]
+    assert neighbor_requests >= 1
+    assert neighbor_timeouts[0] == pytest.approx(REMOTE_DISCOVERY_TIMEOUT_SECONDS, abs=1.0)
+    # The neighbor held its full request budget; an exact-handle send must not
+    # wait on it once the owning peer has attested the handle.
+    assert delivered_at[0] - started < 1.0
+
+
 def test_remote_claude_diagnostic_is_body_free_and_marks_one_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

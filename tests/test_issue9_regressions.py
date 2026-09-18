@@ -240,7 +240,7 @@ def test_exact_remote_handle_survives_unrelated_incomplete_discovery(
         pid=os.getpid(),
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _: [])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([target], False))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([target], False))
     monkeypatch.setattr(runtime, "canonical_source_alias", lambda *_: source.alias)
     responses: list[dict[str, object]] = []
 
