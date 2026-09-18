@@ -162,6 +162,17 @@ def bounded_message(message: str) -> str:
     return message
 
 
+# A send is bounded by OPERATION_TIMEOUT_SECONDS, so a PENDING or
+# REMOTE_AUTHORIZED row older than this can only be an orphan: a live operation
+# would have marked it. The margin covers clock skew and a slow final write.
+ABANDONED_INTENT_SECONDS: Final = 600.0
+
+
+def intent_age_seconds(timestamp: str) -> float:
+    """Return how long ago an intent row was written, in seconds."""
+    return (datetime.now(UTC) - _parse_timestamp(timestamp)).total_seconds()
+
+
 def _parse_timestamp(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value)

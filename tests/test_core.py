@@ -2586,14 +2586,29 @@ def _resolve_cli(home: Path, monkeypatch: pytest.MonkeyPatch, event_id: str) -> 
     return code, ""
 
 
-def _seeded_intent(home: Path, tmp_path: Path, status: IntentStatus) -> str:
+def _seeded_intent(
+    home: Path, tmp_path: Path, status: IntentStatus, *, age_seconds: float = 0.0
+) -> str:
     store = IntentStore(home / ".local/state/cross-agent-chat")
     source = route(tmp_path, project="source")
     target = route(tmp_path)
     event_id = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
     if status != "PENDING":
         store.mark(event_id, status)
+    if age_seconds:
+        _backdate_intent(store, event_id, age_seconds)
     return event_id
+
+
+def _backdate_intent(store: IntentStore, event_id: str, age_seconds: float) -> None:
+    """Age one row so it can only be an orphan, not a live operation."""
+    raw = json.loads(store.path.read_text(encoding="utf-8"))
+    stale = (datetime.now(UTC) - timedelta(seconds=age_seconds)).isoformat()
+    for item in raw:
+        if item["event_id"] == event_id:
+            item["timestamp"] = stale
+    store.path.write_text(json.dumps(raw), encoding="utf-8")
+    store.path.chmod(0o600)
 
 
 @pytest.mark.parametrize("status", ["PENDING", "REMOTE_AUTHORIZED"])
@@ -2607,7 +2622,7 @@ def test_resolve_clears_an_intent_abandoned_in_flight(
     # a courier killed inside its send window would otherwise block that target forever.
     home = tmp_path / "home"
     home.mkdir()
-    event_id = _seeded_intent(home, tmp_path, status)
+    event_id = _seeded_intent(home, tmp_path, status, age_seconds=1200)
 
     assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
 
@@ -2683,3 +2698,40 @@ def test_resolve_refuses_an_unknown_event_id(
 
     with pytest.raises(ChatError, match="intent is unavailable"):
         _resolve_cli(home, monkeypatch, str(uuid4()))
+
+
+@pytest.mark.parametrize("status", ["PENDING", "REMOTE_AUTHORIZED"])
+def test_resolve_refuses_an_intent_that_may_still_be_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: IntentStatus
+) -> None:
+    """Resolving a live send would open a duplicate-delivery window.
+
+    Unblocking the target while its send is still running lets the owner start
+    the same work again and have both arrive. Every send is bounded, so a young
+    row may still belong to a running operation and only an aged one can be
+    proven an orphan. Refusing the young case is what makes the success text's
+    "was still in flight and never completed" true rather than assumed.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, status)
+
+    with pytest.raises(ChatError, match="may still be in flight"):
+        _resolve_cli(home, monkeypatch, event_id)
+
+    store = IntentStore(home / ".local/state/cross-agent-chat")
+    assert [item.status for item in store.intents() if item.event_id == event_id] == [status]
+
+
+def test_resolve_still_accepts_an_unknown_event_at_any_age(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # UNKNOWN_DELIVERY is already terminal for its operation, so there is no live
+    # send to collide with and no reason to make the owner wait.
+    home = tmp_path / "home"
+    home.mkdir()
+    event_id = _seeded_intent(home, tmp_path, "UNKNOWN_DELIVERY")
+
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
+
+    assert "remains UNKNOWN_DELIVERY in fact" in capsys.readouterr().out

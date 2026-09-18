@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Final, NoReturn, cast
 
 from cross_agent_chat import __version__
-from cross_agent_chat.core import ChatError, IntentStore
+from cross_agent_chat.core import (
+    ABANDONED_INTENT_SECONDS,
+    ChatError,
+    IntentStore,
+    intent_age_seconds,
+)
 from cross_agent_chat.install import (
     Installer,
     SettingsError,
@@ -436,9 +441,10 @@ def parser() -> argparse.ArgumentParser:
         "resolve",
         help=(
             "record that you accept one undecided event's uncertainty: an UNKNOWN_DELIVERY, "
-            "or a PENDING/REMOTE_AUTHORIZED intent abandoned in flight. It does not contact, "
-            "cancel, or confirm anything at the recipient, and never makes re-sending that "
-            "same task safe"
+            "or a PENDING/REMOTE_AUTHORIZED intent left behind by an operation that never "
+            "finished. A young in-flight intent is refused so resolving it cannot open a "
+            "duplicate-delivery window. It does not contact, cancel, or confirm anything at "
+            "the recipient, and never makes re-sending that same task safe"
         ),
     )
     resolve_parser.add_argument("event_id")
@@ -559,6 +565,19 @@ def run(arguments: argparse.Namespace) -> int:
                 f"event {arguments.event_id} is {current}, which is already decided; "
                 "nothing to resolve"
             )
+        if current in {"PENDING", "REMOTE_AUTHORIZED"}:
+            # A row this young may still belong to a running operation. Resolving
+            # it would unblock the target while that send is live, so the owner
+            # could start the same work again and have both arrive. Every send is
+            # bounded, so once the budget has elapsed the row can only be an
+            # orphan -- a live operation would have marked it by now.
+            age = intent_age_seconds(matches[0].timestamp)
+            if age < ABANDONED_INTENT_SECONDS:
+                _fail(
+                    f"event {arguments.event_id} is {current} and only "
+                    f"{int(age)}s old, so it may still be in flight; wait until it "
+                    f"is at least {int(ABANDONED_INTENT_SECONDS)}s old, then resolve"
+                )
         store.mark(arguments.event_id, "RESOLVED_BY_OWNER")
         # Only PENDING/REMOTE_AUTHORIZED rows gate a fresh send to the same target,
         # so only those are unblocked by this command.
