@@ -18,8 +18,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
+
 import cross_agent_chat.tailnet_broker as broker
-from cross_agent_chat.runtime import BROKER_CAPACITY_REFUSAL, read_frame
+from cross_agent_chat.runtime import BROKER_CAPACITY_REFUSAL, MAX_FRAME_BYTES, read_frame
 from cross_agent_chat.tailnet_broker import (
     MAX_BROKER_CONNECTIONS,
     MAX_BROKER_CONNECTIONS_PER_PEER,
@@ -61,14 +63,19 @@ def _feed(client: socket.socket, schedule: list[tuple[float, bytes | None]]) -> 
 
     def run() -> None:
         started = time.monotonic()
-        for offset, fragment in schedule:
-            delay = offset - (time.monotonic() - started)
-            if delay > 0:
-                time.sleep(delay)
-            if fragment is None:
-                client.close()
-                return
-            client.sendall(fragment)
+        try:
+            for offset, fragment in schedule:
+                delay = offset - (time.monotonic() - started)
+                if delay > 0:
+                    time.sleep(delay)
+                if fragment is None:
+                    client.close()
+                    return
+                client.sendall(fragment)
+        except OSError:
+            # The trial owns the client and may close it while a large
+            # fragment is still blocked in sendall.
+            return
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
@@ -217,17 +224,62 @@ def test_peeked_request_waits_for_first_bytes() -> None:
         server_side.close()
 
 
-def test_peeked_request_returns_none_when_sender_closes_mid_frame() -> None:
-    """EOF before the frame completes is undecided, and the wait stays bounded."""
+def test_peeked_request_returns_none_when_sender_closes_mid_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EOF before the frame completes stays undecided until the deadline.
+
+    A peek keeps returning the unconsumed bytes even after FIN, so a mid-frame
+    close can only end at the deadline; the wait must stay bounded in peeks.
+    """
+    monkeypatch.setattr(broker, "PEEK_REQUEST_DEADLINE_SECONDS", 0.4)
     client, raw_server = socket.socketpair()
     server_side = _CountingSocket(raw_server)
     try:
-        _feed(client, [(0.0, _AUTHORIZE_FRAME[:24]), (0.3, None)])
+        _feed(client, [(0.0, _AUTHORIZE_FRAME[:24]), (0.1, None)])
         started = time.monotonic()
         assert broker._peeked_request(server_side) is None
-        assert time.monotonic() - started < 4.0
+        assert 0.3 <= time.monotonic() - started < 2.0
         assert server_side.peeks <= _MAX_STALL_PEEKS, (
             f"probe peeked {server_side.peeks} times before a mid-frame EOF"
+        )
+    finally:
+        client.close()
+        server_side.close()
+
+
+def test_unchanged_fragment_expires_at_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fragment that never completes is undecided at the deadline."""
+    monkeypatch.setattr(broker, "PEEK_REQUEST_DEADLINE_SECONDS", 0.4)
+    client, raw_server = socket.socketpair()
+    server_side = _CountingSocket(raw_server)
+    try:
+        client.sendall(_AUTHORIZE_FRAME[:24])
+        started = time.monotonic()
+        assert broker._peeked_request(server_side) is None
+        assert 0.3 <= time.monotonic() - started < 2.0
+        assert server_side.peeks <= _MAX_STALL_PEEKS, (
+            f"probe peeked {server_side.peeks} times before the deadline"
+        )
+    finally:
+        client.close()
+        server_side.close()
+
+
+def test_oversized_frame_is_dropped_without_spinning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frame too large to buffer stays undecided until the deadline, as before."""
+    monkeypatch.setattr(broker, "PEEK_REQUEST_DEADLINE_SECONDS", 0.4)
+    client, raw_server = socket.socketpair()
+    server_side = _CountingSocket(raw_server)
+    try:
+        _feed(client, [(0.0, b"x" * (MAX_FRAME_BYTES + 1))])
+        assert broker._peeked_request(server_side) is None
+        assert server_side.peeks <= _MAX_STALL_PEEKS, (
+            f"probe peeked {server_side.peeks} times on an oversized frame"
         )
     finally:
         client.close()
