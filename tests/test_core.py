@@ -440,7 +440,7 @@ def test_remote_delivery_wraps_reply_with_authenticated_sender_handle(
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(runtime, "local_targets", lambda _: [])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([target], True))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([target], True))
 
     def accept(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         captured.update(payload)
@@ -827,7 +827,11 @@ def test_peers_reports_remote_discovery_completeness(
         True,
         tailnet_address="100.64.0.2",
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [local] if not complete else [])
+    monkeypatch.setattr(
+        runtime,
+        "local_targets",
+        lambda *args, **kwargs: [local] if not complete else [],
+    )
     monkeypatch.setattr(
         runtime, "_remote_discovery", lambda **_: ([remote] if not complete else [], complete)
     )
@@ -984,7 +988,7 @@ def test_alias_send_rejects_incomplete_global_discovery(
         remote=False,
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _: [local])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([], False))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], False))
 
     with pytest.raises(ChatError, match="discovery is incomplete"):
         send(tmp_path / "state", source, target.alias, "hello")
@@ -1009,7 +1013,7 @@ def test_duplicate_codex_aliases_are_ambiguous_after_complete_discovery(
         for _ in range(2)
     ]
     monkeypatch.setattr(runtime, "local_targets", lambda _: aliases)
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([], True))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
 
     with pytest.raises(ChatError, match="ambiguous"):
         send(tmp_path / "state", source, aliases[0].alias, "hello")
@@ -2485,7 +2489,9 @@ def test_remote_discovery_uses_one_deadline_for_queued_workers(
     release = threading.Event()
     started: list[str] = []
 
-    def wait_for_peer(address: str, deadline: float | None = None) -> tuple[list[Target], bool]:
+    def wait_for_peer(
+        address: str, deadline: float | None = None, **_kwargs: object
+    ) -> tuple[list[Target], bool]:
         assert deadline is not None
         started.append(address)
         release.wait(1)
