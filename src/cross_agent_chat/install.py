@@ -34,6 +34,15 @@ from cross_agent_chat import __version__
 from cross_agent_chat.core import ChatError, atomic_json, ensure_private_dir, valid_device
 from cross_agent_chat.devin import devin_profile_root
 from cross_agent_chat.native_helper import (
+    NATIVE_BOOTSTRAP_MATCHER,
+    NATIVE_CREATE_TOOL,
+    NATIVE_DISPATCH_MATCHER,
+    NATIVE_DISPATCH_TOOL,
+    NATIVE_HOOK_SERVER,
+    NATIVE_HOOK_TIMEOUT_SECONDS,
+    NATIVE_HOOK_TYPE,
+    NATIVE_QUEUE_ENV_VALUE,
+    NATIVE_QUEUE_ENV_VAR,
     native_helper_create_hook_group,
     native_helper_dispatch_hook_group,
 )
@@ -439,7 +448,7 @@ def _hook_command(
 ) -> str:
     binary = shlex.quote(str(executable))
     native_queue = (
-        "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE=experimental "
+        f"{NATIVE_QUEUE_ENV_VAR}={NATIVE_QUEUE_ENV_VALUE} "
         if provider == "codex" and codex_native_queue
         else ""
     )
@@ -474,16 +483,16 @@ def _owned_hook(value: object) -> bool:
     if not isinstance(hooks, list) or len(hooks) != 1 or not isinstance(hooks[0], dict):
         return False
     hook = hooks[0]
-    if hook.get("type") == "mcp_tool" and (
+    if hook.get("type") == NATIVE_HOOK_TYPE and (
         (
-            value.get("matcher") == "mcp__cross_agent_chat__native_bootstrap"
-            and hook.get("server") == "codex_app"
-            and hook.get("tool") == "create_thread"
+            value.get("matcher") == NATIVE_BOOTSTRAP_MATCHER
+            and hook.get("server") == NATIVE_HOOK_SERVER
+            and hook.get("tool") == NATIVE_CREATE_TOOL
         )
         or (
-            value.get("matcher") == "mcp__cross_agent_chat__native_dispatch"
-            and hook.get("server") == "codex_app"
-            and hook.get("tool") == "send_message_to_thread"
+            value.get("matcher") == NATIVE_DISPATCH_MATCHER
+            and hook.get("server") == NATIVE_HOOK_SERVER
+            and hook.get("tool") == NATIVE_DISPATCH_TOOL
         )
         or (
             "matcher" not in value
@@ -499,7 +508,7 @@ def _owned_hook(value: object) -> bool:
         tokens = shlex.split(command)
     except ValueError:
         return False
-    if tokens and tokens[0] == "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE=experimental":
+    if tokens and tokens[0] == f"{NATIVE_QUEUE_ENV_VAR}={NATIVE_QUEUE_ENV_VALUE}":
         tokens = tokens[1:]
     return (
         len(tokens) >= 2
@@ -532,7 +541,7 @@ def _owned_hook_native_queue(value: object) -> bool:
         tokens = shlex.split(command)
     except ValueError:
         return False
-    return bool(tokens) and tokens[0] == "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE=experimental"
+    return bool(tokens) and tokens[0] == f"{NATIVE_QUEUE_ENV_VAR}={NATIVE_QUEUE_ENV_VALUE}"
 
 
 def _hook_group(
@@ -586,7 +595,7 @@ def _native_helper_startup_hook_group(executable: Path, device: str) -> dict[str
             {
                 "type": "command",
                 "command": _hook_command(executable, "codex", device, "UserPromptSubmit"),
-                "timeout": 30,
+                "timeout": NATIVE_HOOK_TIMEOUT_SECONDS,
                 "statusMessage": "Preparing Cross Agent Chat delivery",
             }
         ]

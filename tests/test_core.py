@@ -20,6 +20,7 @@ from uuid import uuid4
 
 import pytest
 
+from cross_agent_chat.codex import CodexCourier
 from cross_agent_chat.core import (
     ChatError,
     Intent,
@@ -2285,6 +2286,91 @@ def test_courier_health_emits_exact_ready_contract(tmp_path: Path) -> None:
         "generation": item.generation,
         "alias": item.alias,
     }
+
+
+@pytest.mark.parametrize(
+    ("provider", "queued", "helper_backed", "mode", "mechanism"),
+    [
+        ("claude", False, False, "claude_native_cross_session", "claude_native"),
+        ("devin", False, False, "devin_stop_or_prompt_bound", "devin_prompt_bound"),
+        ("codex", True, True, "codex_experimental_queue", "native_helper"),
+        ("codex", True, False, "codex_experimental_queue", "direct_queue"),
+        ("codex", False, False, "codex_stop_bound", "stop_bound"),
+    ],
+)
+def test_courier_health_reports_the_exact_mechanism_behind_each_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    queued: bool,
+    helper_backed: bool,
+    mode: str,
+    mechanism: str,
+) -> None:
+    item = route(tmp_path, provider=provider, pid=os.getpid())
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.exact_agent",
+        lambda *_: {
+            "session_id": item.session_id,
+            "name": "Gate Health",
+            "kind": "interactive",
+            "cwd": item.cwd,
+        },
+    )
+    courier = (
+        CodexCourier(
+            alias=item.alias,
+            generation=item.generation,
+            native_queue=(tmp_path / "codex", {}, item.session_id) if queued else None,
+        )
+        if provider == "codex"
+        else None
+    )
+
+    health = courier_health(item, courier, include_delivery_mode=True, native_helper=helper_backed)
+
+    assert health["delivery_mode"] == mode
+    assert health["delivery_mechanism"] == mechanism
+
+
+def test_local_target_keeps_the_observed_delivery_mechanism(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = route(tmp_path, pid=os.getpid())
+    health = {
+        "schema_version": 1,
+        "status": "READY",
+        "generation": item.generation,
+        "alias": item.alias,
+        "delivery_mode": "codex_experimental_queue",
+        "delivery_mechanism": "native_helper",
+    }
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", lambda *_args, **_kwargs: health)
+
+    target = _local_target(tmp_path / "state", item)
+
+    assert target is not None
+    assert target.delivery_mode == "codex_experimental_queue"
+    assert target.delivery_mechanism == "native_helper"
+    assert target.public(include_delivery_mode=True)["delivery_mechanism"] == "native_helper"
+
+
+@pytest.mark.parametrize("mechanism", ["unknown", "experimental_queue"])
+def test_local_target_drops_an_unrecognized_delivery_mechanism(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mechanism: str
+) -> None:
+    item = route(tmp_path, pid=os.getpid())
+    health = {
+        "schema_version": 1,
+        "status": "READY",
+        "generation": item.generation,
+        "alias": item.alias,
+        "delivery_mode": "codex_experimental_queue",
+        "delivery_mechanism": mechanism,
+    }
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", lambda *_args, **_kwargs: health)
+
+    assert _local_target(tmp_path / "state", item) is None
 
 
 def test_claude_courier_health_reports_current_alias(

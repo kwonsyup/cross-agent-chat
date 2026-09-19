@@ -6,7 +6,51 @@ import pytest
 
 from cross_agent_chat import runtime
 from cross_agent_chat.core import ChatError, Registry, Route
-from cross_agent_chat.native_helper import NativeHelperStore
+from cross_agent_chat.native_helper import (
+    NativeHelperStore,
+    native_helper_create_hook_group,
+    native_helper_dispatch_hook_group,
+)
+
+
+def test_native_helper_hook_groups_keep_their_installed_bytes() -> None:
+    """Pin the provider hook contract independently of the functions that build it."""
+
+    assert native_helper_create_hook_group() == {
+        "matcher": "mcp__cross_agent_chat__native_bootstrap",
+        "hooks": [
+            {
+                "type": "mcp_tool",
+                "server": "codex_app",
+                "tool": "create_thread",
+                "input": {
+                    "prompt": "${tool_response._meta.create_thread.prompt}",
+                    "target": "${tool_response._meta.create_thread.target}",
+                    "model": "${tool_response._meta.create_thread.model}",
+                    "thinking": "${tool_response._meta.create_thread.thinking}",
+                    "title": "${tool_response._meta.create_thread.title}",
+                },
+                "timeout": 30,
+                "statusMessage": "Starting Cross Agent Chat helper",
+            }
+        ],
+    }
+    assert native_helper_dispatch_hook_group() == {
+        "matcher": "mcp__cross_agent_chat__native_dispatch",
+        "hooks": [
+            {
+                "type": "mcp_tool",
+                "server": "codex_app",
+                "tool": "send_message_to_thread",
+                "input": {
+                    "threadId": "${tool_response._meta.native_args.threadId}",
+                    "prompt": "${tool_response._meta.native_args.prompt}",
+                },
+                "timeout": 30,
+                "statusMessage": "Delivering Cross Agent Chat message",
+            }
+        ],
+    }
 
 
 def route(

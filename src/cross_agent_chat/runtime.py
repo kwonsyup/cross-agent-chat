@@ -86,6 +86,10 @@ from cross_agent_chat.devin import (
     parse_pretool_input,
 )
 from cross_agent_chat.native_helper import (
+    NATIVE_HELPER_MODEL,
+    NATIVE_QUEUE_BINARY_ENV_VAR,
+    NATIVE_QUEUE_ENV_VALUE,
+    NATIVE_QUEUE_ENV_VAR,
     NativeDispatchStore,
     NativeHelperStore,
     native_helper_create_hook_group,
@@ -123,6 +127,16 @@ DeliveryMode = Literal[
     "codex_experimental_queue",
     "devin_stop_or_prompt_bound",
 ]
+DeliveryMechanism = Literal[
+    "claude_native",
+    "native_helper",
+    "direct_queue",
+    "stop_bound",
+    "devin_prompt_bound",
+]
+DELIVERY_MECHANISMS: Final = frozenset(
+    {"claude_native", "devin_prompt_bound", "direct_queue", "native_helper", "stop_bound"}
+)
 
 
 class RegistrationInterrupted(SystemExit):
@@ -178,6 +192,7 @@ class Target:
     pid: int | None = None
     tailnet_address: str | None = None
     delivery_mode: DeliveryMode | None = None
+    delivery_mechanism: DeliveryMechanism | None = None
     title: str | None = None
 
     def public(
@@ -201,6 +216,9 @@ class Target:
         if include_delivery_mode:
             result["delivery_mode"] = (
                 "unknown" if self.delivery_mode is None else self.delivery_mode
+            )
+            result["delivery_mechanism"] = (
+                "unknown" if self.delivery_mechanism is None else self.delivery_mechanism
             )
         return result
 
@@ -489,14 +507,14 @@ def _spawn_courier(root: Path, route: Route) -> None:
     elif route.provider == "codex":
         environment = {
             key: os.environ[key]
-            for key in (*COURIER_ENV_KEYS, "CODEX_HOME", "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE")
+            for key in (*COURIER_ENV_KEYS, "CODEX_HOME", NATIVE_QUEUE_ENV_VAR)
             if key in os.environ
         }
         environment["CODEX_HOME"] = route.profile_root or recipient_profile_root("codex")
         codex = str(owner_binary) if owner_binary is not None else shutil.which("codex")
         if codex is not None:
             with suppress(OSError):
-                environment["CROSS_AGENT_CHAT_CODEX_BINARY"] = str(Path(codex).resolve(strict=True))
+                environment[NATIVE_QUEUE_BINARY_ENV_VAR] = str(Path(codex).resolve(strict=True))
     else:
         environment = {key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ}
     try:
@@ -1086,6 +1104,20 @@ def _delivery_mode(
     )
 
 
+def _delivery_mechanism(
+    route: Route, courier: CodexCourier | None, *, native_helper: bool = False
+) -> DeliveryMechanism:
+    """Name the exact delivery path behind one coarse delivery mode."""
+
+    if route.provider == "claude":
+        return "claude_native"
+    if route.provider == "devin":
+        return "devin_prompt_bound"
+    if native_helper:
+        return "native_helper"
+    return "direct_queue" if courier is not None and courier.native_queue else "stop_bound"
+
+
 def courier_health(
     route: Route,
     courier: CodexCourier | None = None,
@@ -1116,6 +1148,9 @@ def courier_health(
     }
     if include_delivery_mode:
         response["delivery_mode"] = _delivery_mode(route, courier, native_helper=native_helper)
+        response["delivery_mechanism"] = _delivery_mechanism(
+            route, courier, native_helper=native_helper
+        )
     if include_direct_delivery_mode:
         response["direct_delivery_mode"] = _delivery_mode(route, courier)
     return response
@@ -1159,11 +1194,9 @@ def courier_server(
         except (ChatError, OSError):
             identity = ""
         helper_queue = identity == route.owner_identity and native_desktop_process(route.pid)
-    native_enabled = (
-        os.environ.get("CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE") == "experimental" or helper_queue
-    )
+    native_enabled = os.environ.get(NATIVE_QUEUE_ENV_VAR) == NATIVE_QUEUE_ENV_VALUE or helper_queue
     if provider == "codex" and native_enabled:
-        bound_binary = os.environ.get("CROSS_AGENT_CHAT_CODEX_BINARY")
+        bound_binary = os.environ.get(NATIVE_QUEUE_BINARY_ENV_VAR)
         if bound_binary is not None:
             candidate = Path(bound_binary)
             try:
@@ -1422,8 +1455,14 @@ def _local_target(
     alias = response.get("alias")
     expected = {"schema_version", "status", "generation", "alias"}
     observed_mode = response.get("delivery_mode")
+    observed_mechanism = response.get("delivery_mechanism")
     if (
-        set(response) not in (expected, expected | {"delivery_mode"})
+        set(response)
+        not in (
+            expected,
+            expected | {"delivery_mode"},
+            expected | {"delivery_mode", "delivery_mechanism"},
+        )
         or response.get("schema_version") != SCHEMA_VERSION
         or response.get("status") != "READY"
         or response.get("generation") != route.generation
@@ -1438,6 +1477,7 @@ def _local_target(
                 "devin_stop_or_prompt_bound",
             }
         )
+        or (observed_mechanism is not None and observed_mechanism not in DELIVERY_MECHANISMS)
     ):
         return None
     if route.provider == "codex":
@@ -1463,6 +1503,11 @@ def _local_target(
             cwd=route.cwd,
             pid=route.pid,
             delivery_mode=observed_mode if observed_mode is not None else None,
+            delivery_mechanism=(
+                cast(DeliveryMechanism, observed_mechanism)
+                if observed_mechanism is not None
+                else None
+            ),
         )
     except ChatError:
         return None
@@ -1582,7 +1627,7 @@ def _targets_from_tailnet(
         }
         allowed = (
             required
-            | ({"delivery_mode"} if include_delivery_mode else set())
+            | ({"delivery_mode", "delivery_mechanism"} if include_delivery_mode else set())
             | ({"title"} if include_title else set())
         )
         if not isinstance(raw_item, dict) or not required <= set(raw_item) <= allowed:
@@ -1617,9 +1662,17 @@ def _targets_from_tailnet(
                     }
                 )
             )
+            or (
+                "delivery_mechanism" in item
+                and (
+                    not isinstance(item["delivery_mechanism"], str)
+                    or item["delivery_mechanism"] not in DELIVERY_MECHANISMS | {"unknown"}
+                )
+            )
         ):
             raise ChatError("Tailnet peer returned invalid discovery")
         observed_mode = item.get("delivery_mode")
+        observed_mechanism = item.get("delivery_mechanism")
         title = item.get("title")
         if title is not None and (not include_title or not isinstance(title, str)):
             raise ChatError("Tailnet peer returned invalid discovery")
@@ -1636,6 +1689,11 @@ def _targets_from_tailnet(
                 delivery_mode=(
                     cast(DeliveryMode, observed_mode)
                     if isinstance(observed_mode, str) and observed_mode != "unknown"
+                    else None
+                ),
+                delivery_mechanism=(
+                    cast(DeliveryMechanism, observed_mechanism)
+                    if isinstance(observed_mechanism, str) and observed_mechanism != "unknown"
                     else None
                 ),
                 title=valid_name(title, "remote title") if isinstance(title, str) else None,
@@ -2643,7 +2701,7 @@ def native_bootstrap(root: Path, source: Route) -> dict[str, object]:
                     "Do not inspect memory, source files, or unrelated tasks."
                 ),
                 "target": {"type": "projectless", "directoryName": binding.helper_directory},
-                "model": "gpt-5.6-luna",
+                "model": NATIVE_HELPER_MODEL,
                 "thinking": "high",
                 "title": "Cross Agent Chat helper",
             }
@@ -2801,7 +2859,9 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
     allowed = {
         frozenset(base_health),
         frozenset((*base_health, "delivery_mode")),
+        frozenset((*base_health, "delivery_mode", "delivery_mechanism")),
         frozenset((*base_health, "delivery_mode", "direct_delivery_mode")),
+        frozenset((*base_health, "delivery_mode", "delivery_mechanism", "direct_delivery_mode")),
     }
     if frozenset(health) not in allowed or any(
         health.get(key) != value for key, value in base_health.items()
