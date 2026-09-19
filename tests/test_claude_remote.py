@@ -892,10 +892,43 @@ def test_sendmessage_with_valid_helper_but_no_markers_is_unobserved(
     )
 
 
-def test_sendmessage_with_valid_helper_and_denied_marker_is_denied(
+def test_sendmessage_with_valid_helper_and_denied_marker_is_decided(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The gate denied the courier's call and the stream carries no delivered
+    # receipt, so the call provably never ran. That is a decided pre-effect
+    # rejection, not an uncertain delivery.
     stream = _sendmessage_stream("API work [ABC123]", "private body that must not be echoed")
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        settings = json.loads(command[command.index("--settings") + 1])
+        hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        tokens = shlex.split(hook)
+        expected_path = Path(tokens[tokens.index("--expected") + 1])
+        _write_private_marker(expected_path.parent / "denied", b"denied\n")
+        return subprocess.CompletedProcess(command, 0, stream, "")
+
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
+    monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
+    with pytest.raises(ClaudeSendMessageRefused) as error:
+        sendmessage(
+            "API work [ABC123]", "private body that must not be echoed", Path("/usr/bin/false")
+        )
+
+    assert "denied" in str(error.value)
+    assert not isinstance(error.value, UnknownDeliveryError)
+
+
+def test_sendmessage_denied_marker_with_a_delivered_receipt_stays_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A denied marker plus a delivered receipt contradict each other: the deny
+    # did not hold, and the event must stay unknown rather than look decided.
+    stream = _sendmessage_receipt_stream(
+        authoritative_tool_input("API work [ABC123]", "body", SEND_SUMMARY)
+    )
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         settings = json.loads(command[command.index("--settings") + 1])
@@ -914,7 +947,61 @@ def test_sendmessage_with_valid_helper_and_denied_marker_is_denied(
             "API work [ABC123]", "private body that must not be echoed", Path("/usr/bin/false")
         )
 
-    assert error.value.phase == "pretool_gate_denied"
+    assert error.value.phase == "pretool_gate_conflict"
+
+
+def test_sendmessage_denied_marker_with_a_provider_refusal_surfaces_its_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A denied marker plus the provider's own decided refusal receipt both say
+    # nothing was delivered; the provider's cause-specific reason is the better
+    # report.
+    reason = "No agent named 'API work [ABC123]' is reachable."
+    stream = _sendmessage_refusal_stream(json.dumps({"success": False, "message": reason}))
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        settings = json.loads(command[command.index("--settings") + 1])
+        hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        tokens = shlex.split(hook)
+        expected_path = Path(tokens[tokens.index("--expected") + 1])
+        _write_private_marker(expected_path.parent / "denied", b"denied\n")
+        return subprocess.CompletedProcess(command, 0, stream, "")
+
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
+    monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
+    with pytest.raises(ClaudeSendMessageRefused) as error:
+        sendmessage(
+            "API work [ABC123]", "private body that must not be echoed", Path("/usr/bin/false")
+        )
+
+    assert str(error.value) == reason
+
+
+def test_sendmessage_denied_marker_with_an_unreadable_stream_stays_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The gate denied the call but the stream cannot be checked for a delivered
+    # receipt, so the outcome cannot be proven decided.
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        settings = json.loads(command[command.index("--settings") + 1])
+        hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        tokens = shlex.split(hook)
+        expected_path = Path(tokens[tokens.index("--expected") + 1])
+        _write_private_marker(expected_path.parent / "denied", b"denied\n")
+        return subprocess.CompletedProcess(command, 0, "{malformed", "")
+
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
+    monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
+    with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
+        sendmessage(
+            "API work [ABC123]", "private body that must not be echoed", Path("/usr/bin/false")
+        )
+
+    assert error.value.phase == "helper_stream_invalid"
 
 
 def test_sendmessage_with_conflicting_markers_is_unknown(
@@ -946,7 +1033,6 @@ def test_sendmessage_with_conflicting_markers_is_unknown(
 @pytest.mark.parametrize(
     ("stream", "phase"),
     [
-        ("", "no_sendmessage_tool_use"),
         (
             _sendmessage_stream(
                 "API work [ABC123]", "private body that must not be echoed", tool_name="ListAgents"
@@ -969,6 +1055,38 @@ def test_sendmessage_helper_stream_failures_are_body_free_and_enum_bound(
     monkeypatch: pytest.MonkeyPatch, stream: str, phase: ClaudeUnknownPhase
 ) -> None:
     _assert_unknown_helper_phase(monkeypatch, stream, phase)
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        pytest.param("", id="empty-stream"),
+        pytest.param(
+            json.dumps({"type": "system", "subtype": "init", "session_id": "abc"}),
+            id="records-without-a-tool-call",
+        ),
+    ],
+)
+def test_sendmessage_without_a_tool_call_is_decided(
+    monkeypatch: pytest.MonkeyPatch, stream: str
+) -> None:
+    # A complete, readable stream without any SendMessage tool call proves the
+    # courier finished without sending: the only delivery path is that tool,
+    # so nothing was delivered and the outcome is decided, not unknown.
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.subprocess.run",
+        lambda command, **_: subprocess.CompletedProcess(command, 0, stream, ""),
+    )
+    with pytest.raises(ClaudeSendMessageRefused) as error:
+        sendmessage(
+            "API work [ABC123]", "private body that must not be echoed", Path("/usr/bin/false")
+        )
+
+    assert "SendMessage" in str(error.value)
+    assert not isinstance(error.value, UnknownDeliveryError)
 
 
 # These used to assert that a divergent target, an altered body, or an
@@ -1391,7 +1509,7 @@ def test_sendmessage_gate_read_error_after_invocation_stays_unknown(
     monkeypatch.setattr(
         "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
     )
-    monkeypatch.setattr(Path, "read_bytes", lambda _: (_ for _ in ()).throw(OSError("EIO")))
+    monkeypatch.setattr(Path, "lstat", lambda _: (_ for _ in ()).throw(OSError("EIO")))
 
     with pytest.raises(UnknownDeliveryError, match="unknown"):
         sendmessage("API work [ABC123]", "hello", Path("/usr/bin/false"))
@@ -1995,6 +2113,40 @@ def test_receipt_treats_a_reported_non_delivery_as_decided_not_unknown() -> None
     assert "is reachable" in str(caught.value)
     # It must be a deterministic rejection, never an unknown-delivery outcome.
     assert not isinstance(caught.value, UnknownDeliveryError)
+
+
+def test_receipt_treats_a_refusal_with_a_display_rendering_as_decided() -> None:
+    # Claude Code 2.1.278 emits the same decided refusal with a `display` key
+    # carrying the refusal text rendered for a UI surface. The key cannot mark
+    # an effect -- only `msg_id` can -- so the refusal stays decided.
+    reason = "No agent named 'Gone [ABC123]' is reachable."
+    stream = _sendmessage_refusal_stream(
+        json.dumps(
+            {
+                "success": False,
+                "message": reason,
+                "display": f"Error: {reason}",
+            }
+        )
+    )
+
+    with pytest.raises(ClaudeSendMessageRefused) as caught:
+        parse_sendmessage_receipt(stream)
+
+    assert str(caught.value) == reason
+
+
+def test_receipt_keeps_a_refusal_with_a_nonstring_display_uncertain() -> None:
+    # A `display` value that is not the provider's string rendering is not the
+    # observed contract and stays unknown.
+    stream = _sendmessage_refusal_stream(
+        json.dumps({"success": False, "message": "gone", "display": 7})
+    )
+
+    with pytest.raises(ChatError) as caught:
+        parse_sendmessage_receipt(stream)
+
+    assert not isinstance(caught.value, ClaudeSendMessageRefused)
 
 
 @pytest.mark.parametrize(

@@ -539,6 +539,51 @@ def _tool_records(text: str) -> tuple[list[dict[str, object]], list[dict[str, ob
     return uses, results
 
 
+# The provider's decided SendMessage refusal carries `success`, `message` and
+# optionally `display`, the refusal text rendered for a UI surface. `display`
+# is the only extra key measured on a refusal in Claude Code 2.1.278 (the
+# plain-text `to` path emits {success, message, display}); none of the three
+# can mark an effect -- the only effect marker in this protocol is `msg_id`.
+REFUSAL_RESULT_KEYS: Final = frozenset({"success", "message", "display"})
+
+
+def _result_payload(result: dict[str, object]) -> dict[str, object] | None:
+    """Parse a tool_result's single JSON text block, if it has exactly one."""
+    if result.get("is_error") is True:
+        return None
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    text_blocks = [
+        item
+        for item in content
+        if isinstance(item, dict)
+        and item.get("type") == "text"
+        and isinstance(item.get("text"), str)
+    ]
+    if len(text_blocks) != 1:
+        return None
+    try:
+        payload = json.loads(cast(str, text_blocks[0]["text"]))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _refusal_reason(result: dict[str, object]) -> str | None:
+    """The reason of a decided provider refusal result, or None for anything else."""
+    payload = _result_payload(result)
+    if (
+        payload is None
+        or not {"success", "message"} <= set(payload) <= REFUSAL_RESULT_KEYS
+        or payload.get("success") is not False
+        or not isinstance(payload.get("message"), str)
+        or not isinstance(payload.get("display", ""), str)
+    ):
+        return None
+    return cast(str, payload["message"])
+
+
 def parse_sendmessage_receipt(text: str) -> str:
     """Validate one exact successful native SendMessage tool receipt.
 
@@ -577,19 +622,18 @@ def parse_sendmessage_receipt(text: str) -> str:
         result = json.loads(cast(str, text_blocks[0]["text"]))
     except json.JSONDecodeError as error:
         raise ChatError("Claude SendMessage receipt is invalid") from error
-    if isinstance(result, dict) and set(result) == {"success", "message"}:
-        reason = result.get("message")
-        if result.get("success") is False and isinstance(reason, str):
-            # The provider answered that it did not deliver, and it carries no
-            # message id, so nothing was created. Exactly one SendMessage ran and
-            # the gate was consumed exactly once, both established above. That is
-            # a decided refusal before any effect, and reporting it as uncertain
-            # would freeze an event that provably delivered nothing. The narrow
-            # two-key refusal is the shape observed live on Claude Code 2.1.274
-            # and still emitted by the 2.1.278 live gate on 19 Sep 2026; a
-            # refusal carrying any extra key is not this contract and stays
-            # unknown.
-            raise ClaudeSendMessageRefused(reason)
+    reason = _refusal_reason(matches[0])
+    if reason is not None:
+        # The provider answered that it did not deliver, and it carries no
+        # message id, so nothing was created. Exactly one SendMessage ran and
+        # the gate was consumed exactly once, both established above. That is
+        # a decided refusal before any effect, and reporting it as uncertain
+        # would freeze an event that provably delivered nothing. The narrow
+        # refusal contract -- {success, message} plus the provider's optional
+        # `display` rendering -- is the shape observed live on Claude Code
+        # 2.1.274 and still emitted by 2.1.278; a refusal carrying any other
+        # key is not this contract and stays unknown.
+        raise ClaudeSendMessageRefused(reason)
     if (
         not isinstance(result, dict)
         or set(result) != {"success", "message", "msg_id"}
@@ -658,27 +702,70 @@ def gate_consumed(gate: Path) -> bool:
     return consumed is not None
 
 
-def _unconsumed_gate_phase(gate: Path, text: str) -> ClaudeUnknownPhase:
-    # Only the actual normalized hook input can establish why its predicate denied.
-    denied = _gate_marker(gate, "denied", tuple(DENIAL_MARKERS.values()))
-    if denied is not None:
-        return next(phase for phase, value in DENIAL_MARKERS.items() if value == denied)
+_MISMATCH_REASON = "the courier's SendMessage call did not match the authoritative action"
+DENIAL_REASONS: Final[dict[ClaudeUnknownPhase, str]] = {
+    "pretool_gate_denied": "the Cross Agent Chat gate denied the SendMessage call",
+    "sendmessage_payload_mismatch": _MISMATCH_REASON,
+    "sendmessage_target_mismatch": _MISMATCH_REASON,
+    "sendmessage_message_mismatch": _MISMATCH_REASON,
+    "sendmessage_type_mismatch": _MISMATCH_REASON,
+    "sendmessage_summary_mismatch": _MISMATCH_REASON,
+}
+
+
+def _stream_tool_records(text: str) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """The tool records of a bounded fully-dict stream, else unknown delivery."""
     try:
         if len(text.encode()) > 64 * 1024:
-            return "helper_stream_invalid"
+            _unknown("helper_stream_invalid")
         for line in text.splitlines():
             if line and not isinstance(json.loads(line), dict):
-                return "helper_stream_invalid"
-        uses, _ = _tool_records(text)
+                _unknown("helper_stream_invalid")
+        return _tool_records(text)
     except (UnicodeEncodeError, json.JSONDecodeError):
-        return "helper_stream_invalid"
+        _unknown("helper_stream_invalid")
+
+
+def _unconsumed_gate_outcome(gate: Path, text: str) -> NoReturn:
+    # Only the actual normalized hook input can establish why its predicate denied.
+    denied = _gate_marker(gate, "denied", tuple(DENIAL_MARKERS.values()))
+    uses, results = _stream_tool_records(text)
+    if denied is not None:
+        phase = next(phase for phase, value in DENIAL_MARKERS.items() if value == denied)
+        # The marker proves the provider was told to deny the call. A delivered
+        # receipt in the stream would contradict it, so only a stream that
+        # cannot be checked or that shows a success keeps the outcome unknown;
+        # every other recorded result is the denial itself or a decided
+        # provider refusal carrying its own reason.
+        send_ids = {
+            cast(str, use["id"])
+            for use in uses
+            if use.get("name") == "SendMessage" and isinstance(use.get("id"), str)
+        }
+        reasons: list[str] = []
+        for result in results:
+            if result.get("tool_use_id") not in send_ids:
+                continue
+            payload = _result_payload(result)
+            if payload is not None and payload.get("success") is True:
+                _unknown("pretool_gate_conflict")
+            reason = _refusal_reason(result)
+            if reason is not None:
+                reasons.append(reason)
+        if reasons:
+            raise ClaudeSendMessageRefused(reasons[0])
+        raise ClaudeSendMessageRefused(
+            f"Claude SendMessage was not delivered: {DENIAL_REASONS[phase]}"
+        )
     if any(item.get("name") != "SendMessage" for item in uses):
-        return "helper_stream_invalid"
+        _unknown("helper_stream_invalid")
     if not uses:
-        return "no_sendmessage_tool_use"
+        # A complete, readable stream without a SendMessage call proves the
+        # courier finished without sending: the tool is the only delivery path.
+        raise ClaudeSendMessageRefused("Claude courier finished without a SendMessage call")
     if len(uses) != 1:
-        return "multiple_sendmessage_tool_use"
-    return "pretool_gate_unobserved"
+        _unknown("multiple_sendmessage_tool_use")
+    _unknown("pretool_gate_unobserved")
 
 
 def _unknown(phase: ClaudeUnknownPhase) -> NoReturn:
@@ -821,7 +908,7 @@ def sendmessage(target_ref: str, message: str, executable: Path) -> None:
         if completed.returncode != 0:
             _unknown("helper_exit_nonzero")
         if not gate_consumed(gate):
-            _unknown(_unconsumed_gate_phase(gate, completed.stdout))
+            _unconsumed_gate_outcome(gate, completed.stdout)
         try:
             parse_sendmessage_receipt(completed.stdout)
         except ClaudeSendMessageRefused:
