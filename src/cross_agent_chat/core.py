@@ -908,8 +908,9 @@ class RecipientBindings:
     """Private, bounded handle-to-endpoint memory. It never stores content."""
 
     def __init__(self, root: Path) -> None:
+        # No directory side effects here: a refused send must not create state,
+        # and writers get the private guarantee from state_lock/atomic_json.
         self.root = root
-        ensure_private_dir(root)
         self.path = root / "recipients.json"
 
     def bindings(self) -> list[RecipientBinding]:
