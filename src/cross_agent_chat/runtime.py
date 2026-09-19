@@ -2370,6 +2370,54 @@ def sender_readiness_for_route(root: Path, source: Route) -> dict[str, str]:
     return {"status": "ready"}
 
 
+ReplyDelivery = Literal["while_idle", "next_turn", "unknown"]
+# The caller asks before sending, so this bound adds at most this much before the send's own budget.
+REPLY_DELIVERY_TIMEOUT_SECONDS: Final = 1.0
+
+
+def reply_delivery(root: Path, source: Route) -> ReplyDelivery:
+    """Say how an answer sent to this authenticated source session reaches it.
+
+    Claude and a queued Codex route receive a new message while idle. A Stop-bound
+    Codex route or a Devin route is handed a queued message only at its next turn
+    boundary: the end of the current turn if it has already arrived, otherwise the
+    user's next prompt. An unreachable, busy, or unrecognized courier reports unknown.
+    Callers ask before sending: a slow or failing check must never turn an accepted
+    send into an apparent failure that invites a resend.
+    """
+    if source.provider == "claude":
+        mode: str | None = "claude_native_cross_session"
+    elif source.provider == "devin":
+        mode = "devin_stop_or_prompt_bound"
+    else:
+        try:
+            response = request_socket(
+                socket_path(root, source),
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "operation": "health",
+                    "generation": source.generation,
+                    "include_delivery_mode": True,
+                },
+                timeout=REPLY_DELIVERY_TIMEOUT_SECONDS,
+            )
+        except (ChatError, OSError):
+            return "unknown"
+        raw = response.get("delivery_mode")
+        mode = (
+            raw
+            if response.get("status") == "READY"
+            and response.get("generation") == source.generation
+            and isinstance(raw, str)
+            else None
+        )
+    if mode in {"claude_native_cross_session", "codex_experimental_queue"}:
+        return "while_idle"
+    if mode in {"codex_stop_bound", "devin_stop_or_prompt_bound"}:
+        return "next_turn"
+    return "unknown"
+
+
 def native_helper_tools(root: Path, source: Route) -> tuple[str, ...]:
     """Return lifecycle-only tools for an exact eligible Codex app route."""
 

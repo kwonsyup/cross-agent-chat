@@ -2819,3 +2819,80 @@ def test_a_late_result_replaces_the_owner_disposition(
     store.mark(event_id, decided)
 
     assert [item.status for item in store.intents() if item.event_id == event_id] == [decided]
+
+
+@pytest.mark.parametrize(
+    ("provider", "courier_mode", "expected"),
+    [
+        ("claude", None, "while_idle"),
+        ("devin", None, "next_turn"),
+        ("codex", "codex_experimental_queue", "while_idle"),
+        ("codex", "codex_stop_bound", "next_turn"),
+        ("codex", "something_new", "unknown"),
+    ],
+)
+def test_reply_delivery_reports_how_an_answer_reaches_the_sender(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    courier_mode: str | None,
+    expected: str,
+) -> None:
+    from cross_agent_chat import runtime
+
+    source = route(tmp_path, provider=provider)
+
+    def health(_path: Path, request: dict[str, object], timeout: float) -> dict[str, object]:
+        assert request["include_delivery_mode"] is True
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": source.generation,
+            "alias": source.alias,
+            "delivery_mode": courier_mode,
+        }
+
+    monkeypatch.setattr(runtime, "request_socket", health)
+
+    assert runtime.reply_delivery(tmp_path / "state", source) == expected
+
+
+def test_reply_delivery_is_unknown_without_a_current_courier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    source = route(tmp_path)
+
+    def unavailable(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise ChatError("session courier is unavailable")
+
+    monkeypatch.setattr(runtime, "request_socket", unavailable)
+    assert runtime.reply_delivery(tmp_path / "state", source) == "unknown"
+
+    stale = {"schema_version": 1, "status": "READY", "generation": str(uuid4())}
+    monkeypatch.setattr(
+        runtime,
+        "request_socket",
+        lambda *_a, **_k: {**stale, "delivery_mode": "codex_experimental_queue"},
+    )
+    assert runtime.reply_delivery(tmp_path / "state", source) == "unknown"
+
+
+@pytest.mark.parametrize("failure", [OSError("no descriptors"), ChatError("busy")])
+def test_reply_delivery_turns_any_courier_failure_into_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    from cross_agent_chat import runtime
+
+    source = route(tmp_path)
+    timeouts: list[float] = []
+
+    def failing(_path: Path, _request: dict[str, object], timeout: float) -> dict[str, object]:
+        timeouts.append(timeout)
+        raise failure
+
+    monkeypatch.setattr(runtime, "request_socket", failing)
+
+    assert runtime.reply_delivery(tmp_path / "state", source) == "unknown"
+    assert timeouts == [runtime.REPLY_DELIVERY_TIMEOUT_SECONDS]

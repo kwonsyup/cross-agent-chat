@@ -41,6 +41,7 @@ from cross_agent_chat.runtime import (
     presence_is_enabled,
     register,
     register_devin,
+    reply_delivery,
     send,
     sender_readiness,
     sender_readiness_for_route,
@@ -58,7 +59,12 @@ MCP_INSTRUCTIONS: Final = (
     "or when an exact handle stops resolving, not before every send. When requesting work whose "
     "result must return, explicitly ask "
     "the peer to send its answer back through CAC; that requested response is not a replay or "
-    "unsolicited follow-up. Classify the current incoming CAC message: an answer or result "
+    "unsolicited follow-up. After sending, finish your turn; do not sleep, wait, or poll "
+    "chat_status for an answer, because chat_status reports only custody. The chat_send result's "
+    "reply_delivery says how an answer reaches this session: while_idle means it arrives here as "
+    "a new message even after your turn ends; next_turn means it is handed over only at this "
+    "session's next turn boundary, so tell your user it will appear after their next message; "
+    "unknown promises neither. Classify the current incoming CAC message: an answer or result "
     "to your outgoing request is for your local user, so summarize it and do not acknowledge, "
     "echo, or send another message unless it explicitly asks; a new work request that explicitly "
     "asks for a response requires one separate chat_send addressed to that envelope's exact Reply "
@@ -330,7 +336,10 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                         if devin_source is not None
                         else authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
                     )
+                    # Asked before the send so it can neither delay nor fail an accepted one.
+                    delivery = reply_delivery(root, source)
                     result = send(root, source, target, message)
+                    result["reply_delivery"] = delivery
                 elif name == "chat_status":
                     if set(typed_arguments) != {"event_id"} or not isinstance(
                         typed_arguments["event_id"], str
