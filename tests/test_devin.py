@@ -1013,7 +1013,7 @@ def test_devin_originates_remote_send_with_exact_source_alias_and_intent(
         tailnet_address="100.64.0.2",
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _root: [])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([target], True))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([target], True))
     seen: list[dict[str, object]] = []
 
     def remote(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:

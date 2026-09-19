@@ -52,7 +52,7 @@ def test_fuzzy_target_is_ambiguous_across_local_and_remote_peers(
         pid=os.getpid(),
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _: [local])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([remote], True))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([remote], True))
     monkeypatch.setattr(
         runtime,
         "_send_local_target",
@@ -212,7 +212,7 @@ def test_fuzzy_target_refuses_incomplete_remote_discovery_before_intent(
         pid=os.getpid(),
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _: [target])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([], False))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], False))
 
     with pytest.raises(ChatError, match="discovery is incomplete"):
         runtime.send(tmp_path / "state", source, "claude parser", "synthetic probe")
@@ -240,7 +240,7 @@ def test_exact_remote_handle_survives_unrelated_incomplete_discovery(
         pid=os.getpid(),
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _: [])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([target], False))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([target], False))
     monkeypatch.setattr(runtime, "canonical_source_alias", lambda *_: source.alias)
     responses: list[dict[str, object]] = []
 
@@ -289,7 +289,7 @@ def test_fuzzy_local_target_sends_after_complete_global_resolution(
     )
     expected = {"status": "TRANSPORT_ACCEPTED", "to": target.alias}
     monkeypatch.setattr(runtime, "local_targets", lambda _: [target])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([], True))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
     monkeypatch.setattr(runtime, "_send_local_target", lambda *args, **kwargs: expected)
 
     assert runtime.send(tmp_path / "state", source, "claude parser", "synthetic probe") == expected
