@@ -7,6 +7,7 @@ import errno
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shutil
 import signal
@@ -114,6 +115,8 @@ REMOTE_TIMEOUT_SECONDS: Final = (
 LOCAL_DISCOVERY_WORKERS: Final = 32
 LOCAL_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS
 NATIVE_TITLE_TIMEOUT_SECONDS: Final = 2.0
+NATIVE_DESKTOP_APPLICATIONS: Final = Path("/Applications")
+NATIVE_DESKTOP_BUNDLE_IDS: Final = ("com.openai.chat", "com.openai.codex")
 PRESENCE_ENV_VAR: Final = "CROSS_AGENT_CHAT_PRESENCE"
 PROC_PIDTBSDINFO: Final = 3
 PROC_BSDINFO_SIZE: Final = 136
@@ -1158,7 +1161,9 @@ def courier_server(
             identity, _ = recipient_owner_identity("codex", route.pid, route.profile_root)
         except (ChatError, OSError):
             identity = ""
-        helper_queue = identity == route.owner_identity and native_desktop_process(route.pid)
+        helper_queue = (
+            identity == route.owner_identity and native_desktop_bundle(route.pid) is not None
+        )
     native_enabled = (
         os.environ.get("CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE") == "experimental" or helper_queue
     )
@@ -2497,18 +2502,74 @@ def _native_desktop_route(route: Route) -> bool:
     """Recognize a route owned by the bundled Native Codex process."""
 
     try:
-        identity, executable = recipient_owner_identity("codex", route.pid, route.profile_root)
+        identity, _ = recipient_owner_identity("codex", route.pid, route.profile_root)
     except (ChatError, OSError):
         return False
     return (
         route.provider == "codex"
         and identity == route.owner_identity
-        and executable == Path("/Applications/ChatGPT.app/Contents/Resources/codex")
-        and native_desktop_process(route.pid)
+        and native_desktop_bundle(route.pid) is not None
     )
 
 
-def native_desktop_process(pid: int) -> bool:
+def _native_bundle_root(executable: Path, inner: tuple[str, str]) -> Path | None:
+    """Return the ChatGPT.app root containing one bundled executable path."""
+
+    parents = executable.parents
+    if (
+        len(parents) >= 3
+        and parents[2].name == "ChatGPT.app"
+        and parents[1].name == "Contents"
+        and parents[0].name == inner[0]
+        and executable.name == inner[1]
+    ):
+        return parents[2]
+    return None
+
+
+def _supported_native_bundle(bundle: Path) -> Path | None:
+    """Resolve one ChatGPT.app root only inside a supported install location."""
+
+    try:
+        resolved = bundle.resolve(strict=True)
+    except OSError:
+        return None
+    applications = NATIVE_DESKTOP_APPLICATIONS.resolve()
+    if resolved.name != "ChatGPT.app" or (
+        resolved.parent != applications
+        and resolved.parent.parent != applications
+        and resolved.parent != (Path.home() / "Applications").resolve()
+    ):
+        return None
+    try:
+        info = plistlib.loads((resolved / "Contents" / "Info.plist").read_bytes())
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(info, dict)
+        or info.get("CFBundleIdentifier") not in NATIVE_DESKTOP_BUNDLE_IDS
+    ):
+        return None
+    return resolved
+
+
+def native_desktop_bundle(pid: int) -> Path | None:
+    """Resolve the supported ChatGPT.app bundle owning one exact Codex child."""
+
+    if pid <= 0:
+        return None
+    try:
+        _, executable = recipient_owner_identity("codex", pid)
+    except (ChatError, OSError):
+        return None
+    bundle = _native_bundle_root(executable, ("Resources", "codex"))
+    resolved = _supported_native_bundle(bundle) if bundle is not None else None
+    if resolved is None or not native_desktop_process(pid, resolved):
+        return None
+    return resolved
+
+
+def native_desktop_process(pid: int, bundle: Path | None = None) -> bool:
     """Recognize an app-owned Codex child by its bounded Desktop ancestor chain."""
 
     if pid <= 0:
@@ -2525,7 +2586,9 @@ def native_desktop_process(pid: int) -> bool:
             )
         except (ChatError, OSError, subprocess.SubprocessError):
             return False
-        if executable == Path("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"):
+        ancestor = _native_bundle_root(executable, ("MacOS", "ChatGPT"))
+        found = _supported_native_bundle(ancestor) if ancestor is not None else None
+        if found is not None and (bundle is None or found == bundle):
             return True
         raw_parent = parent.stdout.strip()
         if parent.returncode != 0 or not raw_parent.isdigit() or int(raw_parent) == pid:
@@ -2549,11 +2612,11 @@ def _native_account_binary(route: Route) -> Path:
         identity, _ = recipient_owner_identity("codex", route.pid, route.profile_root)
     except (ChatError, OSError) as error:
         raise ChatError("Codex account identity is unavailable") from error
-    if identity != route.owner_identity or not native_desktop_process(route.pid):
+    bundle = native_desktop_bundle(route.pid)
+    if identity != route.owner_identity or bundle is None:
         raise ChatError("Codex account identity is unavailable")
-    bundled = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
     try:
-        return bundled.resolve(strict=True)
+        return (bundle / "Contents" / "Resources" / "codex").resolve(strict=True)
     except OSError as error:
         raise ChatError("Codex account identity is unavailable") from error
 
