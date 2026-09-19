@@ -2366,6 +2366,8 @@ def sender_readiness_for_route(root: Path, source: Route) -> dict[str, str]:
 
 
 ReplyDelivery = Literal["while_idle", "next_turn", "unknown"]
+# The caller asks before sending, so this bound adds at most this much before the send's own budget.
+REPLY_DELIVERY_TIMEOUT_SECONDS: Final = 1.0
 
 
 def reply_delivery(root: Path, source: Route) -> ReplyDelivery:
@@ -2374,7 +2376,9 @@ def reply_delivery(root: Path, source: Route) -> ReplyDelivery:
     Claude and a queued Codex route receive a new message while idle. A Stop-bound
     Codex route or a Devin route is handed a queued message only at its next turn
     boundary: the end of the current turn if it has already arrived, otherwise the
-    user's next prompt. An unreachable or unrecognized courier reports unknown.
+    user's next prompt. An unreachable, busy, or unrecognized courier reports unknown.
+    Callers ask before sending: a slow or failing check must never turn an accepted
+    send into an apparent failure that invites a resend.
     """
     if source.provider == "claude":
         mode: str | None = "claude_native_cross_session"
@@ -2390,9 +2394,9 @@ def reply_delivery(root: Path, source: Route) -> ReplyDelivery:
                     "generation": source.generation,
                     "include_delivery_mode": True,
                 },
-                timeout=HEALTH_TIMEOUT_SECONDS,
+                timeout=REPLY_DELIVERY_TIMEOUT_SECONDS,
             )
-        except ChatError:
+        except (ChatError, OSError):
             return "unknown"
         raw = response.get("delivery_mode")
         mode = (

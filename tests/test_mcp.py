@@ -212,7 +212,13 @@ def test_chat_send_result_says_how_the_answer_returns(
 
     monkeypatch.setattr(cli, "authenticate_mcp_sender", lambda *_args: source)
     monkeypatch.setattr(cli, "send", fake_send)
-    monkeypatch.setattr(cli, "reply_delivery", lambda _root, _source: "next_turn")
+
+    def fake_delivery(_root: Path, _source: Route) -> str:
+        # Asked before the send, so a slow or failing check cannot follow an accepted one.
+        assert sent == []
+        return "next_turn"
+
+    monkeypatch.setattr(cli, "reply_delivery", fake_delivery)
     request = {
         "jsonrpc": "2.0",
         "id": 1,

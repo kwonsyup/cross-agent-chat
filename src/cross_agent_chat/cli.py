@@ -336,8 +336,10 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                         if devin_source is not None
                         else authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
                     )
+                    # Asked before the send so it can neither delay nor fail an accepted one.
+                    delivery = reply_delivery(root, source)
                     result = send(root, source, target, message)
-                    result["reply_delivery"] = reply_delivery(root, source)
+                    result["reply_delivery"] = delivery
                 elif name == "chat_status":
                     if set(typed_arguments) != {"event_id"} or not isinstance(
                         typed_arguments["event_id"], str

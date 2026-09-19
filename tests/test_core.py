@@ -2877,3 +2877,22 @@ def test_reply_delivery_is_unknown_without_a_current_courier(
         lambda *_a, **_k: {**stale, "delivery_mode": "codex_experimental_queue"},
     )
     assert runtime.reply_delivery(tmp_path / "state", source) == "unknown"
+
+
+@pytest.mark.parametrize("failure", [OSError("no descriptors"), ChatError("busy")])
+def test_reply_delivery_turns_any_courier_failure_into_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    from cross_agent_chat import runtime
+
+    source = route(tmp_path)
+    timeouts: list[float] = []
+
+    def failing(_path: Path, _request: dict[str, object], timeout: float) -> dict[str, object]:
+        timeouts.append(timeout)
+        raise failure
+
+    monkeypatch.setattr(runtime, "request_socket", failing)
+
+    assert runtime.reply_delivery(tmp_path / "state", source) == "unknown"
+    assert timeouts == [runtime.REPLY_DELIVERY_TIMEOUT_SECONDS]
