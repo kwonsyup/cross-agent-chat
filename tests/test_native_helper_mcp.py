@@ -9,6 +9,7 @@ from typing import cast
 from uuid import uuid4
 
 import pytest
+from test_native_bundle import fake_desktop_bundle
 
 from cross_agent_chat import runtime
 from cross_agent_chat.cli import mcp
@@ -125,7 +126,10 @@ def test_desktop_catalog_requires_chatgpt_ancestor_binary(monkeypatch: pytest.Mo
     assert not runtime.native_desktop_mcp_host()
 
 
-def test_desktop_catalog_accepts_chatgpt_ancestor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_desktop_catalog_accepts_chatgpt_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = fake_desktop_bundle(tmp_path / "home" / "Applications")
     monkeypatch.setattr("cross_agent_chat.runtime.os.getppid", lambda: 200)
     monkeypatch.setattr(
         "cross_agent_chat.runtime.recipient_owner_identity",
@@ -133,7 +137,7 @@ def test_desktop_catalog_accepts_chatgpt_ancestor(monkeypatch: pytest.MonkeyPatc
             "owner",
             Path("/usr/local/bin/codex")
             if pid == 200
-            else Path("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
+            else bundle / "Contents" / "MacOS" / "ChatGPT",
         ),
     )
     monkeypatch.setattr(
