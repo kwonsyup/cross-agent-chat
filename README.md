@@ -177,6 +177,11 @@ Use `setup --disable-experimental-codex-native-queue` to return that profile's f
 sessions to next-turn delivery. Local Devin integration is global at `~/.config/devin`; it preserves
 unrelated MCP and hook entries and becomes active for a conversation after its first user prompt.
 
+`doctor` also reports a `terminal` line when its own environment carries an inherited Claude
+child-session marker (`CLAUDE_CODE_CHILD_SESSION`), left on a terminal app that was launched
+from inside a Claude session. Claude sessions started from that terminal become hidden children
+that never appear as peers; relaunching the terminal app normally clears it.
+
 ## Architecture
 
 The path is `install → hooks → registration/bootstrap → discovery → exact destination validation

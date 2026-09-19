@@ -160,6 +160,8 @@ def _isolate_founder_surfaces(
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_CHILD_SESSION", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_MESSAGING_SOCKET", raising=False)
     monkeypatch.setenv("TMPDIR", str(temporary))
 
     socket_root = _fixture_socket_root(request)

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `doctor` now reports a `terminal` diagnostic when its own environment carries an inherited
+  Claude child-session marker (`CLAUDE_CODE_CHILD_SESSION`), left on a terminal app launched
+  from inside a Claude session. Claude sessions started from that terminal become hidden
+  children that never appear as peers; the key is omitted when the marker is not set.
+
 ## 0.3.7 - 2026-09-18
 
 - Report how a requested answer returns to the sender. A `chat_send` result now carries

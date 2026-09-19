@@ -547,6 +547,75 @@ def test_doctor_reports_the_selected_profile_queue_mode(
     }
 
 
+def test_doctor_reports_an_inherited_claude_child_session_marker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class ObservedInstaller:
+        def verify_configuration(self) -> bool:
+            return True
+
+        def broker_is_healthy(self) -> bool:
+            return True
+
+        def _codex_native_queue_enabled(self) -> bool:
+            return False
+
+    monkeypatch.setattr(cli, "_installer", lambda _: ObservedInstaller())
+    monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+
+    assert cli.run(parser().parse_args(["doctor", "--json"])) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["terminal"] == (
+        "inherits a Claude child-session marker; Claude sessions started from this "
+        "terminal will be hidden children and will not appear as peers. Relaunch the "
+        "terminal app normally (not from inside a Claude session)."
+    )
+    assert result["next"] == "start a fresh Claude or Codex session, or submit a prompt in Devin"
+
+    assert cli.run(parser().parse_args(["doctor"])) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    assert (
+        "terminal: inherits a Claude child-session marker; Claude sessions started from this "
+        "terminal will be hidden children and will not appear as peers. Relaunch the "
+        "terminal app normally (not from inside a Claude session)." in lines
+    )
+    assert "next: start a fresh Claude or Codex session, or submit a prompt in Devin" in lines
+
+
+def test_doctor_omits_the_terminal_diagnostic_without_the_marker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class ObservedInstaller:
+        def verify_configuration(self) -> bool:
+            return True
+
+        def broker_is_healthy(self) -> bool:
+            return True
+
+        def _codex_native_queue_enabled(self) -> bool:
+            return False
+
+    monkeypatch.setattr(cli, "_installer", lambda _: ObservedInstaller())
+    monkeypatch.delenv("CLAUDE_CODE_CHILD_SESSION", raising=False)
+
+    assert cli.run(parser().parse_args(["doctor", "--json"])) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "codex_native_queue": "stop-bound",
+        "integration": "healthy",
+        "local_broker": "healthy",
+        "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
+        "remote_trust": "tailscale_acl",
+        "version": "0.3.7",
+    }
+
+    assert cli.run(parser().parse_args(["doctor"])) == 0
+
+    assert not any(line.startswith("terminal:") for line in capsys.readouterr().out.splitlines())
+
+
 def test_doctor_explicit_device_overrides_automatic_identity(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

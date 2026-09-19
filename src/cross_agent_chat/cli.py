@@ -75,6 +75,14 @@ MCP_INSTRUCTIONS: Final = (
 )
 
 
+CLAUDE_CHILD_SESSION_ENV: Final = "CLAUDE_CODE_CHILD_SESSION"
+CLAUDE_CHILD_SESSION_DIAGNOSTIC: Final = (
+    "inherits a Claude child-session marker; Claude sessions started from this "
+    "terminal will be hidden children and will not appear as peers. Relaunch the "
+    "terminal app normally (not from inside a Claude session)."
+)
+
+
 def _fail(message: str) -> NoReturn:
     raise ChatError(message)
 
@@ -536,6 +544,8 @@ def run(arguments: argparse.Namespace) -> int:
             if healthy
             else "cross-agent-chat setup",
         }
+        if os.environ.get(CLAUDE_CHILD_SESSION_ENV):
+            doctor_result["terminal"] = CLAUDE_CHILD_SESSION_DIAGNOSTIC
         print(
             json.dumps(doctor_result, sort_keys=True)
             if arguments.json
