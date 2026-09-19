@@ -24,7 +24,6 @@ from cross_agent_chat.claude_runtime import (
     DISCOVERY_TIMEOUT_SECONDS,
     SEND_SUMMARY,
     SEND_TIMEOUT_SECONDS,
-    SENDMESSAGE_RECEIPT_AUTHORITY_KEYS,
     ClaudeSendMessageRefused,
     ClaudeSendMessageUnknownDelivery,
     ClaudeUnknownPhase,
@@ -1177,18 +1176,8 @@ def test_sendmessage_receipt_requires_exact_success_contract() -> None:
         parse_sendmessage_receipt(rejected)
 
     result["is_error"] = False
-    # Additive provider metadata is tolerated on a success receipt: the result
-    # object is additive by design (the provider strips only `display` and
-    # `inlineHandback`), and sibling send paths already emit extra keys.
     text_block["text"] = json.dumps(
         {"success": True, "message": "sent", "msg_id": message_id, "latency_ms": 3}
-    )
-    accepted = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
-    assert parse_sendmessage_receipt(accepted) == message_id
-    # An authority-bearing extra key re-decides the outcome, so it stays
-    # unknown instead of being read as decoration.
-    text_block["text"] = json.dumps(
-        {"success": True, "message": "sent", "msg_id": message_id, "status": "queued"}
     )
     rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="receipt"):
@@ -2304,48 +2293,52 @@ def _sendmessage_result_stream(result: object) -> str:
 
 
 @pytest.mark.parametrize(
-    "extra",
+    "extra_key",
     [
-        pytest.param(
-            {"routing": {"sender": "cross-agent-chat", "target": "@API work"}},
-            id="routing-object",
-        ),
-        pytest.param(
-            {"pin": {"name": "API work", "id": str(uuid4()), "ref": "a1b2c3"}},
-            id="pin-object",
-        ),
-        pytest.param({"msgV": 1}, id="message-version"),
-        pytest.param({"latency_ms": 3}, id="latency"),
-        pytest.param({"detail": None}, id="null-detail"),
-        pytest.param({"resumedMessageCount": 0}, id="resumed-count"),
+        "error",
+        "errorClass",
+        "error_class",
+        "failure",
+        "denied",
+        "refused",
+        "rejected",
+        "status",
+        "state",
+        "delivered",
+        "degradedClass",
+        "degraded_class",
+        "queued",
+        "recipient",
+        "target",
+        "to",
+        "session_id",
+        "sessionId",
+        "agent_id",
+        "agentId",
+        "id",
+        "message_id",
+        "request_id",
+        "display",
+        "inlineHandback",
+        "latency_ms",
+        "routing",
+        "pin",
+        "resumedAgentId",
+        "errorCode",
+        "note",
     ],
 )
-def test_sendmessage_receipt_tolerates_additive_nonauthority_metadata(
-    extra: dict[str, object],
-) -> None:
-    """A success receipt is decided by success+msg_id, not by key count.
-
-    Fails on the pre-extension exact-key contract. The provider's result
-    object is additive by design -- it strips only `display`/`inlineHandback`
-    before serializing -- and the installed Claude Code 2.1.278 already emits
-    extra keys such as `routing` and `pin` on sibling send paths.
-    """
-    message_id = str(uuid4())
-    receipt = {"success": True, "message": "sent", "msg_id": message_id, **extra}
-
-    assert parse_sendmessage_receipt(_sendmessage_result_stream(receipt)) == message_id
-
-
-@pytest.mark.parametrize("authority_key", sorted(SENDMESSAGE_RECEIPT_AUTHORITY_KEYS))
-def test_sendmessage_receipt_rejects_authority_bearing_metadata(authority_key: str) -> None:
-    # A key that could carry the verdict or the target identity is never
-    # decoration: its presence leaves the outcome unknown, whatever its value.
+def test_sendmessage_receipt_rejects_any_extra_key(extra_key: str) -> None:
+    # The receipt is the only evidence of delivery and the parser has no
+    # expected recipient to check an extra field against, so ANY key beside
+    # the success triple -- authoritative-looking or not -- is uncertain,
+    # never success. Fails on the rejected additive-tolerance extension.
     message_id = str(uuid4())
     receipt = {
         "success": True,
         "message": "sent",
         "msg_id": message_id,
-        authority_key: "unexpected",
+        extra_key: "unexpected",
     }
 
     with pytest.raises(ChatError, match="receipt"):
@@ -2372,7 +2365,7 @@ def test_sendmessage_receipt_rejects_incomplete_or_mistyped_contracts(
     message_id = str(uuid4())
     shaped = {key: (message_id if value == "ID" else value) for key, value in receipt.items()}
 
-    with pytest.raises(ChatError, match="receipt"):
+    with pytest.raises(ChatError, match="invalid"):
         parse_sendmessage_receipt(_sendmessage_result_stream(shaped))
 
 
