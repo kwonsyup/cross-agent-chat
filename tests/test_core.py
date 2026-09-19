@@ -2468,6 +2468,45 @@ def test_claude_courier_health_reports_unavailable(
     }
 
 
+def test_claude_courier_health_keeps_a_deliverability_uncertain_row_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `claude agents --json` exposes no capability field -- only identity and
+    # liveness fields -- so a listed row whose SendMessage reachability is
+    # unproven stays READY and listed; only the send itself can decide.
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+    agent = {
+        "session_id": item.session_id,
+        "name": "Gate Health",
+        "kind": "interactive",
+        "cwd": item.cwd,
+    }
+    monkeypatch.setattr("cross_agent_chat.runtime.exact_agent", lambda *_: agent)
+
+    assert courier_health(item) == {
+        "schema_version": 1,
+        "status": "READY",
+        "generation": item.generation,
+        "alias": f"claude@{item.device}:{item.project}:Gate Health",
+    }
+
+
+def test_local_target_drops_an_unavailable_health_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The UNAVAILABLE shape is the only non-ready response old requesters see:
+    # three keys, no alias, and strict requesters drop it rather than list it.
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+    health = {
+        "schema_version": 1,
+        "status": "UNAVAILABLE",
+        "generation": item.generation,
+    }
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", lambda *_args, **_kwargs: health)
+
+    assert _local_target(tmp_path / "state", item) is None
+
+
 @pytest.mark.parametrize(
     "changed",
     [
