@@ -114,9 +114,7 @@ def test_native_account_digest_rejects_invalid_nested_account_read(
         "cross_agent_chat.codex.time.monotonic",
         fake_server_clock(ready, time.monotonic()),
     )
-    monkeypatch.setattr(
-        "cross_agent_chat.codex.NATIVE_METADATA_TIMEOUT_SECONDS", 30.0
-    )
+    monkeypatch.setattr("cross_agent_chat.codex.NATIVE_METADATA_TIMEOUT_SECONDS", 30.0)
     with pytest.raises(ChatError) as error:
         native_account_digest(
             binary=binary,
@@ -150,9 +148,7 @@ def test_native_account_digest_reads_exact_chatgpt_account_without_refresh(
         "cross_agent_chat.codex.time.monotonic",
         fake_server_clock(ready, time.monotonic()),
     )
-    monkeypatch.setattr(
-        "cross_agent_chat.codex.NATIVE_METADATA_TIMEOUT_SECONDS", 30.0
-    )
+    monkeypatch.setattr("cross_agent_chat.codex.NATIVE_METADATA_TIMEOUT_SECONDS", 30.0)
     digest = native_account_digest(
         binary=binary,
         environment={

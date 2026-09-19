@@ -306,9 +306,7 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
     )
     binary.chmod(0o700)
     started = time.monotonic()
-    monkeypatch.setattr(
-        "cross_agent_chat.codex.time.monotonic", fake_server_clock(ready, started)
-    )
+    monkeypatch.setattr("cross_agent_chat.codex.time.monotonic", fake_server_clock(ready, started))
 
     titles = native_thread_titles(
         binary=binary,
@@ -353,9 +351,7 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
     )
     binary.chmod(0o700)
     started = time.monotonic()
-    monkeypatch.setattr(
-        "cross_agent_chat.codex.time.monotonic", fake_server_clock(ready, started)
-    )
+    monkeypatch.setattr("cross_agent_chat.codex.time.monotonic", fake_server_clock(ready, started))
 
     titles = native_thread_titles(
         binary=binary,
@@ -431,9 +427,7 @@ for line in sys.stdin:
     )
     binary.chmod(0o700)
     started = time.monotonic()
-    monkeypatch.setattr(
-        "cross_agent_chat.codex.time.monotonic", fake_server_clock(ready, started)
-    )
+    monkeypatch.setattr("cross_agent_chat.codex.time.monotonic", fake_server_clock(ready, started))
 
     assert (
         native_thread_titles(

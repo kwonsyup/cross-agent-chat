@@ -30,6 +30,7 @@ from cross_agent_chat.core import ChatError, Registry, Route
 from cross_agent_chat.install import (
     BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
     BROKER_HEALTH_WAIT_SECONDS,
+    OWNED_TOML_START,
     BrokerService,
     ConfigurationChangedError,
     Installer,
@@ -5254,6 +5255,215 @@ def test_uninstall_preserves_durable_intents_without_resolving_them(
     statuses = {item["status"] for item in json.loads(original)}
     assert statuses == {"PRE_EFFECT_REJECTED", "UNKNOWN_DELIVERY", "TRANSPORT_ACCEPTED"}
     assert not installer.launch_agent.exists()
+
+
+def test_uninstall_and_reinstall_preserve_foreign_entries_and_durable_intents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    executable = Path("/opt/cross-agent-chat")
+    installer = Installer(home=home, executable=executable, device="studio", devin_global=True)
+    assert installer.devin_hooks is not None
+
+    def canonical(value: object) -> bytes:
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    foreign_claude_hook = {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "foreign-claude-session-start"}],
+    }
+    foreign_claude_server = {"type": "stdio", "command": "foreign-claude-mcp"}
+    foreign_codex_group = {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "foreign-codex-hook"}],
+    }
+    foreign_codex_server = {"command": "foreign-codex-mcp", "args": ["--flag"]}
+    foreign_devin_hook = {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "foreign-devin-hook"}],
+    }
+    foreign_devin_server = {"type": "stdio", "command": "foreign-devin-mcp"}
+    hooks_path = installer.codex_hooks
+    foreign_trust_key = f"{hooks_path}:session_start:0:0"
+    foreign_trust = {"trusted_hash": "sha256:" + "f" * 64}
+    owned_trust = {
+        f"{hooks_path}:session_start:1:0": {
+            "trusted_hash": _hook_trust_hash(
+                _hook_command(executable, "codex", "studio", "SessionStart"),
+                "SessionStart",
+                5,
+            )
+        },
+        f"{hooks_path}:session_end:0:0": {
+            "trusted_hash": _hook_trust_hash(
+                _hook_command(executable, "codex", "studio", "SessionEnd"),
+                "SessionEnd",
+                3,
+            )
+        },
+        f"{hooks_path}:stop:0:0": {
+            "trusted_hash": _hook_trust_hash(
+                _hook_command(executable, "codex", "studio", "Stop"),
+                "Stop",
+                3,
+            )
+        },
+    }
+    installer.claude_settings.parent.mkdir(parents=True)
+    installer.claude_settings.write_text(
+        json.dumps({"hooks": {"SessionStart": [foreign_claude_hook]}})
+    )
+    installer.claude_config.parent.mkdir(parents=True, exist_ok=True)
+    installer.claude_config.write_text(
+        json.dumps({"mcpServers": {"foreign-claude-mcp": foreign_claude_server}})
+    )
+    installer.codex_hooks.parent.mkdir(parents=True, exist_ok=True)
+    installer.codex_hooks.write_text(json.dumps({"hooks": {"SessionStart": [foreign_codex_group]}}))
+    trust_rows = {foreign_trust_key: foreign_trust, **owned_trust}
+    installer.codex_config.write_text(
+        "[mcp_servers.foreign-codex-mcp]\n"
+        'command = "foreign-codex-mcp"\n'
+        'args = ["--flag"]\n\n'
+        "[hooks.state]\n"
+        + "\n".join(
+            f"{json.dumps(key)} = {{ trusted_hash = {json.dumps(row['trusted_hash'])} }}"
+            for key, row in trust_rows.items()
+        )
+        + "\n"
+    )
+    installer.devin_hooks.parent.mkdir(parents=True, exist_ok=True)
+    installer.devin_hooks.write_text(json.dumps({"hooks": {"SessionStart": [foreign_devin_hook]}}))
+    installer.devin_mcp.parent.mkdir(parents=True, exist_ok=True)
+    installer.devin_mcp.write_text(
+        json.dumps({"mcpServers": {"foreign-devin-mcp": foreign_devin_server}})
+    )
+
+    installer.setup()
+    first_plist = installer.launch_agent.read_bytes()
+    assert tomllib.loads(installer.codex_config.read_text())["hooks"]["state"] == trust_rows
+
+    installer.state.mkdir(parents=True, mode=0o700)
+    installer.state.chmod(0o700)
+    intent_rows = [
+        {
+            "schema_version": 1,
+            "event_id": f"00000000-0000-4000-8000-00000000000{index}",
+            "source_key": f"{index:064x}",
+            "source_generation": "00000000-0000-4000-8000-000000000010",
+            "source_alias": "claude@studio:source:00000000",
+            "target_key": f"{index + 16:064x}",
+            "target_generation": "00000000-0000-4000-8000-000000000011",
+            "payload_digest": f"{index + 32:064x}",
+            "status": status,
+            "timestamp": f"2026-09-04T00:00:0{index}+00:00",
+        }
+        for index, status in enumerate(
+            (
+                "PENDING",
+                "REMOTE_AUTHORIZED",
+                "TRANSPORT_ACCEPTED",
+                "UNKNOWN_DELIVERY",
+                "PRE_EFFECT_REJECTED",
+            )
+        )
+    ]
+    intents_payload = json.dumps(intent_rows, indent=2).encode() + b"\n"
+    intents = installer.state / "intents.json"
+    intents.write_bytes(intents_payload)
+    intents.chmod(0o600)
+    lock_payload = b"fixture-lock-identity\n"
+    lock = installer.state / ".intents.lock"
+    lock.write_bytes(lock_payload)
+    lock.chmod(0o600)
+
+    monkeypatch.setattr(Installer, "_stop_broker", lambda self: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: executable)
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+
+    cli.run(parser().parse_args(["uninstall", "--device", "studio"]))
+    assert (
+        "Delivery intent records remain available for owner inspection." in capsys.readouterr().out
+    )
+
+    settings = json.loads(installer.claude_settings.read_text())
+    assert canonical(settings) == canonical({"hooks": {"SessionStart": [foreign_claude_hook]}})
+    claude = json.loads(installer.claude_config.read_text())
+    assert canonical(claude["mcpServers"]["foreign-claude-mcp"]) == canonical(foreign_claude_server)
+    assert set(claude["mcpServers"]) == {"foreign-claude-mcp"}
+    codex_hooks = json.loads(installer.codex_hooks.read_text())
+    assert canonical(codex_hooks) == canonical({"hooks": {"SessionStart": [foreign_codex_group]}})
+    codex_text = installer.codex_config.read_text()
+    assert OWNED_TOML_START not in codex_text
+    parsed_codex = tomllib.loads(codex_text)
+    assert canonical(parsed_codex["mcp_servers"]["foreign-codex-mcp"]) == canonical(
+        foreign_codex_server
+    )
+    assert set(parsed_codex["mcp_servers"]) == {"foreign-codex-mcp"}
+    assert parsed_codex["hooks"]["state"] == {foreign_trust_key: foreign_trust}
+    assert "hooks" not in parsed_codex.get("features", {})
+    devin_hooks = json.loads(installer.devin_hooks.read_text())
+    assert canonical(devin_hooks) == canonical({"hooks": {"SessionStart": [foreign_devin_hook]}})
+    devin_mcp = json.loads(installer.devin_mcp.read_text())
+    assert canonical(devin_mcp["mcpServers"]["foreign-devin-mcp"]) == canonical(
+        foreign_devin_server
+    )
+    assert set(devin_mcp["mcpServers"]) == {"foreign-devin-mcp"}
+    assert (installer.state / "intents.json").read_bytes() == intents_payload
+    assert (installer.state / ".intents.lock").read_bytes() == lock_payload
+    assert not installer.launch_agent.exists()
+    assert not installer.install_state.exists()
+    assert not installer.verify_configuration()
+
+    monkeypatch.setattr(Installer, "broker_is_healthy", lambda self, **_kwargs: True)
+    assert cli.run(parser().parse_args(["doctor", "--device", "studio", "--json"])) == 1
+    doctor = json.loads(capsys.readouterr().out)
+    assert doctor["integration"] == "needs setup"
+    assert doctor["local_broker"] == "healthy"
+
+    installer.setup()
+    fresh = Installer(
+        home=tmp_path / "fresh-home",
+        executable=executable,
+        device="studio",
+        devin_global=True,
+    )
+    fresh.setup()
+
+    assert installer.launch_agent.read_bytes() == first_plist
+    assert installer.launch_agent.read_bytes() == fresh.launch_agent.read_bytes()
+    assert (installer.state / "intents.json").read_bytes() == intents_payload
+    assert (installer.state / ".intents.lock").read_bytes() == lock_payload
+    settings = json.loads(installer.claude_settings.read_text())
+    assert settings["crossSessionInbound"] == "accept"
+    assert canonical(settings["hooks"]["SessionStart"][0]) == canonical(foreign_claude_hook)
+    assert len(settings["hooks"]["SessionStart"]) == 2
+    claude = json.loads(installer.claude_config.read_text())
+    assert canonical(claude["mcpServers"]["foreign-claude-mcp"]) == canonical(foreign_claude_server)
+    assert "cross-agent-chat" in claude["mcpServers"]
+    codex_hooks = json.loads(installer.codex_hooks.read_text())
+    assert canonical(codex_hooks["hooks"]["SessionStart"][0]) == canonical(foreign_codex_group)
+    assert len(codex_hooks["hooks"]["SessionStart"]) == 2
+    parsed_codex = tomllib.loads(installer.codex_config.read_text())
+    assert canonical(parsed_codex["mcp_servers"]["foreign-codex-mcp"]) == canonical(
+        foreign_codex_server
+    )
+    assert "cross-agent-chat" in parsed_codex["mcp_servers"]
+    # Setup only retains provider-written trust; the provider writes it again.
+    assert parsed_codex["hooks"]["state"] == {foreign_trust_key: foreign_trust}
+    devin_hooks = json.loads(installer.devin_hooks.read_text())
+    assert canonical(devin_hooks["hooks"]["SessionStart"][0]) == canonical(foreign_devin_hook)
+    assert len(devin_hooks["hooks"]["SessionStart"]) == 2
+    devin_mcp = json.loads(installer.devin_mcp.read_text())
+    assert canonical(devin_mcp["mcpServers"]["foreign-devin-mcp"]) == canonical(
+        foreign_devin_server
+    )
+    assert "cross-agent-chat" in devin_mcp["mcpServers"]
+    assert installer.install_state.exists()
+    assert installer.verify_configuration()
+    assert cli.run(parser().parse_args(["doctor", "--device", "studio", "--json"])) == 0
+    doctor = json.loads(capsys.readouterr().out)
+    assert doctor["integration"] == "healthy"
+    assert doctor["local_broker"] == "healthy"
 
 
 def test_uninstall_recovery_failure_precedes_all_configuration_mutation(
