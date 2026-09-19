@@ -33,6 +33,10 @@ from tomlkit.exceptions import TOMLKitError
 from cross_agent_chat import __version__
 from cross_agent_chat.core import ChatError, atomic_json, ensure_private_dir, valid_device
 from cross_agent_chat.devin import devin_profile_root
+from cross_agent_chat.native_helper import (
+    native_helper_create_hook_group,
+    native_helper_dispatch_hook_group,
+)
 from cross_agent_chat.runtime import MCP_TOOL_TIMEOUT_SECONDS
 from cross_agent_chat.tailnet import LOCAL_BROKER_HOST, LOCAL_BROKER_PORT, valid_tailnet_address
 
@@ -565,46 +569,13 @@ def _hook_group(
 def _native_helper_create_hook_group() -> dict[str, object]:
     """Invoke the real app create operation only after internal bootstrap success."""
 
-    return {
-        "matcher": "mcp__cross_agent_chat__native_bootstrap",
-        "hooks": [
-            {
-                "type": "mcp_tool",
-                "server": "codex_app",
-                "tool": "create_thread",
-                "input": {
-                    "prompt": "${tool_response._meta.create_thread.prompt}",
-                    "target": "${tool_response._meta.create_thread.target}",
-                    "model": "${tool_response._meta.create_thread.model}",
-                    "thinking": "${tool_response._meta.create_thread.thinking}",
-                    "title": "${tool_response._meta.create_thread.title}",
-                },
-                "timeout": 30,
-                "statusMessage": "Starting Cross Agent Chat helper",
-            }
-        ],
-    }
+    return native_helper_create_hook_group()
 
 
 def _native_helper_dispatch_hook_group() -> dict[str, object]:
     """Invoke Desktop's original-thread operation after one dispatch claim."""
 
-    return {
-        "matcher": "mcp__cross_agent_chat__native_dispatch",
-        "hooks": [
-            {
-                "type": "mcp_tool",
-                "server": "codex_app",
-                "tool": "send_message_to_thread",
-                "input": {
-                    "threadId": "${tool_response._meta.native_args.threadId}",
-                    "prompt": "${tool_response._meta.native_args.prompt}",
-                },
-                "timeout": 30,
-                "statusMessage": "Delivering Cross Agent Chat message",
-            }
-        ],
-    }
+    return native_helper_dispatch_hook_group()
 
 
 def _native_helper_startup_hook_group(executable: Path, device: str) -> dict[str, object]:

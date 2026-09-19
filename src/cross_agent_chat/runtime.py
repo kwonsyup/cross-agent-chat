@@ -85,7 +85,12 @@ from cross_agent_chat.devin import (
     parse_hook_input,
     parse_pretool_input,
 )
-from cross_agent_chat.native_helper import NativeDispatchStore, NativeHelperStore
+from cross_agent_chat.native_helper import (
+    NativeDispatchStore,
+    NativeHelperStore,
+    native_helper_create_hook_group,
+    native_helper_dispatch_hook_group,
+)
 from cross_agent_chat.remote import parse_remote_envelope
 from cross_agent_chat.tailnet import TAILNET_PORT, tailnet_nodes, valid_tailnet_address
 from cross_agent_chat.transport import remote_envelope
@@ -2523,44 +2528,11 @@ def _native_hook_hash(event_name: str, group: dict[str, object]) -> str:
 
 
 def _native_create_hook_group() -> dict[str, object]:
-    return {
-        "matcher": "mcp__cross_agent_chat__native_bootstrap",
-        "hooks": [
-            {
-                "type": "mcp_tool",
-                "server": "codex_app",
-                "tool": "create_thread",
-                "input": {
-                    "prompt": "${tool_response._meta.create_thread.prompt}",
-                    "target": "${tool_response._meta.create_thread.target}",
-                    "model": "${tool_response._meta.create_thread.model}",
-                    "thinking": "${tool_response._meta.create_thread.thinking}",
-                    "title": "${tool_response._meta.create_thread.title}",
-                },
-                "timeout": 30,
-                "statusMessage": "Starting Cross Agent Chat helper",
-            }
-        ],
-    }
+    return native_helper_create_hook_group()
 
 
 def _native_dispatch_hook_group() -> dict[str, object]:
-    return {
-        "matcher": "mcp__cross_agent_chat__native_dispatch",
-        "hooks": [
-            {
-                "type": "mcp_tool",
-                "server": "codex_app",
-                "tool": "send_message_to_thread",
-                "input": {
-                    "threadId": "${tool_response._meta.native_args.threadId}",
-                    "prompt": "${tool_response._meta.native_args.prompt}",
-                },
-                "timeout": 30,
-                "statusMessage": "Delivering Cross Agent Chat message",
-            }
-        ],
-    }
+    return native_helper_dispatch_hook_group()
 
 
 def _native_hook_ready(source: Route, expected: dict[str, object]) -> bool:

@@ -24,6 +24,51 @@ NativeHelperState = Literal["UNKNOWN", "REGISTERED", "RETIRED"]
 NativeDispatchState = Literal["UNKNOWN"]
 
 
+def native_helper_create_hook_group() -> dict[str, object]:
+    """Invoke the real app create operation only after internal bootstrap success."""
+
+    return {
+        "matcher": "mcp__cross_agent_chat__native_bootstrap",
+        "hooks": [
+            {
+                "type": "mcp_tool",
+                "server": "codex_app",
+                "tool": "create_thread",
+                "input": {
+                    "prompt": "${tool_response._meta.create_thread.prompt}",
+                    "target": "${tool_response._meta.create_thread.target}",
+                    "model": "${tool_response._meta.create_thread.model}",
+                    "thinking": "${tool_response._meta.create_thread.thinking}",
+                    "title": "${tool_response._meta.create_thread.title}",
+                },
+                "timeout": 30,
+                "statusMessage": "Starting Cross Agent Chat helper",
+            }
+        ],
+    }
+
+
+def native_helper_dispatch_hook_group() -> dict[str, object]:
+    """Invoke Desktop's original-thread operation after one dispatch claim."""
+
+    return {
+        "matcher": "mcp__cross_agent_chat__native_dispatch",
+        "hooks": [
+            {
+                "type": "mcp_tool",
+                "server": "codex_app",
+                "tool": "send_message_to_thread",
+                "input": {
+                    "threadId": "${tool_response._meta.native_args.threadId}",
+                    "prompt": "${tool_response._meta.native_args.prompt}",
+                },
+                "timeout": 30,
+                "statusMessage": "Delivering Cross Agent Chat message",
+            }
+        ],
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class NativeHelperBinding:
     """One original Codex task and its private same-profile native helper."""

@@ -23,7 +23,7 @@ import pytest
 import tomlkit
 from tomlkit.exceptions import TOMLKitError
 
-from cross_agent_chat import cli
+from cross_agent_chat import cli, runtime
 from cross_agent_chat.cli import parser
 from cross_agent_chat.codex import CodexCourier
 from cross_agent_chat.core import ChatError, Registry, Route
@@ -40,6 +40,7 @@ from cross_agent_chat.install import (
     _hook_command,
     _hook_trust_hash,
     _native_helper_create_hook_group,
+    _native_helper_dispatch_hook_group,
     _owned_hook,
     _owned_hook_native_queue,
     _package_tree_digest,
@@ -48,6 +49,10 @@ from cross_agent_chat.install import (
     _snapshot_path,
     discover_executable,
     installed_device,
+)
+from cross_agent_chat.native_helper import (
+    native_helper_create_hook_group,
+    native_helper_dispatch_hook_group,
 )
 
 
@@ -76,6 +81,22 @@ def test_native_helper_create_hook_reads_private_mcp_metadata() -> None:
         "thinking": "${tool_response._meta.create_thread.thinking}",
         "title": "${tool_response._meta.create_thread.title}",
     }
+
+
+def test_setup_and_runtime_share_one_native_hook_recipe() -> None:
+    def canonical(value: object) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+    assert (
+        canonical(_native_helper_create_hook_group())
+        == canonical(runtime._native_create_hook_group())
+        == canonical(native_helper_create_hook_group())
+    )
+    assert (
+        canonical(_native_helper_dispatch_hook_group())
+        == canonical(runtime._native_dispatch_hook_group())
+        == canonical(native_helper_dispatch_hook_group())
+    )
 
 
 def _seed_durable_intents(installer: Installer) -> bytes:
