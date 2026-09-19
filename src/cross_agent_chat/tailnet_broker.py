@@ -42,6 +42,9 @@ MAX_BROKER_REFUSAL_WORKERS = 4
 TAILNET_BIND_RETRY_SECONDS = 5.0
 TAILNET_REFRESH_POLL_SECONDS = 0.1
 REFUSAL_WRITE_TIMEOUT_SECONDS = 1.0
+PEEK_REQUEST_DEADLINE_SECONDS = 5.0
+PEEK_STALL_WAIT_MIN_SECONDS = 0.005
+PEEK_STALL_WAIT_MAX_SECONDS = 0.1
 
 
 @dataclass(slots=True)
@@ -213,19 +216,33 @@ def _ready_request(connection: socket.socket) -> dict[object, object] | None:
 
 def _peeked_request(connection: socket.socket) -> dict[object, object] | None:
     """Copy the buffered request frame without consuming it, or None if undecided."""
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + PEEK_REQUEST_DEADLINE_SECONDS
     buffered = b""
+    stall_wait = PEEK_STALL_WAIT_MIN_SECONDS
     while b"\n" not in buffered and len(buffered) <= MAX_FRAME_BYTES:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None
         connection.settimeout(remaining)
         try:
-            buffered = connection.recv(65536, socket.MSG_PEEK)
+            peeked = connection.recv(65536, socket.MSG_PEEK)
         except OSError:
             return None
-        if not buffered:
+        if not peeked:
             return None
+        if len(peeked) > len(buffered):
+            buffered = peeked
+            stall_wait = PEEK_STALL_WAIT_MIN_SECONDS
+            continue
+        # The buffered bytes did not grow, so the socket stays readable and an
+        # immediate re-peek would return the same unchanged fragment forever.
+        # Wait a bounded, growing interval -- still inside the same deadline --
+        # for the rest of the frame instead of spinning on it.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(stall_wait, remaining))
+        stall_wait = min(stall_wait * 2, PEEK_STALL_WAIT_MAX_SECONDS)
     return _parse_peeked(buffered)
 
 
