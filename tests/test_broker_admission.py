@@ -18,7 +18,7 @@ import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
@@ -44,9 +44,9 @@ from cross_agent_chat.runtime import (
 )
 from cross_agent_chat.tailnet import TAILNET_PORT
 from cross_agent_chat.tailnet_broker import (
-    BrokerAdmission,
     MAX_BROKER_CONNECTIONS,
     MAX_BROKER_CONNECTIONS_PER_PEER,
+    BrokerAdmission,
     dispatch_broker_connection,
     dispatch_ready_brokers,
 )
@@ -131,9 +131,7 @@ def _broker_loop(
     callback_admission = BrokerAdmission()
     # The harness also runs against the pre-reserve broker to reproduce the
     # starvation this file documents; older revisions take no reserve lane.
-    reserve_supported = "callbacks" in inspect.signature(
-        dispatch_ready_brokers
-    ).parameters
+    reserve_supported = "callbacks" in inspect.signature(dispatch_ready_brokers).parameters
     with (
         ThreadPoolExecutor(max_workers=MAX_BROKER_CONNECTIONS) as workers,
         ThreadPoolExecutor(max_workers=MAX_BROKER_CONNECTIONS) as callback_workers,
@@ -237,9 +235,7 @@ def _build_machine(
         stop=stop,
         threads=threads,
     )
-    broker = threading.Thread(
-        target=_broker_loop, args=(listener, root, stop), daemon=True
-    )
+    broker = threading.Thread(target=_broker_loop, args=(listener, root, stop), daemon=True)
     broker.start()
     machine.threads.append(broker)
     return machine
@@ -309,13 +305,9 @@ def _wired_tailnet(
             and isinstance(payload, dict)
             and payload.get("operation") == "authorize"
         ):
-            try:
+            with suppress(threading.BrokenBarrierError):
                 authorize_gate.wait(timeout=15.0)
-            except threading.BrokenBarrierError:
-                pass
-        return _REAL_REQUEST_TAILNET(
-            "127.0.0.1", payload, port=ports[address], timeout=timeout
-        )
+        return _REAL_REQUEST_TAILNET("127.0.0.1", payload, port=ports[address], timeout=timeout)
 
     def discovered(
         *,
@@ -355,8 +347,8 @@ def _run_reciprocal_level(
             args=(machine, target, release, results),
             daemon=True,
         )
-        for machine, targets in ((machine_a, machine_a.remote_targets), (machine_b, machine_b.remote_targets))
-        for target in targets[:level]
+        for machine in (machine_a, machine_b)
+        for target in machine.remote_targets[:level]
     ]
     for thread in threads:
         thread.start()
@@ -377,9 +369,7 @@ def _count_labels(results: list[_TrialResult], direction: str) -> dict[str, int]
     return counts
 
 
-def test_reciprocal_admission_levels(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_reciprocal_admission_levels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     machine_a = _build_machine("alpha", _ADDRESS_A, _ADDRESS_B, tmp_path, MAX_TARGET_COUNT)
     machine_b = _build_machine("bravo", _ADDRESS_B, _ADDRESS_A, tmp_path, MAX_TARGET_COUNT)
     machine_a.remote_targets = [_remote_target(route, _ADDRESS_B) for route in machine_b.targets]
@@ -404,9 +394,7 @@ def test_reciprocal_admission_levels(
                 )
                 rejected = level - admitted
                 truthful = counts.get("UNKNOWN_DELIVERY", 0) + sum(
-                    count
-                    for label, count in counts.items()
-                    if label.startswith("ChatError:")
+                    count for label, count in counts.items() if label.startswith("ChatError:")
                 )
                 assert truthful == rejected, (
                     f"level {level} {direction}: {rejected} sends were not admitted "
@@ -429,9 +417,7 @@ def test_slow_and_offline_peers_amid_reciprocal_traffic(
 ) -> None:
     machine_a = _build_machine("alpha", _ADDRESS_A, _ADDRESS_B, tmp_path, 1)
     machine_b = _build_machine("bravo", _ADDRESS_B, _ADDRESS_A, tmp_path, 1)
-    machine_c = _build_machine(
-        "charlie", _ADDRESS_C, _ADDRESS_A, tmp_path, 1, accept_delay=0.5
-    )
+    machine_c = _build_machine("charlie", _ADDRESS_C, _ADDRESS_A, tmp_path, 1, accept_delay=0.5)
     closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     closed.bind(("127.0.0.1", 0))
     dead_port = int(closed.getsockname()[1])
