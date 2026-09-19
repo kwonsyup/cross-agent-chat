@@ -213,6 +213,20 @@ queue schema/mode; run the affected contained adapter contracts; perform one fre
 busy, or compaction smoke as applicable; then update the tested matrix. Do not infer support for
 future provider versions from these checks.
 
+The Codex integrations rely on a small set of provider-owned surfaces: the trusted `codex_app`
+MCP hook tools `create_thread` and `send_message_to_thread` (native helper lifecycle and
+dispatch), and the `codex app-server --listen stdio://` experimental session (`initialize` with
+the `experimentalApi` capability, `account/read`, `thread/read`, and the opt-in
+`thread/queue/add`). Recorded installed versions on this Mac:
+
+| Provider binary | Installed version | Mechanisms relied on |
+|---|---|---|
+| `codex` (standalone CLI) | codex-cli 0.155.1 | stdio `account/read`, `thread/read`, opt-in `thread/queue/add` |
+| `/Applications/ChatGPT.app/Contents/Resources/codex` (bundled) | codex-cli 0.155.0-alpha.9.2 | same stdio session for bound native routes, plus `codex_app` `create_thread`/`send_message_to_thread` hooks |
+
+A schema match on one installed version is not a promise for the next; re-run the contained
+contracts and a fresh smoke after every provider update.
+
 From a development environment with the dev dependencies installed, run the contained checks with:
 
 ```bash

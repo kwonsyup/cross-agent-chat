@@ -190,11 +190,9 @@ def test_published_install_references_match_package_version() -> None:
         r"^## (\d+\.\d+\.\d+) -", (root / "CHANGELOG.md").read_text(), flags=re.MULTILINE
     )
     assert changelog_versions[0] == version
-    codex_client_versions = re.findall(
-        r'"clientInfo": \{"name": "cross-agent-chat", "version": "([^"]+)"\}',
-        (root / "src/cross_agent_chat/codex.py").read_text(),
-    )
-    assert codex_client_versions and set(codex_client_versions) == {version}
+    from cross_agent_chat.codex import _client_info
+
+    assert _client_info() == {"name": "cross-agent-chat", "version": version}
     ci = (root / ".github/workflows/ci.yml").read_text()
     assert re.findall(r"cross-agent-chat (\d+\.\d+\.\d+)", ci) == [version]
     assert re.findall(r'"version":"(\d+\.\d+\.\d+)"', ci) == [version]
