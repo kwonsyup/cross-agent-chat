@@ -16,9 +16,11 @@
   simultaneous sends in both directions filled each broker with deliveries waiting on callbacks
   that needed the same seats, and seated sends ended as `UNKNOWN_DELIVERY`. Authorization
   callbacks now have their own small bounded lane, and a connection the broker cannot admit is
-  told so before any request byte is read: the sender records a decided `PRE_EFFECT_REJECTED`
-  ("recipient broker is at capacity; nothing was delivered; send again") instead of a frozen
-  `UNKNOWN_DELIVERY`. Senders older than 0.3.8 still see the uncertain outcome.
+  told so before any request byte is read while the bounded refusal lane has capacity: the
+  sender records a decided `PRE_EFFECT_REJECTED` ("recipient broker is at capacity; nothing was
+  delivered; send again") instead of a frozen `UNKNOWN_DELIVERY`. When that lane is also
+  exhausted the broker closes silently as before and the outcome stays uncertain, as it does for
+  senders older than 0.3.8.
 - Recognize the Codex Native app by the running process's own bundle instead of a fixed
   `/Applications/ChatGPT.app` path: `/Applications`, `~/Applications`, or one folder below
   `/Applications`, with the helper child and its Desktop ancestor in the same bundle and a

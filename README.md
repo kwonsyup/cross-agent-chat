@@ -200,9 +200,10 @@ its first user prompt. Bootstrap health and later native-provider health are che
 The broker discovers live routes. `chat_send` resolves one exact, current destination from an exact
 or unique fuzzy query; ambiguous names are rejected before an effect, and so is incomplete
 discovery for a name. An exact handle attested by exactly one node proceeds even when unrelated
-nodes have not answered; a second node attesting the same handle refuses the send. A broker that
-cannot admit a connection says so before reading the request, which the sender records as a
-decided rejection. It
+nodes have not answered; a second node attesting the same handle within the two-second grace
+refuses the send, and a later claim is not seen. A broker that cannot admit a connection says so
+before reading the request while its small refusal lane has capacity, which the sender records
+as a decided rejection; beyond that it closes silently and the outcome stays unknown. It
 hands delivery to the recipient's process-scoped courier (or, only with explicit profile-local
 opt-in, Codex's version-bound native queue). A reply is a separate send and consumption event, not
 proof supplied by the original send.
