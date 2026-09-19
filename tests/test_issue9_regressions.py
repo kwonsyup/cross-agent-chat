@@ -456,7 +456,9 @@ def test_optional_delivery_mode_preserves_legacy_remote_peer_shape() -> None:
     assert unknown[0].delivery_mode is None
 
 
-def test_optional_delivery_mechanism_preserves_legacy_remote_peer_shape() -> None:
+def test_delivery_mechanism_is_rejected_on_the_remote_peer_wire() -> None:
+    """The local-only key must never appear in a Tailnet peer answer."""
+
     peer = {
         "alias": "codex@m2:parser:beta",
         "provider": "codex",
@@ -466,46 +468,6 @@ def test_optional_delivery_mechanism_preserves_legacy_remote_peer_shape() -> Non
         "generation": str(uuid4()),
         "session_key": "a" * 64,
     }
-    legacy = runtime._targets_from_tailnet(
-        "100.64.0.10",
-        {"schema_version": 1, "peers": [{**peer, "delivery_mode": "codex_experimental_queue"}]},
-        include_delivery_mode=True,
-    )
-    observed = runtime._targets_from_tailnet(
-        "100.64.0.10",
-        {
-            "schema_version": 1,
-            "peers": [
-                {
-                    **peer,
-                    "delivery_mode": "codex_experimental_queue",
-                    "delivery_mechanism": "native_helper",
-                }
-            ],
-        },
-        include_delivery_mode=True,
-    )
-
-    assert legacy[0].delivery_mechanism is None
-    assert legacy[0].public(include_delivery_mode=True)["delivery_mechanism"] == "unknown"
-    assert observed[0].delivery_mode == "codex_experimental_queue"
-    assert observed[0].delivery_mechanism == "native_helper"
-
-    unknown = runtime._targets_from_tailnet(
-        "100.64.0.10",
-        {
-            "schema_version": 1,
-            "peers": [
-                {
-                    **peer,
-                    "delivery_mode": "codex_experimental_queue",
-                    "delivery_mechanism": "unknown",
-                }
-            ],
-        },
-        include_delivery_mode=True,
-    )
-    assert unknown[0].delivery_mechanism is None
 
     with pytest.raises(ChatError, match="invalid discovery"):
         runtime._targets_from_tailnet(
@@ -516,12 +478,21 @@ def test_optional_delivery_mechanism_preserves_legacy_remote_peer_shape() -> Non
                     {
                         **peer,
                         "delivery_mode": "codex_experimental_queue",
-                        "delivery_mechanism": "experimental_queue",
+                        "delivery_mechanism": "native_helper",
                     }
                 ],
             },
             include_delivery_mode=True,
         )
+
+    assert (
+        runtime._targets_from_tailnet(
+            "100.64.0.10",
+            {"schema_version": 1, "peers": [{**peer, "delivery_mode": "codex_experimental_queue"}]},
+            include_delivery_mode=True,
+        )[0].delivery_mechanism
+        is None
+    )
 
 
 def test_last_codex_config_owner_restores_prior_hooks_feature(

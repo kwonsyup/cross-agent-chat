@@ -181,7 +181,7 @@ def test_stop_uses_direct_stop_mode_when_helper_routing_mode_is_experimental(
     assert output["decision"] == "block"
 
 
-def test_stop_ignores_additive_mechanism_label_when_direct_mode_is_stop_bound(
+def test_stop_rejects_a_health_answer_carrying_an_unrequested_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = tmp_path / "state"
@@ -193,7 +193,6 @@ def test_stop_ignores_additive_mechanism_label_when_direct_mode_is_stop_bound(
         pid=os.getpid(),
     )
     Registry(root).upsert(route)
-    event_id = str(uuid4())
     monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
     monkeypatch.setattr(
         "sys.stdin",
@@ -205,34 +204,21 @@ def test_stop_ignores_additive_mechanism_label_when_direct_mode_is_stop_bound(
     )
 
     def request(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
-        operation = payload["operation"]
-        assert isinstance(operation, str)
-        if operation == "health":
-            return {
-                "schema_version": 1,
-                "status": "READY",
-                "generation": route.generation,
-                "alias": route.alias,
-                "delivery_mode": "codex_experimental_queue",
-                "delivery_mechanism": "native_helper",
-                "direct_delivery_mode": "codex_stop_bound",
-            }
-        if operation == "peek":
-            return {
-                "schema_version": 1,
-                "status": "PEEKED",
-                "generation": route.generation,
-                "messages": [{"event_id": event_id, "message": "older stop-bound body"}],
-            }
-        assert operation == "ack"
-        return {"schema_version": 1, "status": "ACKNOWLEDGED", "event_ids": [event_id]}
+        assert payload["operation"] == "health"
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+            "delivery_mode": "codex_stop_bound",
+            "delivery_mechanism": "stop_bound",
+        }
 
     monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
 
     codex_stop(os.getpid(), str(root))
 
-    output = json.loads(capsys.readouterr().out)
-    assert output["decision"] == "block"
+    assert capsys.readouterr().out == "{}\n"
 
 
 def test_presence_off_hooks_are_noops_before_state_creation(

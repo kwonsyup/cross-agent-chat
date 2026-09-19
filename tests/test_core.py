@@ -2327,10 +2327,31 @@ def test_courier_health_reports_the_exact_mechanism_behind_each_mode(
         else None
     )
 
-    health = courier_health(item, courier, include_delivery_mode=True, native_helper=helper_backed)
+    health = courier_health(
+        item,
+        courier,
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
+        native_helper=helper_backed,
+    )
 
     assert health["delivery_mode"] == mode
     assert health["delivery_mechanism"] == mechanism
+
+
+def test_courier_health_without_the_mechanism_flag_keeps_the_legacy_shape(
+    tmp_path: Path,
+) -> None:
+    item = route(tmp_path, pid=os.getpid())
+    courier = CodexCourier(alias=item.alias, generation=item.generation)
+
+    assert courier_health(item, courier, include_delivery_mode=True) == {
+        "schema_version": 1,
+        "status": "READY",
+        "generation": item.generation,
+        "alias": item.alias,
+        "delivery_mode": "codex_stop_bound",
+    }
 
 
 def test_local_target_keeps_the_observed_delivery_mechanism(
@@ -2352,7 +2373,41 @@ def test_local_target_keeps_the_observed_delivery_mechanism(
     assert target is not None
     assert target.delivery_mode == "codex_experimental_queue"
     assert target.delivery_mechanism == "native_helper"
-    assert target.public(include_delivery_mode=True)["delivery_mechanism"] == "native_helper"
+    assert "delivery_mechanism" not in target.public(include_delivery_mode=True)
+    assert (
+        target.public(include_delivery_mode=True, include_delivery_mechanism=True)[
+            "delivery_mechanism"
+        ]
+        == "native_helper"
+    )
+
+
+def test_local_target_lists_an_old_courier_without_mechanism(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A courier that ignores the new request flag still lists with its delivery mode."""
+
+    item = route(tmp_path, pid=os.getpid())
+    health = {
+        "schema_version": 1,
+        "status": "READY",
+        "generation": item.generation,
+        "alias": item.alias,
+        "delivery_mode": "codex_experimental_queue",
+    }
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", lambda *_args, **_kwargs: health)
+
+    target = _local_target(tmp_path / "state", item)
+
+    assert target is not None
+    assert target.delivery_mode == "codex_experimental_queue"
+    assert target.delivery_mechanism is None
+    assert (
+        target.public(include_delivery_mode=True, include_delivery_mechanism=True)[
+            "delivery_mechanism"
+        ]
+        == "unknown"
+    )
 
 
 @pytest.mark.parametrize("mechanism", ["unknown", "experimental_queue"])

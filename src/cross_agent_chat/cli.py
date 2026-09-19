@@ -315,7 +315,9 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
                     }
                 if name == "chat_peers" and not typed_arguments:
                     assert root is not None
-                    result = peers(root, include_delivery_mode=True)
+                    result = peers(
+                        root, include_delivery_mode=True, include_delivery_mechanism=True
+                    )
                     result["sender"] = (
                         sender_readiness_for_route(root, devin_source)
                         if devin_source is not None

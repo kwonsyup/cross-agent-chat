@@ -199,6 +199,7 @@ class Target:
         self,
         *,
         include_delivery_mode: bool = False,
+        include_delivery_mechanism: bool = False,
         include_handle: bool = True,
         include_title: bool = True,
     ) -> dict[str, str]:
@@ -217,9 +218,10 @@ class Target:
             result["delivery_mode"] = (
                 "unknown" if self.delivery_mode is None else self.delivery_mode
             )
-            result["delivery_mechanism"] = (
-                "unknown" if self.delivery_mechanism is None else self.delivery_mechanism
-            )
+            if include_delivery_mechanism:
+                result["delivery_mechanism"] = (
+                    "unknown" if self.delivery_mechanism is None else self.delivery_mechanism
+                )
         return result
 
 
@@ -1124,6 +1126,7 @@ def courier_health(
     *,
     include_delivery_mode: bool = False,
     include_direct_delivery_mode: bool = False,
+    include_delivery_mechanism: bool = False,
     native_helper: bool = False,
 ) -> dict[str, object]:
     alias = route.alias
@@ -1148,6 +1151,7 @@ def courier_health(
     }
     if include_delivery_mode:
         response["delivery_mode"] = _delivery_mode(route, courier, native_helper=native_helper)
+    if include_delivery_mechanism:
         response["delivery_mechanism"] = _delivery_mechanism(
             route, courier, native_helper=native_helper
         )
@@ -1284,6 +1288,9 @@ def courier_server(
                                 include_delivery_mode=request.get("include_delivery_mode") is True,
                                 include_direct_delivery_mode=(
                                     request.get("include_direct_delivery_mode") is True
+                                ),
+                                include_delivery_mechanism=(
+                                    request.get("include_delivery_mechanism") is True
                                 ),
                                 native_helper=(
                                     NativeHelperStore(root).helper_for_original(
@@ -1447,6 +1454,7 @@ def _local_target(
                 "operation": "health",
                 "generation": route.generation,
                 "include_delivery_mode": True,
+                "include_delivery_mechanism": True,
             },
             timeout=timeout,
         )
@@ -1627,7 +1635,7 @@ def _targets_from_tailnet(
         }
         allowed = (
             required
-            | ({"delivery_mode", "delivery_mechanism"} if include_delivery_mode else set())
+            | ({"delivery_mode"} if include_delivery_mode else set())
             | ({"title"} if include_title else set())
         )
         if not isinstance(raw_item, dict) or not required <= set(raw_item) <= allowed:
@@ -1662,17 +1670,9 @@ def _targets_from_tailnet(
                     }
                 )
             )
-            or (
-                "delivery_mechanism" in item
-                and (
-                    not isinstance(item["delivery_mechanism"], str)
-                    or item["delivery_mechanism"] not in DELIVERY_MECHANISMS | {"unknown"}
-                )
-            )
         ):
             raise ChatError("Tailnet peer returned invalid discovery")
         observed_mode = item.get("delivery_mode")
-        observed_mechanism = item.get("delivery_mechanism")
         title = item.get("title")
         if title is not None and (not include_title or not isinstance(title, str)):
             raise ChatError("Tailnet peer returned invalid discovery")
@@ -1689,11 +1689,6 @@ def _targets_from_tailnet(
                 delivery_mode=(
                     cast(DeliveryMode, observed_mode)
                     if isinstance(observed_mode, str) and observed_mode != "unknown"
-                    else None
-                ),
-                delivery_mechanism=(
-                    cast(DeliveryMechanism, observed_mechanism)
-                    if isinstance(observed_mechanism, str) and observed_mechanism != "unknown"
                     else None
                 ),
                 title=valid_name(title, "remote title") if isinstance(title, str) else None,
@@ -2346,6 +2341,7 @@ def peers(
     include_remote: bool = True,
     internal: bool = False,
     include_delivery_mode: bool = False,
+    include_delivery_mechanism: bool = False,
     include_title: bool = False,
     include_devin: bool = True,
 ) -> dict[str, object]:
@@ -2379,6 +2375,7 @@ def peers(
     for target in targets:
         item = target.public(
             include_delivery_mode=include_delivery_mode,
+            include_delivery_mechanism=include_delivery_mechanism,
             include_handle=not internal,
             include_title=not internal or include_title,
         )
@@ -2859,9 +2856,7 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
     allowed = {
         frozenset(base_health),
         frozenset((*base_health, "delivery_mode")),
-        frozenset((*base_health, "delivery_mode", "delivery_mechanism")),
         frozenset((*base_health, "delivery_mode", "direct_delivery_mode")),
-        frozenset((*base_health, "delivery_mode", "delivery_mechanism", "direct_delivery_mode")),
     }
     if frozenset(health) not in allowed or any(
         health.get(key) != value for key, value in base_health.items()
