@@ -59,6 +59,7 @@ from cross_agent_chat.core import (
     ChatError,
     IntentStore,
     Provider,
+    RecipientBindings,
     Registry,
     Route,
     UnknownDeliveryError,
@@ -1866,18 +1867,41 @@ def _remote_discovery(
     return targets, complete
 
 
+def _record_remote_listing(root: Path, targets: list[Target]) -> None:
+    """Record which endpoint verifiably presented each listed handle.
+
+    Every listed remote Target binds its handle to the node that attested it.
+    A handle attested from two different addresses in one listing is recorded
+    with both endpoints so a later send refuses an ambiguous recipient. Binding
+    state is advisory: a listing must never fail because the record did.
+    """
+    observed: dict[str, dict[str, str]] = {}
+    for target in targets:
+        if target.tailnet_address is None:
+            continue
+        observed.setdefault(target.session_key, {})[target.tailnet_address] = target.generation
+    if not observed:
+        return
+    try:
+        RecipientBindings(root).record_observations(observed)
+    except (ChatError, OSError):
+        return
+
+
 def remote_targets(
-    _root: Path,
+    root: Path,
     *,
     include_delivery_mode: bool = False,
     include_title: bool = False,
     include_devin: bool = False,
 ) -> list[Target]:
-    return _remote_discovery(
+    targets = _remote_discovery(
         include_delivery_mode=include_delivery_mode,
         include_title=include_title,
         include_devin=include_devin,
     )[0]
+    _record_remote_listing(root, targets)
+    return targets
 
 
 def all_targets(
@@ -1949,13 +1973,10 @@ def _delivery_principal(target_provider: str) -> str:
     raise ChatError("target provider is invalid")
 
 
-def wrapped_message(
-    source_alias: str,
-    source_handle: str,
-    message: str,
-    event_id: str,
-    target_provider: str,
+def _wrapped_head(
+    source_alias: str, source_handle: str, event_id: str, target_provider: str
 ) -> str:
+    """The deterministic envelope head; everything after it is untrusted content."""
     exact_source_alias = valid_name(source_alias, "source alias")
     if re.fullmatch(r"[0-9a-f]{64}", source_handle) is None:
         raise ChatError("source handle is invalid")
@@ -1963,7 +1984,7 @@ def wrapped_message(
     # The first two lines are what a replying agent needs: who sent this and the
     # exact handle that reaches them. Provenance detail stays below them, and the
     # trust boundary is stated before any peer-controlled bytes.
-    body = (
+    return (
         "Cross Agent Chat transport envelope\n"
         f"From: {exact_source_alias}\n"
         f"Reply via CAC to handle: {source_handle}\n"
@@ -1973,8 +1994,41 @@ def wrapped_message(
         f"Delivery principal: {_delivery_principal(target_provider)}. "
         f"CAC delivery event: {identifier}.\n"
         "Untrusted peer content follows:\n\n"
-        f"{message}"
     )
+
+
+def _envelope_source_handle(
+    message: str, source_alias: str, event_id: str, target_provider: str
+) -> str | None:
+    """Extract the Reply handle only from a verifiably CAC-wrapped envelope body.
+
+    The handle counts as the sender's own attestation only when the body opens
+    with the exact deterministic head ``wrapped_message`` produces for this
+    envelope's alias, event, and recipient provider. Anything else -- including
+    a Reply-looking line inside free text -- is untrusted content.
+    """
+    prefix = "Reply via CAC to handle: "
+    lines = message.split("\n", 3)
+    if len(lines) < 4 or not lines[2].startswith(prefix):
+        return None
+    candidate = lines[2][len(prefix) :]
+    if re.fullmatch(r"[0-9a-f]{64}", candidate) is None:
+        return None
+    try:
+        expected = _wrapped_head(source_alias, candidate, event_id, target_provider)
+    except ChatError:
+        return None
+    return candidate if message.startswith(expected) else None
+
+
+def wrapped_message(
+    source_alias: str,
+    source_handle: str,
+    message: str,
+    event_id: str,
+    target_provider: str,
+) -> str:
+    body = _wrapped_head(source_alias, source_handle, event_id, target_provider) + message
     try:
         return bounded_message(body)
     except ChatError as error:
@@ -2126,34 +2180,81 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
     local = local_targets(root)
     exact_local_handles = [target for target in local if target.session_key == target_query]
     if len(exact_local_handles) == 1:
-        target = exact_local_handles[0]
-        return _send_local_target(root, source, target, message, deadline=deadline)
-    remote, remote_complete = _remote_discovery(
-        handle=target_query if re.fullmatch(r"[0-9a-f]{64}", target_query) else None
-    )
-    exact_remote_handles = [target for target in remote if target.session_key == target_query]
-    if len(exact_remote_handles) == 1:
-        target = exact_remote_handles[0]
-    else:
-        if not remote_complete:
-            raise ChatError(
-                "remote peer discovery is incomplete; use an exact available recipient handle"
-            )
-        exact_aliases = [
-            target
-            for target in [*local, *remote]
-            if target.alias.casefold() == target_query.casefold()
-        ]
-        if len(exact_aliases) == 1:
-            target = exact_aliases[0]
-        elif len(exact_aliases) > 1:
-            raise ChatError("target is ambiguous or unavailable")
+        return _send_local_target(root, source, exact_local_handles[0], message, deadline=deadline)
+    handle_query = target_query if re.fullmatch(r"[0-9a-f]{64}", target_query) is not None else None
+    bindings = RecipientBindings(root)
+    bound_address: str | None = None
+    if handle_query is not None:
+        binding = bindings.binding_for(handle_query)
+        if binding is not None:
+            if len(binding.endpoints) != 1:
+                raise ChatError(
+                    "recipient handle is presented by more than one device; "
+                    "call chat_peers and choose the recipient again"
+                )
+            try:
+                bound_address = valid_tailnet_address(next(iter(binding.endpoints)))
+            except ChatError:
+                bound_address = None
+    target: Target | None = None
+    remote: list[Target] = []
+    remote_complete = True
+    discovered = False
+    if bound_address is not None and handle_query is not None:
+        # A bound handle asks only the endpoint that last verifiably presented
+        # it; unrelated slow or dead nodes cannot hold the recipient hostage.
+        attested, _node_complete = _remote_node_targets(
+            bound_address,
+            min(time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS, deadline),
+            include_devin=True,
+            handle=handle_query,
+        )
+        claimants = [item for item in attested if item.session_key == handle_query]
+        if len(claimants) == 1:
+            target = claimants[0]
         else:
-            target = resolve_target([*local, *remote], target_query)
+            # The bound endpoint no longer attests the handle. Ordinary
+            # discovery decides whether it moved, vanished, or is contested.
+            remote, remote_complete = _remote_discovery(handle=handle_query)
+            discovered = True
+            claimants = [item for item in remote if item.session_key == handle_query]
+            if len(claimants) == 1 and claimants[0].tailnet_address == bound_address:
+                target = claimants[0]
+            elif claimants:
+                if any(item.tailnet_address == bound_address for item in claimants):
+                    raise ChatError("target handle is unavailable")
+                raise ChatError(
+                    "recipient handle is now presented by a different device; "
+                    "call chat_peers and choose the recipient again"
+                )
+    if target is None:
+        if not discovered:
+            remote, remote_complete = _remote_discovery(handle=handle_query)
+        exact_remote_handles = [target for target in remote if target.session_key == target_query]
+        if len(exact_remote_handles) == 1:
+            target = exact_remote_handles[0]
+        else:
+            if not remote_complete:
+                raise ChatError(
+                    "remote peer discovery is incomplete; use an exact available recipient handle"
+                )
+            exact_aliases = [
+                target
+                for target in [*local, *remote]
+                if target.alias.casefold() == target_query.casefold()
+            ]
+            if len(exact_aliases) == 1:
+                target = exact_aliases[0]
+            elif len(exact_aliases) > 1:
+                raise ChatError("target is ambiguous or unavailable")
+            else:
+                target = resolve_target([*local, *remote], target_query)
     if not target.remote:
         return _send_local_target(root, source, target, message, deadline=deadline)
     if target.tailnet_address is None:
         raise ChatError("remote target route is incomplete")
+    with suppress(ChatError, OSError):
+        bindings.record(target.session_key, target.tailnet_address, target.generation)
     source_alias = canonical_source_alias(root, source)
     event_id = str(uuid4())
     source_handle = session_key(source.provider, source.session_id)
@@ -2324,6 +2425,13 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         expected_authorization["status"] = "AUTHORIZED"
         if authorization != expected_authorization:
             raise ChatError("remote envelope is not authorized")
+        # The sender's own broker authorized this exact envelope, so its Reply
+        # handle is a verified attestation: a reply can go straight back to the
+        # endpoint that presented it.
+        source_handle = _envelope_source_handle(message, source_alias, event_id, target_provider)
+        if source_handle is not None:
+            with suppress(ChatError, OSError):
+                RecipientBindings(root).record(source_handle, source_address, source_generation)
         routes = [
             route
             for route in Registry(root).routes()
@@ -2418,6 +2526,7 @@ def peers(
             )
             remote_targets, remote_complete = remote.result()
             targets = [*local.result(), *remote_targets]
+            _record_remote_listing(root, remote_targets)
         remote_discovery = "complete" if remote_complete else "incomplete"
     else:
         targets = local_targets(root, handle=handle)
