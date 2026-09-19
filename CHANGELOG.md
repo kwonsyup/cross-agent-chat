@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.7 - 2026-09-18
+
+- Report how a requested answer returns to the sender. A `chat_send` result now carries
+  `reply_delivery`: `while_idle` for Claude and the experimental Codex queue, `next_turn` for
+  Stop-bound Codex and Devin, and `unknown` when the sender's courier cannot say. The guidance
+  tells every sender to finish its turn instead of sleeping or polling `chat_status`, and a
+  `next_turn` sender to tell its user the answer will appear after their next message. A fresh
+  v0.3.6 Codex CLI requester had held its turn open for about eleven minutes. An unconditional
+  "finish your turn" was withdrawn earlier because it would have stranded Stop-bound answers
+  silently.
+- This release does not add idle delivery for Stop-bound Codex or Devin; it names the limitation.
+- README: state the observed Claude cross-device scope, the known-peer discovery delay, and why the
+  integrations do not depend on the terminal emulator.
+
 ## 0.3.6 - 2026-09-18
 
 - Supply the Claude courier's `SendMessage` arguments from the delivery gate instead of asking a

@@ -195,3 +195,45 @@ def test_chat_send_target_description_does_not_demand_a_fresh_discovery_call(
     assert "life of that peer session" in target
     # It must also steer away from the visible sender, which is the helper.
     assert "delivery helper" in target
+
+
+def test_chat_send_result_says_how_the_answer_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="claude", session_id=str(uuid4()), device="studio", cwd=str(tmp_path), pid=1
+    )
+    sent: list[tuple[str, str]] = []
+
+    def fake_send(_root: Path, _source: Route, target: str, message: str) -> dict[str, object]:
+        sent.append((target, message))
+        return {"schema_version": 1, "status": "TRANSPORT_ACCEPTED", "event_id": "e"}
+
+    monkeypatch.setattr(cli, "authenticate_mcp_sender", lambda *_args: source)
+    monkeypatch.setattr(cli, "send", fake_send)
+    monkeypatch.setattr(cli, "reply_delivery", lambda _root, _source: "next_turn")
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "chat_send", "arguments": {"to": "a" * 64, "message": "hi"}},
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(request) + "\n"))
+
+    mcp("claude", "studio", str(root))
+
+    response = json.loads(capsys.readouterr().out.splitlines()[-1])
+    result = json.loads(response["result"]["content"][0]["text"])
+    assert sent == [("a" * 64, "hi")]
+    assert result["reply_delivery"] == "next_turn"
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+
+
+def test_instructions_stop_senders_waiting_and_explain_both_return_paths() -> None:
+    # A Codex CLI requester slept and polled chat_status for eleven minutes; an
+    # unconditional "finish your turn" would instead strand Stop-bound answers.
+    assert "do not sleep, wait, or poll" in cli.MCP_INSTRUCTIONS
+    assert "while_idle" in cli.MCP_INSTRUCTIONS
+    assert "next_turn" in cli.MCP_INSTRUCTIONS
+    assert "after their next message" in cli.MCP_INSTRUCTIONS

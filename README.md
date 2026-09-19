@@ -10,10 +10,10 @@ non-default roots). Local sessions do not need Tailscale; remote sessions need T
 allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
 files, or turn a remote peer into an owner.
 
-Install v0.3.6 prerelease with:
+Install v0.3.7 prerelease with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.6/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.7/install.sh | sh
 ```
 
 Installation requires Git because the installer builds from the release tag.
@@ -57,17 +57,24 @@ visible by default.
 
 To have an existing coding agent assist with installation, give it this prompt:
 
-> Install the released `v0.3.6` tag, not an arbitrary PR. Identify active consumers and the
+> Install the released `v0.3.7` tag, not an arbitrary PR. Identify active consumers and the
 > selected Claude/Codex roots and local Devin configuration, obtain approval before shared effects, preserve existing intent
 > records, run `cross-agent-chat doctor --json`, and test only fresh actors.
 
 ## Supported surfaces
 
-v0.3.6 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
+v0.3.7 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
 scheduling class to avoid the observed Background scheduling delay. Normal-budget discovery has
 been observed for participating macOS nodes. An aggregate roster can still be incomplete when an
-online non-CAC Tailnet node, such as an iOS node, fails discovery; full remote request/result
-acceptance remains unproved.
+online non-CAC Tailnet node, such as an iOS node, fails discovery, and an unresponsive neighbor can
+delay a send to an exact known peer by up to about 22 seconds. Claude Code request/result was
+observed on public v0.3.6 between two Macs in both directions, and on one Mac, with exact
+payloads and idle receipt. Other remote pairings are not established by that evidence.
+
+The integrations attach to the provider's own process, configuration, hooks, and messaging
+operations, not to a terminal emulator, so ordinary iTerm2, Terminal.app, or Ghostty launches of
+the same supported provider and profile use the same path. tmux, SSH, IDE-hosted, and other hosts
+still need the provider's own process, authentication, and hooks to load normally.
 
 Claude Code uses its native cross-session mechanism. Codex Native uses the built-in Desktop message
 operation through a trusted, automatically managed helper;
@@ -79,7 +86,7 @@ then receives work at a prompt or Stop boundary through its exact provider ident
 |---|---|
 | Claude Code | Native cross-session delivery through the selected Claude configuration. |
 | Codex Native App | Trusted hooks can provision a native helper and use Desktop-native task messaging for a bound original conversation. |
-| Codex CLI | Natural Stop delivery remains supported where the CLI route is registered and current. A fresh public v0.3.4 idle request/result exchange completed. v0.3.5 confines Native bootstrap instructions to bundled Desktop routes, so standalone CLI startup does not receive a Native-only tool instruction; busy acceptance and later original-owner consumption still require revalidation. |
+| Codex CLI | Stop-bound by default: a queued message is handed over at the conversation's next turn boundary. With the experimental queue it can arrive while idle. A fresh public v0.3.6 Codex CLI requester received its Claude answer. Busy acceptance and later original-owner consumption still require revalidation. |
 | Local Devin CLI or App | Global MCP and prompt/Stop hooks support prompt-active conversation discovery and delivery. |
 | Same Mac or permitted Tailnet Mac | Discovery and delivery use the local broker or your Tailscale ACL. Normal-budget discovery has succeeded for participating macOS nodes; an aggregate roster may remain incomplete for an online non-CAC Tailnet node. |
 
@@ -108,6 +115,11 @@ perimeter. Messages are still delivered as untrusted peer/user input, not system
 Codex Stop-bound delivery or the experimental Codex queue, and Devin prompt/Stop-bound delivery.
 Older couriers report `unknown`.
 The mode identifies the active adapter; it does not establish consumption or a reply.
+
+A `chat_send` result also reports `reply_delivery` for the sending session itself: `while_idle`
+means a requested answer can arrive as a new message after that session's turn ends; `next_turn`
+means it is handed over only at the session's next turn boundary, normally after its user's next
+message; `unknown` promises neither. Senders should finish their turn rather than wait or poll.
 
 Codex uses natural Stop delivery by default: a received message is delivered at the next natural
 turn boundary. An explicit, profile-local experimental queue can
