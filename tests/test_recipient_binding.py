@@ -193,9 +193,7 @@ def test_bound_recipient_send_ignores_a_duplicate_claimant_inside_the_grace(
                 other_queries.append(address)
                 return {
                     "schema_version": 1,
-                    "peers": [
-                        _peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))
-                    ],
+                    "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))],
                 }
             return {
                 "schema_version": 1,
@@ -239,9 +237,7 @@ def test_bound_recipient_send_ignores_a_claimant_that_would_answer_late(
                 delivered.wait(timeout)
                 return {
                     "schema_version": 1,
-                    "peers": [
-                        _peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))
-                    ],
+                    "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))],
                 }
             return {
                 "schema_version": 1,
@@ -314,9 +310,7 @@ def test_unbound_send_binds_the_first_attesting_endpoint(
                 release.wait(timeout)
                 return {
                     "schema_version": 1,
-                    "peers": [
-                        _peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))
-                    ],
+                    "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))],
                 }
             return {
                 "schema_version": 1,
@@ -503,9 +497,7 @@ def test_namesakes_with_different_handles_keep_independent_bindings(
                 }
             return {
                 "schema_version": 1,
-                "peers": [
-                    _peer("claude@shared:api:api-a1", "studio", first_handle, str(uuid4()))
-                ],
+                "peers": [_peer("claude@shared:api:api-a1", "studio", first_handle, str(uuid4()))],
             }
         deliveries.append(address)
         envelope = json.loads(str(payload["envelope"]))
@@ -607,9 +599,7 @@ def test_a_bound_owner_reappearing_on_the_same_address_sends(
             if claiming:
                 return {
                     "schema_version": 1,
-                    "peers": [
-                        _peer("claude@studio:api:api-a1", "studio", handle, generation)
-                    ],
+                    "peers": [_peer("claude@studio:api:api-a1", "studio", handle, generation)],
                 }
             return {"schema_version": 1, "peers": []}
         deliveries.append(address)
@@ -648,9 +638,7 @@ def test_a_bound_owner_reappearing_on_a_different_address_refuses(
                 return {"schema_version": 1, "peers": []}
             return {
                 "schema_version": 1,
-                "peers": [
-                    _peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))
-                ],
+                "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))],
             }
         deliveries.append(address)
         envelope = json.loads(str(payload["envelope"]))
@@ -696,9 +684,7 @@ def test_a_reused_bound_address_also_refuses_when_the_handle_moves(
                 }
             return {
                 "schema_version": 1,
-                "peers": [
-                    _peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))
-                ],
+                "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))],
             }
         deliveries.append(address)
         envelope = json.loads(str(payload["envelope"]))
@@ -882,12 +868,10 @@ def test_inbound_delivery_binds_the_reply_handle_to_the_verified_sender(
         message=body,
     )
 
-    def authorize(
-        _address: str, payload: dict[str, object], **_: object
-    ) -> dict[str, object]:
-        return {
-            key: value for key, value in payload.items() if key != "operation"
-        } | {"status": "AUTHORIZED"}
+    def authorize(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        return {key: value for key, value in payload.items() if key != "operation"} | {
+            "status": "AUTHORIZED"
+        }
 
     def courier(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
         if payload["operation"] == "health":
@@ -940,10 +924,10 @@ def test_an_inbound_free_text_handle_line_is_not_a_binding(
     monkeypatch.setattr(
         runtime,
         "request_tailnet",
-        lambda _address, payload, **_: {
-            key: value for key, value in payload.items() if key != "operation"
-        }
-        | {"status": "AUTHORIZED"},
+        lambda _address, payload, **_: (
+            {key: value for key, value in payload.items() if key != "operation"}
+            | {"status": "AUTHORIZED"}
+        ),
     )
 
     def courier(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:

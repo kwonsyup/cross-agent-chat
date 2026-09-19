@@ -13,7 +13,7 @@ import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final, Literal, NoReturn, cast
 from uuid import UUID, uuid4
@@ -841,6 +841,150 @@ class IntentStore:
             for item in existing
         ]
         atomic_json(self.path, [item.to_dict() for item in updated])
+
+
+# Recipient bindings are requester-side memory, not authority: each row only
+# records which transport endpoint verifiably presented a handle most recently.
+RECIPIENT_BINDING_TTL_SECONDS: Final = 7.0 * 24 * 60 * 60
+RECIPIENT_BINDING_LIMIT: Final = 512
+RECIPIENT_ADDRESS_LIMIT: Final = 64
+
+
+@dataclass(frozen=True, slots=True)
+class RecipientBinding:
+    """The endpoint(s) that last verifiably presented one recipient handle.
+
+    One endpoint is a bound owner; two or more means one listing attested the
+    same handle from different devices and the handle is ambiguous.
+    """
+
+    handle: str
+    endpoints: dict[str, str]
+    seen_at: str
+
+    @classmethod
+    def from_object(cls, raw: object) -> RecipientBinding | None:
+        """Parse one durable row, tolerating corruption as no row at all."""
+        if not isinstance(raw, dict) or set(raw) != {"handle", "endpoints", "seen_at"}:
+            return None
+        values = cast(dict[str, object], raw)
+        handle = values["handle"]
+        seen_at = values["seen_at"]
+        endpoints = values["endpoints"]
+        if (
+            not isinstance(handle, str)
+            or re.fullmatch(r"[0-9a-f]{64}", handle) is None
+            or not isinstance(seen_at, str)
+            or not isinstance(endpoints, dict)
+            or not endpoints
+            or len(endpoints) > 16
+        ):
+            return None
+        items = cast(dict[object, object], endpoints)
+        try:
+            _parse_timestamp(seen_at)
+            clean = {
+                address: valid_uuid(generation, "bound generation")
+                for address, generation in ((key, value) for key, value in items.items())
+                if isinstance(address, str)
+                and 0 < len(address) <= RECIPIENT_ADDRESS_LIMIT
+                and isinstance(generation, str)
+            }
+        except ChatError:
+            return None
+        if len(clean) != len(items):
+            return None
+        return cls(handle=handle, endpoints=clean, seen_at=seen_at)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "handle": self.handle,
+            "endpoints": self.endpoints,
+            "seen_at": self.seen_at,
+        }
+
+
+class RecipientBindings:
+    """Private, bounded handle-to-endpoint memory. It never stores content."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        ensure_private_dir(root)
+        self.path = root / "recipients.json"
+
+    def bindings(self) -> list[RecipientBinding]:
+        """Read every row; a missing or corrupt file is simply no memory."""
+        if not self.path.exists():
+            return []
+        try:
+            require_private_file(self.path)
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        by_handle: dict[str, RecipientBinding] = {}
+        for item in raw:
+            binding = RecipientBinding.from_object(item)
+            if binding is None:
+                continue
+            current = by_handle.get(binding.handle)
+            if current is None or _parse_timestamp(binding.seen_at) > _parse_timestamp(
+                current.seen_at
+            ):
+                by_handle[binding.handle] = binding
+        return list(by_handle.values())
+
+    def binding_for(self, handle: str) -> RecipientBinding | None:
+        if re.fullmatch(r"[0-9a-f]{64}", handle) is None:
+            return None
+        for binding in self.bindings():
+            if binding.handle == handle:
+                return binding
+        return None
+
+    def record(self, handle: str, address: str, generation: str) -> None:
+        """Bind one handle to the single endpoint that verifiably presented it."""
+        self.record_observations({handle: {address: generation}})
+
+    def record_observations(self, observations: dict[str, dict[str, str]]) -> None:
+        """Replace the endpoint map for each observed handle in one locked write."""
+        clean: dict[str, dict[str, str]] = {}
+        for handle, endpoints in observations.items():
+            if (
+                re.fullmatch(r"[0-9a-f]{64}", handle) is None
+                or not endpoints
+                or len(endpoints) > 16
+            ):
+                fail("recipient binding is invalid")
+            checked: dict[str, str] = {}
+            for address, generation in endpoints.items():
+                if not isinstance(address, str) or not 0 < len(address) <= (
+                    RECIPIENT_ADDRESS_LIMIT
+                ):
+                    fail("recipient binding is invalid")
+                checked[address] = valid_uuid(generation, "bound generation")
+            clean[handle] = checked
+        if not clean:
+            return
+        with state_lock(self.root, "recipients"):
+            by_handle = {item.handle: item for item in self.bindings()}
+            now = utc_now()
+            for handle, endpoints in clean.items():
+                by_handle[handle] = RecipientBinding(
+                    handle=handle, endpoints=endpoints, seen_at=now
+                )
+            cutoff = datetime.now(UTC) - timedelta(seconds=RECIPIENT_BINDING_TTL_SECONDS)
+            retained = sorted(
+                (
+                    binding
+                    for binding in by_handle.values()
+                    if _parse_timestamp(binding.seen_at) >= cutoff
+                ),
+                key=lambda binding: _parse_timestamp(binding.seen_at),
+                reverse=True,
+            )[:RECIPIENT_BINDING_LIMIT]
+            atomic_json(self.path, [binding.to_dict() for binding in retained])
 
 
 def authenticate_sender(
