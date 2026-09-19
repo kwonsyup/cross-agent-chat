@@ -24,15 +24,19 @@ from cross_agent_chat.claude_runtime import (
     DISCOVERY_TIMEOUT_SECONDS,
     SEND_SUMMARY,
     SEND_TIMEOUT_SECONDS,
+    SENDMESSAGE_RECEIPT_AUTHORITY_KEYS,
     ClaudeSendMessageRefused,
     ClaudeSendMessageUnknownDelivery,
     ClaudeUnknownPhase,
+    _listing_target_refs,
+    _parse_targeted_claude_agents,
     _pretool_denial,
     _pretool_resolution,
     _tool_records,
     authoritative_tool_input,
     claude_binary,
     courier_environment,
+    discover_target_ref,
     gate_consumed,
     parse_claude_agents,
     parse_sendmessage_receipt,
@@ -1173,8 +1177,18 @@ def test_sendmessage_receipt_requires_exact_success_contract() -> None:
         parse_sendmessage_receipt(rejected)
 
     result["is_error"] = False
+    # Additive provider metadata is tolerated on a success receipt: the result
+    # object is additive by design (the provider strips only `display` and
+    # `inlineHandback`), and sibling send paths already emit extra keys.
     text_block["text"] = json.dumps(
         {"success": True, "message": "sent", "msg_id": message_id, "latency_ms": 3}
+    )
+    accepted = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+    assert parse_sendmessage_receipt(accepted) == message_id
+    # An authority-bearing extra key re-decides the outcome, so it stays
+    # unknown instead of being read as decoration.
+    text_block["text"] = json.dumps(
+        {"success": True, "message": "sent", "msg_id": message_id, "status": "queued"}
     )
     rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="receipt"):
@@ -2059,3 +2073,349 @@ def test_pretool_gate_denies_an_expectation_over_the_product_message_bound() -> 
 
     assert phase == "sendmessage_payload_mismatch"
     assert arguments is None
+
+
+def _agents_listing_record(listing: str) -> str:
+    """One stream-json record carrying a ListAgents tool_use_result."""
+    return json.dumps({"tool_use_result": {"listing": listing}})
+
+
+def _run_target_discovery(monkeypatch: pytest.MonkeyPatch, listing: str) -> None:
+    from cross_agent_chat import claude_runtime
+
+    monkeypatch.setattr(claude_runtime, "claude_binary", lambda: Path("/opt/claude"))
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, _agents_listing_record(listing), ""
+        ),
+    )
+
+
+def test_listing_target_refs_pins_the_exact_row_shape() -> None:
+    # Measured on Claude Code 2.1.274 and re-confirmed from the listing
+    # builder embedded in the installed 2.1.278 binary: two leading spaces,
+    # the printable `name [ref]` address, then `  ·  ` columns led by the
+    # kind. This text form is the only documented SendMessage address for a
+    # cross-session peer ("the name IS the address; there is no separate
+    # address syntax" -- the provider's own tool description).
+    assert _listing_target_refs("  API work [a1b2c3]  ·  interactive  ·  idle", "API work") == [
+        "API work [a1b2c3]"
+    ]
+    assert _listing_target_refs("  API work [a1b2c3]  ·  bg  ·  busy", "API work") == [
+        "API work [a1b2c3]"
+    ]
+
+
+def test_listing_target_refs_ignores_extra_unknown_columns() -> None:
+    # The provider appends columns over time; they cannot change the selected
+    # identity. A row carrying only the kind column is also inside the shape.
+    listing = (
+        "  API work [a1b2c3]  ·  interactive  ·  idle  ·  tmux main"
+        '  ·  started 3m ago  ·  future {"json": 1} column\n'
+        "  API work [a1b2c3]  ·  interactive"
+    )
+    assert _listing_target_refs(listing, "API work") == [
+        "API work [a1b2c3]",
+        "API work [a1b2c3]",
+    ]
+
+
+def test_listing_target_refs_reports_every_live_namesake_row() -> None:
+    # Two live rows sharing one name are ambiguous, not a first-match win.
+    listing = "  API work [a1b2c3]  ·  interactive  ·  idle\n  API work [d4e5f6]  ·  bg  ·  busy"
+    assert _listing_target_refs(listing, "API work") == [
+        "API work [a1b2c3]",
+        "API work [d4e5f6]",
+    ]
+
+
+@pytest.mark.parametrize(
+    "neighbor",
+    [
+        pytest.param("  API work [d4e5f6]  ·  stopped  ·  gone", id="stale-kind"),
+        pytest.param("  API work  ·  interactive  ·  idle", id="no-ref"),
+        pytest.param("  API work [d4e5f]  ·  interactive  ·  idle", id="short-token"),
+        pytest.param("  API work [d4e5f67]  ·  interactive  ·  idle", id="long-token"),
+        pytest.param("API work [d4e5f6]  ·  interactive  ·  idle", id="no-indent"),
+        pytest.param("   API work [d4e5f6]  ·  interactive  ·  idle", id="wide-indent"),
+        pytest.param("  API work [d4e5f6] · interactive · idle", id="wrong-separator"),
+        pytest.param("  Other work [d4e5f6]  ·  interactive  ·  idle", id="other-name"),
+    ],
+)
+def test_listing_target_refs_skips_nonconforming_namesakes(neighbor: str) -> None:
+    # A namesake row outside the measured shape never competes with the exact
+    # live row, and never fails the targeted lookup: it is skipped, not
+    # approximated.
+    listing = f"  API work [a1b2c3]  ·  interactive  ·  idle\n{neighbor}"
+    assert _listing_target_refs(listing, "API work") == ["API work [a1b2c3]"]
+
+
+def test_listing_target_refs_counts_a_trailing_space_namesake_as_ambiguous() -> None:
+    # A trailing space still fits the measured row shape, so the row counts as
+    # a live namesake and discovery fails as ambiguous rather than risk the
+    # wrong target.
+    listing = (
+        "  API work [a1b2c3]  ·  interactive  ·  idle\n"
+        "  API work [d4e5f6]  ·  interactive  ·  idle "
+    )
+    assert _listing_target_refs(listing, "API work") == [
+        "API work [a1b2c3]",
+        "API work [d4e5f6]",
+    ]
+
+
+def test_discover_target_ref_rejects_live_namesakes(monkeypatch: pytest.MonkeyPatch) -> None:
+    _run_target_discovery(
+        monkeypatch,
+        "  API work [a1b2c3]  ·  interactive  ·  idle\n"
+        "  API work [d4e5f6]  ·  interactive  ·  busy",
+    )
+    with pytest.raises(ChatError, match="exact supported match"):
+        discover_target_ref("API work")
+
+
+def test_discover_target_ref_skips_stale_and_malformed_neighbors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _run_target_discovery(
+        monkeypatch,
+        "Sessions you can message:\n"
+        "  API work [d4e5f6]  ·  stopped  ·  gone\n"
+        "  API work [a1b2c3]  ·  interactive  ·  idle  ·  tmux main\n"
+        "  Other work [ffffff]  ·  bg  ·  busy",
+    )
+    assert discover_target_ref("API work") == "API work [a1b2c3]"
+
+
+def test_targeted_claude_agents_selects_the_exact_session_over_a_namesake(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    payload = json.dumps(
+        [
+            {
+                "sessionId": session_id,
+                "name": "API work",
+                "kind": "interactive",
+                "cwd": str(tmp_path),
+            },
+            {
+                "sessionId": str(uuid4()),
+                "name": "API work",
+                "kind": "interactive",
+                "cwd": str(tmp_path),
+            },
+        ]
+    )
+    assert _parse_targeted_claude_agents(payload, session_id) == [
+        {
+            "session_id": session_id,
+            "name": "API work",
+            "kind": "interactive",
+            "cwd": str(tmp_path.resolve()),
+        }
+    ]
+
+
+def test_targeted_claude_agents_skips_malformed_neighbors(tmp_path: Path) -> None:
+    session_id = str(uuid4())
+    payload = json.dumps(
+        [
+            "not a dict",
+            {"noSessionId": "unrelated"},
+            {"sessionId": 7},
+            {"sessionId": str(uuid4()), "name": "Other work"},
+            {
+                "sessionId": session_id,
+                "name": "API work",
+                "kind": "interactive",
+                "cwd": str(tmp_path),
+            },
+        ]
+    )
+    assert _parse_targeted_claude_agents(payload, session_id) == [
+        {
+            "session_id": session_id,
+            "name": "API work",
+            "kind": "interactive",
+            "cwd": str(tmp_path.resolve()),
+        }
+    ]
+
+
+def test_targeted_claude_agents_ignores_unknown_fields_on_the_selected_row(
+    tmp_path: Path,
+) -> None:
+    # The provider adds fields over time (status, pid, startedAt); they must
+    # not change the selected identity.
+    session_id = str(uuid4())
+    payload = json.dumps(
+        [
+            {
+                "sessionId": session_id,
+                "name": "API work",
+                "kind": "interactive",
+                "cwd": str(tmp_path),
+                "status": "busy",
+                "pid": 1234,
+                "startedAt": 1789839828243,
+                "future": {"nested": ["unknown", 1]},
+            }
+        ]
+    )
+    assert _parse_targeted_claude_agents(payload, session_id) == [
+        {
+            "session_id": session_id,
+            "name": "API work",
+            "kind": "interactive",
+            "cwd": str(tmp_path.resolve()),
+        }
+    ]
+
+
+def test_targeted_claude_agents_rejects_a_malformed_selected_row(tmp_path: Path) -> None:
+    # A row matching the requested session id but missing a required field is
+    # not skipped like a neighbor: the selected identity itself is unusable,
+    # so the lookup fails rather than guess.
+    session_id = str(uuid4())
+    payload = json.dumps([{"sessionId": session_id, "kind": "interactive", "cwd": str(tmp_path)}])
+    with pytest.raises(ChatError, match="invalid"):
+        _parse_targeted_claude_agents(payload, session_id)
+
+
+def _sendmessage_result_stream(result: object) -> str:
+    """Provider stream logging one SendMessage use plus one JSON result text."""
+    use = {
+        "type": "tool_use",
+        "id": "tool-1",
+        "name": "SendMessage",
+        "input": authoritative_tool_input(
+            COURIER_PLACEHOLDER_TARGET, COURIER_PLACEHOLDER_MESSAGE, SEND_SUMMARY
+        ),
+    }
+    block = {
+        "type": "tool_result",
+        "tool_use_id": "tool-1",
+        "content": [{"type": "text", "text": json.dumps(result)}],
+    }
+    return "\n".join(json.dumps({"message": {"content": [b]}}) for b in (use, block))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param(
+            {"routing": {"sender": "cross-agent-chat", "target": "@API work"}},
+            id="routing-object",
+        ),
+        pytest.param(
+            {"pin": {"name": "API work", "id": str(uuid4()), "ref": "a1b2c3"}},
+            id="pin-object",
+        ),
+        pytest.param({"msgV": 1}, id="message-version"),
+        pytest.param({"latency_ms": 3}, id="latency"),
+        pytest.param({"detail": None}, id="null-detail"),
+        pytest.param({"resumedMessageCount": 0}, id="resumed-count"),
+    ],
+)
+def test_sendmessage_receipt_tolerates_additive_nonauthority_metadata(
+    extra: dict[str, object],
+) -> None:
+    """A success receipt is decided by success+msg_id, not by key count.
+
+    Fails on the pre-extension exact-key contract. The provider's result
+    object is additive by design -- it strips only `display`/`inlineHandback`
+    before serializing -- and the installed Claude Code 2.1.278 already emits
+    extra keys such as `routing` and `pin` on sibling send paths.
+    """
+    message_id = str(uuid4())
+    receipt = {"success": True, "message": "sent", "msg_id": message_id, **extra}
+
+    assert parse_sendmessage_receipt(_sendmessage_result_stream(receipt)) == message_id
+
+
+@pytest.mark.parametrize("authority_key", sorted(SENDMESSAGE_RECEIPT_AUTHORITY_KEYS))
+def test_sendmessage_receipt_rejects_authority_bearing_metadata(authority_key: str) -> None:
+    # A key that could carry the verdict or the target identity is never
+    # decoration: its presence leaves the outcome unknown, whatever its value.
+    message_id = str(uuid4())
+    receipt = {
+        "success": True,
+        "message": "sent",
+        "msg_id": message_id,
+        authority_key: "unexpected",
+    }
+
+    with pytest.raises(ChatError, match="receipt"):
+        parse_sendmessage_receipt(_sendmessage_result_stream(receipt))
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        pytest.param({"success": True, "message": "sent"}, id="missing-msg-id"),
+        pytest.param({"success": True, "msg_id": "ID"}, id="missing-message"),
+        pytest.param({"success": True, "message": "sent", "msg_id": ""}, id="empty-msg-id"),
+        pytest.param({"success": True, "message": "sent", "msg_id": 7}, id="nonstring-msg-id"),
+        pytest.param({"success": True, "message": 7, "msg_id": "ID"}, id="nonstring-message"),
+        pytest.param(
+            {"success": "yes", "message": "sent", "msg_id": "ID"},
+            id="nonboolean-success",
+        ),
+    ],
+)
+def test_sendmessage_receipt_rejects_incomplete_or_mistyped_contracts(
+    receipt: dict[str, object],
+) -> None:
+    message_id = str(uuid4())
+    shaped = {key: (message_id if value == "ID" else value) for key, value in receipt.items()}
+
+    with pytest.raises(ChatError, match="receipt"):
+        parse_sendmessage_receipt(_sendmessage_result_stream(shaped))
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        pytest.param({"success": False, "message": "gone", "routing": {}}, id="additive-refusal"),
+        pytest.param(
+            {"success": False, "message": "gone", "request_id": "r1"},
+            id="protocol-refusal",
+        ),
+        pytest.param(
+            {"success": False, "message": "gone", "status": "refused"},
+            id="authority-refusal",
+        ),
+    ],
+)
+def test_sendmessage_receipt_keeps_a_noncanonical_refusal_unknown(
+    receipt: dict[str, object],
+) -> None:
+    # The decided refusal contract is exactly {success, message} -- the shape
+    # observed on Claude Code 2.1.274 and still emitted by 2.1.278. A refusal
+    # carrying anything else is not that contract and stays unknown.
+    with pytest.raises(ChatError) as caught:
+        parse_sendmessage_receipt(_sendmessage_result_stream(receipt))
+
+    assert not isinstance(caught.value, ClaudeSendMessageRefused)
+
+
+def test_sendmessage_helper_timeout_is_body_free_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
+    )
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(command, SEND_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr("cross_agent_chat.claude_runtime.subprocess.run", run)
+    body = "private body that must not be echoed"
+    with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
+        sendmessage("API work [ABC123]", body, Path("/usr/bin/false"))
+
+    assert error.value.phase == "helper_timeout"
+    assert body not in str(error.value)
