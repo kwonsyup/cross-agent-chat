@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import select
 import socket
 import threading
@@ -112,31 +113,19 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
             "version": __version__,
             "module_path": str(Path(__file__).resolve()),
         }
-    if operation == "peers" and set(request) == {"schema_version", "operation"}:
-        if request.get("schema_version") != SCHEMA_VERSION:
-            raise ChatError("Tailnet broker request is invalid")
-        valid_tailnet_address(peer_address)
-        return peers(root, include_remote=False, internal=True, include_devin=False)
-    if operation == "peers" and set(request) == {
-        "schema_version",
-        "operation",
-        "include_devin",
-    }:
+    if operation == "peers":
+        include_flags = {"include_delivery_mode", "include_title", "include_devin"}
+        optional = set(request) - {"schema_version", "operation"}
+        handle = request.get("handle")
         if (
-            request.get("schema_version") != SCHEMA_VERSION
-            or request.get("include_devin") is not True
-        ):
-            raise ChatError("Tailnet broker request is invalid")
-        valid_tailnet_address(peer_address)
-        return peers(root, include_remote=False, internal=True, include_devin=True)
-    if operation == "peers" and set(request) == {
-        "schema_version",
-        "operation",
-        "include_delivery_mode",
-    }:
-        if (
-            request.get("schema_version") != SCHEMA_VERSION
-            or request.get("include_delivery_mode") is not True
+            not optional <= (include_flags | {"handle"})
+            or ("include_title" in optional and "include_delivery_mode" not in optional)
+            or request.get("schema_version") != SCHEMA_VERSION
+            or any(request.get(key) is not True for key in optional & include_flags)
+            or (
+                "handle" in optional
+                and (not isinstance(handle, str) or re.fullmatch(r"[0-9a-f]{64}", handle) is None)
+            )
         ):
             raise ChatError("Tailnet broker request is invalid")
         valid_tailnet_address(peer_address)
@@ -144,72 +133,10 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
             root,
             include_remote=False,
             internal=True,
-            include_delivery_mode=True,
-            include_devin=False,
-        )
-    if operation == "peers" and set(request) == {
-        "schema_version",
-        "operation",
-        "include_delivery_mode",
-        "include_devin",
-    }:
-        if (
-            request.get("schema_version") != SCHEMA_VERSION
-            or request.get("include_delivery_mode") is not True
-            or request.get("include_devin") is not True
-        ):
-            raise ChatError("Tailnet broker request is invalid")
-        valid_tailnet_address(peer_address)
-        return peers(
-            root,
-            include_remote=False,
-            internal=True,
-            include_delivery_mode=True,
-            include_devin=True,
-        )
-    if operation == "peers" and set(request) == {
-        "schema_version",
-        "operation",
-        "include_delivery_mode",
-        "include_title",
-    }:
-        if (
-            request.get("schema_version") != SCHEMA_VERSION
-            or request.get("include_delivery_mode") is not True
-            or request.get("include_title") is not True
-        ):
-            raise ChatError("Tailnet broker request is invalid")
-        valid_tailnet_address(peer_address)
-        return peers(
-            root,
-            include_remote=False,
-            internal=True,
-            include_delivery_mode=True,
-            include_title=True,
-            include_devin=False,
-        )
-    if operation == "peers" and set(request) == {
-        "schema_version",
-        "operation",
-        "include_delivery_mode",
-        "include_title",
-        "include_devin",
-    }:
-        if (
-            request.get("schema_version") != SCHEMA_VERSION
-            or request.get("include_delivery_mode") is not True
-            or request.get("include_title") is not True
-            or request.get("include_devin") is not True
-        ):
-            raise ChatError("Tailnet broker request is invalid")
-        valid_tailnet_address(peer_address)
-        return peers(
-            root,
-            include_remote=False,
-            internal=True,
-            include_delivery_mode=True,
-            include_title=True,
-            include_devin=True,
+            include_delivery_mode="include_delivery_mode" in optional,
+            include_title="include_title" in optional,
+            include_devin="include_devin" in optional,
+            handle=cast(str | None, handle if "handle" in optional else None),
         )
     authorization_fields = {
         "schema_version",

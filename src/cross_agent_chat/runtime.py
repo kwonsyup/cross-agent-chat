@@ -1475,11 +1475,12 @@ def _local_target_before_deadline(root: Path, route: Route, deadline: float) -> 
     return _local_target(root, route, timeout=min(HEALTH_TIMEOUT_SECONDS, remaining))
 
 
-def local_targets(root: Path) -> list[Target]:
+def local_targets(root: Path, *, handle: str | None = None) -> list[Target]:
     routes = [
         route
         for route in Registry(root).routes()
-        if route.process_is_live()
+        if (handle is None or session_key(route.provider, route.session_id) == handle)
+        and route.process_is_live()
         and route.cwd_is_available()
         and not NativeHelperStore(root).is_helper_lineage(route)
     ]
@@ -1651,11 +1652,19 @@ def _remote_node_targets(
     include_delivery_mode: bool = False,
     include_title: bool = False,
     include_devin: bool = False,
+    handle: str | None = None,
 ) -> tuple[list[Target], bool]:
     if deadline is None:
         deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
     legacy: dict[str, object] = {"schema_version": SCHEMA_VERSION, "operation": "peers"}
     variants: list[tuple[dict[str, object], bool]] = []
+    if handle is not None:
+        bound: dict[str, object] = {**legacy, "handle": handle}
+        if include_delivery_mode:
+            bound["include_delivery_mode"] = True
+        if include_devin:
+            bound["include_devin"] = True
+        variants.append((bound, include_delivery_mode))
     if include_delivery_mode and include_devin:
         variants.append(({**legacy, "include_delivery_mode": True, "include_devin": True}, True))
     if include_delivery_mode:
@@ -1696,6 +1705,8 @@ def _remote_node_targets(
         }
         if include_devin:
             rich_payload["include_devin"] = True
+        if handle is not None:
+            rich_payload["handle"] = handle
         raw = request_tailnet(
             address,
             rich_payload,
@@ -1724,7 +1735,11 @@ def _remote_node_targets(
 
 
 def _remote_discovery(
-    *, include_delivery_mode: bool = False, include_title: bool = False, include_devin: bool = True
+    *,
+    include_delivery_mode: bool = False,
+    include_title: bool = False,
+    include_devin: bool = True,
+    handle: str | None = None,
 ) -> tuple[list[Target], bool]:
     addresses = tailnet_nodes()
     if not addresses:
@@ -1734,17 +1749,14 @@ def _remote_discovery(
     deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
     workers = ThreadPoolExecutor(max_workers=min(16, len(addresses)))
     futures = [
-        (
-            workers.submit(
-                _remote_node_targets,
-                address,
-                deadline,
-                include_delivery_mode=include_delivery_mode,
-                include_title=include_title,
-                include_devin=include_devin,
-            )
-            if include_delivery_mode or include_title or include_devin
-            else workers.submit(_remote_node_targets, address, deadline)
+        workers.submit(
+            _remote_node_targets,
+            address,
+            deadline,
+            include_delivery_mode=include_delivery_mode,
+            include_title=include_title,
+            include_devin=include_devin,
+            handle=handle,
         )
         for address in addresses
     ]
@@ -2025,7 +2037,9 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
     if len(exact_local_handles) == 1:
         target = exact_local_handles[0]
         return _send_local_target(root, source, target, message, deadline=deadline)
-    remote, remote_complete = _remote_discovery()
+    remote, remote_complete = _remote_discovery(
+        handle=target_query if re.fullmatch(r"[0-9a-f]{64}", target_query) else None
+    )
     exact_remote_handles = [target for target in remote if target.session_key == target_query]
     if len(exact_remote_handles) == 1:
         target = exact_remote_handles[0]
@@ -2290,6 +2304,7 @@ def peers(
     include_delivery_mode: bool = False,
     include_title: bool = False,
     include_devin: bool = True,
+    handle: str | None = None,
 ) -> dict[str, object]:
     display_titles = not internal or include_title
     deadline = time.monotonic() + (
@@ -2297,17 +2312,18 @@ def peers(
     )
     if include_remote:
         with ThreadPoolExecutor(max_workers=2) as workers:
-            local = workers.submit(local_targets, root)
+            local = workers.submit(local_targets, root, handle=handle)
             remote = workers.submit(
                 _remote_discovery,
                 include_delivery_mode=include_delivery_mode,
                 include_title=display_titles,
+                handle=handle,
             )
             remote_targets, remote_complete = remote.result()
             targets = [*local.result(), *remote_targets]
         remote_discovery = "complete" if remote_complete else "incomplete"
     else:
-        targets = local_targets(root)
+        targets = local_targets(root, handle=handle)
         remote_discovery = "not_requested"
     if not include_devin:
         targets = [target for target in targets if target.provider != "devin"]
