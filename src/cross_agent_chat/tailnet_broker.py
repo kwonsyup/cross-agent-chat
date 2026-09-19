@@ -260,6 +260,18 @@ def serve_broker_connection(root: Path, connection: socket.socket, peer_address:
     emit_frame_safely(connection, handle_broker_request(root, raw, peer_address))
 
 
+def probe_broker_connection(root: Path, connection: socket.socket, peer_address: str) -> None:
+    """Answer one overflowed connection only when it is a reverse authorization."""
+    connection.settimeout(5.0)
+    try:
+        raw: object = json.loads(read_frame(connection))
+    except json.JSONDecodeError as error:
+        raise ChatError("Tailnet broker request is invalid") from error
+    if not isinstance(raw, dict) or raw.get("operation") != "authorize":
+        raise ChatError("Tailnet broker request is invalid")
+    emit_frame_safely(connection, handle_broker_request(root, raw, peer_address))
+
+
 def _serve_and_close(
     root: Path,
     connection: socket.socket,
@@ -275,19 +287,50 @@ def _serve_and_close(
             admission.release(peer_address)
 
 
+def _probe_and_close(
+    root: Path,
+    connection: socket.socket,
+    peer_address: str,
+    admission: BrokerAdmission,
+) -> None:
+    with connection:
+        try:
+            probe_broker_connection(root, connection, peer_address)
+        except (ChatError, OSError):
+            return
+        finally:
+            admission.release(peer_address)
+
+
 def dispatch_broker_connection(
     workers: Executor,
     root: Path,
     connection: socket.socket,
     peer_address: str,
     admission: BrokerAdmission,
+    callbacks: tuple[Executor, BrokerAdmission] | None = None,
 ) -> bool:
     """Give each accepted connection an independent bounded worker."""
-    if not admission.acquire(peer_address):
-        connection.close()
-        return False
-    workers.submit(_serve_and_close, root, connection, peer_address, admission)
-    return True
+    if admission.acquire(peer_address):
+        workers.submit(_serve_and_close, root, connection, peer_address, admission)
+        return True
+    # A receive handler holds its admission while it waits on a reverse
+    # authorization callback to the sender's broker, and that callback needs
+    # admission of its own there. When reciprocal traffic fills a peer budget
+    # with receive handlers, the callbacks they wait on are refused and every
+    # admitted send dies as an unknown outcome. Overflow connections therefore
+    # get one bounded reserve lane that serves only authorize requests, so a
+    # completion callback always reaches a worker while every other operation
+    # keeps the same truthful rejection it had before.
+    if callbacks is not None:
+        callback_workers, callback_admission = callbacks
+        if callback_admission.acquire(peer_address):
+            callback_workers.submit(
+                _probe_and_close, root, connection, peer_address, callback_admission
+            )
+            return True
+    connection.close()
+    return False
 
 
 def dispatch_ready_brokers(
@@ -295,6 +338,7 @@ def dispatch_ready_brokers(
     root: Path,
     readable: list[socket.socket],
     admission: BrokerAdmission,
+    callbacks: tuple[Executor, BrokerAdmission] | None = None,
 ) -> int:
     """Accept each ready listener without letting one vanished connection stall the broker."""
     dispatched = 0
@@ -309,6 +353,7 @@ def dispatch_ready_brokers(
             connection,
             cast(tuple[str, int], peer)[0],
             admission,
+            callbacks,
         ):
             dispatched += 1
     return dispatched
@@ -326,11 +371,16 @@ def broker_server(state_root_value: str | None) -> None:
         tailnet_binding: tuple[str, int] | None = None
         tailnet_server: socket.socket | None = None
         admission = BrokerAdmission()
+        callback_admission = BrokerAdmission()
         with (
             ThreadPoolExecutor(
                 max_workers=MAX_BROKER_CONNECTIONS,
                 thread_name_prefix="cross-agent-chat",
             ) as workers,
+            ThreadPoolExecutor(
+                max_workers=MAX_BROKER_CONNECTIONS,
+                thread_name_prefix="cross-agent-chat-callback",
+            ) as callback_workers,
             ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix="cross-agent-chat-refresh",
@@ -369,7 +419,13 @@ def broker_server(state_root_value: str | None) -> None:
                     timeout = max(0.0, next_refresh_at - time.monotonic())
                 selectable_servers = [local_server] if refresh is not None else servers
                 readable, _, _ = select.select(selectable_servers, [], [], timeout)
-                dispatch_ready_brokers(workers, root, readable, admission)
+                dispatch_ready_brokers(
+                    workers,
+                    root,
+                    readable,
+                    admission,
+                    (callback_workers, callback_admission),
+                )
     finally:
         for server in servers:
             server.close()
