@@ -101,44 +101,6 @@ COURIER_PLACEHOLDER_MESSAGE: Final = "placeholder"
 SENDMESSAGE_TOOL_INPUT_KEYS: Final = frozenset(
     {"to", "recipient", "message", "content", "type", "summary"}
 )
-# Receipt keys that would re-decide the outcome if present. The SendMessage
-# result object is additive by design: the provider strips only `display` and
-# `inlineHandback` before serializing it, and in Claude Code 2.1.278 sibling
-# send paths already emit extra keys such as `routing`, `pin`, `request_id`,
-# `target`, and `resumedAgentId`. Extra metadata that cannot carry the verdict
-# or the target identity is therefore tolerated on a success receipt; a key
-# from this set always could -- or should never reach the serialized result at
-# all, like the stripped display fields -- so its presence leaves the outcome
-# UNKNOWN rather than read as incidental decoration.
-SENDMESSAGE_RECEIPT_AUTHORITY_KEYS: Final = frozenset(
-    {
-        "error",
-        "errorClass",
-        "error_class",
-        "failure",
-        "denied",
-        "refused",
-        "rejected",
-        "status",
-        "state",
-        "delivered",
-        "degradedClass",
-        "degraded_class",
-        "queued",
-        "recipient",
-        "target",
-        "to",
-        "session_id",
-        "sessionId",
-        "agent_id",
-        "agentId",
-        "id",
-        "message_id",
-        "request_id",
-        "display",
-        "inlineHandback",
-    }
-)
 SUMMARY_REJECT_RE: Final = re.compile(r"[\x00-\x08\x0a-\x0d\x0e-\x1f\x7f-\x9f\u2028\u2029]")
 ClaudeUnknownPhase = Literal[
     "pretool_gate_unobserved",
@@ -585,9 +547,9 @@ def parse_sendmessage_receipt(text: str) -> str:
     the delivered payload and is deliberately not compared here. Exact target
     and content are guaranteed upstream by ``authoritative_tool_input``; what
     remains to establish is that exactly one SendMessage ran and the provider
-    accepted it. A success receipt carries the required keys plus any additive
-    metadata the provider attaches; only keys that could carry the verdict or
-    the target identity are rejected as unknown.
+    accepted it. The receipt is the only evidence of delivery, and an unknown
+    field may contradict it, so the accepted key set is exact rather than
+    additive.
     """
     try:
         uses, results = _tool_records(text)
@@ -624,17 +586,16 @@ def parse_sendmessage_receipt(text: str) -> str:
             # a decided refusal before any effect, and reporting it as uncertain
             # would freeze an event that provably delivered nothing. The narrow
             # two-key refusal is the shape observed live on Claude Code 2.1.274
-            # and is the refusal shape its 2.1.278 build still emits; a refusal
-            # carrying any extra key is not this contract and stays unknown.
+            # and still emitted by the 2.1.278 live gate on 19 Sep 2026; a
+            # refusal carrying any extra key is not this contract and stays
+            # unknown.
             raise ClaudeSendMessageRefused(reason)
     if (
         not isinstance(result, dict)
-        or not {"success", "message", "msg_id"} <= set(result)
-        or set(result) & SENDMESSAGE_RECEIPT_AUTHORITY_KEYS
+        or set(result) != {"success", "message", "msg_id"}
         or result.get("success") is not True
         or not isinstance(result.get("message"), str)
         or not isinstance(result.get("msg_id"), str)
-        or result.get("msg_id") == ""
     ):
         raise ChatError("Claude SendMessage receipt is invalid")
     return valid_uuid(cast(str, result["msg_id"]), "courier message id")
