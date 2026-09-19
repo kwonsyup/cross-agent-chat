@@ -86,6 +86,39 @@ def route(
     )
 
 
+def wait_for_courier_socket(path: Path, timeout: float = 2.0) -> None:
+    """Wait until a courier socket is usable, not merely present.
+
+    The path exists between bind() and the 0600 chmod; require_socket rightly
+    rejects that transient state, so existence alone is not a readiness signal.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            time.sleep(0.01)
+            continue
+        if (
+            stat.S_ISSOCK(metadata.st_mode)
+            and metadata.st_uid == os.getuid()
+            and stat.S_IMODE(metadata.st_mode) == 0o600
+        ):
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.1)
+            try:
+                probe.connect(str(path))
+            except OSError:
+                pass
+            else:
+                return
+            finally:
+                probe.close()
+        time.sleep(0.01)
+    else:
+        pytest.fail("courier socket did not become safely ready")
+
+
 def test_codex_alias_distinguishes_sessions_in_one_project(tmp_path: Path) -> None:
     first = route(tmp_path)
     second = route(tmp_path)
@@ -1685,10 +1718,7 @@ def test_claude_bootstrap_survives_delayed_native_health_without_claiming_a_peer
     )
     worker.start()
     path = socket_path(root, item)
-    deadline = time.monotonic() + 2.0
-    while not path.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert path.exists()
+    wait_for_courier_socket(path)
     try:
         bootstrap = request_socket(
             path,
@@ -1783,10 +1813,7 @@ def test_initial_bootstrap_follows_prebootstrap_health_without_native_lookup(
     )
     worker.start()
     path = socket_path(root, item)
-    deadline = time.monotonic() + 2.0
-    while not path.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert path.exists()
+    wait_for_courier_socket(path)
     health = threading.Thread(target=health_before_bootstrap, daemon=True)
     health.start()
     try:
@@ -1846,31 +1873,7 @@ def test_prebootstrap_accept_is_rejected_before_native_delivery(
     )
     worker.start()
     path = socket_path(root, item)
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        try:
-            metadata = path.lstat()
-        except FileNotFoundError:
-            time.sleep(0.01)
-            continue
-        if (
-            stat.S_ISSOCK(metadata.st_mode)
-            and metadata.st_uid == os.getuid()
-            and stat.S_IMODE(metadata.st_mode) == 0o600
-        ):
-            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            probe.settimeout(0.1)
-            try:
-                probe.connect(str(path))
-            except OSError:
-                pass
-            else:
-                break
-            finally:
-                probe.close()
-        time.sleep(0.01)
-    else:
-        pytest.fail("courier socket did not become safely ready")
+    wait_for_courier_socket(path)
     event_id = str(uuid4())
     try:
         assert request_socket(
@@ -1929,10 +1932,8 @@ def test_incomplete_prebootstrap_frame_cannot_delay_initial_bootstrap(
     )
     worker.start()
     path = socket_path(root, item)
+    wait_for_courier_socket(path)
     deadline = time.monotonic() + 2.0
-    while not path.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert path.exists()
     partial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     while True:
         try:

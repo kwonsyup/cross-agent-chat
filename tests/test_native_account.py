@@ -4,6 +4,8 @@ import hashlib
 import json
 import sys
 import textwrap
+import time
+from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
@@ -21,6 +23,27 @@ ACCOUNT_DIGEST = hashlib.sha256(
 ).hexdigest()
 
 
+def fake_server_clock(ready: Path, anchor: float) -> Callable[[], float]:
+    """Hold the metadata clock at `anchor` until the fake provider is ready.
+
+    The app-server subprocess can take seconds to exec under host load; the
+    protocol deadline must only measure the exchange that runs after the fake
+    has actually started.
+    """
+    real_monotonic = time.monotonic
+    observed: list[float] = []
+
+    def clock() -> float:
+        now = real_monotonic()
+        if not observed:
+            if not ready.exists():
+                return anchor
+            observed.append(now)
+        return anchor + (now - observed[0])
+
+    return clock
+
+
 def fake_codex_binary(tmp_path: Path, mode: str = "valid") -> tuple[Path, Path, Path]:
     home = tmp_path / "codex-home"
     home.mkdir()
@@ -31,6 +54,8 @@ def fake_codex_binary(tmp_path: Path, mode: str = "valid") -> tuple[Path, Path, 
         + textwrap.dedent(
             """
             import json, os, sys
+            from pathlib import Path
+            Path(os.environ["TEST_READY"]).touch()
             mode = os.environ["TEST_MODE"]
             email = os.environ["TEST_EMAIL"]
             trace = open(os.environ["TEST_TRACE"], "a", encoding="utf-8")
@@ -81,9 +106,17 @@ def fake_codex_binary(tmp_path: Path, mode: str = "valid") -> tuple[Path, Path, 
 
 @pytest.mark.parametrize("mode", ["null", "api-key", "error", "wrong-home"])
 def test_native_account_digest_rejects_invalid_nested_account_read(
-    tmp_path: Path, mode: str
+    tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     binary, home, trace = fake_codex_binary(tmp_path, mode)
+    ready = tmp_path / "ready"
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.time.monotonic",
+        fake_server_clock(ready, time.monotonic()),
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.NATIVE_METADATA_TIMEOUT_SECONDS", 30.0
+    )
     with pytest.raises(ChatError) as error:
         native_account_digest(
             binary=binary,
@@ -92,6 +125,7 @@ def test_native_account_digest_rejects_invalid_nested_account_read(
                 "TEST_TRACE": str(trace),
                 "TEST_MODE": mode,
                 "TEST_EMAIL": ACCOUNT_EMAIL,
+                "TEST_READY": str(ready),
             },
         )
     assert "Codex account identity is unavailable" in str(error.value)
@@ -108,9 +142,17 @@ def test_native_account_digest_rejects_invalid_nested_account_read(
 
 
 def test_native_account_digest_reads_exact_chatgpt_account_without_refresh(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     binary, home, trace = fake_codex_binary(tmp_path)
+    ready = tmp_path / "ready"
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.time.monotonic",
+        fake_server_clock(ready, time.monotonic()),
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.NATIVE_METADATA_TIMEOUT_SECONDS", 30.0
+    )
     digest = native_account_digest(
         binary=binary,
         environment={
@@ -118,6 +160,7 @@ def test_native_account_digest_reads_exact_chatgpt_account_without_refresh(
             "TEST_TRACE": str(trace),
             "TEST_MODE": "valid",
             "TEST_EMAIL": ACCOUNT_EMAIL,
+            "TEST_READY": str(ready),
         },
     )
 
