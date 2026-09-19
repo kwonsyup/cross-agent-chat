@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -114,6 +115,7 @@ REMOTE_TIMEOUT_SECONDS: Final = (
 LOCAL_DISCOVERY_WORKERS: Final = 32
 LOCAL_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS
 NATIVE_TITLE_TIMEOUT_SECONDS: Final = 2.0
+KNOWN_HANDLE_GRACE_SECONDS: Final = 2.0
 PRESENCE_ENV_VAR: Final = "CROSS_AGENT_CHAT_PRESENCE"
 PROC_PIDTBSDINFO: Final = 3
 PROC_BSDINFO_SIZE: Final = 136
@@ -1724,7 +1726,11 @@ def _remote_node_targets(
 
 
 def _remote_discovery(
-    *, include_delivery_mode: bool = False, include_title: bool = False, include_devin: bool = True
+    *,
+    include_delivery_mode: bool = False,
+    include_title: bool = False,
+    include_devin: bool = True,
+    handle: str | None = None,
 ) -> tuple[list[Target], bool]:
     addresses = tailnet_nodes()
     if not addresses:
@@ -1748,19 +1754,56 @@ def _remote_discovery(
         )
         for address in addresses
     ]
+    pending = set(futures)
+    attested = False
     try:
-        for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
-            outcome = future.result()
-            discovered, node_complete = outcome
-            targets.extend(discovered)
-            complete = complete and node_complete
-    except FuturesTimeoutError:
-        complete = False
+        try:
+            for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
+                pending.discard(future)
+                discovered, node_complete = future.result()
+                targets.extend(discovered)
+                complete = complete and node_complete
+                if handle is not None and any(
+                    target.session_key == handle for target in discovered
+                ):
+                    attested = True
+                    break
+        except FuturesTimeoutError:
+            complete = False
+        if attested:
+            # The first attestation settles an exact handle unless a second
+            # claimant answers; unrelated nodes get a short grace to weigh in.
+            remaining = deadline - time.monotonic()
+            try:
+                for future in as_completed(
+                    pending,
+                    timeout=max(0.0, min(remaining, KNOWN_HANDLE_GRACE_SECONDS)),
+                ):
+                    pending.discard(future)
+                    discovered, node_complete = future.result()
+                    targets.extend(discovered)
+                    complete = complete and node_complete
+            except FuturesTimeoutError:
+                complete = False
     finally:
         for future in futures:
             future.cancel()
         workers.shutdown(wait=False, cancel_futures=True)
     return targets, complete
+
+
+def _remote_discovery_for_query(target_query: str) -> tuple[list[Target], bool]:
+    """Pass an exact handle to the collector only when the seam accepts one."""
+    if re.fullmatch(r"[0-9a-f]{64}", target_query) is None:
+        return _remote_discovery()
+    try:
+        accepts_handle = "handle" in inspect.signature(_remote_discovery).parameters
+    except (TypeError, ValueError):
+        accepts_handle = False
+    if not accepts_handle:
+        # Test doubles keep the historical zero-argument collector seam.
+        return _remote_discovery()
+    return _remote_discovery(handle=target_query)
 
 
 def remote_targets(
@@ -2025,7 +2068,7 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
     if len(exact_local_handles) == 1:
         target = exact_local_handles[0]
         return _send_local_target(root, source, target, message, deadline=deadline)
-    remote, remote_complete = _remote_discovery()
+    remote, remote_complete = _remote_discovery_for_query(target_query)
     exact_remote_handles = [target for target in remote if target.session_key == target_query]
     if len(exact_remote_handles) == 1:
         target = exact_remote_handles[0]

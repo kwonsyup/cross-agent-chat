@@ -1791,6 +1791,303 @@ def test_remote_send_uses_tailnet_broker_without_ssh_configuration(
     assert "hello" not in (tmp_path / "intents.json").read_text()
 
 
+def test_exact_handle_send_stops_waiting_on_silent_unrelated_peer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = "100.64.0.11"
+    silent = "100.64.0.12"
+    handle = session_key("claude", str(uuid4()))
+    peer = {
+        "alias": "claude@studio:api:api-a1",
+        "provider": "claude",
+        "device": "studio",
+        "project": "api",
+        "status": "available",
+        "generation": str(uuid4()),
+        "session_key": handle,
+    }
+    release = threading.Event()
+    delivered_at: list[float] = []
+
+    def request(
+        address: str, payload: dict[str, object], *, timeout: float = 2.0
+    ) -> dict[str, object]:
+        if payload.get("operation") == "peers":
+            if address == silent:
+                # The neighbor accepts the connection and never answers inside
+                # its request budget; release only frees the fixture worker.
+                release.wait(timeout)
+                raise ChatError("silent neighbor never answered")
+            return {"schema_version": 1, "peers": [peer]}
+        delivered_at.append(time.monotonic())
+        envelope = json.loads(str(payload["envelope"]))
+        return {
+            "schema_version": 1,
+            "event_id": envelope["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": peer["alias"],
+            "provider": "claude",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [silent, owner])
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
+    monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 8.0)
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="imac",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(source)
+
+    started = time.monotonic()
+    try:
+        result = send(tmp_path, source, handle, "hello")
+    finally:
+        release.set()
+
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+    assert result["to"] == peer["alias"]
+    # The old collector held this send for the whole 8-second discovery budget;
+    # the known-handle grace bounds the wait on the unrelated silent node.
+    assert delivered_at[0] - started < 4.0
+
+
+def test_exact_handle_duplicate_attestation_within_grace_refuses_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = "100.64.0.11"
+    clone = "100.64.0.12"
+    handle = session_key("claude", str(uuid4()))
+    generation = str(uuid4())
+    deliveries: list[dict[str, object]] = []
+
+    def peer(alias: str, device: str) -> dict[str, object]:
+        return {
+            "alias": alias,
+            "provider": "claude",
+            "device": device,
+            "project": "api",
+            "status": "available",
+            "generation": generation,
+            "session_key": handle,
+        }
+
+    def request(
+        address: str, payload: dict[str, object], *, timeout: float = 2.0
+    ) -> dict[str, object]:
+        if payload.get("operation") == "peers":
+            if address == clone:
+                # A forged or stale clone attests the same handle inside the
+                # grace window, so it still feeds duplicate detection.
+                time.sleep(0.3)
+                return {"schema_version": 1, "peers": [peer("claude@laptop:api:api-a1", "laptop")]}
+            return {"schema_version": 1, "peers": [peer("claude@studio:api:api-a1", "studio")]}
+        deliveries.append(payload)
+        envelope = json.loads(str(payload["envelope"]))
+        return {
+            "schema_version": 1,
+            "event_id": envelope["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": "claude@studio:api:api-a1",
+            "provider": "claude",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [first, clone])
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
+    monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 8.0)
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="imac",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(source)
+
+    with pytest.raises(ChatError, match="target handle is unavailable"):
+        send(tmp_path, source, handle, "hello")
+
+    assert deliveries == []
+
+
+def test_exact_handle_late_attestation_reports_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = "100.64.0.11"
+    laggard = "100.64.0.12"
+    handle = session_key("claude", str(uuid4()))
+    peer = {
+        "alias": "claude@studio:api:api-a1",
+        "provider": "claude",
+        "device": "studio",
+        "project": "api",
+        "status": "available",
+        "generation": str(uuid4()),
+        "session_key": handle,
+    }
+    release = threading.Event()
+    answered = threading.Event()
+    late_attestations: list[str] = []
+
+    def request(
+        address: str, payload: dict[str, object], *, timeout: float = 2.0
+    ) -> dict[str, object]:
+        if address == laggard:
+            # Answers only after the grace has already closed; its roster would
+            # have attested the same handle, so this is a genuine second
+            # attestation that the collector never consumed.
+            release.wait(timeout)
+            late_attestations.append(handle)
+            answered.set()
+            return {"schema_version": 1, "peers": [peer]}
+        return {"schema_version": 1, "peers": [peer]}
+
+    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [owner, laggard])
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
+    monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 8.0)
+
+    try:
+        targets, complete = runtime._remote_discovery(handle=handle)
+    finally:
+        release.set()
+
+    # Residual: a duplicate attestation landing after KNOWN_HANDLE_GRACE_SECONDS
+    # is never seen, so send() proceeds on the single in-grace attestation.
+    # complete=False is the signal that an unanswered node may still hold a
+    # claimant; the latency win trades away post-grace duplicate visibility.
+    assert complete is False
+    assert [target.session_key for target in targets] == [handle]
+    assert answered.wait(2.0)
+    assert late_attestations == [handle]
+
+
+def test_alias_send_still_waits_on_silent_unrelated_peer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = "100.64.0.11"
+    silent = "100.64.0.12"
+    target_alias = "claude@studio:api:api-a1"
+    release = threading.Event()
+
+    def request(
+        address: str, payload: dict[str, object], *, timeout: float = 2.0
+    ) -> dict[str, object]:
+        if payload.get("operation") == "peers":
+            if address == silent:
+                release.wait(timeout)
+                raise ChatError("silent neighbor never answered")
+            return {
+                "schema_version": 1,
+                "peers": [
+                    {
+                        "alias": target_alias,
+                        "provider": "claude",
+                        "device": "studio",
+                        "project": "api",
+                        "status": "available",
+                        "generation": str(uuid4()),
+                        "session_key": "a" * 64,
+                    }
+                ],
+            }
+        envelope = json.loads(str(payload["envelope"]))
+        return {
+            "schema_version": 1,
+            "event_id": envelope["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target_alias,
+            "provider": "claude",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [silent, owner])
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
+    monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 4.0)
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="imac",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(source)
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(ChatError, match="remote peer discovery is incomplete"):
+            send(tmp_path, source, target_alias, "hello")
+    finally:
+        release.set()
+
+    # Alias queries keep the old contract: a known alias match does not shorten
+    # the wait, so the silent neighbor still holds the send for the deadline.
+    assert time.monotonic() - started >= 3.5
+
+
+def test_exact_handle_send_is_refused_when_attested_generation_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = "100.64.0.11"
+    advertised = str(uuid4())
+    live = str(uuid4())
+    handle = session_key("claude", str(uuid4()))
+    peer = {
+        "alias": "claude@studio:api:api-a1",
+        "provider": "claude",
+        "device": "studio",
+        "project": "api",
+        "status": "available",
+        "generation": advertised,
+        "session_key": handle,
+    }
+    envelope_generations: list[str] = []
+
+    def request(
+        address: str, payload: dict[str, object], *, timeout: float = 2.0
+    ) -> dict[str, object]:
+        if payload.get("operation") == "peers":
+            return {"schema_version": 1, "peers": [peer]}
+        envelope = json.loads(str(payload["envelope"]))
+        envelope_generations.append(str(envelope["generation"]))
+        if envelope["generation"] != live:
+            # The broker's exact-generation gate refuses a stale attestation the
+            # same way receive_remote rejects a route that has moved on.
+            return {
+                "schema_version": 1,
+                "event_id": envelope["event_id"],
+                "status": "PRE_EFFECT_REJECTED",
+                "provider": "claude",
+                "error": "remote destination rejected before provider effect",
+            }
+        return {
+            "schema_version": 1,
+            "event_id": envelope["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": peer["alias"],
+            "provider": "claude",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [owner])
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="imac",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(source)
+
+    with pytest.raises(ChatError, match="remote target rejected the message"):
+        send(tmp_path, source, handle, "hello")
+
+    # The envelope carried the attested generation; nothing cached or skipped
+    # the broker's validation, so the stale attestation was not accepted.
+    assert envelope_generations == [advertised]
+    assert IntentStore(tmp_path).intents()[0].status == "PRE_EFFECT_REJECTED"
+
+
 def test_remote_claude_diagnostic_is_body_free_and_marks_one_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
