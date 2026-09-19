@@ -10,6 +10,7 @@ import socket
 import threading
 import time
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -17,6 +18,8 @@ from typing import cast
 from cross_agent_chat import __version__
 from cross_agent_chat.core import SCHEMA_VERSION, ChatError
 from cross_agent_chat.runtime import (
+    BROKER_CAPACITY_REFUSAL,
+    MAX_FRAME_BYTES,
     authorize_remote,
     emit_frame_safely,
     peers,
@@ -34,8 +37,10 @@ from cross_agent_chat.tailnet import (
 
 MAX_BROKER_CONNECTIONS = 16
 MAX_BROKER_CONNECTIONS_PER_PEER = 2
+MAX_BROKER_REFUSAL_WORKERS = 4
 TAILNET_BIND_RETRY_SECONDS = 5.0
 TAILNET_REFRESH_POLL_SECONDS = 0.1
+REFUSAL_WRITE_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass(slots=True)
@@ -260,15 +265,61 @@ def serve_broker_connection(root: Path, connection: socket.socket, peer_address:
     emit_frame_safely(connection, handle_broker_request(root, raw, peer_address))
 
 
+def _parse_peeked(buffered: bytes) -> dict[object, object] | None:
+    if b"\n" not in buffered or len(buffered) > MAX_FRAME_BYTES:
+        return None
+    try:
+        raw: object = json.loads(buffered.split(b"\n", 1)[0])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return cast(dict[object, object], raw) if isinstance(raw, dict) else None
+
+
+def _ready_request(connection: socket.socket) -> dict[object, object] | None:
+    """A complete request already buffered, or None while anything is undecided."""
+    try:
+        buffered = connection.recv(65536, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+    except OSError:
+        return None
+    return _parse_peeked(buffered)
+
+
+def _peeked_request(connection: socket.socket) -> dict[object, object] | None:
+    """Copy the buffered request frame without consuming it, or None if undecided."""
+    deadline = time.monotonic() + 5.0
+    buffered = b""
+    while b"\n" not in buffered and len(buffered) <= MAX_FRAME_BYTES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        connection.settimeout(remaining)
+        try:
+            buffered = connection.recv(65536, socket.MSG_PEEK)
+        except OSError:
+            return None
+        if not buffered:
+            return None
+    return _parse_peeked(buffered)
+
+
 def probe_broker_connection(root: Path, connection: socket.socket, peer_address: str) -> None:
-    """Answer one overflowed connection only when it is a reverse authorization."""
+    """Serve an overflowed authorize, refuse anything else before reading it."""
+    request = _peeked_request(connection)
+    if request is None:
+        # Undecided without consuming a byte: drop silently, as before.
+        return
+    if request.get("operation") != "authorize":
+        # The request was only peeked at, never consumed or dispatched, so the
+        # capacity refusal is truthful and cannot be confused with a response
+        # to a request that was read.
+        connection.settimeout(REFUSAL_WRITE_TIMEOUT_SECONDS)
+        emit_frame_safely(connection, BROKER_CAPACITY_REFUSAL)
+        return
     connection.settimeout(5.0)
     try:
         raw: object = json.loads(read_frame(connection))
     except json.JSONDecodeError as error:
         raise ChatError("Tailnet broker request is invalid") from error
-    if not isinstance(raw, dict) or raw.get("operation") != "authorize":
-        raise ChatError("Tailnet broker request is invalid")
     emit_frame_safely(connection, handle_broker_request(root, raw, peer_address))
 
 
@@ -302,6 +353,35 @@ def _probe_and_close(
             admission.release(peer_address)
 
 
+def _refuse_and_close(connection: socket.socket, budget: threading.BoundedSemaphore) -> None:
+    """Tell one overflowed connection it was refused, then close, bounded."""
+    try:
+        connection.settimeout(REFUSAL_WRITE_TIMEOUT_SECONDS)
+        emit_frame_safely(connection, BROKER_CAPACITY_REFUSAL)
+        # A bare close with unread request bytes can reset before the
+        # refusal arrives; the half-close orders it ahead of the FIN.
+        with suppress(OSError):
+            connection.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+    finally:
+        connection.close()
+        budget.release()
+
+
+def _refuse_overflow(
+    connection: socket.socket,
+    refusals: tuple[Executor, threading.BoundedSemaphore] | None,
+) -> bool:
+    if refusals is None:
+        return False
+    refusal_workers, refusal_budget = refusals
+    if not refusal_budget.acquire(blocking=False):
+        return False
+    refusal_workers.submit(_refuse_and_close, connection, refusal_budget)
+    return True
+
+
 def dispatch_broker_connection(
     workers: Executor,
     root: Path,
@@ -309,11 +389,21 @@ def dispatch_broker_connection(
     peer_address: str,
     admission: BrokerAdmission,
     callbacks: tuple[Executor, BrokerAdmission] | None = None,
+    refusals: tuple[Executor, threading.BoundedSemaphore] | None = None,
 ) -> bool:
     """Give each accepted connection an independent bounded worker."""
     if admission.acquire(peer_address):
         workers.submit(_serve_and_close, root, connection, peer_address, admission)
         return True
+    # A complete request already buffered names its lane without consuming a
+    # byte, so an overflowed non-authorize request is refused outright and
+    # never spends a callback-lane seat.
+    ready = _ready_request(connection)
+    if ready is not None and ready.get("operation") != "authorize":
+        if _refuse_overflow(connection, refusals):
+            return True
+        connection.close()
+        return False
     # A receive handler holds its admission while it waits on a reverse
     # authorization callback to the sender's broker, and that callback needs
     # admission of its own there. When reciprocal traffic fills a peer budget
@@ -329,6 +419,12 @@ def dispatch_broker_connection(
                 _probe_and_close, root, connection, peer_address, callback_admission
             )
             return True
+    # Nothing admitted this connection and no request byte was read, so no
+    # effect is possible: answer with the definite capacity refusal instead of
+    # an ambiguous close that freezes the send as unknown. The writer budget
+    # keeps a flood of refused connections from owning unbounded workers.
+    if _refuse_overflow(connection, refusals):
+        return True
     connection.close()
     return False
 
@@ -339,6 +435,7 @@ def dispatch_ready_brokers(
     readable: list[socket.socket],
     admission: BrokerAdmission,
     callbacks: tuple[Executor, BrokerAdmission] | None = None,
+    refusals: tuple[Executor, threading.BoundedSemaphore] | None = None,
 ) -> int:
     """Accept each ready listener without letting one vanished connection stall the broker."""
     dispatched = 0
@@ -354,6 +451,7 @@ def dispatch_ready_brokers(
             cast(tuple[str, int], peer)[0],
             admission,
             callbacks,
+            refusals,
         ):
             dispatched += 1
     return dispatched
@@ -372,6 +470,7 @@ def broker_server(state_root_value: str | None) -> None:
         tailnet_server: socket.socket | None = None
         admission = BrokerAdmission()
         callback_admission = BrokerAdmission()
+        refusal_budget = threading.BoundedSemaphore(MAX_BROKER_CONNECTIONS)
         with (
             ThreadPoolExecutor(
                 max_workers=MAX_BROKER_CONNECTIONS,
@@ -381,6 +480,10 @@ def broker_server(state_root_value: str | None) -> None:
                 max_workers=MAX_BROKER_CONNECTIONS,
                 thread_name_prefix="cross-agent-chat-callback",
             ) as callback_workers,
+            ThreadPoolExecutor(
+                max_workers=MAX_BROKER_REFUSAL_WORKERS,
+                thread_name_prefix="cross-agent-chat-refusal",
+            ) as refusal_workers,
             ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix="cross-agent-chat-refresh",
@@ -425,6 +528,7 @@ def broker_server(state_root_value: str | None) -> None:
                     readable,
                     admission,
                     (callback_workers, callback_admission),
+                    (refusal_workers, refusal_budget),
                 )
     finally:
         for server in servers:

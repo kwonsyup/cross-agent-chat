@@ -1118,6 +1118,7 @@ def test_broker_excludes_remote_listener_while_refresh_is_pending(
         readable: list[object],
         _admission: BrokerAdmission,
         _callbacks: object = None,
+        _refusals: object = None,
     ) -> int:
         dispatched.append(readable)
         return 0

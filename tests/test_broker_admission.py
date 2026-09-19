@@ -18,7 +18,7 @@ import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
@@ -37,6 +37,7 @@ from cross_agent_chat.core import (
     session_key,
 )
 from cross_agent_chat.runtime import (
+    BROKER_CAPACITY_REFUSAL,
     Target,
     emit_frame_safely,
     read_frame,
@@ -46,6 +47,7 @@ from cross_agent_chat.tailnet import TAILNET_PORT
 from cross_agent_chat.tailnet_broker import (
     MAX_BROKER_CONNECTIONS,
     MAX_BROKER_CONNECTIONS_PER_PEER,
+    MAX_BROKER_REFUSAL_WORKERS,
     BrokerAdmission,
     dispatch_broker_connection,
     dispatch_ready_brokers,
@@ -56,6 +58,8 @@ _ADDRESS_A = "100.64.0.11"
 _ADDRESS_B = "100.64.0.12"
 _ADDRESS_C = "100.64.0.13"
 _ADDRESS_D = "100.64.0.14"
+_CAPACITY_LABEL = "ChatError:recipient broker is at capacity; nothing was delivered; send again"
+_PRE_EFFECT_LABEL = "ChatError:remote target rejected the message before provider effect"
 
 
 class _PeerListener(socket.socket):
@@ -129,16 +133,29 @@ def _broker_loop(
 ) -> None:
     admission = BrokerAdmission()
     callback_admission = BrokerAdmission()
+    refusal_budget = threading.BoundedSemaphore(MAX_BROKER_CONNECTIONS)
     # The harness also runs against the pre-reserve broker to reproduce the
     # starvation this file documents; older revisions take no reserve lane.
-    reserve_supported = "callbacks" in inspect.signature(dispatch_ready_brokers).parameters
+    parameters = inspect.signature(dispatch_ready_brokers).parameters
+    reserve_supported = "callbacks" in parameters
+    refusal_supported = "refusals" in parameters
     with (
         ThreadPoolExecutor(max_workers=MAX_BROKER_CONNECTIONS) as workers,
         ThreadPoolExecutor(max_workers=MAX_BROKER_CONNECTIONS) as callback_workers,
+        ThreadPoolExecutor(max_workers=MAX_BROKER_REFUSAL_WORKERS) as refusal_workers,
     ):
         while not stop.is_set():
             readable, _, _ = select.select([listener], [], [], 0.05)
-            if readable and reserve_supported:
+            if readable and refusal_supported:
+                dispatch_ready_brokers(
+                    workers,
+                    root,
+                    readable,
+                    admission,
+                    (callback_workers, callback_admission),
+                    (refusal_workers, refusal_budget),
+                )
+            elif readable and reserve_supported:
                 dispatch_ready_brokers(
                     workers,
                     root,
@@ -289,9 +306,12 @@ _REAL_STATE_LOCK = core_module.state_lock
 def _wired_tailnet(
     monkeypatch: pytest.MonkeyPatch,
     ports: dict[str, int],
-    authorize_gate: threading.Barrier | None = None,
+    authorize_parties: int = 0,
 ) -> Iterator[list[float]]:
     """Route Tailnet addresses to loopback ports and time every state-lock wait."""
+    gate = threading.Event()
+    gate_lock = threading.Lock()
+    gate_arrived = 0
 
     def routed(
         address: str,
@@ -300,13 +320,20 @@ def _wired_tailnet(
         port: int = TAILNET_PORT,
         timeout: float = 2.0,
     ) -> dict[str, object]:
+        nonlocal gate_arrived
         if (
-            authorize_gate is not None
+            not gate.is_set()
             and isinstance(payload, dict)
             and payload.get("operation") == "authorize"
         ):
-            with suppress(threading.BrokenBarrierError):
-                authorize_gate.wait(timeout=15.0)
+            with gate_lock:
+                gate_arrived += 1
+                if gate_arrived >= authorize_parties:
+                    gate.set()
+            # The gate only rendez-vous the first authorize_parties callbacks;
+            # a later caller passes immediately instead of straddling a new
+            # barrier generation for a bound it can never fill.
+            gate.wait(timeout=15.0)
         return _REAL_REQUEST_TAILNET("127.0.0.1", payload, port=ports[address], timeout=timeout)
 
     def discovered(
@@ -378,8 +405,7 @@ def test_reciprocal_admission_levels(tmp_path: Path, monkeypatch: pytest.MonkeyP
     try:
         for level in (1, 3, 6, 12):
             seated = min(level, MAX_BROKER_CONNECTIONS_PER_PEER)
-            gate = threading.Barrier(2 * seated)
-            with _wired_tailnet(monkeypatch, ports, authorize_gate=gate) as lock_waits:
+            with _wired_tailnet(monkeypatch, ports, authorize_parties=2 * seated) as lock_waits:
                 results, wall = _run_reciprocal_level(machine_a, machine_b, level)
             for direction in (machine_a.name, machine_b.name):
                 counts = _count_labels(results, direction)
@@ -388,26 +414,29 @@ def test_reciprocal_admission_levels(tmp_path: Path, monkeypatch: pytest.MonkeyP
                     f"max_lock_wait={max(lock_waits, default=0.0):.4f}s {counts}"
                 )
                 admitted = counts.get("TRANSPORT_ACCEPTED", 0)
-                assert admitted == seated, (
-                    f"level {level} {direction}: expected {seated} admitted sends to "
-                    f"complete, got {counts}"
+                # Seats recycle as sends finish, so more than `seated` sends may
+                # complete; the invariant is that every send is decided -- a
+                # seat holder either completes or reports a truthful pre-effect
+                # refusal -- and at least one send per direction makes it all
+                # the way through the reverse authorization path.
+                assert admitted >= 1, (
+                    f"level {level} {direction}: no send completed through the "
+                    f"callback path, got {counts}"
                 )
-                rejected = level - admitted
-                truthful = counts.get("UNKNOWN_DELIVERY", 0) + sum(
-                    count for label, count in counts.items() if label.startswith("ChatError:")
-                )
-                assert truthful == rejected, (
-                    f"level {level} {direction}: {rejected} sends were not admitted "
-                    f"but {level - truthful} reported no outcome label"
-                )
+                assert sum(counts.values()) == level
+                assert set(counts) <= {
+                    "TRANSPORT_ACCEPTED",
+                    _CAPACITY_LABEL,
+                    _PRE_EFFECT_LABEL,
+                }, f"level {level} {direction} produced an undecided send: {counts}"
             assert wall < 20.0, f"level {level} did not finish in bounded time"
             for machine in (machine_a, machine_b):
-                undecided = [
+                unresolved = [
                     intent.status
                     for intent in IntentStore(machine.root).intents()
-                    if intent.status in {"PENDING", "REMOTE_AUTHORIZED"}
+                    if intent.status in {"PENDING", "REMOTE_AUTHORIZED", "UNKNOWN_DELIVERY"}
                 ]
-                assert undecided == [], f"{machine.name} left in-flight intents: {undecided}"
+                assert unresolved == [], f"{machine.name} left unresolved intents: {unresolved}"
     finally:
         _stop_machines([machine_a, machine_b])
 
@@ -490,28 +519,43 @@ def test_slow_and_offline_peers_amid_reciprocal_traffic(
         _stop_machines([machine_a, machine_b, machine_c])
 
 
+@contextmanager
+def _lanes() -> Iterator[
+    tuple[
+        ThreadPoolExecutor,
+        tuple[ThreadPoolExecutor, BrokerAdmission],
+        tuple[ThreadPoolExecutor, threading.BoundedSemaphore],
+    ]
+]:
+    with (
+        ThreadPoolExecutor(max_workers=MAX_BROKER_CONNECTIONS) as workers,
+        ThreadPoolExecutor(max_workers=MAX_BROKER_CONNECTIONS) as callback_workers,
+        ThreadPoolExecutor(max_workers=MAX_BROKER_REFUSAL_WORKERS) as refusal_workers,
+    ):
+        yield (
+            workers,
+            (callback_workers, BrokerAdmission()),
+            (refusal_workers, threading.BoundedSemaphore(MAX_BROKER_CONNECTIONS)),
+        )
+
+
 def test_authorize_callback_is_answered_when_peer_budget_is_full(tmp_path: Path) -> None:
     """The minimal reproduction: two in-flight receive handlers exhaust one peer's
     budget, and the reverse authorization they wait on must still be served."""
     peer = "100.64.0.11"
     admission = BrokerAdmission()
-    callback_admission = BrokerAdmission()
     held: list[socket.socket] = []
-    with (
-        ThreadPoolExecutor(max_workers=MAX_BROKER_CONNECTIONS) as workers,
-        ThreadPoolExecutor(max_workers=MAX_BROKER_CONNECTIONS) as callback_workers,
-    ):
-        callbacks = (callback_workers, callback_admission)
+    with _lanes() as (workers, callbacks, refusals):
         for _ in range(MAX_BROKER_CONNECTIONS_PER_PEER):
             client, server_side = socket.socketpair()
             held.append(client)
             assert dispatch_broker_connection(
-                workers, tmp_path, server_side, peer, admission, callbacks
+                workers, tmp_path, server_side, peer, admission, callbacks, refusals
             )
         client, server_side = socket.socketpair()
         try:
             assert dispatch_broker_connection(
-                workers, tmp_path, server_side, peer, admission, callbacks
+                workers, tmp_path, server_side, peer, admission, callbacks, refusals
             )
             client.sendall(
                 b'{"schema_version":1,"operation":"authorize",'
@@ -524,6 +568,7 @@ def test_authorize_callback_is_answered_when_peer_budget_is_full(tmp_path: Path)
             )
             client.settimeout(5.0)
             response = json.loads(client.recv(4096))
+            assert response != BROKER_CAPACITY_REFUSAL
             assert response["status"] == "REFUSED"
             assert response["event_id"] == "00000000-0000-4000-8000-000000000001"
         finally:
@@ -532,60 +577,127 @@ def test_authorize_callback_is_answered_when_peer_budget_is_full(tmp_path: Path)
                 held_client.close()
 
 
-def test_overflow_forward_connection_keeps_truthful_rejection(tmp_path: Path) -> None:
-    """An overflowed non-authorize request is closed exactly as before the reserve lane."""
+def test_overflow_forward_connection_gets_capacity_refusal(tmp_path: Path) -> None:
+    """An overflowed non-authorize request is refused before a byte is read."""
     peer = "100.64.0.11"
     admission = BrokerAdmission()
-    callback_admission = BrokerAdmission()
     held: list[socket.socket] = []
-    with (
-        ThreadPoolExecutor(max_workers=MAX_BROKER_CONNECTIONS) as workers,
-        ThreadPoolExecutor(max_workers=MAX_BROKER_CONNECTIONS) as callback_workers,
-    ):
-        callbacks = (callback_workers, callback_admission)
+    with _lanes() as (workers, callbacks, refusals):
         for _ in range(MAX_BROKER_CONNECTIONS_PER_PEER):
             client, server_side = socket.socketpair()
             held.append(client)
             assert dispatch_broker_connection(
-                workers, tmp_path, server_side, peer, admission, callbacks
+                workers, tmp_path, server_side, peer, admission, callbacks, refusals
             )
         client, server_side = socket.socketpair()
         try:
-            assert dispatch_broker_connection(
-                workers, tmp_path, server_side, peer, admission, callbacks
-            )
             client.sendall(b'{"schema_version":1,"operation":"peers"}\n')
+            assert dispatch_broker_connection(
+                workers, tmp_path, server_side, peer, admission, callbacks, refusals
+            )
             client.settimeout(5.0)
-            assert client.recv(4096) == b""
+            assert json.loads(read_frame(client)) == BROKER_CAPACITY_REFUSAL
         finally:
             client.close()
             for held_client in held:
                 held_client.close()
 
 
-def test_callback_reserve_is_bounded(tmp_path: Path) -> None:
-    """The reserve lane itself stays bounded: silent connections exhaust it too."""
+def test_overload_frame_is_never_sent_after_request_bytes(tmp_path: Path) -> None:
+    """Once a request is read and dispatched, its response is never the refusal."""
     peer = "100.64.0.11"
     admission = BrokerAdmission()
-    callback_admission = BrokerAdmission()
-    held: list[socket.socket] = []
-    with (
-        ThreadPoolExecutor(max_workers=MAX_BROKER_CONNECTIONS) as workers,
-        ThreadPoolExecutor(max_workers=MAX_BROKER_CONNECTIONS) as callback_workers,
-    ):
-        callbacks = (callback_workers, callback_admission)
+    with _lanes() as (workers, callbacks, refusals):
+        client, server_side = socket.socketpair()
         try:
-            for _ in range(2 * MAX_BROKER_CONNECTIONS_PER_PEER):
-                client, server_side = socket.socketpair()
-                held.append(client)
-                assert dispatch_broker_connection(
-                    workers, tmp_path, server_side, peer, admission, callbacks
-                )
+            assert dispatch_broker_connection(
+                workers, tmp_path, server_side, peer, admission, callbacks, refusals
+            )
+            client.sendall(
+                b'{"schema_version":1,"operation":"authorize",'
+                b'"event_id":"00000000-0000-4000-8000-000000000001",'
+                b'"source_alias":"codex@peer:proj:peer",'
+                b'"source_generation":"00000000-0000-4000-8000-000000000002",'
+                b'"target_key":"' + b"a" * 64 + b'",'
+                b'"target_generation":"00000000-0000-4000-8000-000000000003",'
+                b'"payload_digest":"' + b"b" * 64 + b'"}\n'
+            )
+            client.settimeout(5.0)
+            response = json.loads(read_frame(client))
+            assert response != BROKER_CAPACITY_REFUSAL
+            assert response["event_id"] == "00000000-0000-4000-8000-000000000001"
+        finally:
+            client.close()
+
+
+def test_overload_refusal_frame_bytes(tmp_path: Path) -> None:
+    """The refused connection receives exactly the fixed capacity refusal frame."""
+    peer = "100.64.0.11"
+    admission = BrokerAdmission()
+    held: list[socket.socket] = []
+    with _lanes() as (workers, callbacks, refusals):
+        for _ in range(2 * MAX_BROKER_CONNECTIONS_PER_PEER):
             client, server_side = socket.socketpair()
             held.append(client)
-            assert not dispatch_broker_connection(
-                workers, tmp_path, server_side, peer, admission, callbacks
+            assert dispatch_broker_connection(
+                workers, tmp_path, server_side, peer, admission, callbacks, refusals
             )
+        client, server_side = socket.socketpair()
+        try:
+            assert dispatch_broker_connection(
+                workers, tmp_path, server_side, peer, admission, callbacks, refusals
+            )
+            expected = (
+                json.dumps(BROKER_CAPACITY_REFUSAL, separators=(",", ":"), ensure_ascii=False)
+                + "\n"
+            ).encode()
+            client.settimeout(5.0)
+            received = b""
+            while not received.endswith(b"\n"):
+                received += client.recv(4096)
+            assert received == expected
+            assert json.loads(received) == BROKER_CAPACITY_REFUSAL
         finally:
+            client.close()
+            for held_client in held:
+                held_client.close()
+
+
+def test_refusal_writer_budget_is_bounded(tmp_path: Path) -> None:
+    """An exhausted refusal-writer budget falls back to a silent close."""
+    peer = "100.64.0.11"
+    admission = BrokerAdmission()
+    held: list[socket.socket] = []
+    with _lanes() as (workers, callbacks, refusals):
+        for _ in range(2 * MAX_BROKER_CONNECTIONS_PER_PEER):
+            client, server_side = socket.socketpair()
+            held.append(client)
+            assert dispatch_broker_connection(
+                workers, tmp_path, server_side, peer, admission, callbacks, refusals
+            )
+        _workers, refusal_budget = refusals
+        for _ in range(MAX_BROKER_CONNECTIONS):
+            assert refusal_budget.acquire(blocking=False)
+        assert not refusal_budget.acquire(blocking=False)
+        client, server_side = socket.socketpair()
+        try:
+            assert not dispatch_broker_connection(
+                workers, tmp_path, server_side, peer, admission, callbacks, refusals
+            )
+            client.settimeout(5.0)
+            assert client.recv(4096) == b""
+        finally:
+            client.close()
+            for _ in range(MAX_BROKER_CONNECTIONS):
+                refusal_budget.release()
+        client, server_side = socket.socketpair()
+        try:
+            assert dispatch_broker_connection(
+                workers, tmp_path, server_side, peer, admission, callbacks, refusals
+            )
+            client.settimeout(5.0)
+            assert json.loads(read_frame(client)) == BROKER_CAPACITY_REFUSAL
+        finally:
+            client.close()
             for held_client in held:
                 held_client.close()

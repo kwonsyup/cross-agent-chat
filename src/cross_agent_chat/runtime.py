@@ -96,6 +96,15 @@ from cross_agent_chat.tailnet import TAILNET_PORT, tailnet_nodes, valid_tailnet_
 from cross_agent_chat.transport import remote_envelope
 
 MAX_FRAME_BYTES: Final = 64 * 1024
+# The one answer a broker can give a connection it refuses to admit: no request
+# byte was consumed and no effect is possible, so the refusal is decided rather
+# than unknown. It is emitted only before any request byte is read, which keeps
+# it impossible to confuse with a response to a request that was dispatched.
+BROKER_CAPACITY_REFUSAL: Final[dict[str, object]] = {
+    "schema_version": SCHEMA_VERSION,
+    "status": "REFUSED",
+    "detail": "recipient broker is at capacity",
+}
 SOCKET_TIMEOUT_SECONDS: Final = 5.0
 MCP_TOOL_TIMEOUT_SECONDS: Final = 270.0
 OPERATION_TIMEOUT_SECONDS: Final = 260.0
@@ -2103,6 +2112,11 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
     except ChatError:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
         raise
+    if response == BROKER_CAPACITY_REFUSAL:
+        # The broker refused admission before reading a byte, so nothing could
+        # have happened. Older brokers close instead, which stays unknown.
+        store.mark(event_id, "PRE_EFFECT_REJECTED")
+        raise ChatError("recipient broker is at capacity; nothing was delivered; send again")
     rejection = pre_effect_error(response, event_id, target.provider)
     if rejection is not None:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
