@@ -184,9 +184,10 @@ sessions to next-turn delivery. Local Devin integration is global at `~/.config/
 unrelated MCP and hook entries and becomes active for a conversation after its first user prompt.
 
 `doctor` also reports a `terminal` line when its own environment carries an inherited Claude
-child-session marker (`CLAUDE_CODE_CHILD_SESSION`), left on a terminal app that was launched
-from inside a Claude session. Claude sessions started from that terminal become hidden children
-that never appear as peers; relaunching the terminal app normally clears it.
+child-session marker (`CLAUDE_CODE_CHILD_SESSION`). The marker is expected inside a Claude tool
+or hook subprocess and needs no action there; it also stays behind on a terminal app that was
+launched from inside a Claude session, where every Claude session started becomes a hidden
+child that never appears as a peer. Relaunching that terminal app normally clears it.
 
 ## Architecture
 

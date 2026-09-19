@@ -77,9 +77,12 @@ MCP_INSTRUCTIONS: Final = (
 
 CLAUDE_CHILD_SESSION_ENV: Final = "CLAUDE_CODE_CHILD_SESSION"
 CLAUDE_CHILD_SESSION_DIAGNOSTIC: Final = (
-    "inherits a Claude child-session marker; Claude sessions started from this "
-    "terminal will be hidden children and will not appear as peers. Relaunch the "
-    "terminal app normally (not from inside a Claude session)."
+    "this process carries an inherited Claude child-session marker; Claude "
+    "sessions started from this shell would be hidden children and would not "
+    "appear as peers. Inside a Claude tool or hook subprocess the marker is "
+    "expected; if this shell was opened normally in a terminal app, that "
+    "terminal app instance was launched from inside a Claude session and "
+    "should be relaunched normally (not from inside a Claude session)."
 )
 
 
