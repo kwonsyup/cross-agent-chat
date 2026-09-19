@@ -183,7 +183,7 @@ def test_exact_local_handle_does_not_wait_for_remote_discovery(
     monkeypatch.setattr(
         runtime,
         "_remote_discovery",
-        lambda: pytest.fail("exact local delivery queried remote peers"),
+        lambda **_: pytest.fail("exact local delivery queried remote peers"),
     )
     monkeypatch.setattr(runtime, "_send_local_target", lambda *args, **kwargs: expected)
 

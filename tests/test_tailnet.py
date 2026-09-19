@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -87,10 +88,20 @@ def test_legacy_broker_peer_request_filters_new_devin_routes(
     calls: list[bool] = []
 
     def observed_peers(
-        _root: Path, *, include_remote: bool, internal: bool, include_devin: bool
+        _root: Path,
+        *,
+        include_remote: bool,
+        internal: bool,
+        include_delivery_mode: bool,
+        include_title: bool,
+        include_devin: bool,
+        handle: str | None,
     ) -> dict[str, object]:
         assert include_remote is False
         assert internal is True
+        assert include_delivery_mode is False
+        assert include_title is False
+        assert handle is None
         calls.append(include_devin)
         return {"schema_version": 1, "peers": []}
 
@@ -2702,3 +2713,365 @@ def test_wrapped_message_keeps_the_frame_budget_reason_when_the_envelope_causes_
     assert "encoded frame budget" in reason
     assert "envelope adds" not in reason
     assert "16 KiB" not in reason
+
+
+def _loaded_broker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    route_count: int = 30,
+    slow_probe_seconds: float = 1.0,
+    requester_budget_seconds: float = 0.4,
+) -> tuple[Path, Route, Route, str, list[dict[str, object]]]:
+    """A broker with many routes whose non-target couriers answer slowly.
+
+    The requester keeps a shrunken per-node budget the way the incident's real
+    budget expired: the broker's full-roster answer outlives the requester's
+    socket timeout, so the answer is computed but lost. A requester-side
+    timeout or a broker-side invalid-request close both surface as
+    UnknownDeliveryError, matching request_tailnet's wire semantics.
+    """
+    broker_root = tmp_path / "broker"
+    requester_root = tmp_path / "requester"
+    routes = [
+        Route.create(
+            provider="codex",
+            session_id=str(uuid4()),
+            device="m1",
+            cwd=str(tmp_path),
+            pid=os.getpid(),
+        )
+        for _ in range(route_count)
+    ]
+    registry = Registry(broker_root)
+    for route in routes:
+        registry.upsert(route)
+    target = routes[0]
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="imac",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(requester_root).upsert(source)
+    by_generation = {route.generation: route for route in [*routes, source]}
+
+    def couriers(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        route = by_generation[str(payload["generation"])]
+        if route is not target and route is not source:
+            time.sleep(slow_probe_seconds)
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+        }
+
+    calls: list[dict[str, object]] = []
+    broker_workers = ThreadPoolExecutor(max_workers=4)
+
+    def wire(
+        address: str,
+        payload: dict[str, object],
+        *,
+        port: int = 47071,
+        timeout: float = 2.0,
+    ) -> dict[str, object]:
+        del port
+        calls.append(payload)
+        if payload.get("operation") == "receive":
+            envelope = json.loads(str(payload["envelope"]))
+            return {
+                "schema_version": 1,
+                "event_id": envelope["event_id"],
+                "status": "TRANSPORT_ACCEPTED",
+                "to": envelope["target_alias"],
+                "provider": "codex",
+            }
+        future = broker_workers.submit(handle_broker_request, broker_root, payload, address)
+        try:
+            return future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            raise UnknownDeliveryError("Tailnet delivery state is unknown") from None
+        except ChatError as error:
+            raise UnknownDeliveryError("Tailnet delivery state is unknown") from error
+
+    monkeypatch.setattr(runtime, "request_socket", couriers)
+    monkeypatch.setattr(runtime, "request_tailnet", wire)
+    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: ["100.64.0.11"])
+    monkeypatch.setattr(runtime, "REMOTE_DISCOVERY_TIMEOUT_SECONDS", requester_budget_seconds)
+    handle = session_key(target.provider, target.session_id)
+    return requester_root, source, target, handle, calls
+
+
+def test_send_to_an_exact_handle_does_not_wait_for_a_full_loaded_roster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exact-handle send must not need a loaded node's complete roster.
+
+    Reproduces the 19 Sep incident: ~30 routes with slow couriers made the
+    broker's full-roster answer outlive the requester's per-node budget, so an
+    exact-handle send failed pre-effect with "remote peer discovery is
+    incomplete" while the target's own courier was healthy. The handle-bound
+    variant lets the broker answer after validating only the owning route.
+    """
+    root, source, _target, handle, calls = _loaded_broker(tmp_path, monkeypatch)
+
+    result = send(root, source, handle, "hello")
+
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+    peers_calls = [payload for payload in calls if payload.get("operation") == "peers"]
+    assert peers_calls == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "handle": handle,
+            "include_devin": True,
+        }
+    ]
+    # Counterexample on the same fixture: the un-bound roster query still
+    # outlives the requester budget and reports incomplete.
+    discovered, complete = runtime._remote_discovery()
+    assert discovered == []
+    assert complete is False
+
+
+def test_exact_handle_send_falls_back_to_a_full_roster_on_an_old_broker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broker that rejects the unknown variant costs one extra round-trip."""
+    handle = session_key("codex", str(uuid4()))
+    peer = {
+        "alias": "codex@remote:api:123456789abc",
+        "provider": "codex",
+        "device": "remote",
+        "project": "api",
+        "status": "available",
+        "generation": str(uuid4()),
+        "session_key": handle,
+    }
+    calls: list[dict[str, object]] = []
+
+    def old_broker(
+        _address: str,
+        payload: dict[str, object],
+        *,
+        port: int = 47071,
+        timeout: float = 2.0,
+    ) -> dict[str, object]:
+        del port, timeout
+        calls.append(payload)
+        if payload.get("operation") == "receive":
+            envelope = json.loads(str(payload["envelope"]))
+            return {
+                "schema_version": 1,
+                "event_id": envelope["event_id"],
+                "status": "TRANSPORT_ACCEPTED",
+                "to": envelope["target_alias"],
+                "provider": "codex",
+            }
+        if "handle" in payload:
+            raise ChatError("legacy broker rejected unknown field")
+        return {"schema_version": 1, "peers": [peer]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", old_broker)
+    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: ["100.64.0.2"])
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="imac",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(source)
+
+    result = send(tmp_path, source, handle, "hello")
+
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+    assert calls[:2] == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "handle": handle,
+            "include_devin": True,
+        },
+        {"schema_version": 1, "operation": "peers", "include_devin": True},
+    ]
+    assert calls[2].get("operation") == "receive"
+
+
+def test_handle_bound_roster_query_is_empty_and_complete_for_an_unowned_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="m1",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(route)
+
+    def forbidden(_path: Path, _payload: dict[str, object], **_: object) -> dict[str, object]:
+        pytest.fail("an unowned handle must not trigger any courier probe")
+
+    monkeypatch.setattr(runtime, "request_socket", forbidden)
+
+    answer = handle_broker_request(
+        tmp_path,
+        {"schema_version": 1, "operation": "peers", "handle": "f" * 64},
+        "100.64.0.10",
+    )
+
+    assert answer == {"schema_version": 1, "peers": []}
+
+    monkeypatch.setattr(runtime, "request_tailnet", lambda *_a, **_k: answer)
+    targets, complete = runtime._remote_node_targets("100.64.0.10", handle="f" * 64)
+    assert targets == []
+    assert complete is True
+
+
+def test_handle_bound_roster_query_still_drops_a_route_that_fails_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound answer runs the same courier validation as the full roster."""
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="m1",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(route)
+    handle = session_key(route.provider, route.session_id)
+    probes: list[dict[str, object]] = []
+
+    def stale_generation(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        probes.append(payload)
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": str(uuid4()),
+            "alias": route.alias,
+        }
+
+    monkeypatch.setattr(runtime, "request_socket", stale_generation)
+
+    answer = handle_broker_request(
+        tmp_path,
+        {"schema_version": 1, "operation": "peers", "handle": handle},
+        "100.64.0.10",
+    )
+
+    assert answer == {"schema_version": 1, "peers": []}
+    assert len(probes) == 1
+
+
+def test_handle_bound_roster_variants_carry_the_same_include_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: list[tuple[bool, bool, bool, str | None]] = []
+
+    def observed_peers(
+        _root: Path,
+        *,
+        include_remote: bool,
+        internal: bool,
+        include_delivery_mode: bool,
+        include_title: bool,
+        include_devin: bool,
+        handle: str | None,
+    ) -> dict[str, object]:
+        assert include_remote is False
+        assert internal is True
+        observed.append((include_delivery_mode, include_title, include_devin, handle))
+        return {"schema_version": 1, "peers": []}
+
+    monkeypatch.setattr(tailnet_broker_module, "peers", observed_peers)
+    handle = "e" * 64
+    for extra in (
+        {"handle": handle},
+        {"handle": handle, "include_devin": True},
+        {"handle": handle, "include_delivery_mode": True},
+        {"handle": handle, "include_delivery_mode": True, "include_devin": True},
+        {"handle": handle, "include_delivery_mode": True, "include_title": True},
+        {
+            "handle": handle,
+            "include_delivery_mode": True,
+            "include_title": True,
+            "include_devin": True,
+        },
+    ):
+        request = {"schema_version": 1, "operation": "peers", **extra}
+        assert handle_broker_request(tmp_path, request, "100.64.0.10") == {
+            "schema_version": 1,
+            "peers": [],
+        }
+
+    assert observed == [
+        (False, False, False, handle),
+        (False, False, True, handle),
+        (True, False, False, handle),
+        (True, False, True, handle),
+        (True, True, False, handle),
+        (True, True, True, handle),
+    ]
+
+
+def test_handle_bound_variant_is_rejected_with_any_extra_or_invalid_field(
+    tmp_path: Path,
+) -> None:
+    """Strictness matches the other variants: exact key set, exact values."""
+    handle = "f" * 64
+    for request in (
+        {"schema_version": 1, "operation": "peers", "handle": handle, "extra": True},
+        {"schema_version": 1, "operation": "peers", "handle": "not-a-handle"},
+        {"schema_version": 1, "operation": "peers", "handle": "F" * 64},
+        {"schema_version": 1, "operation": "peers", "handle": handle[:-1]},
+        {"schema_version": 1, "operation": "peers", "handle": 5},
+        {"schema_version": 1, "operation": "peers", "handle": handle, "include_devin": False},
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "handle": handle,
+            "include_title": True,
+        },
+        {"schema_version": 2, "operation": "peers", "handle": handle},
+    ):
+        with pytest.raises(ChatError, match="broker request"):
+            handle_broker_request(tmp_path, request, "100.64.0.10")
+
+
+def test_exact_handle_send_still_refuses_duplicate_attestation_across_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handle = "a" * 64
+    peer = {
+        "alias": "codex@remote:api:123456789abc",
+        "provider": "codex",
+        "device": "remote",
+        "project": "api",
+        "status": "available",
+        "generation": str(uuid4()),
+        "session_key": handle,
+    }
+
+    def broker(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        if payload.get("operation") == "peers":
+            return {"schema_version": 1, "peers": [peer]}
+        pytest.fail("a refused send must not reach the receive boundary")
+
+    monkeypatch.setattr(runtime, "request_tailnet", broker)
+    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: ["100.64.0.11", "100.64.0.12"])
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="imac",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(source)
+
+    with pytest.raises(ChatError, match="target handle is unavailable"):
+        send(tmp_path, source, handle, "hello")

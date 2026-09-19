@@ -828,7 +828,11 @@ def test_peers_reports_remote_discovery_completeness(
         True,
         tailnet_address="100.64.0.2",
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [local] if not complete else [])
+    monkeypatch.setattr(
+        runtime,
+        "local_targets",
+        lambda *args, **kwargs: [local] if not complete else [],
+    )
     monkeypatch.setattr(
         runtime, "_remote_discovery", lambda **_: ([remote] if not complete else [], complete)
     )
@@ -2626,7 +2630,9 @@ def test_remote_discovery_uses_one_deadline_for_queued_workers(
     release = threading.Event()
     started: list[str] = []
 
-    def wait_for_peer(address: str, deadline: float | None = None) -> tuple[list[Target], bool]:
+    def wait_for_peer(
+        address: str, deadline: float | None = None, **_kwargs: object
+    ) -> tuple[list[Target], bool]:
         assert deadline is not None
         started.append(address)
         release.wait(1)
