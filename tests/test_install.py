@@ -565,9 +565,12 @@ def test_doctor_reports_an_inherited_claude_child_session_marker(
 
     result = json.loads(capsys.readouterr().out)
     assert result["terminal"] == (
-        "inherits a Claude child-session marker; Claude sessions started from this "
-        "terminal will be hidden children and will not appear as peers. Relaunch the "
-        "terminal app normally (not from inside a Claude session)."
+        "this process carries an inherited Claude child-session marker; Claude "
+        "sessions started from this shell would be hidden children and would not "
+        "appear as peers. Inside a Claude tool or hook subprocess the marker is "
+        "expected; if this shell was opened normally in a terminal app, that "
+        "terminal app instance was launched from inside a Claude session and "
+        "should be relaunched normally (not from inside a Claude session)."
     )
     assert result["next"] == "start a fresh Claude or Codex session, or submit a prompt in Devin"
 
@@ -575,11 +578,40 @@ def test_doctor_reports_an_inherited_claude_child_session_marker(
 
     lines = capsys.readouterr().out.splitlines()
     assert (
-        "terminal: inherits a Claude child-session marker; Claude sessions started from this "
-        "terminal will be hidden children and will not appear as peers. Relaunch the "
-        "terminal app normally (not from inside a Claude session)." in lines
+        "terminal: this process carries an inherited Claude child-session marker; Claude "
+        "sessions started from this shell would be hidden children and would not "
+        "appear as peers. Inside a Claude tool or hook subprocess the marker is "
+        "expected; if this shell was opened normally in a terminal app, that "
+        "terminal app instance was launched from inside a Claude session and "
+        "should be relaunched normally (not from inside a Claude session)." in lines
     )
     assert "next: start a fresh Claude or Codex session, or submit a prompt in Devin" in lines
+
+
+def test_doctor_scopes_the_marker_to_the_process_under_tool_child_indicators(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class ObservedInstaller:
+        def verify_configuration(self) -> bool:
+            return True
+
+        def broker_is_healthy(self) -> bool:
+            return True
+
+        def _codex_native_queue_enabled(self) -> bool:
+            return False
+
+    monkeypatch.setattr(cli, "_installer", lambda _: ObservedInstaller())
+    monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+
+    assert cli.run(parser().parse_args(["doctor", "--json"])) == 0
+
+    line = json.loads(capsys.readouterr().out)["terminal"]
+    assert line.startswith("this process carries an inherited Claude child-session marker")
+    assert "this terminal" not in line
+    assert "if this shell was opened normally in a terminal app" in line
 
 
 def test_doctor_omits_the_terminal_diagnostic_without_the_marker(
