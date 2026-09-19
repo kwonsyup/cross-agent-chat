@@ -66,6 +66,19 @@ CLAUDE_CONTEXT_ENV_KEYS: Final = (
 )
 BOUND_CLAUDE_BINARY_ENV: Final = "CROSS_AGENT_CHAT_CLAUDE_BINARY"
 TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z")
+# One ListAgents row: two leading spaces, the printable `name [ref]` address,
+# then `  ·  `-separated columns whose first is the kind (`interactive` or
+# `bg`) followed by free-form status/detail columns the provider may extend.
+# The `name [ref]` text is the only documented cross-session SendMessage
+# address -- the embedded tool description in Claude Code 2.1.278 says "the
+# name IS the address; there is no separate address syntax", and `claude
+# agents --json` carries sessionId for preflight identity but documents no way
+# to pass it as `to`. The ref itself is the provider's deterministic
+# hash(kind, session id) token, so it stays bound to exact session identity.
+LISTING_ROW_RE: Final = re.compile(
+    r"^  (?P<name>.+?) \[(?P<token>[A-Za-z0-9]{6})\]  ·  "
+    r"(?:interactive|bg)(?:  ·  [^\r\n]+)*$"
+)
 # The provider schema declares `summary` an optional one-line UI preview of at
 # most 200 characters; it is display text, never routing or authority data.
 SUMMARY_MAX_CHARACTERS: Final = 200
@@ -87,6 +100,44 @@ COURIER_PLACEHOLDER_MESSAGE: Final = "placeholder"
 # stay inside it.
 SENDMESSAGE_TOOL_INPUT_KEYS: Final = frozenset(
     {"to", "recipient", "message", "content", "type", "summary"}
+)
+# Receipt keys that would re-decide the outcome if present. The SendMessage
+# result object is additive by design: the provider strips only `display` and
+# `inlineHandback` before serializing it, and in Claude Code 2.1.278 sibling
+# send paths already emit extra keys such as `routing`, `pin`, `request_id`,
+# `target`, and `resumedAgentId`. Extra metadata that cannot carry the verdict
+# or the target identity is therefore tolerated on a success receipt; a key
+# from this set always could -- or should never reach the serialized result at
+# all, like the stripped display fields -- so its presence leaves the outcome
+# UNKNOWN rather than read as incidental decoration.
+SENDMESSAGE_RECEIPT_AUTHORITY_KEYS: Final = frozenset(
+    {
+        "error",
+        "errorClass",
+        "error_class",
+        "failure",
+        "denied",
+        "refused",
+        "rejected",
+        "status",
+        "state",
+        "delivered",
+        "degradedClass",
+        "degraded_class",
+        "queued",
+        "recipient",
+        "target",
+        "to",
+        "session_id",
+        "sessionId",
+        "agent_id",
+        "agentId",
+        "id",
+        "message_id",
+        "request_id",
+        "display",
+        "inlineHandback",
+    }
 )
 SUMMARY_REJECT_RE: Final = re.compile(r"[\x00-\x08\x0a-\x0d\x0e-\x1f\x7f-\x9f\u2028\u2029]")
 ClaudeUnknownPhase = Literal[
@@ -258,6 +309,19 @@ def claude_alias(device: str, project: str, agent: ClaudeAgent) -> str:
     return valid_name(rendered, "Claude alias")
 
 
+def _listing_target_refs(listing: str, session_name: str) -> list[str]:
+    """The exact ``name [ref]`` rows one name owns in a ListAgents listing.
+
+    Rows that do not match the measured shape -- a namesake under another kind,
+    a stale record, or a malformed line -- are skipped, never approximated.
+    """
+    return [
+        f"{match.group('name')} [{match.group('token')}]"
+        for line in listing.splitlines()
+        if (match := LISTING_ROW_RE.fullmatch(line)) and match.group("name") == session_name
+    ]
+
+
 def discover_target_ref(session_name: str) -> str:
     command = [
         str(claude_binary()),
@@ -298,15 +362,7 @@ def discover_target_ref(session_name: str) -> str:
             listings.append(listing)
     if completed.returncode != 0 or len(listings) != 1:
         raise ChatError("Claude ListAgents discovery failed")
-    pattern = re.compile(
-        r"^  (?P<name>.+?) \[(?P<token>[A-Za-z0-9]{6})\]  ·  "
-        r"(?:interactive|bg)(?:  ·  [^\r\n]+)*$"
-    )
-    refs = [
-        f"{match.group('name')} [{match.group('token')}]"
-        for line in listings[0].splitlines()
-        if (match := pattern.fullmatch(line)) and match.group("name") == session_name
-    ]
+    refs = _listing_target_refs(listings[0], session_name)
     if len(refs) != 1 or TARGET_REF_RE.fullmatch(refs[0]) is None:
         raise ChatError("Claude target discovery is not one exact supported match")
     return refs[0]
@@ -529,7 +585,9 @@ def parse_sendmessage_receipt(text: str) -> str:
     the delivered payload and is deliberately not compared here. Exact target
     and content are guaranteed upstream by ``authoritative_tool_input``; what
     remains to establish is that exactly one SendMessage ran and the provider
-    accepted it.
+    accepted it. A success receipt carries the required keys plus any additive
+    metadata the provider attaches; only keys that could carry the verdict or
+    the target identity are rejected as unknown.
     """
     try:
         uses, results = _tool_records(text)
@@ -564,14 +622,19 @@ def parse_sendmessage_receipt(text: str) -> str:
             # message id, so nothing was created. Exactly one SendMessage ran and
             # the gate was consumed exactly once, both established above. That is
             # a decided refusal before any effect, and reporting it as uncertain
-            # would freeze an event that provably delivered nothing.
+            # would freeze an event that provably delivered nothing. The narrow
+            # two-key refusal is the shape observed live on Claude Code 2.1.274
+            # and is the refusal shape its 2.1.278 build still emits; a refusal
+            # carrying any extra key is not this contract and stays unknown.
             raise ClaudeSendMessageRefused(reason)
     if (
         not isinstance(result, dict)
-        or set(result) != {"success", "message", "msg_id"}
+        or not {"success", "message", "msg_id"} <= set(result)
+        or set(result) & SENDMESSAGE_RECEIPT_AUTHORITY_KEYS
         or result.get("success") is not True
         or not isinstance(result.get("message"), str)
         or not isinstance(result.get("msg_id"), str)
+        or result.get("msg_id") == ""
     ):
         raise ChatError("Claude SendMessage receipt is invalid")
     return valid_uuid(cast(str, result["msg_id"]), "courier message id")
