@@ -190,11 +190,9 @@ def test_published_install_references_match_package_version() -> None:
         r"^## (\d+\.\d+\.\d+) -", (root / "CHANGELOG.md").read_text(), flags=re.MULTILINE
     )
     assert changelog_versions[0] == version
-    codex_client_versions = re.findall(
-        r'"clientInfo": \{"name": "cross-agent-chat", "version": "([^"]+)"\}',
-        (root / "src/cross_agent_chat/codex.py").read_text(),
-    )
-    assert codex_client_versions and set(codex_client_versions) == {version}
+    from cross_agent_chat.codex import _client_info
+
+    assert _client_info() == {"name": "cross-agent-chat", "version": version}
     ci = (root / ".github/workflows/ci.yml").read_text()
     assert re.findall(r"cross-agent-chat (\d+\.\d+\.\d+)", ci) == [version]
     assert re.findall(r'"version":"(\d+\.\d+\.\d+)"', ci) == [version]
@@ -543,8 +541,77 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "local_broker": "healthy",
         "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
-        "version": "0.3.7",
+        "version": "0.3.8",
     }
+
+
+def test_doctor_reports_an_inherited_claude_child_session_marker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class ObservedInstaller:
+        def verify_configuration(self) -> bool:
+            return True
+
+        def broker_is_healthy(self) -> bool:
+            return True
+
+        def _codex_native_queue_enabled(self) -> bool:
+            return False
+
+    monkeypatch.setattr(cli, "_installer", lambda _: ObservedInstaller())
+    monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+
+    assert cli.run(parser().parse_args(["doctor", "--json"])) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["terminal"] == (
+        "inherits a Claude child-session marker; Claude sessions started from this "
+        "terminal will be hidden children and will not appear as peers. Relaunch the "
+        "terminal app normally (not from inside a Claude session)."
+    )
+    assert result["next"] == "start a fresh Claude or Codex session, or submit a prompt in Devin"
+
+    assert cli.run(parser().parse_args(["doctor"])) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    assert (
+        "terminal: inherits a Claude child-session marker; Claude sessions started from this "
+        "terminal will be hidden children and will not appear as peers. Relaunch the "
+        "terminal app normally (not from inside a Claude session)." in lines
+    )
+    assert "next: start a fresh Claude or Codex session, or submit a prompt in Devin" in lines
+
+
+def test_doctor_omits_the_terminal_diagnostic_without_the_marker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class ObservedInstaller:
+        def verify_configuration(self) -> bool:
+            return True
+
+        def broker_is_healthy(self) -> bool:
+            return True
+
+        def _codex_native_queue_enabled(self) -> bool:
+            return False
+
+    monkeypatch.setattr(cli, "_installer", lambda _: ObservedInstaller())
+    monkeypatch.delenv("CLAUDE_CODE_CHILD_SESSION", raising=False)
+
+    assert cli.run(parser().parse_args(["doctor", "--json"])) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "codex_native_queue": "stop-bound",
+        "integration": "healthy",
+        "local_broker": "healthy",
+        "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
+        "remote_trust": "tailscale_acl",
+        "version": "0.3.8",
+    }
+
+    assert cli.run(parser().parse_args(["doctor"])) == 0
+
+    assert not any(line.startswith("terminal:") for line in capsys.readouterr().out.splitlines())
 
 
 def test_doctor_explicit_device_overrides_automatic_identity(
@@ -3381,7 +3448,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.3.7')\n"
+        "    print('cross-agent-chat 0.3.8')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -3407,7 +3474,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.3.7"
+    assert completed.stdout.strip() == "cross-agent-chat 0.3.8"
     assert stage.exists()
 
 
@@ -4849,7 +4916,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.3.7",
+            "version": "0.3.8",
             "module_path": str(module),
         },
     )
@@ -5027,7 +5094,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.3.7",
+            "version": "0.3.8",
             "module_path": str(module),
         }
 

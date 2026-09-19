@@ -9,6 +9,7 @@ from typing import cast
 from uuid import uuid4
 
 import pytest
+from test_native_bundle import fake_desktop_bundle
 
 from cross_agent_chat import runtime
 from cross_agent_chat.cli import mcp
@@ -125,7 +126,10 @@ def test_desktop_catalog_requires_chatgpt_ancestor_binary(monkeypatch: pytest.Mo
     assert not runtime.native_desktop_mcp_host()
 
 
-def test_desktop_catalog_accepts_chatgpt_ancestor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_desktop_catalog_accepts_chatgpt_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = fake_desktop_bundle(tmp_path / "home" / "Applications")
     monkeypatch.setattr("cross_agent_chat.runtime.os.getppid", lambda: 200)
     monkeypatch.setattr(
         "cross_agent_chat.runtime.recipient_owner_identity",
@@ -133,7 +137,7 @@ def test_desktop_catalog_accepts_chatgpt_ancestor(monkeypatch: pytest.MonkeyPatc
             "owner",
             Path("/usr/local/bin/codex")
             if pid == 200
-            else Path("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
+            else bundle / "Contents" / "MacOS" / "ChatGPT",
         ),
     )
     monkeypatch.setattr(
@@ -396,6 +400,44 @@ def test_native_bootstrap_is_one_effect_and_returns_private_projectless_create_a
     with pytest.raises(ChatError, match="bootstrap"):
         runtime.native_bootstrap(state_root, original)
     assert NativeHelperStore(state_root).bindings()[0].state == "UNKNOWN"
+
+
+def test_native_bootstrap_create_args_keep_their_installed_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin the private create_thread arguments independently of their producer."""
+
+    state_root = tmp_path / "state"
+    original = route(tmp_path, session_id="00000000-0000-4000-8000-00000000000a")
+    Registry(state_root).upsert(original)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_native_account_digest", lambda *_args: "a" * 64)
+    monkeypatch.setattr(runtime, "_native_hook_ready", lambda *_args: True)
+
+    result = runtime.native_bootstrap(state_root, original)
+
+    binding = NativeHelperStore(state_root).bindings()[0]
+    metadata = cast(dict[str, object], result["_meta"])
+    prompt = cast(str, cast(dict[str, object], metadata["create_thread"])["prompt"])
+    token_match = re.search(r"token ([0-9a-f-]{36})", prompt)
+    assert token_match is not None
+    assert result == {
+        "content": [{"type": "text", "text": "Native delivery helper setup was submitted."}],
+        "_meta": {
+            "create_thread": {
+                "prompt": (
+                    "You are the Cross Agent Chat native delivery helper. "
+                    f"Call native_register once with token {token_match.group(1)}, "
+                    "then wait for inbound work. "
+                    "Do not inspect memory, source files, or unrelated tasks."
+                ),
+                "target": {"type": "projectless", "directoryName": binding.helper_directory},
+                "model": "gpt-5.6-luna",
+                "thinking": "high",
+                "title": "Cross Agent Chat helper",
+            }
+        },
+    }
 
 
 def test_failed_registration_preserves_unknown_binding(

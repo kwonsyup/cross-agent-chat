@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.3.8 - 2026-09-19
+
+- Resolve an exact recipient handle without asking every Mac for its whole roster. A reply to the
+  exact handle on a received envelope was refused before sending ("remote peer discovery is
+  incomplete") when the owning Mac was busy: its broker health-checked every local session before
+  answering and missed the sender's budget. A sender now asks each broker only about that one
+  handle; the owning broker validates that one session exactly as before, and every other broker
+  answers at once. Older brokers reject the new question immediately and are asked the old way.
+- Stop waiting on unrelated Macs once the owner of an exact handle has answered. Other nodes get
+  two more seconds to claim the same handle, which still refuses the send; after that discovery is
+  reported incomplete and delivery proceeds to the single attested owner. An unresponsive neighbor
+  previously held such a send for up to about 22 seconds.
+- Keep reverse authorization moving under reciprocal traffic. With two seats per peer, several
+  simultaneous sends in both directions filled each broker with deliveries waiting on callbacks
+  that needed the same seats, and seated sends ended as `UNKNOWN_DELIVERY`. Authorization
+  callbacks now have their own small bounded lane, and a connection the broker cannot admit is
+  told so before any request byte is read while the bounded refusal lane has capacity: the
+  sender records a decided `PRE_EFFECT_REJECTED` ("recipient broker is at capacity; nothing was
+  delivered; send again") instead of a frozen `UNKNOWN_DELIVERY`. When that lane is also
+  exhausted the broker closes silently as before and the outcome stays uncertain, as it does for
+  senders older than 0.3.8.
+- Recognize the Codex Native app by the running process's own bundle instead of a fixed
+  `/Applications/ChatGPT.app` path: `/Applications`, `~/Applications`, or one folder below
+  `/Applications`, with the helper child and its Desktop ancestor in the same bundle and a
+  matching bundle identifier.
+- Pin the Claude session-listing row format and the exact `SendMessage` receipt contract with
+  contract tests (namesakes, malformed neighbors, extra columns, every extra receipt key). The
+  receipt stays exact on purpose: it is the only evidence of delivery, and an unknown field may
+  contradict it. Claude Code 2.1.278 exposes no structured cross-session target reference.
+- `doctor` reports a `terminal` line when its environment carries an inherited Claude
+  child-session marker. A terminal app launched from inside a Claude session (for example with
+  `open -n`) passes the marker on, and every Claude session started there is a hidden child that
+  never appears as a peer. Relaunching the terminal app normally clears it.
+- `chat_peers` can name the exact local delivery mechanism behind a mode (`native_helper`,
+  `direct_queue`, `stop_bound`, `claude_native`, `devin_prompt_bound`). It is local only, sent only
+  when asked for, and never travels between Macs.
+- Native helper defaults and hook constants live in one place; the app-server client reports the
+  package version.
+- This release does not add idle delivery for Devin or Stop-bound Codex.
+
 ## 0.3.7 - 2026-09-18
 
 - Report how a requested answer returns to the sender. A `chat_send` result now carries

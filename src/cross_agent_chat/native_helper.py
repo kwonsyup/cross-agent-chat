@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import Final, Literal, cast
 from uuid import uuid4
 
 from cross_agent_chat.core import (
@@ -23,17 +23,29 @@ from cross_agent_chat.core import (
 NativeHelperState = Literal["UNKNOWN", "REGISTERED", "RETIRED"]
 NativeDispatchState = Literal["UNKNOWN"]
 
+NATIVE_HELPER_MODEL: Final = "gpt-5.6-luna"
+NATIVE_HOOK_TIMEOUT_SECONDS: Final = 30
+NATIVE_QUEUE_ENV_VAR: Final = "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE"
+NATIVE_QUEUE_ENV_VALUE: Final = "experimental"
+NATIVE_QUEUE_BINARY_ENV_VAR: Final = "CROSS_AGENT_CHAT_CODEX_BINARY"
+NATIVE_BOOTSTRAP_MATCHER: Final = "mcp__cross_agent_chat__native_bootstrap"
+NATIVE_DISPATCH_MATCHER: Final = "mcp__cross_agent_chat__native_dispatch"
+NATIVE_HOOK_TYPE: Final = "mcp_tool"
+NATIVE_HOOK_SERVER: Final = "codex_app"
+NATIVE_CREATE_TOOL: Final = "create_thread"
+NATIVE_DISPATCH_TOOL: Final = "send_message_to_thread"
+
 
 def native_helper_create_hook_group() -> dict[str, object]:
     """Invoke the real app create operation only after internal bootstrap success."""
 
     return {
-        "matcher": "mcp__cross_agent_chat__native_bootstrap",
+        "matcher": NATIVE_BOOTSTRAP_MATCHER,
         "hooks": [
             {
-                "type": "mcp_tool",
-                "server": "codex_app",
-                "tool": "create_thread",
+                "type": NATIVE_HOOK_TYPE,
+                "server": NATIVE_HOOK_SERVER,
+                "tool": NATIVE_CREATE_TOOL,
                 "input": {
                     "prompt": "${tool_response._meta.create_thread.prompt}",
                     "target": "${tool_response._meta.create_thread.target}",
@@ -41,7 +53,7 @@ def native_helper_create_hook_group() -> dict[str, object]:
                     "thinking": "${tool_response._meta.create_thread.thinking}",
                     "title": "${tool_response._meta.create_thread.title}",
                 },
-                "timeout": 30,
+                "timeout": NATIVE_HOOK_TIMEOUT_SECONDS,
                 "statusMessage": "Starting Cross Agent Chat helper",
             }
         ],
@@ -52,17 +64,17 @@ def native_helper_dispatch_hook_group() -> dict[str, object]:
     """Invoke Desktop's original-thread operation after one dispatch claim."""
 
     return {
-        "matcher": "mcp__cross_agent_chat__native_dispatch",
+        "matcher": NATIVE_DISPATCH_MATCHER,
         "hooks": [
             {
-                "type": "mcp_tool",
-                "server": "codex_app",
-                "tool": "send_message_to_thread",
+                "type": NATIVE_HOOK_TYPE,
+                "server": NATIVE_HOOK_SERVER,
+                "tool": NATIVE_DISPATCH_TOOL,
                 "input": {
                     "threadId": "${tool_response._meta.native_args.threadId}",
                     "prompt": "${tool_response._meta.native_args.prompt}",
                 },
-                "timeout": 30,
+                "timeout": NATIVE_HOOK_TIMEOUT_SECONDS,
                 "statusMessage": "Delivering Cross Agent Chat message",
             }
         ],

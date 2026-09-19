@@ -52,7 +52,7 @@ def test_fuzzy_target_is_ambiguous_across_local_and_remote_peers(
         pid=os.getpid(),
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _: [local])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([remote], True))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([remote], True))
     monkeypatch.setattr(
         runtime,
         "_send_local_target",
@@ -183,7 +183,7 @@ def test_exact_local_handle_does_not_wait_for_remote_discovery(
     monkeypatch.setattr(
         runtime,
         "_remote_discovery",
-        lambda: pytest.fail("exact local delivery queried remote peers"),
+        lambda **_: pytest.fail("exact local delivery queried remote peers"),
     )
     monkeypatch.setattr(runtime, "_send_local_target", lambda *args, **kwargs: expected)
 
@@ -212,7 +212,7 @@ def test_fuzzy_target_refuses_incomplete_remote_discovery_before_intent(
         pid=os.getpid(),
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _: [target])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([], False))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], False))
 
     with pytest.raises(ChatError, match="discovery is incomplete"):
         runtime.send(tmp_path / "state", source, "claude parser", "synthetic probe")
@@ -240,7 +240,7 @@ def test_exact_remote_handle_survives_unrelated_incomplete_discovery(
         pid=os.getpid(),
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _: [])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([target], False))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([target], False))
     monkeypatch.setattr(runtime, "canonical_source_alias", lambda *_: source.alias)
     responses: list[dict[str, object]] = []
 
@@ -289,7 +289,7 @@ def test_fuzzy_local_target_sends_after_complete_global_resolution(
     )
     expected = {"status": "TRANSPORT_ACCEPTED", "to": target.alias}
     monkeypatch.setattr(runtime, "local_targets", lambda _: [target])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([], True))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
     monkeypatch.setattr(runtime, "_send_local_target", lambda *args, **kwargs: expected)
 
     assert runtime.send(tmp_path / "state", source, "claude parser", "synthetic probe") == expected
@@ -454,6 +454,45 @@ def test_optional_delivery_mode_preserves_legacy_remote_peer_shape() -> None:
         include_delivery_mode=True,
     )
     assert unknown[0].delivery_mode is None
+
+
+def test_delivery_mechanism_is_rejected_on_the_remote_peer_wire() -> None:
+    """The local-only key must never appear in a Tailnet peer answer."""
+
+    peer = {
+        "alias": "codex@m2:parser:beta",
+        "provider": "codex",
+        "device": "m2",
+        "project": "parser",
+        "status": "available",
+        "generation": str(uuid4()),
+        "session_key": "a" * 64,
+    }
+
+    with pytest.raises(ChatError, match="invalid discovery"):
+        runtime._targets_from_tailnet(
+            "100.64.0.10",
+            {
+                "schema_version": 1,
+                "peers": [
+                    {
+                        **peer,
+                        "delivery_mode": "codex_experimental_queue",
+                        "delivery_mechanism": "native_helper",
+                    }
+                ],
+            },
+            include_delivery_mode=True,
+        )
+
+    assert (
+        runtime._targets_from_tailnet(
+            "100.64.0.10",
+            {"schema_version": 1, "peers": [{**peer, "delivery_mode": "codex_experimental_queue"}]},
+            include_delivery_mode=True,
+        )[0].delivery_mechanism
+        is None
+    )
 
 
 def test_last_codex_config_owner_restores_prior_hooks_feature(

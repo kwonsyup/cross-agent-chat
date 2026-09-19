@@ -14,6 +14,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Final, cast
 
+from cross_agent_chat import __version__
 from cross_agent_chat.core import (
     ChatError,
     Provider,
@@ -28,6 +29,12 @@ MAX_PEEK_FRAME_BYTES: Final = 64 * 1024
 NATIVE_QUEUE_TIMEOUT_SECONDS: Final = 15.0
 MAX_NATIVE_STDOUT_BYTES: Final = 64 * 1024
 NATIVE_METADATA_TIMEOUT_SECONDS: Final = 2.0
+
+
+def _client_info() -> dict[str, str]:
+    """Identify this exact client once per version-bound app-server session."""
+
+    return {"name": "cross-agent-chat", "version": __version__}
 
 
 def native_account_digest(*, binary: Path, environment: dict[str, str]) -> str:
@@ -81,7 +88,7 @@ def native_account_digest(*, binary: Path, environment: dict[str, str]) -> str:
                 "id": 0,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "cross-agent-chat", "version": "0.3.7"},
+                    "clientInfo": _client_info(),
                     "capabilities": {"experimentalApi": True},
                 },
             }
@@ -130,7 +137,7 @@ def queue_native_input(
         "id": 0,
         "method": "initialize",
         "params": {
-            "clientInfo": {"name": "cross-agent-chat", "version": "0.3.7"},
+            "clientInfo": _client_info(),
             "capabilities": {"experimentalApi": True},
         },
     }
@@ -314,7 +321,7 @@ def native_thread_titles(
                 "id": 0,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "cross-agent-chat", "version": "0.3.7"},
+                    "clientInfo": _client_info(),
                     "capabilities": {"experimentalApi": True},
                 },
             }

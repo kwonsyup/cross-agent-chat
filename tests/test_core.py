@@ -20,6 +20,7 @@ from uuid import uuid4
 
 import pytest
 
+from cross_agent_chat.codex import CodexCourier
 from cross_agent_chat.core import (
     ChatError,
     Intent,
@@ -440,7 +441,7 @@ def test_remote_delivery_wraps_reply_with_authenticated_sender_handle(
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(runtime, "local_targets", lambda _: [])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([target], True))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([target], True))
 
     def accept(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         captured.update(payload)
@@ -827,7 +828,11 @@ def test_peers_reports_remote_discovery_completeness(
         True,
         tailnet_address="100.64.0.2",
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [local] if not complete else [])
+    monkeypatch.setattr(
+        runtime,
+        "local_targets",
+        lambda *args, **kwargs: [local] if not complete else [],
+    )
     monkeypatch.setattr(
         runtime, "_remote_discovery", lambda **_: ([remote] if not complete else [], complete)
     )
@@ -984,7 +989,7 @@ def test_alias_send_rejects_incomplete_global_discovery(
         remote=False,
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _: [local])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([], False))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], False))
 
     with pytest.raises(ChatError, match="discovery is incomplete"):
         send(tmp_path / "state", source, target.alias, "hello")
@@ -1009,7 +1014,7 @@ def test_duplicate_codex_aliases_are_ambiguous_after_complete_discovery(
         for _ in range(2)
     ]
     monkeypatch.setattr(runtime, "local_targets", lambda _: aliases)
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda: ([], True))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
 
     with pytest.raises(ChatError, match="ambiguous"):
         send(tmp_path / "state", source, aliases[0].alias, "hello")
@@ -2287,6 +2292,146 @@ def test_courier_health_emits_exact_ready_contract(tmp_path: Path) -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("provider", "queued", "helper_backed", "mode", "mechanism"),
+    [
+        ("claude", False, False, "claude_native_cross_session", "claude_native"),
+        ("devin", False, False, "devin_stop_or_prompt_bound", "devin_prompt_bound"),
+        ("codex", True, True, "codex_experimental_queue", "native_helper"),
+        ("codex", True, False, "codex_experimental_queue", "direct_queue"),
+        ("codex", False, False, "codex_stop_bound", "stop_bound"),
+    ],
+)
+def test_courier_health_reports_the_exact_mechanism_behind_each_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    queued: bool,
+    helper_backed: bool,
+    mode: str,
+    mechanism: str,
+) -> None:
+    item = route(tmp_path, provider=provider, pid=os.getpid())
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.exact_agent",
+        lambda *_: {
+            "session_id": item.session_id,
+            "name": "Gate Health",
+            "kind": "interactive",
+            "cwd": item.cwd,
+        },
+    )
+    courier = (
+        CodexCourier(
+            alias=item.alias,
+            generation=item.generation,
+            native_queue=(tmp_path / "codex", {}, item.session_id) if queued else None,
+        )
+        if provider == "codex"
+        else None
+    )
+
+    health = courier_health(
+        item,
+        courier,
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
+        native_helper=helper_backed,
+    )
+
+    assert health["delivery_mode"] == mode
+    assert health["delivery_mechanism"] == mechanism
+
+
+def test_courier_health_without_the_mechanism_flag_keeps_the_legacy_shape(
+    tmp_path: Path,
+) -> None:
+    item = route(tmp_path, pid=os.getpid())
+    courier = CodexCourier(alias=item.alias, generation=item.generation)
+
+    assert courier_health(item, courier, include_delivery_mode=True) == {
+        "schema_version": 1,
+        "status": "READY",
+        "generation": item.generation,
+        "alias": item.alias,
+        "delivery_mode": "codex_stop_bound",
+    }
+
+
+def test_local_target_keeps_the_observed_delivery_mechanism(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = route(tmp_path, pid=os.getpid())
+    health = {
+        "schema_version": 1,
+        "status": "READY",
+        "generation": item.generation,
+        "alias": item.alias,
+        "delivery_mode": "codex_experimental_queue",
+        "delivery_mechanism": "native_helper",
+    }
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", lambda *_args, **_kwargs: health)
+
+    target = _local_target(tmp_path / "state", item)
+
+    assert target is not None
+    assert target.delivery_mode == "codex_experimental_queue"
+    assert target.delivery_mechanism == "native_helper"
+    assert "delivery_mechanism" not in target.public(include_delivery_mode=True)
+    assert (
+        target.public(include_delivery_mode=True, include_delivery_mechanism=True)[
+            "delivery_mechanism"
+        ]
+        == "native_helper"
+    )
+
+
+def test_local_target_lists_an_old_courier_without_mechanism(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A courier that ignores the new request flag still lists with its delivery mode."""
+
+    item = route(tmp_path, pid=os.getpid())
+    health = {
+        "schema_version": 1,
+        "status": "READY",
+        "generation": item.generation,
+        "alias": item.alias,
+        "delivery_mode": "codex_experimental_queue",
+    }
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", lambda *_args, **_kwargs: health)
+
+    target = _local_target(tmp_path / "state", item)
+
+    assert target is not None
+    assert target.delivery_mode == "codex_experimental_queue"
+    assert target.delivery_mechanism is None
+    assert (
+        target.public(include_delivery_mode=True, include_delivery_mechanism=True)[
+            "delivery_mechanism"
+        ]
+        == "unknown"
+    )
+
+
+@pytest.mark.parametrize("mechanism", ["unknown", "experimental_queue"])
+def test_local_target_drops_an_unrecognized_delivery_mechanism(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mechanism: str
+) -> None:
+    item = route(tmp_path, pid=os.getpid())
+    health = {
+        "schema_version": 1,
+        "status": "READY",
+        "generation": item.generation,
+        "alias": item.alias,
+        "delivery_mode": "codex_experimental_queue",
+        "delivery_mechanism": mechanism,
+    }
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", lambda *_args, **_kwargs: health)
+
+    assert _local_target(tmp_path / "state", item) is None
+
+
 def test_claude_courier_health_reports_current_alias(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2485,7 +2630,9 @@ def test_remote_discovery_uses_one_deadline_for_queued_workers(
     release = threading.Event()
     started: list[str] = []
 
-    def wait_for_peer(address: str, deadline: float | None = None) -> tuple[list[Target], bool]:
+    def wait_for_peer(
+        address: str, deadline: float | None = None, **_kwargs: object
+    ) -> tuple[list[Target], bool]:
         assert deadline is not None
         started.append(address)
         release.wait(1)

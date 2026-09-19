@@ -7,6 +7,7 @@ import errno
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shutil
 import signal
@@ -86,6 +87,10 @@ from cross_agent_chat.devin import (
     parse_pretool_input,
 )
 from cross_agent_chat.native_helper import (
+    NATIVE_HELPER_MODEL,
+    NATIVE_QUEUE_BINARY_ENV_VAR,
+    NATIVE_QUEUE_ENV_VALUE,
+    NATIVE_QUEUE_ENV_VAR,
     NativeDispatchStore,
     NativeHelperStore,
     native_helper_create_hook_group,
@@ -96,6 +101,15 @@ from cross_agent_chat.tailnet import TAILNET_PORT, tailnet_nodes, valid_tailnet_
 from cross_agent_chat.transport import remote_envelope
 
 MAX_FRAME_BYTES: Final = 64 * 1024
+# The one answer a broker can give a connection it refuses to admit: no request
+# byte was consumed and no effect is possible, so the refusal is decided rather
+# than unknown. It is emitted only before any request byte is read, which keeps
+# it impossible to confuse with a response to a request that was dispatched.
+BROKER_CAPACITY_REFUSAL: Final[dict[str, object]] = {
+    "schema_version": SCHEMA_VERSION,
+    "status": "REFUSED",
+    "detail": "recipient broker is at capacity",
+}
 SOCKET_TIMEOUT_SECONDS: Final = 5.0
 MCP_TOOL_TIMEOUT_SECONDS: Final = 270.0
 OPERATION_TIMEOUT_SECONDS: Final = 260.0
@@ -114,6 +128,9 @@ REMOTE_TIMEOUT_SECONDS: Final = (
 LOCAL_DISCOVERY_WORKERS: Final = 32
 LOCAL_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS
 NATIVE_TITLE_TIMEOUT_SECONDS: Final = 2.0
+NATIVE_DESKTOP_APPLICATIONS: Final = Path("/Applications")
+NATIVE_DESKTOP_BUNDLE_IDS: Final = ("com.openai.chat", "com.openai.codex")
+KNOWN_HANDLE_GRACE_SECONDS: Final = 2.0
 PRESENCE_ENV_VAR: Final = "CROSS_AGENT_CHAT_PRESENCE"
 PROC_PIDTBSDINFO: Final = 3
 PROC_BSDINFO_SIZE: Final = 136
@@ -123,6 +140,16 @@ DeliveryMode = Literal[
     "codex_experimental_queue",
     "devin_stop_or_prompt_bound",
 ]
+DeliveryMechanism = Literal[
+    "claude_native",
+    "native_helper",
+    "direct_queue",
+    "stop_bound",
+    "devin_prompt_bound",
+]
+DELIVERY_MECHANISMS: Final = frozenset(
+    {"claude_native", "devin_prompt_bound", "direct_queue", "native_helper", "stop_bound"}
+)
 
 
 class RegistrationInterrupted(SystemExit):
@@ -178,12 +205,14 @@ class Target:
     pid: int | None = None
     tailnet_address: str | None = None
     delivery_mode: DeliveryMode | None = None
+    delivery_mechanism: DeliveryMechanism | None = None
     title: str | None = None
 
     def public(
         self,
         *,
         include_delivery_mode: bool = False,
+        include_delivery_mechanism: bool = False,
         include_handle: bool = True,
         include_title: bool = True,
     ) -> dict[str, str]:
@@ -202,6 +231,10 @@ class Target:
             result["delivery_mode"] = (
                 "unknown" if self.delivery_mode is None else self.delivery_mode
             )
+            if include_delivery_mechanism:
+                result["delivery_mechanism"] = (
+                    "unknown" if self.delivery_mechanism is None else self.delivery_mechanism
+                )
         return result
 
 
@@ -489,14 +522,14 @@ def _spawn_courier(root: Path, route: Route) -> None:
     elif route.provider == "codex":
         environment = {
             key: os.environ[key]
-            for key in (*COURIER_ENV_KEYS, "CODEX_HOME", "CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE")
+            for key in (*COURIER_ENV_KEYS, "CODEX_HOME", NATIVE_QUEUE_ENV_VAR)
             if key in os.environ
         }
         environment["CODEX_HOME"] = route.profile_root or recipient_profile_root("codex")
         codex = str(owner_binary) if owner_binary is not None else shutil.which("codex")
         if codex is not None:
             with suppress(OSError):
-                environment["CROSS_AGENT_CHAT_CODEX_BINARY"] = str(Path(codex).resolve(strict=True))
+                environment[NATIVE_QUEUE_BINARY_ENV_VAR] = str(Path(codex).resolve(strict=True))
     else:
         environment = {key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ}
     try:
@@ -1086,12 +1119,27 @@ def _delivery_mode(
     )
 
 
+def _delivery_mechanism(
+    route: Route, courier: CodexCourier | None, *, native_helper: bool = False
+) -> DeliveryMechanism:
+    """Name the exact delivery path behind one coarse delivery mode."""
+
+    if route.provider == "claude":
+        return "claude_native"
+    if route.provider == "devin":
+        return "devin_prompt_bound"
+    if native_helper:
+        return "native_helper"
+    return "direct_queue" if courier is not None and courier.native_queue else "stop_bound"
+
+
 def courier_health(
     route: Route,
     courier: CodexCourier | None = None,
     *,
     include_delivery_mode: bool = False,
     include_direct_delivery_mode: bool = False,
+    include_delivery_mechanism: bool = False,
     native_helper: bool = False,
 ) -> dict[str, object]:
     alias = route.alias
@@ -1116,6 +1164,10 @@ def courier_health(
     }
     if include_delivery_mode:
         response["delivery_mode"] = _delivery_mode(route, courier, native_helper=native_helper)
+    if include_delivery_mechanism:
+        response["delivery_mechanism"] = _delivery_mechanism(
+            route, courier, native_helper=native_helper
+        )
     if include_direct_delivery_mode:
         response["direct_delivery_mode"] = _delivery_mode(route, courier)
     return response
@@ -1158,12 +1210,12 @@ def courier_server(
             identity, _ = recipient_owner_identity("codex", route.pid, route.profile_root)
         except (ChatError, OSError):
             identity = ""
-        helper_queue = identity == route.owner_identity and native_desktop_process(route.pid)
-    native_enabled = (
-        os.environ.get("CROSS_AGENT_CHAT_CODEX_NATIVE_QUEUE") == "experimental" or helper_queue
-    )
+        helper_queue = (
+            identity == route.owner_identity and native_desktop_bundle(route.pid) is not None
+        )
+    native_enabled = os.environ.get(NATIVE_QUEUE_ENV_VAR) == NATIVE_QUEUE_ENV_VALUE or helper_queue
     if provider == "codex" and native_enabled:
-        bound_binary = os.environ.get("CROSS_AGENT_CHAT_CODEX_BINARY")
+        bound_binary = os.environ.get(NATIVE_QUEUE_BINARY_ENV_VAR)
         if bound_binary is not None:
             candidate = Path(bound_binary)
             try:
@@ -1251,6 +1303,9 @@ def courier_server(
                                 include_delivery_mode=request.get("include_delivery_mode") is True,
                                 include_direct_delivery_mode=(
                                     request.get("include_direct_delivery_mode") is True
+                                ),
+                                include_delivery_mechanism=(
+                                    request.get("include_delivery_mechanism") is True
                                 ),
                                 native_helper=(
                                     NativeHelperStore(root).helper_for_original(
@@ -1414,6 +1469,7 @@ def _local_target(
                 "operation": "health",
                 "generation": route.generation,
                 "include_delivery_mode": True,
+                "include_delivery_mechanism": True,
             },
             timeout=timeout,
         )
@@ -1422,8 +1478,14 @@ def _local_target(
     alias = response.get("alias")
     expected = {"schema_version", "status", "generation", "alias"}
     observed_mode = response.get("delivery_mode")
+    observed_mechanism = response.get("delivery_mechanism")
     if (
-        set(response) not in (expected, expected | {"delivery_mode"})
+        set(response)
+        not in (
+            expected,
+            expected | {"delivery_mode"},
+            expected | {"delivery_mode", "delivery_mechanism"},
+        )
         or response.get("schema_version") != SCHEMA_VERSION
         or response.get("status") != "READY"
         or response.get("generation") != route.generation
@@ -1438,6 +1500,7 @@ def _local_target(
                 "devin_stop_or_prompt_bound",
             }
         )
+        or (observed_mechanism is not None and observed_mechanism not in DELIVERY_MECHANISMS)
     ):
         return None
     if route.provider == "codex":
@@ -1463,6 +1526,11 @@ def _local_target(
             cwd=route.cwd,
             pid=route.pid,
             delivery_mode=observed_mode if observed_mode is not None else None,
+            delivery_mechanism=(
+                cast(DeliveryMechanism, observed_mechanism)
+                if observed_mechanism is not None
+                else None
+            ),
         )
     except ChatError:
         return None
@@ -1475,11 +1543,12 @@ def _local_target_before_deadline(root: Path, route: Route, deadline: float) -> 
     return _local_target(root, route, timeout=min(HEALTH_TIMEOUT_SECONDS, remaining))
 
 
-def local_targets(root: Path) -> list[Target]:
+def local_targets(root: Path, *, handle: str | None = None) -> list[Target]:
     routes = [
         route
         for route in Registry(root).routes()
-        if route.process_is_live()
+        if (handle is None or session_key(route.provider, route.session_id) == handle)
+        and route.process_is_live()
         and route.cwd_is_available()
         and not NativeHelperStore(root).is_helper_lineage(route)
     ]
@@ -1651,11 +1720,19 @@ def _remote_node_targets(
     include_delivery_mode: bool = False,
     include_title: bool = False,
     include_devin: bool = False,
+    handle: str | None = None,
 ) -> tuple[list[Target], bool]:
     if deadline is None:
         deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
     legacy: dict[str, object] = {"schema_version": SCHEMA_VERSION, "operation": "peers"}
     variants: list[tuple[dict[str, object], bool]] = []
+    if handle is not None:
+        bound: dict[str, object] = {**legacy, "handle": handle}
+        if include_delivery_mode:
+            bound["include_delivery_mode"] = True
+        if include_devin:
+            bound["include_devin"] = True
+        variants.append((bound, include_delivery_mode))
     if include_delivery_mode and include_devin:
         variants.append(({**legacy, "include_delivery_mode": True, "include_devin": True}, True))
     if include_delivery_mode:
@@ -1696,6 +1773,8 @@ def _remote_node_targets(
         }
         if include_devin:
             rich_payload["include_devin"] = True
+        if handle is not None:
+            rich_payload["handle"] = handle
         raw = request_tailnet(
             address,
             rich_payload,
@@ -1724,7 +1803,11 @@ def _remote_node_targets(
 
 
 def _remote_discovery(
-    *, include_delivery_mode: bool = False, include_title: bool = False, include_devin: bool = True
+    *,
+    include_delivery_mode: bool = False,
+    include_title: bool = False,
+    include_devin: bool = True,
+    handle: str | None = None,
 ) -> tuple[list[Target], bool]:
     addresses = tailnet_nodes()
     if not addresses:
@@ -1734,28 +1817,48 @@ def _remote_discovery(
     deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
     workers = ThreadPoolExecutor(max_workers=min(16, len(addresses)))
     futures = [
-        (
-            workers.submit(
-                _remote_node_targets,
-                address,
-                deadline,
-                include_delivery_mode=include_delivery_mode,
-                include_title=include_title,
-                include_devin=include_devin,
-            )
-            if include_delivery_mode or include_title or include_devin
-            else workers.submit(_remote_node_targets, address, deadline)
+        workers.submit(
+            _remote_node_targets,
+            address,
+            deadline,
+            include_delivery_mode=include_delivery_mode,
+            include_title=include_title,
+            include_devin=include_devin,
+            handle=handle,
         )
         for address in addresses
     ]
+    pending = set(futures)
+    attested = False
     try:
-        for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
-            outcome = future.result()
-            discovered, node_complete = outcome
-            targets.extend(discovered)
-            complete = complete and node_complete
-    except FuturesTimeoutError:
-        complete = False
+        try:
+            for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
+                pending.discard(future)
+                discovered, node_complete = future.result()
+                targets.extend(discovered)
+                complete = complete and node_complete
+                if handle is not None and any(
+                    target.session_key == handle for target in discovered
+                ):
+                    attested = True
+                    break
+        except FuturesTimeoutError:
+            complete = False
+        if attested:
+            # The first attestation settles an exact handle unless a second
+            # claimant answers; unrelated nodes get a short grace to weigh in.
+            remaining = deadline - time.monotonic()
+            try:
+                for future in as_completed(
+                    pending,
+                    timeout=max(0.0, min(remaining, KNOWN_HANDLE_GRACE_SECONDS)),
+                ):
+                    pending.discard(future)
+                    discovered, node_complete = future.result()
+                    targets.extend(discovered)
+                    complete = complete and node_complete
+            except FuturesTimeoutError:
+                complete = False
     finally:
         for future in futures:
             future.cancel()
@@ -2025,7 +2128,9 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
     if len(exact_local_handles) == 1:
         target = exact_local_handles[0]
         return _send_local_target(root, source, target, message, deadline=deadline)
-    remote, remote_complete = _remote_discovery()
+    remote, remote_complete = _remote_discovery(
+        handle=target_query if re.fullmatch(r"[0-9a-f]{64}", target_query) else None
+    )
     exact_remote_handles = [target for target in remote if target.session_key == target_query]
     if len(exact_remote_handles) == 1:
         target = exact_remote_handles[0]
@@ -2103,6 +2208,11 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
     except ChatError:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
         raise
+    if response == BROKER_CAPACITY_REFUSAL:
+        # The broker refused admission before reading a byte, so nothing could
+        # have happened. Older brokers close instead, which stays unknown.
+        store.mark(event_id, "PRE_EFFECT_REJECTED")
+        raise ChatError("recipient broker is at capacity; nothing was delivered; send again")
     rejection = pre_effect_error(response, event_id, target.provider)
     if rejection is not None:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
@@ -2288,8 +2398,10 @@ def peers(
     include_remote: bool = True,
     internal: bool = False,
     include_delivery_mode: bool = False,
+    include_delivery_mechanism: bool = False,
     include_title: bool = False,
     include_devin: bool = True,
+    handle: str | None = None,
 ) -> dict[str, object]:
     display_titles = not internal or include_title
     deadline = time.monotonic() + (
@@ -2297,17 +2409,18 @@ def peers(
     )
     if include_remote:
         with ThreadPoolExecutor(max_workers=2) as workers:
-            local = workers.submit(local_targets, root)
+            local = workers.submit(local_targets, root, handle=handle)
             remote = workers.submit(
                 _remote_discovery,
                 include_delivery_mode=include_delivery_mode,
                 include_title=display_titles,
+                handle=handle,
             )
             remote_targets, remote_complete = remote.result()
             targets = [*local.result(), *remote_targets]
         remote_discovery = "complete" if remote_complete else "incomplete"
     else:
-        targets = local_targets(root)
+        targets = local_targets(root, handle=handle)
         remote_discovery = "not_requested"
     if not include_devin:
         targets = [target for target in targets if target.provider != "devin"]
@@ -2321,6 +2434,7 @@ def peers(
     for target in targets:
         item = target.public(
             include_delivery_mode=include_delivery_mode,
+            include_delivery_mechanism=include_delivery_mechanism,
             include_handle=not internal,
             include_title=not internal or include_title,
         )
@@ -2497,18 +2611,74 @@ def _native_desktop_route(route: Route) -> bool:
     """Recognize a route owned by the bundled Native Codex process."""
 
     try:
-        identity, executable = recipient_owner_identity("codex", route.pid, route.profile_root)
+        identity, _ = recipient_owner_identity("codex", route.pid, route.profile_root)
     except (ChatError, OSError):
         return False
     return (
         route.provider == "codex"
         and identity == route.owner_identity
-        and executable == Path("/Applications/ChatGPT.app/Contents/Resources/codex")
-        and native_desktop_process(route.pid)
+        and native_desktop_bundle(route.pid) is not None
     )
 
 
-def native_desktop_process(pid: int) -> bool:
+def _native_bundle_root(executable: Path, inner: tuple[str, str]) -> Path | None:
+    """Return the ChatGPT.app root containing one bundled executable path."""
+
+    parents = executable.parents
+    if (
+        len(parents) >= 3
+        and parents[2].name == "ChatGPT.app"
+        and parents[1].name == "Contents"
+        and parents[0].name == inner[0]
+        and executable.name == inner[1]
+    ):
+        return parents[2]
+    return None
+
+
+def _supported_native_bundle(bundle: Path) -> Path | None:
+    """Resolve one ChatGPT.app root only inside a supported install location."""
+
+    try:
+        resolved = bundle.resolve(strict=True)
+    except OSError:
+        return None
+    applications = NATIVE_DESKTOP_APPLICATIONS.resolve()
+    if resolved.name != "ChatGPT.app" or (
+        resolved.parent != applications
+        and resolved.parent.parent != applications
+        and resolved.parent != (Path.home() / "Applications").resolve()
+    ):
+        return None
+    try:
+        info = plistlib.loads((resolved / "Contents" / "Info.plist").read_bytes())
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(info, dict)
+        or info.get("CFBundleIdentifier") not in NATIVE_DESKTOP_BUNDLE_IDS
+    ):
+        return None
+    return resolved
+
+
+def native_desktop_bundle(pid: int) -> Path | None:
+    """Resolve the supported ChatGPT.app bundle owning one exact Codex child."""
+
+    if pid <= 0:
+        return None
+    try:
+        _, executable = recipient_owner_identity("codex", pid)
+    except (ChatError, OSError):
+        return None
+    bundle = _native_bundle_root(executable, ("Resources", "codex"))
+    resolved = _supported_native_bundle(bundle) if bundle is not None else None
+    if resolved is None or not native_desktop_process(pid, resolved):
+        return None
+    return resolved
+
+
+def native_desktop_process(pid: int, bundle: Path | None = None) -> bool:
     """Recognize an app-owned Codex child by its bounded Desktop ancestor chain."""
 
     if pid <= 0:
@@ -2525,7 +2695,9 @@ def native_desktop_process(pid: int) -> bool:
             )
         except (ChatError, OSError, subprocess.SubprocessError):
             return False
-        if executable == Path("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"):
+        ancestor = _native_bundle_root(executable, ("MacOS", "ChatGPT"))
+        found = _supported_native_bundle(ancestor) if ancestor is not None else None
+        if found is not None and (bundle is None or found == bundle):
             return True
         raw_parent = parent.stdout.strip()
         if parent.returncode != 0 or not raw_parent.isdigit() or int(raw_parent) == pid:
@@ -2549,11 +2721,11 @@ def _native_account_binary(route: Route) -> Path:
         identity, _ = recipient_owner_identity("codex", route.pid, route.profile_root)
     except (ChatError, OSError) as error:
         raise ChatError("Codex account identity is unavailable") from error
-    if identity != route.owner_identity or not native_desktop_process(route.pid):
+    bundle = native_desktop_bundle(route.pid)
+    if identity != route.owner_identity or bundle is None:
         raise ChatError("Codex account identity is unavailable")
-    bundled = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
     try:
-        return bundled.resolve(strict=True)
+        return (bundle / "Contents" / "Resources" / "codex").resolve(strict=True)
     except OSError as error:
         raise ChatError("Codex account identity is unavailable") from error
 
@@ -2643,7 +2815,7 @@ def native_bootstrap(root: Path, source: Route) -> dict[str, object]:
                     "Do not inspect memory, source files, or unrelated tasks."
                 ),
                 "target": {"type": "projectless", "directoryName": binding.helper_directory},
-                "model": "gpt-5.6-luna",
+                "model": NATIVE_HELPER_MODEL,
                 "thinking": "high",
                 "title": "Cross Agent Chat helper",
             }

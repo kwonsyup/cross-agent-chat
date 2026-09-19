@@ -181,6 +181,46 @@ def test_stop_uses_direct_stop_mode_when_helper_routing_mode_is_experimental(
     assert output["decision"] == "block"
 
 
+def test_stop_rejects_a_health_answer_carrying_an_unrequested_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+            )
+        ),
+    )
+
+    def request(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        assert payload["operation"] == "health"
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+            "delivery_mode": "codex_stop_bound",
+            "delivery_mechanism": "stop_bound",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+
+    codex_stop(os.getpid(), str(root))
+
+    assert capsys.readouterr().out == "{}\n"
+
+
 def test_presence_off_hooks_are_noops_before_state_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -284,7 +324,7 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
             "id": 0,
             "method": "initialize",
             "params": {
-                "clientInfo": {"name": "cross-agent-chat", "version": "0.3.7"},
+                "clientInfo": {"name": "cross-agent-chat", "version": "0.3.8"},
                 "capabilities": {"experimentalApi": True},
             },
         }
