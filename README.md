@@ -10,10 +10,10 @@ non-default roots). Local sessions do not need Tailscale; remote sessions need T
 allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
 files, or turn a remote peer into an owner.
 
-Install v0.3.7 prerelease with:
+Install v0.3.8 prerelease with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.7/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.8/install.sh | sh
 ```
 
 Installation requires Git because the installer builds from the release tag.
@@ -57,24 +57,30 @@ visible by default.
 
 To have an existing coding agent assist with installation, give it this prompt:
 
-> Install the released `v0.3.7` tag, not an arbitrary PR. Identify active consumers and the
+> Install the released `v0.3.8` tag, not an arbitrary PR. Identify active consumers and the
 > selected Claude/Codex roots and local Devin configuration, obtain approval before shared effects, preserve existing intent
 > records, run `cross-agent-chat doctor --json`, and test only fresh actors.
 
 ## Supported surfaces
 
-v0.3.7 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
+v0.3.8 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
 scheduling class to avoid the observed Background scheduling delay. Normal-budget discovery has
 been observed for participating macOS nodes. An aggregate roster can still be incomplete when an
-online non-CAC Tailnet node, such as an iOS node, fails discovery, and an unresponsive neighbor can
-delay a send to an exact known peer by up to about 22 seconds. Claude Code request/result was
+online non-CAC Tailnet node, such as an iOS node, fails discovery. A send to an exact handle asks
+each broker only about that handle, and once its owner has answered, other nodes get two more
+seconds to claim the same handle (which refuses the send) before delivery proceeds; a send by
+alias or fuzzy name still needs complete discovery and can wait about 22 seconds on an
+unresponsive neighbor. Claude Code request/result was
 observed on public v0.3.6 between two Macs in both directions, and on one Mac, with exact
 payloads and idle receipt. Other remote pairings are not established by that evidence.
 
 The integrations attach to the provider's own process, configuration, hooks, and messaging
 operations, not to a terminal emulator, so ordinary iTerm2, Terminal.app, or Ghostty launches of
 the same supported provider and profile use the same path. tmux, SSH, IDE-hosted, and other hosts
-still need the provider's own process, authentication, and hooks to load normally.
+still need the provider's own process, authentication, and hooks to load normally. Observed on
+v0.3.7: a Claude Code session started over SSH registered and was listed as available, but the
+recipient Mac's courier could not deliver to it and the sender got `UNKNOWN_DELIVERY`; start
+recipients from a terminal app in the logged-in desktop session.
 
 Claude Code uses its native cross-session mechanism. Codex Native uses the built-in Desktop message
 operation through a trusted, automatically managed helper;
@@ -192,7 +198,11 @@ Claude or Codex hook registers its provider, process and profile context; a Devi
 its first user prompt. Bootstrap health and later native-provider health are checked separately.
 
 The broker discovers live routes. `chat_send` resolves one exact, current destination from an exact
-or unique fuzzy query; ambiguous names and incomplete discovery are rejected before an effect. It
+or unique fuzzy query; ambiguous names are rejected before an effect, and so is incomplete
+discovery for a name. An exact handle attested by exactly one node proceeds even when unrelated
+nodes have not answered; a second node attesting the same handle refuses the send. A broker that
+cannot admit a connection says so before reading the request, which the sender records as a
+decided rejection. It
 hands delivery to the recipient's process-scoped courier (or, only with explicit profile-local
 opt-in, Codex's version-bound native queue). A reply is a separate send and consumption event, not
 proof supplied by the original send.

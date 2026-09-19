@@ -341,6 +341,7 @@ def _wired_tailnet(
         include_delivery_mode: bool = False,
         include_title: bool = False,
         include_devin: bool = True,
+        handle: str | None = None,
     ) -> tuple[list[Target], bool]:
         machine = _caller.machine
         return list(machine.remote_targets), True
