@@ -10,6 +10,10 @@ conversation depends on that provider's receiving mode, and idle receipt is not
 established for every surface. Read the receiving column before relying on a
 reply.
 
+> **Documentation note:** this source tree documents the unreleased candidate.
+> Text marked *(candidate)* describes behavior not yet in the published v0.3.8
+> prerelease; the install command below still installs that released tag.
+
 ## What it does
 
 Inside a supported coding session, the agent gets three local tools over MCP:
@@ -35,8 +39,13 @@ product traffic uses the Mac's Tailnet IPv4 address on TCP `47071`, and the
 local broker listens on `127.0.0.1:47072`. Same-Mac sessions do not need
 Tailscale. A roster can stay incomplete when an online non-CAC Tailnet node
 (such as a phone) fails discovery; that affects alias/fuzzy sends, not an
-exact handle whose owner answered. ChatGPT/Claude web apps, Gemini, Grok,
+exact token whose owner answered. ChatGPT/Claude web apps, Gemini, Grok,
 cloud Devin, Windows, and Linux have no support claim.
+
+**After any install or upgrade, start fresh sessions on every participating
+Mac** — see *Install* below. The supported request/reply scope is fresh
+sender session to fresh recipient session; retained pre-upgrade sessions may
+keep exchanging only with other retained sessions.
 
 ## Prerequisites
 
@@ -51,9 +60,11 @@ cloud Devin, Windows, and Linux have no support claim.
 
 ## What setup changes
 
-Installation is not just a binary copy. Before writing, setup snapshots every
-affected configuration file into `~/.cache/cross-agent-chat/backups/` for
-rollback, then writes:
+Installation is not just a binary copy, and it is never silent. *(Candidate)*
+the installer requires explicit approval — without `CROSS_AGENT_CHAT_APPROVE=1`
+it prints this effect summary and exits before any staging or write. With
+approval it snapshots every affected configuration file into
+`~/.cache/cross-agent-chat/backups/` for rollback, then writes:
 
 - Selected Claude root (`~/.claude` or `$CLAUDE_CONFIG_DIR`): sets
   `crossSessionInbound` to `accept` in `settings.json`, merges owned
@@ -65,32 +76,54 @@ rollback, then writes:
   `hooks.json`.
 - Devin global root (`~/.config/devin`): registers the MCP server and merges
   lifecycle hooks (SessionStart, SessionEnd, Stop, UserPromptSubmit,
-  PreToolUse). The current installer enables this integration globally even
-  when Devin is not installed.
+  PreToolUse) — only when the Devin root exists or Devin was explicitly
+  selected.
 - `~/Library/LaunchAgents/io.github.kwonsyup.cross-agent-chat.plist`: the
   owner-local broker, plus install metadata under
   `~/.config/cross-agent-chat`, state under `~/.local/state/cross-agent-chat`,
   and staged runtimes under `~/.local/share/cross-agent-chat-runtime`.
 
-Setup writes to the selected Claude and Codex roots whether or not those
-providers are installed. It preserves unrelated settings, hooks, MCP servers,
-and credentials, and refuses before writing when shared-file ownership would
-be ambiguous.
+*(Candidate)* a fresh install selects only the provider roots that already
+exist on the Mac; `CROSS_AGENT_CHAT_PROVIDERS` (a comma-separated subset of
+`claude,codex,devin`) selects explicitly. An upgrade retains the provider set
+the previous install recorded — a recorded provider is never silently
+dropped — and setup refuses before writing when shared-file ownership would
+be ambiguous. Unrelated settings, hooks, MCP servers, and credentials are
+preserved.
 
 ## Install
 
 Install v0.3.8 prerelease with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.8/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.8/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
-This installs the released `v0.3.8` tag and performs setup in one step.
-The stable command is `~/.local/bin/cross-agent-chat`; if your shell does not
-resolve it, put `~/.local/bin` on `PATH` or invoke the absolute path. Re-running
-the installer upgrades and repairs the owned configuration. An existing
-session keeps the integration it loaded at startup — start a fresh session (or,
-for Devin, submit a prompt) to pick up the tools.
+`CROSS_AGENT_CHAT_APPROVE=1` is set on `sh`, not on `curl`. On the candidate
+installer it is the required consent surface described above; the published
+v0.3.8 script predates that gate and ignores the variable, so this command is
+safe for both. This installs the released `v0.3.8` tag and performs setup in
+one step. The stable command is `~/.local/bin/cross-agent-chat`; if your shell
+does not resolve it, put `~/.local/bin` on `PATH` or invoke the absolute path.
+Re-running the installer upgrades and repairs the owned configuration.
+
+### Session compatibility after install or upgrade
+
+*(Candidate)* recipient handles changed to opaque endpoint tokens — see *First
+use*. **After installing or upgrading on every participating Mac, start fresh
+sender *and* recipient provider sessions.** The supported request/reply scope
+on this release is fresh-session to fresh-session.
+
+- Sessions retained from before the upgrade may keep exchanging with other
+  retained sessions through the upgraded broker.
+- Mixed pre-upgrade/new sessions are unsupported: an initial request can be
+  accepted (`TRANSPORT_ACCEPTED`) while the reply token in its envelope is
+  unusable by the older side. Do not retry that exchange under a new event —
+  start fresh sessions on both ends. Not every mixed-mode failure happens
+  before effect.
+- There is no raw-handle fallback, no translation or migration, and no
+  binding cache to repair — the token is self-contained, so a fresh
+  `chat_peers` listing is the only fix.
 
 ## First use
 
@@ -107,20 +140,26 @@ the matrix), does the work, and replies with a separate send. On a Stop-bound
 or prompt-bound requester the answer is handed over at that session's next
 turn — do not mistake that for delivery while it sits idle.
 
-Handles are opaque and stay valid for the life of that peer session. Display
-names are checked across devices; multiple matches or incomplete discovery
-require an exact handle. An incomplete roster can be refreshed with another
-read-only `chat_peers` call, which never authorizes resending an accepted or
-unknown message. Once an endpoint verifiably presents a handle, the sender
-binds that handle to that endpoint, so a handle that later reappears on a
-different device is refused until a fresh listing picks an owner again. When
-one node attests a handle, other nodes get a short grace window to claim the
-same handle — a second claim refuses the send, while a claim arriving after
-the window is not seen.
+*(Candidate)* the `handle` that `chat_peers` returns is an opaque endpoint
+token, not a raw session handle. A token pins the exact session key and route
+generation to the endpoint that presented them — the stable Tailnet node for
+a remote peer, or the local state root on the same Mac — and is
+self-contained: at send time the sender re-reads the Tailscale authority for
+the node's current address and requires that one endpoint to re-attest the
+exact session and generation before any effect. A token whose session
+restarted under a new generation stops resolving; run `chat_peers` again and
+send to the fresh token. A raw pre-upgrade handle is refused with guidance to
+re-list. Display-name and alias selection still work against a complete
+roster; multiple matches or incomplete remote discovery require an exact
+token. Tokens are selectors, not secrets — their encoding is not
+authentication, and holding one only names a recipient. An incomplete roster
+can be refreshed with another read-only `chat_peers` call, which never
+authorizes resending an accepted or unknown message.
 
 A delivered message arrives through the recipient provider's own inbox, so its
 visible sender is the local delivery helper, not the peer. Replies go to the
-`Reply via CAC to handle:` value in the envelope, not to the visible sender.
+`Reply via CAC to handle:` value in the envelope — on the candidate that
+value is the sender's reply token — not to the visible sender.
 
 Disposable worker sessions can opt out of the roster with
 `CROSS_AGENT_CHAT_PRESENCE=off`: no route, courier, or peer listing.
@@ -179,7 +218,9 @@ Upgrades briefly restart the shared broker while preserving live couriers,
 pending input, and route identity; runtimes referenced by live routes are
 retained, so an upgrade never removes a running courier's executable. If a
 failed setup finds newer provider settings during rollback, it retains them
-and recovery custody for diagnosis.
+and recovery custody for diagnosis. *(Candidate)* after any upgrade, the
+session-compatibility rule under *Install* applies: start fresh sessions on
+every participating Mac.
 
 `uninstall` removes only Cross Agent Chat-owned runtime, hooks, MCP entries,
 the service, and transient route state, then restores the recorded prior
@@ -201,11 +242,14 @@ the inbound policy nor any delivery guarantee.
 provider delivery → separate reply → cleanup/recovery`. Fresh provider
 sessions register a route bound to their process, profile, device, and a
 generation; Devin routes wait for the first user prompt. Sends resolve one
-exact destination — ambiguous names and incomplete discovery refuse before any
-effect — and the recipient broker validates the event and reverse-authorizes
-it with the sender's broker before handing the body to the recipient-local
-integration. Durable state carries metadata and digests only, never message
-bodies. [docs/source-map.md](docs/source-map.md) maps these steps to modules.
+exact destination — an opaque endpoint token, or a unique name against a
+complete roster — and re-validate the session key, route generation, and
+presenting endpoint before any effect; ambiguous names and incomplete
+discovery refuse the same way. The recipient broker validates the event and
+reverse-authorizes it with the sender's broker before handing the body to
+the recipient-local integration. Durable state carries metadata and digests
+only, never message bodies. [docs/source-map.md](docs/source-map.md) maps
+these steps to modules.
 
 Provider compatibility is version-sensitive. The Codex integrations rely on
 the trusted `codex_app` MCP tools (`create_thread`,

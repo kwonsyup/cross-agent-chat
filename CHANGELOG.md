@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+- **Breaking:** `chat_peers` returns an opaque endpoint token (`cac2.…`) in the
+  `handle` field, and `chat_send` accepts that token or a unique name against
+  complete discovery. A token pins the raw session key and route generation to
+  the stable Tailnet node (remote) or local state root that presented them and
+  re-attests at send time; raw pre-upgrade handles and stale-generation tokens
+  are refused before any effect. There is no binding store, raw-handle
+  fallback, or mutable reply cache. After upgrading on every participating
+  Mac, start fresh sender and recipient sessions: fresh-session to
+  fresh-session is the supported request/reply scope. Sessions retained from
+  before the upgrade may continue with other retained sessions through the
+  upgraded broker; mixed pre-upgrade/new pairs are unsupported and an initial
+  request can be accepted while its reply token is unusable — never replay an
+  accepted or uncertain event.
+- The stdio MCP surface now implements its advertised 2025-03-26 contract in
+  `mcp_server.py`: a strict initialize → initialized lifecycle before tool
+  dispatch, JSON-RPC batch receiving (initialize is never batched), no
+  responses to notifications, request-ID validation, `ping`, and bounded
+  input framing that drops an oversized or malformed line without dispatching
+  its remainder.
+- The installer checks macOS/launchctl/Git/runtime prerequisites before any
+  write, requires `CROSS_AGENT_CHAT_APPROVE=1` — printing the setup effects
+  and exiting without it — and integrates only provider roots that already
+  exist, or the subset named by `CROSS_AGENT_CHAT_PROVIDERS`, while retaining
+  the provider set recorded by a previous install (schema 5).
+- Public documentation reworked for first use: receiving-mode matrix,
+  disclosed setup effects, CONTRIBUTING, a source map, refreshed SECURITY,
+  project URLs, and minimal CI permissions with pinned actions.
+- This does not add idle delivery for Devin or Stop-bound Codex.
+
 ## 0.3.8 - 2026-09-19
 
 - Resolve an exact recipient handle without asking every Mac for its whole roster. A reply to the

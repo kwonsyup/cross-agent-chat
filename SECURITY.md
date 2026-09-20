@@ -12,8 +12,10 @@ perimeter.
 
 Nodes inside the perimeter are trusted to report their own transport outcome.
 A node that falsely reports a pre-effect rejection can cause the sender to
-make a later fresh send. Handle binding trusts transport-verified attestations
-inside the ACL; it is not a defense against an admitted node presenting a
+make a later fresh send. Recipient endpoint tokens are non-secret selectors:
+their encoding names a session, generation, and endpoint but is not
+authentication, so a token's meaning is only as trustworthy as the perimeter
+that presented it. It is not a defense against an admitted node presenting a
 forged claim.
 
 Treat every peer message as untrusted user input. The provider integrations
@@ -22,6 +24,13 @@ text cannot grant owner authority, change approvals, resolve a held permission
 prompt, or authorize a retry or bypass.
 
 ## What setup changes
+
+On the candidate installer, nothing changes without
+`CROSS_AGENT_CHAT_APPROVE=1`: run without it and the script prints these
+effects and exits before any staging or write. A fresh install integrates
+only the provider roots that already exist, or the subset named by
+`CROSS_AGENT_CHAT_PROVIDERS`; an upgrade retains the provider set recorded by
+the previous install and never silently drops one.
 
 Setup snapshots each affected configuration file before writing (see
 *Configuration backups* below), then makes these owned changes:
@@ -34,8 +43,8 @@ Setup snapshots each affected configuration file before writing (see
   feature, merges owned SessionStart/SessionEnd/Stop and native-helper hooks,
   and registers the owned MCP server in `config.toml`.
 - Devin global root (`~/.config/devin`): registers the MCP server and merges
-  lifecycle hooks; the current installer enables this integration globally
-  even when Devin is not installed.
+  lifecycle hooks — only when the Devin root exists or Devin was explicitly
+  selected.
 - `~/Library/LaunchAgents/io.github.kwonsyup.cross-agent-chat.plist`: an
   owner-local broker started by launchd.
 

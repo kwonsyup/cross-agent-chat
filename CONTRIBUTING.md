@@ -46,8 +46,9 @@ Mac where you intend the provider interaction, e.g. after a provider upgrade:
 A dev checkout is not an installed product. Do not run `install.sh` or
 `cross-agent-chat setup` from a development environment unless you mean to
 modify that Mac's real provider configuration — they write to the selected
-Claude/Codex roots, `~/.config/devin`, and launchd. `doctor` is safe to run
-anywhere; it is read-only and reports `needs setup` on an unconfigured host.
+provider roots and launchd (the installer additionally requires
+`CROSS_AGENT_CHAT_APPROVE=1`). `doctor` is safe to run anywhere; it is
+read-only and reports `needs setup` on an unconfigured host.
 
 ## Where things live
 
@@ -63,8 +64,10 @@ Reviews reject changes that weaken these, even to make a test pass:
 - No replay of accepted or uncertain work. `TRANSPORT_ACCEPTED` is custody,
   `UNKNOWN_DELIVERY` means an effect may have happened; neither may be retried
   by the product.
-- Exact-recipient selection. Ambiguous names, incomplete discovery, and a
-  handle that moved endpoints refuse before any effect.
+- Exact-recipient selection. Ambiguous names, incomplete discovery, a raw
+  pre-upgrade handle, and a token whose session or generation no longer
+  re-attests all refuse before any effect. Endpoint tokens are self-contained;
+  there is no binding store to migrate.
 - Bound sender identity. Codex thread metadata, Claude process/profile checks,
   and Devin's single-use trusted-hook capability — the model never nominates
   its own sender identity.
