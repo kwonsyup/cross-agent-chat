@@ -214,8 +214,10 @@ def _ready_request(connection: socket.socket) -> dict[object, object] | None:
     return _parse_peeked(buffered)
 
 
-def _peeked_request(connection: socket.socket) -> dict[object, object] | None:
-    """Copy the buffered request frame without consuming it, or None if undecided."""
+def _peeked_request(
+    connection: socket.socket,
+) -> tuple[dict[object, object], float] | None:
+    """Copy the buffered request frame and its deadline, or None if undecided."""
     deadline = time.monotonic() + PEEK_REQUEST_DEADLINE_SECONDS
     buffered = b""
     stall_wait = PEEK_STALL_WAIT_MIN_SECONDS
@@ -243,15 +245,17 @@ def _peeked_request(connection: socket.socket) -> dict[object, object] | None:
             return None
         time.sleep(min(stall_wait, remaining))
         stall_wait = min(stall_wait * 2, PEEK_STALL_WAIT_MAX_SECONDS)
-    return _parse_peeked(buffered)
+    request = _parse_peeked(buffered)
+    return (request, deadline) if request is not None else None
 
 
 def probe_broker_connection(root: Path, connection: socket.socket, peer_address: str) -> None:
     """Serve an overflowed authorize, refuse anything else before reading it."""
-    request = _peeked_request(connection)
-    if request is None:
+    peeked = _peeked_request(connection)
+    if peeked is None:
         # Undecided without consuming a byte: drop silently, as before.
         return
+    request, deadline = peeked
     if request.get("operation") != "authorize":
         # The request was only peeked at, never consumed or dispatched, so the
         # capacity refusal is truthful and cannot be confused with a response
@@ -259,9 +263,10 @@ def probe_broker_connection(root: Path, connection: socket.socket, peer_address:
         connection.settimeout(REFUSAL_WRITE_TIMEOUT_SECONDS)
         emit_frame_safely(connection, BROKER_CAPACITY_REFUSAL)
         return
-    connection.settimeout(5.0)
     try:
-        raw: object = json.loads(read_frame(connection))
+        # Consuming the already-peeked frame runs on what remains of the same
+        # probe deadline, not a fresh wait that would double the reserve hold.
+        raw: object = json.loads(read_frame(connection, deadline=deadline))
     except json.JSONDecodeError as error:
         raise ChatError("Tailnet broker request is invalid") from error
     emit_frame_safely(connection, handle_broker_request(root, raw, peer_address))

@@ -281,9 +281,26 @@ def require_socket(path: Path) -> None:
         raise ChatError("session courier socket is unsafe")
 
 
-def read_frame(connection: socket.socket, limit: int = MAX_FRAME_BYTES) -> bytes:
+def read_frame(
+    connection: socket.socket,
+    limit: int = MAX_FRAME_BYTES,
+    *,
+    deadline: float | None = None,
+) -> bytes:
+    # One absolute deadline bounds the whole frame. Callers that pass no
+    # deadline get theirs from the socket's configured timeout, so a slow
+    # trickle spends the same budget instead of renewing it on every recv.
+    if deadline is None:
+        configured = connection.gettimeout()
+        if configured is not None:
+            deadline = time.monotonic() + configured
     payload = b""
     while b"\n" not in payload:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("courier frame deadline expired")
+            connection.settimeout(remaining)
         chunk = connection.recv(min(65536, limit + 1 - len(payload)))
         if not chunk:
             break
@@ -310,14 +327,26 @@ def emit_frame_safely(connection: socket.socket, payload: dict[str, object]) -> 
 def request_socket(
     path: Path, payload: dict[str, object], *, timeout: float = SOCKET_TIMEOUT_SECONDS
 ) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(timeout)
     attempted_write = False
     try:
         require_socket(path)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("courier exchange deadline expired before connect")
+        client.settimeout(remaining)
         client.connect(str(path))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("courier exchange deadline expired before write")
+        client.settimeout(remaining)
         attempted_write = True
         emit_frame(client, payload)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("courier exchange deadline expired before read")
+        client.settimeout(remaining)
         raw = json.loads(read_frame(client))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError) as error:
         if not attempted_write:
@@ -338,13 +367,24 @@ def request_tailnet(
     timeout: float = 2.0,
 ) -> dict[str, object]:
     """Exchange one bounded frame with a Tailnet broker."""
+    deadline = time.monotonic() + timeout
     attempted_write = False
     try:
-        client = socket.create_connection((address, port), timeout=timeout)
-        client.settimeout(timeout)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Tailnet exchange deadline expired before connect")
+        client = socket.create_connection((address, port), timeout=remaining)
         with client:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Tailnet exchange deadline expired before write")
+            client.settimeout(remaining)
             attempted_write = True
             emit_frame(client, payload)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Tailnet exchange deadline expired before read")
+            client.settimeout(remaining)
             raw: object = json.loads(read_frame(client))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError) as error:
         if not attempted_write:

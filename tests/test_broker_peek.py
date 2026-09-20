@@ -196,8 +196,9 @@ def test_peeked_request_leaves_frame_buffered() -> None:
     server_side = _CountingSocket(raw_server)
     try:
         client.sendall(_AUTHORIZE_FRAME + b"\n")
-        request = broker._peeked_request(server_side)
-        assert request is not None
+        peeked = broker._peeked_request(server_side)
+        assert peeked is not None
+        request, _deadline = peeked
         assert request.get("operation") == "authorize"
         server_side.settimeout(5.0)
         assert read_frame(server_side) == _AUTHORIZE_FRAME
@@ -213,9 +214,10 @@ def test_peeked_request_waits_for_first_bytes() -> None:
     try:
         _feed(client, [(0.3, _AUTHORIZE_FRAME + b"\n")])
         started = time.monotonic()
-        request = broker._peeked_request(server_side)
+        peeked = broker._peeked_request(server_side)
         elapsed = time.monotonic() - started
-        assert request is not None
+        assert peeked is not None
+        request, _deadline = peeked
         assert request.get("operation") == "authorize"
         assert elapsed >= 0.2
         assert server_side.peeks <= 8
