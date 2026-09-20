@@ -17,6 +17,7 @@ from cross_agent_chat.core import (
 )
 from cross_agent_chat.install import (
     Installer,
+    NoProviderRootsError,
     SettingsError,
     default_device,
     discover_executable,
@@ -140,6 +141,16 @@ def _installer(
         devin_global=True,
         providers=selected,
     )
+
+
+def _doctor_installer(device: str | None) -> Installer | None:
+    try:
+        return _installer(device)
+    except NoProviderRootsError:
+        # A fresh profile is a useful doctor result, not an install failure.
+        # Do not construct an empty installer: its verification paths could
+        # inspect provider files that are absent or intentionally unselected.
+        return None
 
 
 MCP_INTERNAL_TOOLS: Final = frozenset({"native_bootstrap", "native_register", "native_dispatch"})
@@ -597,15 +608,19 @@ def run(arguments: argparse.Namespace) -> int:
         next_step = "Start a fresh Claude or Codex session, or submit a prompt in Devin."
         print(f"Cross Agent Chat is ready on {installer.device}. {next_step}")
     elif command == "doctor":
-        installer = _installer(arguments.device)
-        integration_healthy = installer.verify_configuration()
-        broker_healthy = installer.broker_is_healthy()
+        doctor_installer = _doctor_installer(arguments.device)
+        integration_healthy = (
+            doctor_installer is not None and doctor_installer.verify_configuration()
+        )
+        broker_healthy = doctor_installer is not None and doctor_installer.broker_is_healthy()
         healthy = integration_healthy and broker_healthy
         doctor_result = {
             "version": __version__,
             "integration": "healthy" if integration_healthy else "needs setup",
             "codex_native_queue": (
-                "experimental" if installer._codex_native_queue_enabled() else "stop-bound"
+                "experimental"
+                if doctor_installer is not None and doctor_installer._codex_native_queue_enabled()
+                else "stop-bound"
             ),
             "local_broker": "healthy" if broker_healthy else "unavailable",
             "remote_trust": "tailscale_acl",

@@ -76,6 +76,86 @@ def test_resolve_providers_refuses_before_mutation_without_roots(tmp_path: Path)
     assert not list(home.iterdir())
 
 
+@pytest.mark.parametrize("json_output", (True, False))
+def test_real_cli_doctor_reports_fresh_profile_without_writes(
+    tmp_path: Path, json_output: bool
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = os.environ.copy()
+    environment["HOME"] = str(home)
+    environment.pop("CODEX_HOME", None)
+    environment.pop("CLAUDE_CONFIG_DIR", None)
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    arguments = ["doctor"] + (["--json"] if json_output else [])
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from cross_agent_chat.cli import main; raise SystemExit(main())",
+            *arguments,
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert result.stderr == ""
+    if json_output:
+        assert json.loads(result.stdout) == {
+            "codex_native_queue": "stop-bound",
+            "integration": "needs setup",
+            "local_broker": "unavailable",
+            "next": "cross-agent-chat setup",
+            "remote_trust": "tailscale_acl",
+            "version": "0.4.0",
+        }
+    else:
+        assert result.stdout == (
+            "version: 0.4.0\n"
+            "integration: needs setup\n"
+            "codex_native_queue: stop-bound\n"
+            "local_broker: unavailable\n"
+            "remote_trust: tailscale_acl\n"
+            "next: cross-agent-chat setup\n"
+        )
+    assert tuple(home.iterdir()) == ()
+
+
+def test_real_cli_setup_preserves_strict_explicit_provider_selection(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = os.environ.copy()
+    environment["HOME"] = str(home)
+    environment.pop("CODEX_HOME", None)
+    environment.pop("CLAUDE_CONFIG_DIR", None)
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from cross_agent_chat.cli import main; raise SystemExit(main())",
+            "setup",
+            "--provider",
+            "codex",
+            "--yes",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "provider configuration roots are absent: codex" in result.stderr
+    assert tuple(home.iterdir()) == ()
+
+
 def test_resolve_providers_selects_only_existing_roots(tmp_path: Path) -> None:
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)

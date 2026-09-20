@@ -81,6 +81,10 @@ class SettingsError(RuntimeError):
     """A safe setup or configuration failure."""
 
 
+class NoProviderRootsError(SettingsError):
+    """No provider configuration roots exist for this profile."""
+
+
 class ConfigurationChangedError(SettingsError):
     """Provider configuration changed before setup writes or guarded rollback."""
 
@@ -351,7 +355,7 @@ def resolve_providers(
             else tuple(provider for provider in SUPPORTED_PROVIDERS if present[provider])
         )
         if not selected:
-            raise SettingsError(
+            raise NoProviderRootsError(
                 "no supported provider configuration roots exist; "
                 "install a provider or pass --provider"
             )
