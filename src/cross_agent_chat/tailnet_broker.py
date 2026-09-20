@@ -190,7 +190,7 @@ def serve_broker_connection(root: Path, connection: socket.socket, peer_address:
     connection.settimeout(5.0)
     try:
         raw: object = json.loads(read_frame(connection))
-    except json.JSONDecodeError as error:
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ChatError("Tailnet broker request is invalid") from error
     emit_frame_safely(connection, handle_broker_request(root, raw, peer_address))
 
@@ -267,7 +267,7 @@ def probe_broker_connection(root: Path, connection: socket.socket, peer_address:
         # Consuming the already-peeked frame runs on what remains of the same
         # probe deadline, not a fresh wait that would double the reserve hold.
         raw: object = json.loads(read_frame(connection, deadline=deadline))
-    except json.JSONDecodeError as error:
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ChatError("Tailnet broker request is invalid") from error
     emit_frame_safely(connection, handle_broker_request(root, raw, peer_address))
 

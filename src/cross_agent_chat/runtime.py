@@ -2454,10 +2454,15 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
             "target_generation": generation,
             "payload_digest": payload_digest,
         }
+        # The authorization callback and the provider accept draw from one
+        # absolute budget: a slow answer from the sender's broker spends time
+        # the accept can no longer use, and the pair can never hold the
+        # receive longer than their combined configured bound.
+        deadline = time.monotonic() + AUTHORIZE_TIMEOUT_SECONDS + ACCEPT_TIMEOUT_SECONDS
         authorization = request_tailnet(
             source_address,
             authorization_request,
-            timeout=AUTHORIZE_TIMEOUT_SECONDS,
+            timeout=min(AUTHORIZE_TIMEOUT_SECONDS, deadline - time.monotonic()),
         )
         expected_authorization = {
             key: value for key, value in authorization_request.items() if key != "operation"
@@ -2500,7 +2505,7 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
                 "event_id": event_id,
                 "message": message,
             },
-            timeout=ACCEPT_TIMEOUT_SECONDS,
+            timeout=min(ACCEPT_TIMEOUT_SECONDS, deadline - time.monotonic()),
         )
         delivery_expected: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,

@@ -30,6 +30,8 @@ from cross_agent_chat.core import (
     session_key,
 )
 from cross_agent_chat.runtime import (
+    ACCEPT_TIMEOUT_SECONDS,
+    AUTHORIZE_TIMEOUT_SECONDS,
     MAX_FRAME_BYTES,
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     Target,
@@ -1621,6 +1623,130 @@ def test_remote_receive_routes_registered_codex_original_to_its_helper(
         "to": original.alias,
         "provider": "codex",
     }
+
+
+def _remote_receive_target(tmp_path: Path) -> tuple[Route, Target]:
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(route)
+    return route, Target(
+        alias=route.alias,
+        provider="codex",
+        device=route.device,
+        project=route.project,
+        generation=route.generation,
+        session_key=session_key("codex", route.session_id),
+        remote=False,
+        session_id=route.session_id,
+        cwd=route.cwd,
+        pid=route.pid,
+    )
+
+
+def test_remote_receive_authorization_spend_shrinks_the_accept_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow authorization answer spends from the same budget the accept uses.
+
+    The sender-broker callback and the provider accept draw from one
+    absolute deadline, so time the callback consumed is no longer
+    available to the accept.
+    """
+    route, public_target = _remote_receive_target(tmp_path)
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=str(uuid4()),
+        target_alias=route.alias,
+        generation=route.generation,
+        message="hello",
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    now = [1_000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    authorize_timeouts: list[float] = []
+    accept_timeouts: list[float] = []
+
+    def authorize(
+        _address: str, payload: dict[str, object], *, timeout: float, **_kwargs: object
+    ) -> dict[str, object]:
+        authorize_timeouts.append(timeout)
+        now[0] += 30.0
+        return {key: value for key, value in payload.items() if key != "operation"} | {
+            "status": "AUTHORIZED"
+        }
+
+    def accept(
+        _path: Path, payload: dict[str, object], *, timeout: float, **_kwargs: object
+    ) -> dict[str, object]:
+        accept_timeouts.append(timeout)
+        return {
+            "schema_version": 1,
+            "event_id": event_id,
+            "status": "TRANSPORT_ACCEPTED",
+            "to": route.alias,
+            "provider": "codex",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", authorize)
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", accept)
+
+    assert receive_remote(tmp_path, envelope, "100.64.0.11")["status"] == "TRANSPORT_ACCEPTED"
+    assert authorize_timeouts == [AUTHORIZE_TIMEOUT_SECONDS]
+    assert accept_timeouts == [
+        pytest.approx(AUTHORIZE_TIMEOUT_SECONDS + ACCEPT_TIMEOUT_SECONDS - 30.0)
+    ]
+
+
+def test_remote_receive_spent_budget_refuses_before_any_accept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A budget already spent by authorization leaves nothing for the accept.
+
+    The accept is armed with the shared remainder -- here nothing -- rather
+    than a fresh provider budget, so the receive stays a decided
+    pre-effect refusal.
+    """
+    route, public_target = _remote_receive_target(tmp_path)
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=str(uuid4()),
+        target_alias=route.alias,
+        generation=route.generation,
+        message="hello",
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    now = [1_000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    accept_timeouts: list[float] = []
+
+    def authorize(
+        _address: str, payload: dict[str, object], **_kwargs: object
+    ) -> dict[str, object]:
+        now[0] += AUTHORIZE_TIMEOUT_SECONDS + ACCEPT_TIMEOUT_SECONDS + 1.0
+        return {key: value for key, value in payload.items() if key != "operation"} | {
+            "status": "AUTHORIZED"
+        }
+
+    def accept(
+        _path: Path, payload: dict[str, object], *, timeout: float, **_kwargs: object
+    ) -> dict[str, object]:
+        accept_timeouts.append(timeout)
+        raise ChatError("session courier is unavailable before delivery")
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", authorize)
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", accept)
+
+    assert receive_remote(tmp_path, envelope, "100.64.0.11")["status"] == "PRE_EFFECT_REJECTED"
+    assert accept_timeouts and accept_timeouts[0] <= 0.0
 
 
 def test_remote_claude_receipt_uses_fresh_discovery_alias_after_rename(

@@ -28,7 +28,12 @@ from cross_agent_chat.runtime import (
     request_socket,
     request_tailnet,
 )
-from cross_agent_chat.tailnet_broker import probe_broker_connection, serve_broker_connection
+from cross_agent_chat.tailnet_broker import (
+    BrokerAdmission,
+    _serve_and_close,
+    probe_broker_connection,
+    serve_broker_connection,
+)
 
 _PEER = "100.64.0.11"
 
@@ -282,6 +287,46 @@ def test_broker_intake_runs_on_one_total_deadline(
     finally:
         client.close()
         scripted.close()
+
+
+def test_broker_intake_rejects_undecodable_utf8_as_a_protocol_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed UTF-8 at the JSON boundary is a request error, not a worker fault.
+
+    A UnicodeDecodeError escaping the broker's decode would leave a worker
+    thread dying with an unhandled exception; the boundary must classify it
+    like malformed JSON -- a decided protocol error the worker swallows.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    client, scripted = _scripted_pair(clock)
+    scripted.script.append((0.0, b"\xff\xfe\n"))
+    try:
+        with pytest.raises(ChatError, match="invalid"):
+            serve_broker_connection(tmp_path, scripted, _PEER)
+    finally:
+        client.close()
+        scripted.close()
+
+
+def test_undecodable_utf8_completes_the_worker_and_releases_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The serve worker finishes cleanly and frees its admission on bad UTF-8."""
+    clock = _FakeClock()
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    client, scripted = _scripted_pair(clock)
+    scripted.script.append((0.0, b"\xff\xfe\n"))
+    admission = BrokerAdmission()
+    assert admission.acquire(_PEER)
+    try:
+        _serve_and_close(tmp_path, scripted, _PEER, admission)
+    finally:
+        client.close()
+    assert admission.by_peer == {}
+    assert admission.acquire(_PEER)
+    admission.release(_PEER)
 
 
 def test_probe_consumes_inside_the_original_peek_deadline(
