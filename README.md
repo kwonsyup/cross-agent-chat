@@ -1,261 +1,222 @@
 # Cross Agent Chat
 
-Local-first chat between authenticated Claude Code, Codex, and local Devin sessions on your Mac
-or permitted Tailnet.
+Chat between Claude Code, Codex, and local Devin sessions on one Mac or across
+permitted Macs on your Tailnet — using the provider accounts and terminal apps
+you already have.
 
-Before installing, each Mac needs a supported macOS Claude Code, Codex, or local Devin installation with its
-own working authenticated provider session. Install Cross Agent Chat separately on every Mac and
-selected provider-profile root that will use it (`CLAUDE_CONFIG_DIR` and `CODEX_HOME` select
-non-default roots). Local sessions do not need Tailscale; remote sessions need Tailnet reachability
-allowed by your Tailscale ACL. Cross Agent Chat does not copy credentials, synchronize accounts or
-files, or turn a remote peer into an owner.
+**Status: macOS prerelease.** Peer discovery and sending work between the
+supported providers below. How a delivered message enters the recipient's
+conversation depends on that provider's receiving mode, and idle receipt is not
+established for every surface. Read the receiving column before relying on a
+reply.
 
-Install v0.3.8 prerelease with:
+## What it does
+
+Inside a supported coding session, the agent gets three local tools over MCP:
+`chat_peers` discovers live sessions, `chat_send` delivers one message to an
+exact recipient, and `chat_status` reads the sender's own content-free custody
+record. A per-user broker coordinates delivery on the Mac and over your
+Tailnet. There are no Cross Agent Chat accounts, no peer files to edit, and no
+terminal extensions — the integration follows the provider process, not the
+terminal window.
+
+## Compatibility and receiving
+
+| Surface | Receiving a delivered message |
+|---|---|
+| Claude Code | Native cross-session delivery through constrained helpers. Recorded working in GUI-hosted terminal sessions (Terminal.app, iTerm2, Ghostty). One SSH-launched session registered and listed, but delivery to it failed; start recipients from the logged-in desktop session. |
+| Codex CLI | Stop-bound by default: a queued message is handed over at the conversation's next natural turn. Reception while idle is not guaranteed, and pending input held only in the courier's memory is lost if it exits first. A profile-local opt-in experimental queue can deliver while idle on tested versions. |
+| Codex Native App | A managed helper bound to the original conversation/profile/account uses Desktop-native task messaging through trusted hooks. |
+| Local Devin (CLI or App) | Delivered at a prompt or Stop boundary. A conversation becomes discoverable only after its first user prompt. Receiving in an already-idle original conversation is a known gap, not a working feature. |
+
+Peers never need matching provider accounts or a shared coding platform. Remote
+sessions additionally require Tailscale reachability allowed by your ACL;
+product traffic uses the Mac's Tailnet IPv4 address on TCP `47071`, and the
+local broker listens on `127.0.0.1:47072`. Same-Mac sessions do not need
+Tailscale. A roster can stay incomplete when an online non-CAC Tailnet node
+(such as a phone) fails discovery; that affects alias/fuzzy sends, not an
+exact handle whose owner answered. ChatGPT/Claude web apps, Gemini, Grok,
+cloud Devin, Windows, and Linux have no support claim.
+
+## Prerequisites
+
+- macOS with a supported Claude Code, Codex, or local Devin installation that
+  already has its own working authenticated session.
+- Git (the installer builds from a release tag) and either `uv` or Python
+  ≥ 3.11; the installer bootstraps a runtime tool when neither is present.
+- Install separately on every Mac and on every selected provider-profile root
+  that will participate (`CLAUDE_CONFIG_DIR` and `CODEX_HOME` select
+  non-default roots).
+- For remote peers: Tailscale with ACL-permitted reachability between the Macs.
+
+## What setup changes
+
+Installation is not just a binary copy. Before writing, setup snapshots every
+affected configuration file into `~/.cache/cross-agent-chat/backups/` for
+rollback, then writes:
+
+- Selected Claude root (`~/.claude` or `$CLAUDE_CONFIG_DIR`): sets
+  `crossSessionInbound` to `accept` in `settings.json`, merges owned
+  SessionStart/SessionEnd hooks, and registers the Cross Agent Chat MCP server
+  in `.claude.json`.
+- Selected Codex root (`~/.codex` or `$CODEX_HOME`): enables the hooks feature
+  and adds the owned MCP server and approval behavior in `config.toml`, and
+  merges owned SessionStart/SessionEnd/Stop plus native-helper hooks into
+  `hooks.json`.
+- Devin global root (`~/.config/devin`): registers the MCP server and merges
+  lifecycle hooks (SessionStart, SessionEnd, Stop, UserPromptSubmit,
+  PreToolUse). The current installer enables this integration globally even
+  when Devin is not installed.
+- `~/Library/LaunchAgents/io.github.kwonsyup.cross-agent-chat.plist`: the
+  owner-local broker, plus install metadata under
+  `~/.config/cross-agent-chat`, state under `~/.local/state/cross-agent-chat`,
+  and staged runtimes under `~/.local/share/cross-agent-chat-runtime`.
+
+Setup writes to the selected Claude and Codex roots whether or not those
+providers are installed. It preserves unrelated settings, hooks, MCP servers,
+and credentials, and refuses before writing when shared-file ownership would
+be ambiguous.
+
+## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.8/install.sh | sh
 ```
 
-Installation requires Git because the installer builds from the release tag.
+This installs the latest published release tag and performs setup in one step.
+The stable command is `~/.local/bin/cross-agent-chat`; if your shell does not
+resolve it, put `~/.local/bin` on `PATH` or invoke the absolute path. Re-running
+the installer upgrades and repairs the owned configuration. An existing
+session keeps the integration it loaded at startup — start a fresh session (or,
+for Devin, submit a prompt) to pick up the tools.
 
-The installer supplies a Python runtime when the Mac lacks a compatible one. Its default stable
-command is `~/.local/bin/cross-agent-chat`; it stages releases under
-`~/.local/share/cross-agent-chat-runtime`, then writes the selected Claude `settings.json` and
-`.claude.json`, selected Codex `config.toml` and `hooks.json`, local Devin global MCP and hook
-settings, per-profile install metadata, and the owner-local LaunchAgent broker. Setup can replace the shared broker, so inspect active
-consumers and selected roots before an install, upgrade, or uninstall. Upgrades preserve existing
-couriers and their route generations. Existing sessions keep their loaded integration; fresh
-Claude and Codex sessions use the updated tools and hooks. A local Devin conversation joins the
-peer roster when its first user prompt is submitted.
+## First use
 
-Start a fresh session, then ask naturally:
+Open two fresh supported sessions — for example Claude Code on this Mac and
+Codex on another permitted Mac. In one, ask naturally:
 
-> List my live Cross Agent Chat peers and send hello to the session on my other Mac.
+> List my Cross Agent Chat peers, then ask the session on my other Mac what
+> project is in its working directory and what language it uses, and send me
+> the answer.
 
-Codex uses Stop-bound delivery by default: accepted input waits for its next natural turn and is
-not an idle-wake guarantee. The experimental queue remains an explicit profile-local opt-in.
+The agent calls `chat_peers`, picks the exact `handle` of the intended peer,
+and sends. The recipient receives the request at its receiving boundary (see
+the matrix), does the work, and replies with a separate send. On a Stop-bound
+or prompt-bound requester the answer is handed over at that session's next
+turn — do not mistake that for delivery while it sits idle.
 
-Cross Agent Chat follows the provider processes you already use. There are no peer files,
-Cross Agent Chat accounts, or terminal-specific extensions. Permitted online Tailnet Macs appear
-automatically.
-Use the opaque exact `handle` returned by `chat_peers` to select a recipient. Display names are
-checked across devices; multiple matches or incomplete discovery require an exact handle.
-`chat_peers` reports the invoking sender's readiness separately from each recipient's delivery mode.
-An incomplete roster may be refreshed with another read-only `chat_peers` call; that does not
-authorize resending an accepted or unknown message. An exact handle stays valid for the life of
-that peer session, so `chat_peers` is for discovery and for when an exact handle stops resolving,
-not a required step before every send.
+Handles are opaque and stay valid for the life of that peer session. Display
+names are checked across devices; multiple matches or incomplete discovery
+require an exact handle. An incomplete roster can be refreshed with another
+read-only `chat_peers` call, which never authorizes resending an accepted or
+unknown message. Once an endpoint verifiably presents a handle, the sender
+binds that handle to that endpoint, so a handle that later reappears on a
+different device is refused until a fresh listing picks an owner again. When
+one node attests a handle, other nodes get a short grace window to claim the
+same handle — a second claim refuses the send, while a claim arriving after
+the window is not seen.
 
-A delivered Cross Agent Chat message arrives through your provider's own inbox, so its visible
-sender is this host's Cross Agent Chat delivery helper, not the peer. Reply to the `Reply via CAC
-to handle:` value in the message's envelope; replying to the visible sender address reaches the
-helper, which is already gone.
+A delivered message arrives through the recipient provider's own inbox, so its
+visible sender is the local delivery helper, not the peer. Replies go to the
+`Reply via CAC to handle:` value in the envelope, not to the visible sender.
 
-Disposable worker launchers can set `CROSS_AGENT_CHAT_PRESENCE=off`. That worker remains out
-of Cross Agent Chat's peer roster and creates no route or courier; ordinary sessions remain
-visible by default.
+Disposable worker sessions can opt out of the roster with
+`CROSS_AGENT_CHAT_PRESENCE=off`: no route, courier, or peer listing.
 
-To have an existing coding agent assist with installation, give it this prompt:
+## Trust and delivery semantics
 
-> Install the released `v0.3.8` tag, not an arbitrary PR. Identify active consumers and the
-> selected Claude/Codex roots and local Devin configuration, obtain approval before shared effects, preserve existing intent
-> records, run `cross-agent-chat doctor --json`, and test only fresh actors.
+- `TRANSPORT_ACCEPTED` means the exact destination accepted custody. It is not
+  a read receipt. Do not resend.
+- `UNKNOWN_DELIVERY` means an effect may have happened. Inspect the intended
+  recipient yourself; never retry that task under a new event, wording, or
+  transport. `cross-agent-chat resolve EVENT_ID` records that you accept the
+  uncertainty — it contacts nothing and does not make re-sending safe.
+- A deterministic pre-effect refusal means no message effect occurred; fix the
+  cause and send fresh.
+- `chat_status(EVENT_ID)` reads the exact sender's body-free custody record.
+  It never contacts a provider, replays delivery, or treats custody as
+  consumption; `not_observed` is not a negative receipt.
+- `chat_send` also reports `reply_delivery` for the sending session:
+  `while_idle` means a reply can arrive as a new message after the turn ends,
+  `next_turn` means it is handed over at the next turn boundary, and `unknown`
+  promises neither. Finish your turn rather than waiting or polling.
 
-## Supported surfaces
-
-v0.3.8 is a macOS prerelease. It runs the owned user-facing broker with launchd's Standard
-scheduling class to avoid the observed Background scheduling delay. Normal-budget discovery has
-been observed for participating macOS nodes. An aggregate roster can still be incomplete when an
-online non-CAC Tailnet node, such as an iOS node, fails discovery. A send to an exact handle asks
-each broker only about that handle, and once its owner has answered, other nodes get two more
-seconds to claim the same handle (which refuses the send) before delivery proceeds; a send by
-alias or fuzzy name still needs complete discovery and can wait about 22 seconds on an
-unresponsive neighbor. Claude Code request/result was
-observed on public v0.3.6 between two Macs in both directions, and on one Mac, with exact
-payloads and idle receipt. Other remote pairings are not established by that evidence.
-
-The integrations attach to the provider's own process, configuration, hooks, and messaging
-operations, not to a terminal emulator, so ordinary iTerm2, Terminal.app, or Ghostty launches of
-the same supported provider and profile use the same path. tmux, SSH, IDE-hosted, and other hosts
-still need the provider's own process, authentication, and hooks to load normally. Observed on
-v0.3.7: a Claude Code session started over SSH registered and was listed as available, but the
-recipient Mac's courier could not deliver to it and the sender got `UNKNOWN_DELIVERY`; start
-recipients from a terminal app in the logged-in desktop session.
-
-Claude Code uses its native cross-session mechanism. Codex Native uses the built-in Desktop message
-operation through a trusted, automatically managed helper;
-its body and task-creation arguments remain private to the trusted hook path. Local Devin uses its
-global MCP and lifecycle hooks; a conversation becomes discoverable only after its first user prompt,
-then receives work at a prompt or Stop boundary through its exact provider identity.
-
-| Surface | Current behavior |
-|---|---|
-| Claude Code | Native cross-session delivery through the selected Claude configuration. |
-| Codex Native App | Trusted hooks can provision a native helper and use Desktop-native task messaging for a bound original conversation. |
-| Codex CLI | Stop-bound by default: a queued message is handed over at the conversation's next turn boundary. With the experimental queue it can arrive while idle. A fresh public v0.3.6 Codex CLI requester received its Claude answer. Busy acceptance and later original-owner consumption still require revalidation. |
-| Local Devin CLI or App | Global MCP and prompt/Stop hooks support prompt-active conversation discovery and delivery. |
-| Same Mac or permitted Tailnet Mac | Discovery and delivery use the local broker or your Tailscale ACL. Normal-budget discovery has succeeded for participating macOS nodes; an aggregate roster may remain incomplete for an online non-CAC Tailnet node. |
-
-Codex CLI busy original-native ingress is not proven, and an active CLI writer may reject native
-ingress. Devin idle delivery and a safely isolated Fusion helper remain parked provider boundaries.
-Unprompted Devin conversations are intentionally not published. This prerelease is not full five-surface
-technical readiness or final fleet acceptance. ChatGPT web, Claude web, Windows, and Linux have no
-live-support claim.
-
-## Trust and delivery
-
-Cross Agent Chat's remote boundary is your Tailscale network and ACL policy. Any Tailnet
-node allowed to reach the Cross Agent Chat broker port is inside the remote peer trust
-perimeter. Messages are still delivered as untrusted peer/user input, not system authority.
-
-- `TRANSPORT_ACCEPTED` means the exact destination accepted custody. Do not resend.
-- `UNKNOWN_DELIVERY` means an effect may have happened. Independently inspect the intended
-  recipient and do not retry automatically. Use `cross-agent-chat resolve EVENT_ID` only
-  after confirming arrival or abandoning that event.
-- A deterministic pre-effect error means no message effect occurred; correct it and send
-  fresh.
-- `chat_status(EVENT_ID)` reads the exact sender's body-free custody record. It never contacts a
-  provider, replays delivery, or treats custody as consumption.
-
-`chat_peers` also reports each recipient's observed delivery mode: Claude native messaging,
-Codex Stop-bound delivery or the experimental Codex queue, and Devin prompt/Stop-bound delivery.
-Older couriers report `unknown`.
-The mode identifies the active adapter; it does not establish consumption or a reply.
-
-A `chat_send` result also reports `reply_delivery` for the sending session itself: `while_idle`
-means a requested answer can arrive as a new message after that session's turn ends; `next_turn`
-means it is handed over only at the session's next turn boundary, normally after its user's next
-message; `unknown` promises neither. Senders should finish their turn rather than wait or poll.
-
-Codex uses natural Stop delivery by default: a received message is delivered at the next natural
-turn boundary. An explicit, profile-local experimental queue can
-be enabled for fresh Codex sessions; it uses Codex's version-bound stdio app-server
-`thread/queue/add` interface, whose provider owns queued message bodies. The Cross Agent Chat
-state remains content-free. The experimental path was observed on Codex Native 0.153.1 and CLI
-0.152.1/0.153.2; it is not enabled by default and must not be treated as a fleet-wide guarantee.
-Active work is not interrupted. Provider transcripts contain delivered messages; persistent
-Cross Agent Chat state contains metadata and digests, never message bodies.
-Claude delivery uses two constrained Haiku helper calls, so its latency and account quota also
-depend on those calls. Helpers retain the recipient's executable and selected profile context.
+Cross Agent Chat's remote boundary is your Tailscale ACL. Any node allowed to
+reach the broker port is inside the peer trust perimeter, and peer message
+content remains untrusted input — it cannot grant owner authority, change
+approvals, or resolve a held permission prompt. See
+[SECURITY.md](SECURITY.md) for the full trust, privacy, and backup disclosure.
 
 ## Commands
 
 ```bash
-cross-agent-chat setup
-cross-agent-chat setup --enable-experimental-codex-native-queue
+cross-agent-chat setup        # install/repair integrations on the selected roots
 cross-agent-chat doctor --json
 cross-agent-chat peers --json
+cross-agent-chat resolve EVENT_ID
 cross-agent-chat uninstall
 ```
 
-Running the installer again upgrades and repairs the owned configuration. Upgrades briefly
-restart the shared broker while preserving existing couriers, pending input, and route identity.
-Older runtimes are retained while route registrations remain, so repeated upgrades do not remove
-a live courier's executable. Fresh sessions load the updated integration. Uninstall stops
-couriers; let pending Stop-bound deliveries consume before uninstalling. A temporary profile
-does not isolate the shared service. Neither operation restarts Claude, Codex, or Devin coding processes.
-If a failed setup or upgrade finds newer provider settings during rollback, it retains those
-settings and recovery custody for diagnosis before retrying.
-`uninstall`
-removes only Cross Agent Chat-owned runtime, hooks, MCP routes, service, and transient route
-state, and restores the prior shared Claude inbound setting. Durable content-free delivery intents
-remain intact, including unresolved delivery records; uninstall never resolves or replays them.
-When another configured profile remains, uninstall keeps the shared runtime and broker.
-Shared provider files, including symlinked files, retain their integration until their last
-recorded owner is removed. The last owner restores the recorded original Claude inbound and
-Codex hooks settings while retaining unrelated settings. Older install records that lack file
-ownership information are handled conservatively; unavailable original values are not invented.
-Sharing only one of a Codex config file and its hook file across profiles is rejected before
-setup writes.
+`setup --enable-experimental-codex-native-queue` opts the active Codex profile
+into the version-bound provider queue for fresh sessions;
+`--disable-experimental-codex-native-queue` returns it to Stop-bound delivery.
+The provider owns queued bodies and schemas in that mode.
 
-Claude users may choose `dialogExpiry: "never"` in trusted user settings to remove the provider
-approval-dialog deadline for future held inbound messages. It does not change the recipient inbound
-policy, extend an existing hold, survive recipient shutdown, or guarantee delivery. Cross Agent
-Chat does not set it globally or store/retry message bodies.
+`doctor` verifies installed configuration and local broker health. It does not
+prove provider authentication, hook consent inside every live session, remote
+reachability, recipient consumption, or a completed return journey. It also
+reports a `terminal` line when its own environment carries an inherited
+`CLAUDE_CODE_CHILD_SESSION` marker — expected inside a Claude tool/hook
+subprocess, but a terminal app launched from inside a Claude session keeps it,
+and Claude sessions started there become hidden children that never appear as
+peers. Relaunch the terminal app normally to clear it.
 
-`setup` uses the active provider roots: by default Claude reads `~/.claude/settings.json` and
-`~/.claude.json`, while an explicit `CLAUDE_CONFIG_DIR=/path/to/profile` reads
-`/path/to/profile/settings.json` and `/path/to/profile/.claude.json`. Codex uses the active
-`CODEX_HOME` for `config.toml` and `hooks.json`. Configure each selected root separately; setup,
-doctor, backups, and uninstall stay on that exact root. Existing same-root account switches need
-fresh provider sessions; Cross Agent Chat does not copy credentials or retarget live sessions.
-Use `setup --disable-experimental-codex-native-queue` to return that profile's fresh Codex
-sessions to next-turn delivery. Local Devin integration is global at `~/.config/devin`; it preserves
-unrelated MCP and hook entries and becomes active for a conversation after its first user prompt.
+## Upgrade, recovery, and uninstall
 
-`doctor` also reports a `terminal` line when its own environment carries an inherited Claude
-child-session marker (`CLAUDE_CODE_CHILD_SESSION`). The marker is expected inside a Claude tool
-or hook subprocess and needs no action there; it also stays behind on a terminal app that was
-launched from inside a Claude session, where every Claude session started becomes a hidden
-child that never appears as a peer. Relaunching that terminal app normally clears it.
+Upgrades briefly restart the shared broker while preserving live couriers,
+pending input, and route identity; runtimes referenced by live routes are
+retained, so an upgrade never removes a running courier's executable. If a
+failed setup finds newer provider settings during rollback, it retains them
+and recovery custody for diagnosis.
 
-## Architecture
+`uninstall` removes only Cross Agent Chat-owned runtime, hooks, MCP entries,
+the service, and transient route state, then restores the recorded prior
+Claude inbound and Codex hooks settings on the last owner while retaining
+unrelated settings. Content-free delivery intent records — including
+unresolved deliveries — are kept for owner inspection and are never resolved
+or replayed. Shared provider files keep their integration until their last
+recorded owner is removed. Pending Stop-bound deliveries live in courier
+memory; let them consume before uninstalling.
 
-The path is `install → hooks → registration/bootstrap → discovery → exact destination validation
-→ provider delivery → separate reply → cleanup/recovery`. Setup merges owned Claude SessionStart/
-SessionEnd and Codex SessionStart/SessionEnd/Stop hooks into the selected provider roots, adds the
-local Devin lifecycle and MCP integration, and starts one owner-local LaunchAgent broker. A fresh
-Claude or Codex hook registers its provider, process and profile context; a Devin route waits for
-its first user prompt. Bootstrap health and later native-provider health are checked separately.
+Claude users may optionally set `dialogExpiry: "never"` in trusted user
+settings to remove the provider approval-dialog deadline for future held
+inbound messages. Cross Agent Chat does not set it, and it changes neither
+the inbound policy nor any delivery guarantee.
 
-The broker discovers live routes. `chat_send` resolves one exact, current destination from an exact
-or unique fuzzy query; ambiguous names are rejected before an effect, and so is incomplete
-discovery for a name. An exact handle attested by exactly one node proceeds even when unrelated
-nodes have not answered; a second node attesting the same handle within the two-second grace
-refuses the send, and a later claim is not seen. Once an endpoint verifiably presents a handle —
-through a peers listing, an earlier send, or an authorized inbound delivery — a small
-requester-local file binds the handle to that endpoint, so a later send asks only the bound node
-and a handle that reappears on a different device is refused until a fresh listing picks an owner
-again. The binding trusts transport-verified attestations inside the Tailnet ACL; it is not a
-defense against an admitted node presenting a forged claim. A broker that cannot admit a connection says so
-before reading the request while its small refusal lane has capacity, which the sender records
-as a decided rejection; beyond that it closes silently and the outcome stays unknown. It
-hands delivery to the recipient's process-scoped courier (or, only with explicit profile-local
-opt-in, Codex's version-bound native queue). A reply is a separate send and consumption event, not
-proof supplied by the original send.
-Session-end hooks remove owned live routes; recovery preserves content-free intent metadata and does
-not replay accepted or unknown events.
+## How it works
 
-Local couriers use owner-local sockets. Remote broker traffic binds directly to the Mac's Tailnet
-address and relies on the Tailnet ACL; SSH is operator tooling, not product transport. A default
-Codex Stop-bound courier holds pending input only in memory, so it can lose it if that courier exits
-before the next natural Stop. The experimental queue leaves the message body with Codex's provider
-queue and transcript, while Cross Agent Chat retains only metadata and digests. Neither mode
-synchronizes permissions, accounts, files, or provider state between Macs.
+`install → hooks → registration → discovery → exact destination validation →
+provider delivery → separate reply → cleanup/recovery`. Fresh provider
+sessions register a route bound to their process, profile, device, and a
+generation; Devin routes wait for the first user prompt. Sends resolve one
+exact destination — ambiguous names and incomplete discovery refuse before any
+effect — and the recipient broker validates the event and reverse-authorizes
+it with the sender's broker before handing the body to the recipient-local
+integration. Durable state carries metadata and digests only, never message
+bodies. [docs/source-map.md](docs/source-map.md) maps these steps to modules.
 
-### Provider updates and contained contributor checks
+Provider compatibility is version-sensitive. The Codex integrations rely on
+the trusted `codex_app` MCP tools (`create_thread`,
+`send_message_to_thread`) and the stdio app-server session (`initialize` with
+`experimentalApi`, `account/read`, `thread/read`, opt-in `thread/queue/add`);
+recorded installs were standalone `codex` 0.155.1 and bundled
+0.155.0-alpha.9.2, Claude Code 2.1.278, and Devin CLI 3000.10.27. A schema
+match on one version is not a promise for the next.
 
-For a provider update, record the installed provider version, selected profile roots, and native
-queue schema/mode; run the affected contained adapter contracts; perform one fresh owned idle,
-busy, or compaction smoke as applicable; then update the tested matrix. Do not infer support for
-future provider versions from these checks.
+## Contributing and support
 
-The Codex integrations rely on a small set of provider-owned surfaces: the trusted `codex_app`
-MCP hook tools `create_thread` and `send_message_to_thread` (native helper lifecycle and
-dispatch), and the `codex app-server --listen stdio://` experimental session (`initialize` with
-the `experimentalApi` capability, `account/read`, `thread/read`, and the opt-in
-`thread/queue/add`). Recorded installed versions on this Mac:
-
-| Provider binary | Installed version | Mechanisms relied on |
-|---|---|---|
-| `codex` (standalone CLI) | codex-cli 0.155.1 | stdio `account/read`, `thread/read`, opt-in `thread/queue/add` |
-| `/Applications/ChatGPT.app/Contents/Resources/codex` (bundled) | codex-cli 0.155.0-alpha.9.2 | same stdio session for bound native routes, plus `codex_app` `create_thread`/`send_message_to_thread` hooks |
-
-A schema match on one installed version is not a promise for the next; re-run the contained
-contracts and a fresh smoke after every provider update.
-
-From a development environment with the dev dependencies installed, run the contained checks with:
-
-```bash
-python -m pytest tests/test_install.py tests/test_codex.py tests/test_claude_remote.py tests/test_tailnet.py
-```
-
-The test fixtures redirect `HOME`, `CODEX_HOME`, sockets, temporary files, and provider/service
-calls into fixture-owned paths; they test contracts and failure boundaries, not a live account or
-installed macOS service. They also guard the subprocess calls made by the suite, but are not an OS
-sandbox for every arbitrary child process. Review any new child-process path and use an approved
-environment for live installation or provider testing.
-
-See [SECURITY.md](SECURITY.md) for the trust boundary and vulnerability reporting.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, contained
+checks, live-test boundaries, and the redacted issue recipe. See
+[CHANGELOG.md](CHANGELOG.md) for version history.
 
 Licensed under Apache-2.0.

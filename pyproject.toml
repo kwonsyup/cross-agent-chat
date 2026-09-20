@@ -20,6 +20,10 @@ classifiers = [
 ]
 dependencies = ["tomlkit>=0.13,<0.14"]
 
+[project.urls]
+Source = "https://github.com/kwonsyup/cross-agent-chat"
+Issues = "https://github.com/kwonsyup/cross-agent-chat/issues"
+
 [project.optional-dependencies]
 dev = [
   "build>=1.2",
@@ -39,8 +43,10 @@ packages = ["src/cross_agent_chat"]
 include = [
   "/src",
   "/tests",
+  "/docs",
   "/README.md",
   "/SECURITY.md",
+  "/CONTRIBUTING.md",
   "/CHANGELOG.md",
   "/LICENSE",
   "/pyproject.toml",
