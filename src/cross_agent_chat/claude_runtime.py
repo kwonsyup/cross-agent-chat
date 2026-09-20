@@ -547,10 +547,8 @@ def _tool_records(text: str) -> tuple[list[dict[str, object]], list[dict[str, ob
 REFUSAL_RESULT_KEYS: Final = frozenset({"success", "message", "display"})
 
 
-def _result_payload(result: dict[str, object]) -> dict[str, object] | None:
+def _result_text_payload(result: dict[str, object]) -> dict[str, object] | None:
     """Parse a tool_result's single JSON text block, if it has exactly one."""
-    if result.get("is_error") is True:
-        return None
     content = result.get("content")
     if not isinstance(content, list):
         return None
@@ -570,9 +568,15 @@ def _result_payload(result: dict[str, object]) -> dict[str, object] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _refusal_reason(result: dict[str, object]) -> str | None:
-    """The reason of a decided provider refusal result, or None for anything else."""
-    payload = _result_payload(result)
+def _result_payload(result: dict[str, object]) -> dict[str, object] | None:
+    """Parse a tool_result's single JSON text block, if it has exactly one."""
+    if result.get("is_error") is True:
+        return None
+    return _result_text_payload(result)
+
+
+def _refusal_reason_payload(payload: dict[str, object] | None) -> str | None:
+    """The reason of a decided provider refusal payload, or None for anything else."""
     if (
         payload is None
         or not {"success", "message"} <= set(payload) <= REFUSAL_RESULT_KEYS
@@ -582,6 +586,11 @@ def _refusal_reason(result: dict[str, object]) -> str | None:
     ):
         return None
     return cast(str, payload["message"])
+
+
+def _refusal_reason(result: dict[str, object]) -> str | None:
+    """The reason of a decided provider refusal result, or None for anything else."""
+    return _refusal_reason_payload(_result_payload(result))
 
 
 def parse_sendmessage_receipt(text: str) -> str:
@@ -597,8 +606,8 @@ def parse_sendmessage_receipt(text: str) -> str:
     additive.
     """
     try:
-        uses, results = _tool_records(text)
-    except json.JSONDecodeError as error:
+        uses, results, _terminal = _stream_tool_records(text)
+    except ClaudeSendMessageUnknownDelivery as error:
         raise ChatError("Claude SendMessage receipt is invalid") from error
     if len(uses) != 1 or uses[0].get("name") != "SendMessage":
         raise ChatError("Claude SendMessage receipt is invalid")
@@ -713,66 +722,136 @@ DENIAL_REASONS: Final[dict[ClaudeUnknownPhase, str]] = {
 }
 
 
-def _stream_tool_records(text: str) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """The tool records of a bounded semantically complete stream, else unknown.
+# The provider ends every completed run with one `result` record as the final
+# stream line (the headless docs guarantee it is last). Its shape, measured on
+# Claude Code 2.1.278, carries these semantic fields; the measurement proves
+# the shape, not every refusal subtype or value, so names and types are
+# required but values are not enumerated.
+_TERMINAL_INT_FIELDS: Final = ("num_turns", "result_index", "queued_turn_count")
 
-    Semantic completeness means the tool graph is closed: every tool_result
-    correlates to an observed tool_use, and every use is SendMessage -- the
-    only tool the courier is given. A result whose use record is missing, or a
-    foreign tool, means the stream lost or reordered records, so nothing in it
-    can support a decided pre-effect conclusion.
+
+def _terminal_shape(record: dict[str, object]) -> bool:
+    """Whether one record carries the provider's measured terminal shape."""
+    return (
+        record.get("type") == "result"
+        and isinstance(record.get("subtype"), str)
+        and isinstance(record.get("is_error"), bool)
+        and "stop_reason" in record
+        and (record["stop_reason"] is None or isinstance(record["stop_reason"], str))
+        and isinstance(record.get("terminal_reason"), str)
+        and isinstance(record.get("permission_denials"), list)
+        and all(
+            isinstance(record.get(field), int) and not isinstance(record.get(field), bool)
+            for field in _TERMINAL_INT_FIELDS
+        )
+    )
+
+
+def _stream_tool_records(
+    text: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
+    """The tool records and terminal of a semantically complete stream.
+
+    Completeness is ordered, not just well-typed: the stream must end in
+    exactly one terminal provider result record -- nothing may follow it --
+    and the tool graph must close, with every tool_result naming exactly one
+    earlier SendMessage use and no use or result repeated. Anything else --
+    an absent, partial or nonfinal terminal, an orphan or duplicate record,
+    a foreign tool -- cannot prove a pre-effect conclusion and is reported
+    as an invalid stream.
     """
     try:
         if len(text.encode()) > 64 * 1024:
             _unknown("helper_stream_invalid")
+        records: list[dict[str, object]] = []
         for line in text.splitlines():
-            if line and not isinstance(json.loads(line), dict):
+            if not line:
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict) or not isinstance(record.get("type"), str):
                 _unknown("helper_stream_invalid")
+            records.append(cast(dict[str, object], record))
     except (UnicodeEncodeError, json.JSONDecodeError):
         _unknown("helper_stream_invalid")
-    uses, results = _tool_records(text)
-    use_ids = {use.get("id") for use in uses if isinstance(use.get("id"), str)}
-    if any(use.get("name") != "SendMessage" for use in uses):
+    if (
+        not records
+        or not _terminal_shape(records[-1])
+        or any(record.get("type") == "result" for record in records[:-1])
+    ):
         _unknown("helper_stream_invalid")
-    if any(result.get("tool_use_id") not in use_ids for result in results):
-        _unknown("helper_stream_invalid")
-    return uses, results
+    uses: list[dict[str, object]] = []
+    results: list[dict[str, object]] = []
+    use_ids: set[str] = set()
+    answered: set[str] = set()
+    for record in records:
+        message = record.get("message")
+        blocks = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                _unknown("helper_stream_invalid")
+            kind = block.get("type")
+            if kind == "tool_use":
+                use_id = block.get("id")
+                if (
+                    block.get("name") != "SendMessage"
+                    or not isinstance(use_id, str)
+                    or not use_id
+                    or use_id in use_ids
+                ):
+                    _unknown("helper_stream_invalid")
+                use_ids.add(use_id)
+                uses.append(block)
+            elif kind == "tool_result":
+                result_id = block.get("tool_use_id")
+                if (
+                    not isinstance(result_id, str)
+                    or result_id not in use_ids
+                    or result_id in answered
+                ):
+                    _unknown("helper_stream_invalid")
+                answered.add(result_id)
+                results.append(block)
+    return uses, results, records[-1]
 
 
 def _unconsumed_gate_outcome(gate: Path, text: str) -> NoReturn:
     # Only the actual normalized hook input can establish why its predicate denied.
     denied = _gate_marker(gate, "denied", tuple(DENIAL_MARKERS.values()))
-    uses, results = _stream_tool_records(text)
+    uses, results, _terminal = _stream_tool_records(text)
     if denied is not None:
         phase = next(phase for phase, value in DENIAL_MARKERS.items() if value == denied)
-        # The marker proves the provider was told to deny the call. The stream
-        # is already closed and correlated, so every result here answers one of
-        # the observed SendMessage calls. A result that still carries an effect
-        # -- success or a message id -- contradicts the deny and keeps the
-        # outcome unknown; a result that cannot be parsed cannot be checked at
-        # all; every other recorded result is the denial itself or a decided
-        # provider refusal carrying its own reason.
+        # The marker proves the provider was told to deny a call, not that the
+        # denial completed: the stream itself must show that. It is already
+        # closed, ordered and terminal-verified, so every result here answers
+        # the courier's one permitted SendMessage call. A result still carrying
+        # an effect -- success or a message id -- contradicts the deny; a
+        # payload that is not the measured canonical refusal cannot be checked
+        # for one; a use left unanswered is an incomplete call, not a denial.
+        if len(uses) > 1:
+            _unknown("multiple_sendmessage_tool_use")
         reasons: list[str] = []
         for result in results:
-            payload = _result_payload(result)
-            if payload is not None:
-                if payload.get("success") is True or "msg_id" in payload:
-                    _unknown("pretool_gate_conflict")
-                reason = _refusal_reason(result)
-                if reason is not None:
-                    reasons.append(reason)
-            elif result.get("is_error") is not True:
+            payload = _result_text_payload(result)
+            if payload is None:
                 _unknown("helper_stream_invalid")
+            if payload.get("success") is True or "msg_id" in payload:
+                _unknown("pretool_gate_conflict")
+            reason = _refusal_reason_payload(payload)
+            if reason is None:
+                _unknown("helper_stream_invalid")
+            reasons.append(reason)
+        if uses and not results:
+            _unknown("helper_stream_invalid")
         if reasons:
             raise ClaudeSendMessageRefused(reasons[0])
         raise ClaudeSendMessageRefused(
             f"Claude SendMessage was not delivered: {DENIAL_REASONS[phase]}"
         )
     if not uses:
-        # Semantic completeness already guarantees there are no results here:
-        # a complete, readable stream with no SendMessage call and no result
-        # proves the courier finished without sending: the tool is the only
-        # delivery path.
+        # A terminal-complete stream with no tool records proves the courier
+        # finished without sending: the tool is the only delivery path.
         raise ClaudeSendMessageRefused("Claude courier finished without a SendMessage call")
     if len(uses) != 1:
         _unknown("multiple_sendmessage_tool_use")

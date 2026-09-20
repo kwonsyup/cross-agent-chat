@@ -74,6 +74,23 @@ def _write_private_marker(path: Path, value: bytes) -> None:
         os.fsync(handle.fileno())
 
 
+def _terminal_record(**overrides: object) -> dict[str, object]:
+    """The provider's final stream record, measured on Claude Code 2.1.278."""
+    record: dict[str, object] = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 1,
+        "result_index": 0,
+        "queued_turn_count": 0,
+        "stop_reason": "end_turn",
+        "terminal_reason": "completed",
+        "permission_denials": [],
+    }
+    record.update(overrides)
+    return record
+
+
 def _sendmessage_stream(
     target: str,
     message: str,
@@ -99,7 +116,9 @@ def _sendmessage_stream(
         }
         for index in range(extra_uses + 1)
     ]
-    return "\n".join(json.dumps({"message": {"content": [use]}}) for use in uses)
+    records = [json.dumps({"type": "assistant", "message": {"content": [use]}}) for use in uses]
+    records.append(json.dumps(_terminal_record()))
+    return "\n".join(records)
 
 
 def _assert_unknown_helper_phase(
@@ -175,7 +194,12 @@ def _sendmessage_receipt_stream(
             }
         ],
     }
-    return "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+    records = [
+        json.dumps({"type": "assistant", "message": {"content": [use]}}),
+        json.dumps({"type": "user", "message": {"content": [result]}}),
+        json.dumps(_terminal_record()),
+    ]
+    return "\n".join(records)
 
 
 def _assert_sendmessage_delivered(
@@ -895,10 +919,15 @@ def test_sendmessage_with_valid_helper_but_no_markers_is_unobserved(
 def test_sendmessage_with_valid_helper_and_denied_marker_is_decided(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The gate denied the courier's call and the stream carries no delivered
-    # receipt, so the call provably never ran. That is a decided pre-effect
-    # rejection, not an uncertain delivery.
-    stream = _sendmessage_stream("API work [ABC123]", "private body that must not be echoed")
+    # The gate denied the courier's call and the complete stream carries no
+    # SendMessage call and no delivered receipt, so nothing provably ran. That
+    # is a decided pre-effect rejection, not an uncertain delivery.
+    stream = "\n".join(
+        [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "abc"}),
+            json.dumps(_terminal_record()),
+        ]
+    )
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         settings = json.loads(command[command.index("--settings") + 1])
@@ -1060,9 +1089,14 @@ def test_sendmessage_helper_stream_failures_are_body_free_and_enum_bound(
 @pytest.mark.parametrize(
     "stream",
     [
-        pytest.param("", id="empty-stream"),
+        pytest.param(json.dumps(_terminal_record()), id="terminal-only"),
         pytest.param(
-            json.dumps({"type": "system", "subtype": "init", "session_id": "abc"}),
+            "\n".join(
+                [
+                    json.dumps({"type": "system", "subtype": "init", "session_id": "abc"}),
+                    json.dumps(_terminal_record()),
+                ]
+            ),
             id="records-without-a-tool-call",
         ),
     ],
@@ -1070,9 +1104,10 @@ def test_sendmessage_helper_stream_failures_are_body_free_and_enum_bound(
 def test_sendmessage_without_a_tool_call_is_decided(
     monkeypatch: pytest.MonkeyPatch, stream: str
 ) -> None:
-    # A complete, readable stream without any SendMessage tool call proves the
-    # courier finished without sending: the only delivery path is that tool,
-    # so nothing was delivered and the outcome is decided, not unknown.
+    # A complete, readable stream -- ending in the provider's terminal result
+    # record -- without any SendMessage tool call proves the courier finished
+    # without sending: the only delivery path is that tool, so nothing was
+    # delivered and the outcome is decided, not unknown.
     monkeypatch.setattr(
         "cross_agent_chat.claude_runtime.claude_binary", lambda: Path("/usr/bin/false")
     )
@@ -1267,7 +1302,7 @@ def test_sendmessage_receipt_requires_exact_success_contract() -> None:
     message_id = str(uuid4())
     # The provider stream logs the courier's placeholder proposal, which the
     # gate replaced before execution; the receipt never inspects it.
-    use = {
+    use: dict[str, object] = {
         "type": "tool_use",
         "id": "tool-1",
         "name": "SendMessage",
@@ -1284,34 +1319,39 @@ def test_sendmessage_receipt_requires_exact_success_contract() -> None:
         "tool_use_id": "tool-1",
         "content": [text_block],
     }
-    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
+    terminal = json.dumps(_terminal_record())
+
+    def build(blocks: list[dict[str, object]]) -> str:
+        records = [
+            json.dumps({"type": "assistant", "message": {"content": [blocks[0]]}}),
+            json.dumps({"type": "user", "message": {"content": list(blocks[1:])}}),
+            terminal,
+        ]
+        return "\n".join(records)
+
+    stream = build([use, result])
 
     assert parse_sendmessage_receipt(stream) == message_id
 
     result["is_error"] = True
-    rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="receipt"):
-        parse_sendmessage_receipt(rejected)
+        parse_sendmessage_receipt(build([use, result]))
 
     result["is_error"] = False
     text_block["text"] = json.dumps(
         {"success": True, "message": "sent", "msg_id": message_id, "latency_ms": 3}
     )
-    rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="receipt"):
-        parse_sendmessage_receipt(rejected)
+        parse_sendmessage_receipt(build([use, result]))
     text_block["text"] = json.dumps({"success": True, "msg_id": message_id})
-    rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="receipt"):
-        parse_sendmessage_receipt(rejected)
+        parse_sendmessage_receipt(build([use, result]))
     text_block["text"] = "sent ok"
-    rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="receipt"):
-        parse_sendmessage_receipt(rejected)
+        parse_sendmessage_receipt(build([use, result]))
     text_block["text"] = json.dumps({"success": True, "message": "sent", "msg_id": "not-a-uuid"})
-    rejected = "\n".join(json.dumps({"message": {"content": [block]}}) for block in (use, result))
     with pytest.raises(ChatError, match="invalid"):
-        parse_sendmessage_receipt(rejected)
+        parse_sendmessage_receipt(build([use, result]))
 
 
 @pytest.mark.parametrize("uses", [0, 2])
@@ -1327,7 +1367,15 @@ def test_sendmessage_receipt_requires_exactly_one_sendmessage_use(uses: int) -> 
         }
         for index in range(uses)
     ]
-    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in blocks)
+    stream = "\n".join(
+        [
+            *(
+                json.dumps({"type": "assistant", "message": {"content": [block]}})
+                for block in blocks
+            ),
+            json.dumps(_terminal_record()),
+        ]
+    )
 
     with pytest.raises(ChatError, match="receipt"):
         parse_sendmessage_receipt(stream)
@@ -1443,7 +1491,13 @@ def test_sendmessage_receipt_rejects_result_contract_violations(
         results = [dict(result, tool_use_id="other-tool")]
     elif expected_results == "duplicate":
         results = [result, dict(result)]
-    stream = "\n".join(json.dumps({"message": {"content": [block]}}) for block in [use, *results])
+    stream = "\n".join(
+        [
+            json.dumps({"type": "assistant", "message": {"content": [use]}}),
+            json.dumps({"type": "user", "message": {"content": results}}),
+            json.dumps(_terminal_record()),
+        ]
+    )
 
     with pytest.raises(ChatError, match="receipt"):
         parse_sendmessage_receipt(stream)
@@ -2088,6 +2142,7 @@ def _sendmessage_refusal_stream(result_text: str) -> str:
         [
             json.dumps({"type": "assistant", "message": {"content": [use]}}),
             json.dumps({"type": "user", "message": {"content": [result]}}),
+            json.dumps(_terminal_record()),
         ]
     )
 
@@ -2441,7 +2496,13 @@ def _sendmessage_result_stream(result: object) -> str:
         "tool_use_id": "tool-1",
         "content": [{"type": "text", "text": json.dumps(result)}],
     }
-    return "\n".join(json.dumps({"message": {"content": [b]}}) for b in (use, block))
+    return "\n".join(
+        [
+            json.dumps({"type": "assistant", "message": {"content": [use]}}),
+            json.dumps({"type": "user", "message": {"content": [block]}}),
+            json.dumps(_terminal_record()),
+        ]
+    )
 
 
 @pytest.mark.parametrize(
