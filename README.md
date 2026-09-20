@@ -85,11 +85,14 @@ approval it snapshots every affected configuration file into
 
 *(Candidate)* a fresh install selects only the provider roots that already
 exist on the Mac; `CROSS_AGENT_CHAT_PROVIDERS` (a comma-separated subset of
-`claude,codex,devin`) selects explicitly. An upgrade retains the provider set
+`claude,codex,devin`) selects explicitly, as does a repeated
+`cross-agent-chat setup --provider NAME`. An upgrade retains the provider set
 the previous install recorded — a recorded provider is never silently
 dropped — and setup refuses before writing when shared-file ownership would
-be ambiguous. Unrelated settings, hooks, MCP servers, and credentials are
-preserved.
+be ambiguous. `cross-agent-chat setup` prints a read-only plan of the exact
+selected roots and effects, then requires `--yes` or one interactive
+confirmation before any write; it never reads piped stdin for consent.
+Unrelated settings, hooks, MCP servers, and credentials are preserved.
 
 ## Install
 
@@ -191,7 +194,8 @@ approvals, or resolve a held permission prompt. See
 ## Commands
 
 ```bash
-cross-agent-chat setup        # install/repair integrations on the selected roots
+cross-agent-chat setup        # print the plan, then install/repair on the selected roots
+                              # (--provider NAME selects explicitly, --yes approves)
 cross-agent-chat doctor --json
 cross-agent-chat peers --json
 cross-agent-chat resolve EVENT_ID

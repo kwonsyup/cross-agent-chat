@@ -26,6 +26,10 @@
   and exiting without it — and integrates only provider roots that already
   exist, or the subset named by `CROSS_AGENT_CHAT_PROVIDERS`, while retaining
   the provider set recorded by a previous install (schema 5).
+  `cross-agent-chat setup` prints a read-only plan of exact roots and
+  effects, then requires `--yes` or interactive confirmation before any
+  write; a repeated `--provider NAME` selects providers explicitly, and the
+  hidden staged path requires `--yes`.
 - Public documentation reworked for first use: receiving-mode matrix,
   disclosed setup effects, CONTRIBUTING, a source map, refreshed SECURITY,
   project URLs, and minimal CI permissions with pinned actions.
