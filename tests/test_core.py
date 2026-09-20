@@ -1790,8 +1790,13 @@ def test_initial_bootstrap_follows_prebootstrap_health_without_native_lookup(
 
     original_read_frame = runtime.read_frame
 
-    def track_health_frame(connection: socket.socket, limit: int = MAX_FRAME_BYTES) -> bytes:
-        frame = original_read_frame(connection, limit)
+    def track_health_frame(
+        connection: socket.socket,
+        limit: int = MAX_FRAME_BYTES,
+        *,
+        deadline: float | None = None,
+    ) -> bytes:
+        frame = original_read_frame(connection, limit, deadline=deadline)
         request = json.loads(frame)
         if isinstance(request, dict) and request.get("operation") == "health":
             health_received.set()
@@ -1913,9 +1918,14 @@ def test_incomplete_prebootstrap_frame_cannot_delay_initial_bootstrap(
 
     original_read_frame = runtime.read_frame
 
-    def tracked_read_frame(connection: socket.socket, limit: int = MAX_FRAME_BYTES) -> bytes:
+    def tracked_read_frame(
+        connection: socket.socket,
+        limit: int = MAX_FRAME_BYTES,
+        *,
+        deadline: float | None = None,
+    ) -> bytes:
         frame_started.set()
-        return original_read_frame(connection, limit)
+        return original_read_frame(connection, limit, deadline=deadline)
 
     monkeypatch.setattr(runtime, "read_frame", tracked_read_frame)
     worker = threading.Thread(

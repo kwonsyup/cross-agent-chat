@@ -30,6 +30,7 @@ from cross_agent_chat.core import (
     session_key,
 )
 from cross_agent_chat.runtime import (
+    MAX_FRAME_BYTES,
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     Target,
     authorize_remote,
@@ -2526,7 +2527,7 @@ def test_broker_receive_preserves_proven_rejection_and_post_write_uncertainty(
     monkeypatch.setattr(
         tailnet_broker_module,
         "read_frame",
-        lambda _: json.dumps(
+        lambda _connection, _limit=MAX_FRAME_BYTES, **_kwargs: json.dumps(
             {"schema_version": 1, "operation": "receive", "envelope": envelope}
         ).encode(),
     )

@@ -15,6 +15,7 @@ import os
 import socket
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -79,6 +80,11 @@ class _ScriptedSocket(socket.socket):
     def gettimeout(self) -> float | None:
         return self._timeout
 
+    def connect(self, address: object) -> None:
+        # Exchange tests stand in for the dial; connecting a socketpair end
+        # for real would fail with EISCONN.
+        return None
+
     def recv(self, bufsize: int, flags: int = 0) -> bytes:
         self.recv_calls += 1
         assert self.script, "scripted recv ran out of results"
@@ -94,6 +100,31 @@ class _ScriptedSocket(socket.socket):
 def _scripted_pair(clock: _FakeClock) -> tuple[socket.socket, _ScriptedSocket]:
     client, server = socket.socketpair()
     return client, _ScriptedSocket(server, clock)
+
+
+def _scheduling_gap_spy(
+    clock: _FakeClock, gap: float, recorded: list[float | None]
+) -> Callable[..., bytes]:
+    """A read_frame double that wastes ``gap`` seconds before delegating.
+
+    It simulates the scheduling delay between the exchange arming the
+    remaining socket timeout and the frame read starting; the deadline the
+    caller carried in is recorded so the trial can prove the gap spent the
+    original budget rather than extending it.
+    """
+    original = read_frame
+
+    def spy(
+        connection: socket.socket,
+        limit: int = MAX_FRAME_BYTES,
+        *,
+        deadline: float | None = None,
+    ) -> bytes:
+        recorded.append(deadline)
+        clock.advance(gap)
+        return original(connection, limit, deadline=deadline)
+
+    return spy
 
 
 def _socket_path(name: str) -> Path:
@@ -528,3 +559,75 @@ def test_tailnet_connect_timeout_is_pre_effect(
             timeout=1.0,
         )
     assert not isinstance(error.value, UnknownDeliveryError)
+
+
+def test_courier_scheduling_gap_cannot_extend_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pause between arming and the read must not grow the frame budget.
+
+    The exchange used to arm the remaining socket timeout and then let
+    read_frame rebuild ``now + gettimeout()``; a scheduling delay between
+    those calls pushed the absolute deadline out. The deadline is carried
+    in explicitly, so a 0.4 s gap spends the original budget -- the 0.9 s
+    scripted fragment arrives too late and the exchange dies at t+1.0.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    client_end, scripted = _scripted_pair(clock)
+    scripted.script.append((0.9, b'{"status":"READY"}\n'))
+    path = _socket_path("courier-gap.sock")
+    listener = _unix_listener(path)
+    recorded: list[float | None] = []
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.read_frame",
+        _scheduling_gap_spy(clock, 0.4, recorded),
+    )
+    monkeypatch.setattr(socket, "socket", lambda *_args, **_kwargs: scripted)
+    try:
+        with pytest.raises(UnknownDeliveryError):
+            request_socket(path, {"operation": "health"}, timeout=1.0)
+    finally:
+        client_end.close()
+        scripted.close()
+        listener.close()
+        path.unlink(missing_ok=True)
+    assert recorded == [1_001.0]
+    assert clock.monotonic() == pytest.approx(1_001.0)
+
+
+def test_tailnet_scheduling_gap_cannot_extend_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tailnet exchange carries the same absolute deadline into the read."""
+    clock = _FakeClock()
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    client_end, scripted = _scripted_pair(clock)
+    scripted.script.append((0.8, b'{"status":"READY"}\n'))
+    recorded: list[float | None] = []
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.read_frame",
+        _scheduling_gap_spy(clock, 0.4, recorded),
+    )
+
+    def create_connection(
+        address: tuple[str, int],
+        timeout: float | None = None,
+        source_address: tuple[str, int] | None = None,
+    ) -> socket.socket:
+        clock.advance(0.1)
+        return scripted
+
+    monkeypatch.setattr(socket, "create_connection", create_connection)
+    try:
+        with pytest.raises(UnknownDeliveryError):
+            request_tailnet(
+                "100.64.0.11",
+                {"schema_version": 1, "operation": "peers"},
+                timeout=1.0,
+            )
+    finally:
+        client_end.close()
+        scripted.close()
+    assert recorded == [1_001.0]
+    assert clock.monotonic() == pytest.approx(1_001.0)

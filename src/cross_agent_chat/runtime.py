@@ -347,7 +347,7 @@ def request_socket(
         if remaining <= 0:
             raise TimeoutError("courier exchange deadline expired before read")
         client.settimeout(remaining)
-        raw = json.loads(read_frame(client))
+        raw = json.loads(read_frame(client, deadline=deadline))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError) as error:
         if not attempted_write:
             raise ChatError("session courier is unavailable before delivery") from error
@@ -385,7 +385,7 @@ def request_tailnet(
             if remaining <= 0:
                 raise TimeoutError("Tailnet exchange deadline expired before read")
             client.settimeout(remaining)
-            raw: object = json.loads(read_frame(client))
+            raw: object = json.loads(read_frame(client, deadline=deadline))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError) as error:
         if not attempted_write:
             raise ChatError("Tailnet peer is unavailable before delivery") from error
