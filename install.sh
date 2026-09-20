@@ -28,6 +28,7 @@ if ! command -v uv >/dev/null 2>&1; then
             fail 'Cross Agent Chat requires uv, python3 >= 3.11, or curl for bootstrap.'
     fi
 fi
+# shellcheck disable=SC3067 # macOS /bin/sh implements -O; the ownership check is required.
 { [ -n "${HOME:-}" ] && [ "$HOME" != "/" ] && [ -d "$HOME" ] && [ -O "$HOME" ] &&
     [ -w "$HOME" ]; } || fail 'Cross Agent Chat requires a safe owned HOME directory.'
 
@@ -171,6 +172,7 @@ if [ -n "${CROSS_AGENT_CHAT_DEVICE:-}" ]; then
 fi
 # Approval was granted through CROSS_AGENT_CHAT_APPROVE=1; provider_args entries
 # are already validated against the supported provider list.
+# shellcheck disable=SC2086 # provider_args must word-split into separate flags.
 "$staged_runtime/bin/cross-agent-chat" _install-staged "$@" --yes $provider_args
 
 published_executable=$(command -v cross-agent-chat 2>/dev/null || true)
