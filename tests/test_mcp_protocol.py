@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
-from typing import Any
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -49,7 +49,25 @@ def _handshake() -> list[object]:
     return [_initialize(), INITIALIZED]
 
 
-def _responses(capsys: pytest.CaptureFixture[str]) -> list[Any]:
+def _dict(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    return value
+
+
+def _list(value: object) -> list[object]:
+    assert isinstance(value, list)
+    return value
+
+
+def _result(response: object) -> dict[str, object]:
+    return _dict(_dict(response)["result"])
+
+
+def _error(response: object) -> dict[str, object]:
+    return _dict(_dict(response)["error"])
+
+
+def _responses(capsys: pytest.CaptureFixture[str]) -> list[object]:
     return [json.loads(line) for line in capsys.readouterr().out.splitlines()]
 
 
@@ -109,16 +127,19 @@ def test_full_initialize_initialized_list_call_journey(
     responses = _responses(capsys)
     # The initialized notification produced no output line.
     assert len(responses) == 3
-    initialize = responses[0]
+    initialize = _dict(responses[0])
     assert initialize["id"] == 1
-    assert initialize["result"]["protocolVersion"] == "2025-03-26"
-    assert initialize["result"]["serverInfo"]["name"] == "cross-agent-chat"
-    assert {tool["name"] for tool in responses[1]["result"]["tools"]} == {
+    result = _result(initialize)
+    assert result["protocolVersion"] == "2025-03-26"
+    assert _dict(result["serverInfo"])["name"] == "cross-agent-chat"
+    assert {_dict(tool)["name"] for tool in _list(_result(responses[1])["tools"])} == {
         "chat_peers",
         "chat_send",
         "chat_status",
     }
-    called = json.loads(responses[2]["result"]["content"][0]["text"])
+    text = _dict(_list(_result(responses[2])["content"])[0])["text"]
+    assert isinstance(text, str)
+    called = json.loads(text)
     assert called["sender"] == {"status": "ready"}
 
 
@@ -171,9 +192,9 @@ def test_requests_before_initialize_are_rejected_without_dispatch(
 
     responses = _responses(capsys)
     assert sent == []
-    assert responses[0]["error"]["code"] == -32600
-    assert responses[1]["error"]["code"] == -32600
-    assert "not initialized" in responses[0]["error"]["message"]
+    assert _error(responses[0])["code"] == -32600
+    assert _error(responses[1])["code"] == -32600
+    assert "not initialized" in cast(str, _error(responses[0])["message"])
 
 
 def test_initialized_notification_before_initialize_does_not_open_operation(
@@ -193,8 +214,8 @@ def test_initialized_notification_before_initialize_does_not_open_operation(
     mcp("claude", "studio", str(tmp_path / "state"))
 
     (response,) = _responses(capsys)
-    assert response["error"]["code"] == -32600
-    assert "not initialized" in response["error"]["message"]
+    assert _error(response)["code"] == -32600
+    assert "not initialized" in cast(str, _error(response)["message"])
 
 
 def test_tools_call_between_initialize_and_initialized_is_rejected(
@@ -225,9 +246,9 @@ def test_tools_call_between_initialize_and_initialized_is_rejected(
 
     responses = _responses(capsys)
     assert sent == []
-    assert responses[0]["result"]["protocolVersion"] == "2025-03-26"
-    assert responses[1]["error"]["code"] == -32600
-    assert "not initialized" in responses[1]["error"]["message"]
+    assert _result(responses[0])["protocolVersion"] == "2025-03-26"
+    assert _error(responses[1])["code"] == -32600
+    assert "not initialized" in cast(str, _error(responses[1])["message"])
 
 
 @pytest.mark.parametrize(
@@ -288,10 +309,10 @@ def test_malformed_initialize_params_are_rejected_and_do_not_open_operation(
 
     responses = _responses(capsys)
     assert sent == []
-    assert responses[0]["error"]["code"] == -32602
+    assert _error(responses[0])["code"] == -32602
     # The failed initialize plus an early initialized notification still leaves
     # the session unopened, so the tool call is refused without dispatch.
-    assert responses[1]["error"]["code"] == -32600
+    assert _error(responses[1])["code"] == -32600
 
 
 @pytest.mark.parametrize("version", ["2024-11-05", "2025-06-18", "1.0.0"])
@@ -316,9 +337,9 @@ def test_other_declared_versions_are_answered_with_the_supported_revision(
     mcp("claude", "studio", str(tmp_path / "state"))
 
     responses = _responses(capsys)
-    assert responses[0]["result"]["protocolVersion"] == "2025-03-26"
+    assert _result(responses[0])["protocolVersion"] == "2025-03-26"
     # An older provider client that completes the handshake still operates.
-    assert "tools" in responses[1]["result"]
+    assert "tools" in _result(responses[1])
 
 
 def test_reinitialize_is_rejected_before_and_after_operation(
@@ -340,11 +361,11 @@ def test_reinitialize_is_rejected_before_and_after_operation(
     mcp("claude", "studio", str(tmp_path / "state"))
 
     responses = _responses(capsys)
-    assert responses[0]["result"]["protocolVersion"] == "2025-03-26"
-    assert responses[1]["error"]["code"] == -32600
-    assert "already initialized" in responses[1]["error"]["message"]
-    assert responses[2]["error"]["code"] == -32600
-    assert "already initialized" in responses[2]["error"]["message"]
+    assert _result(responses[0])["protocolVersion"] == "2025-03-26"
+    assert _error(responses[1])["code"] == -32600
+    assert "already initialized" in cast(str, _error(responses[1])["message"])
+    assert _error(responses[2])["code"] == -32600
+    assert "already initialized" in cast(str, _error(responses[2])["message"])
 
 
 def test_mixed_batch_returns_one_array_without_notification_responses(
@@ -362,10 +383,10 @@ def test_mixed_batch_returns_one_array_without_notification_responses(
     mcp("claude", "studio", str(tmp_path / "state"))
 
     responses = _responses(capsys)
-    array = responses[1]
-    assert [item["id"] for item in array] == [7, "p"]
-    assert "tools" in array[0]["result"]
-    assert array[1]["result"] == {}
+    array = _list(responses[1])
+    assert [_dict(item)["id"] for item in array] == [7, "p"]
+    assert "tools" in _result(array[0])
+    assert _result(array[1]) == {}
 
 
 def test_batched_initialize_cannot_unlock_a_tools_call_in_the_same_batch(
@@ -393,12 +414,13 @@ def test_batched_initialize_cannot_unlock_a_tools_call_in_the_same_batch(
 
     assert sent == []
     (array,) = _responses(capsys)
-    assert array[0]["error"]["code"] == -32600
-    assert "batch" in array[0]["error"]["message"]
+    items = _list(array)
+    assert _error(items[0])["code"] == -32600
+    assert "batch" in cast(str, _error(items[0])["message"])
     # The batched initialized notification is also ignored before a valid
     # initialize, so the tool call is refused without dispatch.
-    assert array[1]["error"]["code"] == -32600
-    assert array[2] == {"jsonrpc": "2.0", "id": 3, "result": {}}
+    assert _error(items[1])["code"] == -32600
+    assert items[2] == {"jsonrpc": "2.0", "id": 3, "result": {}}
 
 
 def test_batch_of_only_notifications_produces_no_output(
@@ -439,12 +461,13 @@ def test_invalid_batch_element_gets_error_and_valid_sibling_is_served(
     mcp("claude", "studio", str(tmp_path / "state"))
 
     (array,) = _responses(capsys)
-    assert array[0] == {
+    items = _list(array)
+    assert items[0] == {
         "jsonrpc": "2.0",
         "id": None,
         "error": {"code": -32600, "message": "invalid request"},
     }
-    assert array[1] == {"jsonrpc": "2.0", "id": 1, "result": {}}
+    assert items[1] == {"jsonrpc": "2.0", "id": 1, "result": {}}
 
 
 @pytest.mark.parametrize(
@@ -475,7 +498,7 @@ def test_tools_list_rejects_cursors_and_arbitrary_params(
     mcp("claude", "studio", str(tmp_path / "state"))
 
     responses = _responses(capsys)
-    assert responses[1]["error"]["code"] == -32602
+    assert _error(responses[1])["code"] == -32602
 
 
 def test_tools_list_accepts_absent_and_meta_params(
@@ -497,8 +520,8 @@ def test_tools_list_accepts_absent_and_meta_params(
     mcp("claude", "studio", str(tmp_path / "state"))
 
     responses = _responses(capsys)
-    assert "tools" in responses[1]["result"]
-    assert "tools" in responses[2]["result"]
+    assert "tools" in _result(responses[1])
+    assert "tools" in _result(responses[2])
 
 
 @pytest.mark.parametrize("identifier", [None, True, 1.5, [1], {"a": 1}])
@@ -538,9 +561,9 @@ def test_request_id_cannot_be_reused_within_a_session(
     mcp("claude", "studio", str(tmp_path / "state"))
 
     responses = _responses(capsys)
-    assert responses[0]["result"] == {}
-    assert responses[1]["error"]["code"] == -32600
-    assert "already used" in responses[1]["error"]["message"]
+    assert _result(responses[0]) == {}
+    assert _error(responses[1])["code"] == -32600
+    assert "already used" in cast(str, _error(responses[1])["message"])
 
 
 @pytest.mark.parametrize(
@@ -592,7 +615,7 @@ def test_missing_method_and_wrong_jsonrpc_are_invalid_requests(
         "id": None,
         "error": {"code": -32600, "message": "invalid request"},
     }
-    assert responses[2]["error"]["code"] == -32700
+    assert _error(responses[2])["code"] == -32700
 
 
 def test_unknown_and_cancel_notifications_get_no_response(
@@ -683,9 +706,11 @@ def test_cancel_notification_cannot_recall_a_dispatched_effect(
     # nothing: the send ran once and its response was still emitted.
     assert sent == [("a" * 64, "hi")]
     responses = _responses(capsys)
-    array = responses[-1]
-    assert array[0]["id"] == 1
-    assert json.loads(array[0]["result"]["content"][0]["text"])["event_id"] == "e"
+    array = _list(responses[-1])
+    assert _dict(array[0])["id"] == 1
+    text = _dict(_list(_result(array[0])["content"])[0])["text"]
+    assert isinstance(text, str)
+    assert json.loads(text)["event_id"] == "e"
 
 
 def test_execution_failure_after_a_possible_effect_is_a_tool_result(
@@ -733,9 +758,11 @@ def test_execution_failure_after_a_possible_effect_is_a_tool_result(
     assert effects == ["maybe-delivered"]
     # Execution uncertainty is a tool result the client must not confuse with a
     # refused call; the malformed second call is a JSON-RPC invalid-params error.
-    assert responses[1]["result"]["isError"] is True
-    assert "uncertain" in responses[1]["result"]["content"][0]["text"]
-    assert responses[2]["error"]["code"] == -32602
+    assert _result(responses[1])["isError"] is True
+    text = _dict(_list(_result(responses[1])["content"])[0])["text"]
+    assert isinstance(text, str)
+    assert "uncertain" in text
+    assert _error(responses[2])["code"] == -32602
 
 
 def test_oversized_frame_is_dropped_and_framing_is_restored(
@@ -771,7 +798,7 @@ def test_multibyte_oversized_frame_is_dropped_by_encoded_length(
     mcp("claude", "studio", str(tmp_path / "state"))
 
     responses = _responses(capsys)
-    assert responses[0]["error"]["code"] == -32700
+    assert _error(responses[0])["code"] == -32700
     assert responses[1] == {"jsonrpc": "2.0", "id": 1, "result": {}}
 
 
@@ -790,6 +817,6 @@ def test_malformed_utf8_frame_costs_one_frame_and_framing_is_restored(
         "id": None,
         "error": {"code": -32700, "message": "parse error"},
     }
-    assert responses[1]["error"]["code"] == -32700
+    assert _error(responses[1])["code"] == -32700
     assert responses[2] == {"jsonrpc": "2.0", "id": 1, "result": {}}
     assert len(responses) == 3
