@@ -152,7 +152,7 @@ def test_fragments_inside_one_deadline_complete(
     clock = _FakeClock()
     monkeypatch.setattr(time, "monotonic", clock.monotonic)
     client, scripted = _scripted_pair(clock)
-    scripted.script.extend([(0.2, b'{"a":'), (0.2, b'1}\n')])
+    scripted.script.extend([(0.2, b'{"a":'), (0.2, b"1}\n")])
     try:
         assert read_frame(scripted, deadline=clock.monotonic() + 1.0) == b'{"a":1}'
     finally:
@@ -256,9 +256,7 @@ def test_broker_intake_accepts_fragments_inside_the_deadline(
     clock = _FakeClock()
     monkeypatch.setattr(time, "monotonic", clock.monotonic)
     client, scripted = _scripted_pair(clock)
-    scripted.script.extend(
-        [(0.5, b'{"schema_version":1,'), (0.5, b'"operation":"peers"}\n')]
-    )
+    scripted.script.extend([(0.5, b'{"schema_version":1,'), (0.5, b'"operation":"peers"}\n')])
     try:
         serve_broker_connection(tmp_path, scripted, _PEER)
         client.settimeout(5.0)
@@ -275,9 +273,7 @@ def test_broker_intake_runs_on_one_total_deadline(
     clock = _FakeClock()
     monkeypatch.setattr(time, "monotonic", clock.monotonic)
     client, scripted = _scripted_pair(clock)
-    scripted.script.extend(
-        [(4.0, b'{"schema_version":1,'), (4.0, b'"operation":"peers"}\n')]
-    )
+    scripted.script.extend([(4.0, b'{"schema_version":1,'), (4.0, b'"operation":"peers"}\n')])
     try:
         with pytest.raises(TimeoutError):
             serve_broker_connection(tmp_path, scripted, _PEER)
@@ -522,9 +518,7 @@ def test_connect_consumes_the_shared_exchange_budget(
     assert connect_timeouts == [1.0]
     # Write and read stages arm only the ~0.1 s remainder, never a fresh budget.
     assert len(scripted.timeouts) >= 2
-    assert all(
-        isinstance(value, float) and 0.0 < value < 0.5 for value in scripted.timeouts
-    )
+    assert all(isinstance(value, float) and 0.0 < value < 0.5 for value in scripted.timeouts)
 
 
 def test_tailnet_post_write_timeout_is_unknown(

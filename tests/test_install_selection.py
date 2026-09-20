@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from cross_agent_chat import cli
+from cross_agent_chat.cli import parser
+from cross_agent_chat.core import ChatError
 from cross_agent_chat.install import (
     Installer,
     SettingsError,
@@ -369,3 +373,157 @@ def test_install_script_forwards_providers_and_yes(tmp_path: Path) -> None:
     assert "--yes" in forwarded
     providers = [forwarded[index + 1] for index, arg in enumerate(forwarded) if arg == "--provider"]
     assert providers == ["claude", "devin"]
+
+
+def _cli_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *providers: str) -> Path:
+    home = tmp_path / "home"
+    for provider in providers:
+        (home / f".{provider}").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: Path("/opt/cross-agent-chat"))
+    return home
+
+
+def test_setup_cli_prints_plan_then_threads_provider_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = _cli_home(tmp_path, monkeypatch, "claude", "codex")
+    installed: list[tuple[str, ...]] = []
+    monkeypatch.setattr(Installer, "install", lambda self: installed.append(self.providers))
+
+    assert cli.run(parser().parse_args(["setup", "--provider", "claude", "--yes"])) == 0
+
+    output = capsys.readouterr().out
+    plan, _, ready = output.partition("Cross Agent Chat is ready")
+    assert "Cross Agent Chat setup plan:" in plan
+    assert f"claude at {(home / '.claude').resolve()}" in plan
+    assert "codex at" not in plan
+    assert ready
+    assert installed == [("claude",)]
+
+
+def test_setup_cli_non_tty_without_yes_refuses_without_stdin_or_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = _cli_home(tmp_path, monkeypatch, "claude")
+
+    class _NonTty:
+        def isatty(self) -> bool:
+            return False
+
+        def read(self, *_args: object) -> str:
+            raise AssertionError("stdin was read")
+
+    monkeypatch.setattr(sys, "stdin", _NonTty())
+    monkeypatch.setattr(
+        Installer, "install", lambda self: pytest.fail("install ran without approval")
+    )
+
+    assert cli.main(["setup"]) == 2
+
+    captured = capsys.readouterr()
+    assert "Cross Agent Chat setup plan:" in captured.out
+    assert "--yes" in captured.err
+    assert not (home / ".claude" / "settings.json").exists()
+    assert not (home / ".config" / "cross-agent-chat").exists()
+
+
+def test_setup_cli_tty_decline_and_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = _cli_home(tmp_path, monkeypatch, "claude")
+
+    class _Tty:
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(sys, "stdin", _Tty())
+    installed: list[tuple[str, ...]] = []
+    monkeypatch.setattr(Installer, "install", lambda self: installed.append(self.providers))
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
+
+    with pytest.raises(ChatError, match="not approved"):
+        cli.run(parser().parse_args(["setup"]))
+    assert installed == []
+    assert not (home / ".claude" / "settings.json").exists()
+
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+    assert cli.run(parser().parse_args(["setup"])) == 0
+    assert installed == [("claude",)]
+
+
+def test_setup_cli_queue_flag_requires_selected_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cli_home(tmp_path, monkeypatch, "claude", "codex")
+    monkeypatch.setattr(
+        Installer, "install", lambda self: pytest.fail("install ran without approval")
+    )
+
+    assert (
+        cli.main(["setup", "--provider", "claude", "--enable-experimental-codex-native-queue"]) == 2
+    )
+
+
+def test_install_staged_requires_yes_before_any_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cli_home(tmp_path, monkeypatch, "claude")
+    monkeypatch.setattr(
+        Installer,
+        "install_staged",
+        lambda self, _stage, _stable: pytest.fail("staged install ran without --yes"),
+    )
+
+    with pytest.raises(ChatError, match="requires --yes"):
+        cli.run(
+            parser().parse_args(
+                [
+                    "_install-staged",
+                    "--staged-runtime",
+                    str(tmp_path / "stage"),
+                    "--stable-entrypoint",
+                    str(tmp_path / "bin/cross-agent-chat"),
+                ]
+            )
+        )
+
+
+def test_install_staged_threads_providers_and_prints_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = _cli_home(tmp_path, monkeypatch, "claude", "codex")
+    installed: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        Installer,
+        "install_staged",
+        lambda self, _stage, _stable: installed.append(self.providers),
+    )
+
+    assert (
+        cli.run(
+            parser().parse_args(
+                [
+                    "_install-staged",
+                    "--staged-runtime",
+                    str(tmp_path / "stage"),
+                    "--stable-entrypoint",
+                    str(tmp_path / "bin/cross-agent-chat"),
+                    "--provider",
+                    "claude",
+                    "--yes",
+                ]
+            )
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "Cross Agent Chat setup plan:" in output
+    assert f"claude at {(home / '.claude').resolve()}" in output
+    assert "codex at" not in output
+    assert "Install the runtime" in output
+    assert installed == [("claude",)]

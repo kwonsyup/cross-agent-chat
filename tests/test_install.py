@@ -231,6 +231,8 @@ def test_cli_maps_active_provider_profile_roots(
     home = tmp_path / "home"
     claude_profile = tmp_path / "claude-profile"
     codex_profile = tmp_path / "codex-profile"
+    claude_profile.mkdir()
+    codex_profile.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_profile))
     monkeypatch.setenv("CODEX_HOME", str(codex_profile))
@@ -239,6 +241,9 @@ def test_cli_maps_active_provider_profile_roots(
 
     installer = cli._installer("studio")
 
+    # The active env roots are both selected, so the installer manages
+    # exactly their configuration files and nothing else.
+    assert installer.providers == ("claude", "codex")
     assert installer.claude_settings == claude_profile / "settings.json"
     assert installer.claude_config == claude_profile / ".claude.json"
     assert installer.codex_config == codex_profile / "config.toml"
@@ -488,6 +493,7 @@ def test_staged_install_uses_the_unique_installed_device_identity(
                     str(tmp_path / "stage"),
                     "--stable-entrypoint",
                     str(tmp_path / "bin/cross-agent-chat"),
+                    "--yes",
                 ]
             )
         )

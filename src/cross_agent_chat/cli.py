@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Final, NoReturn, cast
 
@@ -20,6 +21,7 @@ from cross_agent_chat.install import (
     default_device,
     discover_executable,
     installed_device,
+    resolve_providers,
 )
 from cross_agent_chat.mcp_server import (
     MethodNotFound,
@@ -94,7 +96,12 @@ def _fail(message: str) -> NoReturn:
     raise ChatError(message)
 
 
-def _installer(device: str | None, *, codex_native_queue: bool | None = None) -> Installer:
+def _installer(
+    device: str | None,
+    *,
+    codex_native_queue: bool | None = None,
+    requested: Iterable[str] | None = None,
+) -> Installer:
     home = Path.home()
     raw_codex_home = os.environ.get("CODEX_HOME")
     codex_home = None if raw_codex_home in {None, ""} else Path(raw_codex_home).expanduser()
@@ -109,6 +116,13 @@ def _installer(device: str | None, *, codex_native_queue: bool | None = None) ->
             codex_home=codex_home,
             claude_config_dir=claude_config_dir,
         )
+    selected = resolve_providers(
+        home=home,
+        requested=requested,
+        codex_home=codex_home,
+        claude_config_dir=claude_config_dir,
+        devin_global=True,
+    )
     return Installer(
         home=home,
         executable=discover_executable(Path(sys.argv[0])),
@@ -118,6 +132,7 @@ def _installer(device: str | None, *, codex_native_queue: bool | None = None) ->
         claude_config_dir=claude_config_dir,
         codex_native_queue=codex_native_queue,
         devin_global=True,
+        providers=selected,
     )
 
 
@@ -447,6 +462,18 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     setup = commands.add_parser("setup", help="install and verify native provider integrations")
     setup.add_argument("--device")
+    setup.add_argument(
+        "--provider",
+        choices=("claude", "codex", "devin"),
+        action="append",
+        default=None,
+        help="integrate only the named provider roots; repeatable",
+    )
+    setup.add_argument(
+        "--yes",
+        action="store_true",
+        help="approve the printed setup plan without an interactive confirmation",
+    )
     setup_native_queue = setup.add_mutually_exclusive_group()
     setup_native_queue.add_argument(
         "--enable-experimental-codex-native-queue",
@@ -524,6 +551,10 @@ def parser() -> argparse.ArgumentParser:
     staged_install.add_argument("--staged-runtime", type=Path, required=True)
     staged_install.add_argument("--stable-entrypoint", type=Path, required=True)
     staged_install.add_argument("--device")
+    staged_install.add_argument(
+        "--provider", choices=("claude", "codex", "devin"), action="append", default=None
+    )
+    staged_install.add_argument("--yes", action="store_true")
     return root
 
 
@@ -537,7 +568,22 @@ def run(arguments: argparse.Namespace) -> int:
             if arguments.disable_experimental_codex_native_queue
             else None
         )
-        installer = _installer(arguments.device, codex_native_queue=codex_native_queue)
+        installer = _installer(
+            arguments.device,
+            codex_native_queue=codex_native_queue,
+            requested=arguments.provider,
+        )
+        # The read-only plan discloses exact roots and effects before any
+        # Installer lock, parent creation, config, or service operation.
+        plan = installer.plan()
+        print(plan.describe())
+        if not arguments.yes:
+            if not sys.stdin.isatty():
+                _fail(
+                    "setup requires --yes or an interactive terminal; refusing to read piped stdin"
+                )
+            if input("Apply this setup plan? [y/N] ").strip().lower() not in {"y", "yes"}:
+                _fail("setup was not approved")
         installer.install()
         next_step = "Start a fresh Claude or Codex session, or submit a prompt in Devin."
         print(f"Cross Agent Chat is ready on {installer.device}. {next_step}")
@@ -659,6 +705,10 @@ def run(arguments: argparse.Namespace) -> int:
 
         return 0 if run_pretool_gate(arguments.expected) else 2
     elif command == "_install-staged":
+        # The hidden staged path is only ever invoked by an approved shell
+        # run; the approval is a hard requirement, not a parsed courtesy.
+        if not arguments.yes:
+            _fail("_install-staged requires --yes")
         home = Path.home()
         codex_home = (
             None
@@ -679,6 +729,13 @@ def run(arguments: argparse.Namespace) -> int:
             )
         if device is None:
             device = default_device()
+        selected = resolve_providers(
+            home=home,
+            requested=arguments.provider,
+            codex_home=codex_home,
+            claude_config_dir=claude_config_dir,
+            devin_global=True,
+        )
         installer = Installer(
             home=home,
             executable=arguments.stable_entrypoint,
@@ -687,7 +744,9 @@ def run(arguments: argparse.Namespace) -> int:
             codex_home=codex_home,
             claude_config_dir=claude_config_dir,
             devin_global=True,
+            providers=selected,
         )
+        print(installer.plan(staged=True).describe())
         installer.install_staged(arguments.staged_runtime, arguments.stable_entrypoint)
         ready_message = f"Cross Agent Chat is ready on {device}."
         next_step = "Start a fresh Claude or Codex session, or submit a prompt in Devin."
