@@ -68,8 +68,15 @@ def _init_record() -> dict[str, object]:
     return {"type": "system", "subtype": "init", "session_id": str(uuid4())}
 
 
-def _record(*blocks: dict[str, object], record_type: str = "assistant") -> dict[str, object]:
-    return {"type": record_type, "message": {"content": list(blocks)}}
+def _record(
+    *blocks: dict[str, object],
+    record_type: str = "assistant",
+    role: str | None = None,
+) -> dict[str, object]:
+    message: dict[str, object] = {"content": list(blocks)}
+    if role is not None:
+        message["role"] = role
+    return {"type": record_type, "message": message}
 
 
 def _sendmessage_use(identifier: str = "tool-1", name: str = "SendMessage") -> dict[str, object]:
@@ -92,7 +99,7 @@ def _result(
     tool_use_id: str,
     payload: object,
     *,
-    is_error: bool = False,
+    is_error: object = None,
     content: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     block: dict[str, object] = {
@@ -102,8 +109,8 @@ def _result(
             content if content is not None else [{"type": "text", "text": json.dumps(payload)}]
         ),
     }
-    if is_error:
-        block["is_error"] = True
+    if is_error is not None:
+        block["is_error"] = is_error
     return block
 
 
@@ -604,6 +611,207 @@ def test_unobserved_gate_with_use_and_msg_id_result_is_unknown(
 
 
 # ---------------------------------------------------------------------------
+# Closed tool-result container: the shared analyzer may not filter away or
+# reinterpret blocks, keys or flags it cannot check, on either outcome path.
+
+
+def _assert_unknown_on_both_paths(monkeypatch: pytest.MonkeyPatch, stream: str) -> None:
+    denied = _outcome(monkeypatch, stream, denied=DENIAL_MARKERS["pretool_gate_denied"])
+    _assert_unknown(denied, "helper_stream_invalid")
+    consumed = _outcome(monkeypatch, stream, consumed=True)
+    _assert_unknown(consumed, "receipt_invalid")
+
+
+@pytest.mark.parametrize("is_error", [True, "yes", 1], ids=["true", "string", "int"])
+def test_is_error_result_is_unknown_on_both_paths(
+    monkeypatch: pytest.MonkeyPatch, is_error: object
+) -> None:
+    # A true or non-boolean is_error may conceal arbitrary provider output; it
+    # cannot be checked for effect evidence on either path.
+    stream = _stream(
+        _record(_sendmessage_use()),
+        _record(
+            _result("tool-1", {"success": False, "message": "gone"}, is_error=is_error),
+            record_type="user",
+        ),
+        _terminal_record(),
+    )
+
+    _assert_unknown_on_both_paths(monkeypatch, stream)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        pytest.param(
+            {
+                "type": "tool_result",
+                "tool_use_id": "tool-1",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"success": False, "message": "gone"}),
+                    },
+                    {"type": "image", "source": {"data": "..."}},
+                ],
+            },
+            id="unknown-non-text-sibling",
+        ),
+        pytest.param(
+            {
+                "type": "tool_result",
+                "tool_use_id": "tool-1",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"success": False, "message": "gone"}),
+                        "extra": 1,
+                    }
+                ],
+            },
+            id="extra-text-block-key",
+        ),
+        pytest.param(
+            {
+                "type": "tool_result",
+                "tool_use_id": "tool-1",
+                "cache_control": {"type": "ephemeral"},
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"success": False, "message": "gone"}),
+                    }
+                ],
+            },
+            id="extra-result-block-key",
+        ),
+        pytest.param(
+            {
+                "type": "tool_result",
+                "tool_use_id": "tool-1",
+                "content": [{"type": "text"}],
+            },
+            id="text-block-missing-text-key",
+        ),
+    ],
+)
+def test_unclosed_result_block_is_unknown_on_both_paths(
+    monkeypatch: pytest.MonkeyPatch, result: dict[str, object]
+) -> None:
+    # The measured result block is exactly {type, tool_use_id, content} plus an
+    # optional boolean is_error, and its content is exactly one {type, text}
+    # block. Sibling blocks or unlisted keys are never filtered away.
+    stream = _stream(
+        _record(_sendmessage_use()),
+        _record(result, record_type="user"),
+        _terminal_record(),
+    )
+
+    _assert_unknown_on_both_paths(monkeypatch, stream)
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        pytest.param(
+            [
+                _record(_sendmessage_use(), record_type="user"),
+                _terminal_record(),
+            ],
+            id="tool-use-in-user-record",
+        ),
+        pytest.param(
+            [
+                _record(_sendmessage_use()),
+                _record(
+                    _result("tool-1", {"success": False, "message": "gone"}),
+                    record_type="assistant",
+                ),
+                _terminal_record(),
+            ],
+            id="tool-result-in-assistant-record",
+        ),
+        pytest.param(
+            [
+                _record(_sendmessage_use()),
+                _record(
+                    _result("tool-1", {"success": False, "message": "gone"}),
+                    {"type": "text", "text": "note"},
+                    record_type="user",
+                ),
+                _terminal_record(),
+            ],
+            id="result-with-inert-sibling",
+        ),
+        pytest.param(
+            [
+                _record(_sendmessage_use(), role="user"),
+                _terminal_record(),
+            ],
+            id="assistant-record-with-user-role",
+        ),
+        pytest.param(
+            [
+                _record(_sendmessage_use(), role="assistant"),
+                _record(
+                    _result("tool-1", {"success": False, "message": "gone"}),
+                    record_type="user",
+                    role="assistant",
+                ),
+                _terminal_record(),
+            ],
+            id="user-record-with-assistant-role",
+        ),
+        pytest.param(
+            [
+                {"type": "bogus"},
+                _record(_sendmessage_use()),
+                _terminal_record(),
+            ],
+            id="unknown-outer-type",
+        ),
+        pytest.param(
+            [
+                {"type": "future_effect", "msg_id": str(uuid4())},
+                _record(_sendmessage_use()),
+                _terminal_record(),
+            ],
+            id="unknown-outer-type-with-effect-key",
+        ),
+        pytest.param(
+            [
+                _record({"type": "image", "source": {"data": "..."}}),
+                _record(_sendmessage_use()),
+                _terminal_record(),
+            ],
+            id="unknown-content-block-type",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "message": {
+                        "content": [{"type": "tool_use", "id": "tool-9", "name": "SendMessage"}]
+                    },
+                },
+                _record(_sendmessage_use()),
+                _terminal_record(),
+            ],
+            id="tool-block-in-metadata-record",
+        ),
+    ],
+)
+def test_wrong_role_or_unknown_shape_is_unknown_on_both_paths(
+    monkeypatch: pytest.MonkeyPatch, records: list[dict[str, object]]
+) -> None:
+    # Tool evidence belongs to its measured role: uses in assistant records,
+    # results alone in user records, nothing tool-bearing elsewhere. Unknown
+    # record or block types are uncheckable even without a recognized tool.
+    _assert_unknown_on_both_paths(monkeypatch, _stream(*records))
+
+
+# ---------------------------------------------------------------------------
 # Decided controls: complete measured evidence stays decided or accepted.
 
 
@@ -760,5 +968,65 @@ def test_consumed_gate_with_canonical_refusal_is_decided(
     )
 
     error = _outcome(monkeypatch, stream, consumed=True)
+
+    _assert_refused(error, reason)
+
+
+def test_consumed_gate_with_measured_metadata_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Harmless variation inside the measured contract stays accepted: a
+    # rate_limit_event record, volatile outer metadata keys, agreeing message
+    # roles, inert text/reasoning blocks and an explicit is_error:false.
+    stream = _stream(
+        _init_record(),
+        {"type": "rate_limit_event", "rate_limit": {"resets_at": 1758.0}},
+        {
+            **_record(
+                {"type": "thinking", "thinking": "planning"},
+                {"type": "redacted_thinking", "data": "..."},
+                _sendmessage_use(),
+                role="assistant",
+            ),
+            "uuid": str(uuid4()),
+        },
+        {
+            **_record(
+                _result(
+                    "tool-1",
+                    {"success": True, "message": "sent", "msg_id": str(uuid4())},
+                    is_error=False,
+                ),
+                record_type="user",
+                role="user",
+            ),
+            "parent_tool_use_id": None,
+        },
+        _terminal_record(duration_ms=5),
+    )
+
+    assert _outcome(monkeypatch, stream, consumed=True) is None
+
+
+def test_denied_marker_with_measured_metadata_is_decided(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reason = "No agent named 'API work [ABC123]' is reachable."
+    stream = _stream(
+        {"type": "rate_limit_event", "rate_limit": {"resets_at": 1758.0}},
+        _record(
+            {"type": "text", "text": "calling the tool"},
+            _sendmessage_use(),
+            role="assistant",
+        ),
+        _record(
+            _result("tool-1", {"success": False, "message": reason}, is_error=False),
+            record_type="user",
+            role="user",
+        ),
+        _terminal_record(),
+    )
+
+    error = _outcome(monkeypatch, stream, denied=DENIAL_MARKERS["pretool_gate_denied"])
 
     _assert_refused(error, reason)

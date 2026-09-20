@@ -193,9 +193,20 @@ def _installed_mcp_device(server: object, provider: str) -> str:
 
 
 def installed_device(
-    *, home: Path, codex_home: Path | None, claude_config_dir: Path | None
+    *,
+    home: Path,
+    codex_home: Path | None,
+    claude_config_dir: Path | None,
+    providers: Iterable[str] | None = None,
 ) -> str | None:
-    """Read one unambiguous installed device identity for the active profiles."""
+    """Read one unambiguous installed device identity for the active profiles.
+
+    ``providers`` narrows discovery to the selected roots: an unselected
+    provider's configuration is never read, so invalid or foreign content
+    there cannot break a subset command. Errors inside a selected provider
+    are still surfaced.
+    """
+    selected = {"claude", "codex", "devin"} if providers is None else set(providers)
     if claude_config_dir is not None:
         claude_root = claude_config_dir.expanduser()
         if not claude_root.is_absolute() or claude_root == Path("/"):
@@ -209,21 +220,22 @@ def installed_device(
     codex_config = selected_codex_home.resolve(strict=False) / "config.toml"
     devin_mcp_config = (home / ".config" / "devin" / "mcp_config.json").resolve(strict=False)
 
-    claude = _json_object(claude_config)
-    raw_claude_servers = claude.get("mcpServers")
-    if raw_claude_servers is None:
-        claude_device = None
-    elif not isinstance(raw_claude_servers, MutableMapping):
-        raise SettingsError("installed Cross Agent Chat device identity is invalid")
-    else:
-        claude_server = raw_claude_servers.get(SERVER_NAME)
-        claude_device = (
-            None if claude_server is None else _installed_mcp_device(claude_server, "claude")
-        )
+    claude_device = None
+    if "claude" in selected:
+        claude = _json_object(claude_config)
+        raw_claude_servers = claude.get("mcpServers")
+        if raw_claude_servers is None:
+            claude_device = None
+        elif not isinstance(raw_claude_servers, MutableMapping):
+            raise SettingsError("installed Cross Agent Chat device identity is invalid")
+        else:
+            claude_server = raw_claude_servers.get(SERVER_NAME)
+            claude_device = (
+                None if claude_server is None else _installed_mcp_device(claude_server, "claude")
+            )
 
-    if not codex_config.exists():
-        codex_device = None
-    else:
+    codex_device = None
+    if "codex" in selected and codex_config.exists():
         try:
             codex = tomlkit.parse(codex_config.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, TOMLKitError) as error:
@@ -239,17 +251,19 @@ def installed_device(
                 None if codex_server is None else _installed_mcp_device(codex_server, "codex")
             )
 
-    devin = _json_object(devin_mcp_config)
-    raw_devin_servers = devin.get("mcpServers")
-    if raw_devin_servers is None:
-        devin_device = None
-    elif not isinstance(raw_devin_servers, MutableMapping):
-        raise SettingsError("installed Cross Agent Chat device identity is invalid")
-    else:
-        devin_server = raw_devin_servers.get(SERVER_NAME)
-        devin_device = (
-            None if devin_server is None else _installed_mcp_device(devin_server, "devin")
-        )
+    devin_device = None
+    if "devin" in selected:
+        devin = _json_object(devin_mcp_config)
+        raw_devin_servers = devin.get("mcpServers")
+        if raw_devin_servers is None:
+            devin_device = None
+        elif not isinstance(raw_devin_servers, MutableMapping):
+            raise SettingsError("installed Cross Agent Chat device identity is invalid")
+        else:
+            devin_server = raw_devin_servers.get(SERVER_NAME)
+            devin_device = (
+                None if devin_server is None else _installed_mcp_device(devin_server, "devin")
+            )
 
     candidates = {
         device for device in (claude_device, codex_device, devin_device) if device is not None
@@ -3504,8 +3518,19 @@ class Installer:
         self._recover_unfinished_transaction()
         recorded_metadata = _json_object(self.install_state)
         recorded_schema = recorded_metadata.get("schema_version")
-        normalized_metadata = self._install_metadata(_json_object(self.claude_settings))
-        metadata = recorded_metadata if recorded_schema in {4, 5} else normalized_metadata
+        if recorded_schema in {4, 5}:
+            # Schema 4/5 records carry their own provider ownership, so the
+            # record is authoritative here. Re-deriving legacy metadata would
+            # read an unselected provider's live configuration for nothing.
+            metadata = recorded_metadata
+        else:
+            # Schemas 1-3 predate recorded ownership and are re-derived through
+            # the legacy normalizer. Its settings argument is only consumed
+            # when no install record exists at all, so a recorded schema-1-3
+            # uninstall does not read Claude settings either.
+            metadata = self._install_metadata(
+                {} if recorded_metadata else _json_object(self.claude_settings)
+            )
         recorded_paths = self._metadata_provider_paths(metadata)
         if recorded_paths is not None:
             self._require_recorded_provider_paths(recorded_paths)

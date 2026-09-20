@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -655,7 +656,7 @@ def test_local_scope_token_cannot_send_to_a_remote_peer_and_vice_versa(
 def test_legacy_raw_handles_are_rejected_before_any_effect(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    sender: object,
+    sender: Callable[[Path, Route, str, str], dict[str, object]],
 ) -> None:
     source = _source(tmp_path)
     monkeypatch.setattr(
@@ -675,7 +676,7 @@ def test_legacy_raw_handles_are_rejected_before_any_effect(
     )
 
     with pytest.raises(ChatError, match="opaque tokens"):
-        sender(tmp_path, source, "ab" * 32, "hello")  # type: ignore[operator]
+        sender(tmp_path, source, "ab" * 32, "hello")
 
 
 def test_duplicate_local_aliases_are_ambiguous_and_cannot_shadow_a_remote_token(

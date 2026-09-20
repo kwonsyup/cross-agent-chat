@@ -211,7 +211,9 @@ def test_chat_send_target_description_does_not_demand_a_fresh_discovery_call(
 
     assert "Fresh" not in target
     assert "Reply handle" in target
-    assert "life of that peer session" in target
+    assert "route and protocol generation" in target
+    assert "fresh sessions" in target
+    assert "mixed-generation request cannot be answered" in target
     # It must also steer away from the visible sender, which is the helper.
     assert "delivery helper" in target
 

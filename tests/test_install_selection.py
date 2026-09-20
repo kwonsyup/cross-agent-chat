@@ -262,6 +262,110 @@ def test_subset_uninstall_leaves_unselected_and_shared_surfaces(
     assert primary.launch_agent.exists()
 
 
+def test_schema5_codex_only_uninstall_never_reads_unselected_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    installer = _installer(home, providers=("codex",))
+    installer.setup()
+    # Corrupt the unselected Claude roots after the codex-only install: the
+    # recorded schema-5 metadata must satisfy the uninstall without reading
+    # them, and their bytes must survive untouched.
+    claude_settings = home / ".claude" / "settings.json"
+    claude_settings.parent.mkdir()
+    claude_settings.write_bytes(b"{malformed")
+    claude_config = home / ".claude.json"
+    claude_config.write_bytes(b"not json{")
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+
+    installer.uninstall()
+
+    assert "cross-agent-chat" not in (home / ".codex" / "hooks.json").read_text()
+    assert "cross-agent-chat" not in (home / ".codex" / "config.toml").read_text()
+    assert claude_settings.read_bytes() == b"{malformed"
+    assert claude_config.read_bytes() == b"not json{"
+    assert not installer.install_state.exists()
+
+
+def test_schema5_devin_only_uninstall_never_reads_unselected_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    devin_root = home / ".config" / "devin"
+    devin_root.mkdir(parents=True)
+    installer = _installer(home, providers=("devin",), devin_global=True)
+    installer.setup()
+    claude_settings = home / ".claude" / "settings.json"
+    claude_settings.parent.mkdir()
+    claude_settings.write_bytes(b"{malformed")
+    claude_config = home / ".claude.json"
+    claude_config.write_bytes(b"not json{")
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+
+    installer.uninstall()
+
+    assert "cross-agent-chat" not in (devin_root / "mcp_config.json").read_text()
+    assert "cross-agent-chat" not in (devin_root / "config.json").read_text()
+    assert claude_settings.read_bytes() == b"{malformed"
+    assert claude_config.read_bytes() == b"not json{"
+    assert not installer.install_state.exists()
+
+
+def test_schema5_uninstall_still_surfaces_selected_provider_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Isolation only covers unselected roots: a malformed selected codex
+    # config must still fail the codex-only uninstall.
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    installer = _installer(home, providers=("codex",))
+    installer.setup()
+    (home / ".codex" / "config.toml").write_bytes(b"\xff\xfe not toml")
+    monkeypatch.setattr(installer, "broker_is_loaded", lambda: False)
+    monkeypatch.setattr(installer, "_stop_broker", lambda: None)
+
+    with pytest.raises(SettingsError):
+        installer.uninstall()
+
+
+def test_cli_subset_profile_ignores_invalid_unselected_configs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A recorded codex-only profile resolves its provider set first, so doctor
+    # and uninstall derive the device from the codex root alone and never read
+    # the invalid or foreign unselected Claude/Devin configuration.
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    installer = _installer(home, providers=("codex",))
+    installer.setup()
+    claude_config = home / ".claude.json"
+    claude_config.write_bytes(b"not json{")
+    claude_settings = home / ".claude" / "settings.json"
+    claude_settings.parent.mkdir(exist_ok=True)
+    claude_settings.write_bytes(b"{malformed")
+    devin_mcp = home / ".config" / "devin" / "mcp_config.json"
+    devin_mcp.parent.mkdir(parents=True)
+    devin_mcp.write_bytes(b"not json{")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: Path("/opt/cross-agent-chat"))
+    monkeypatch.setattr(Installer, "broker_is_healthy", lambda self, **_: True)
+    monkeypatch.setattr(Installer, "broker_is_loaded", lambda self: False)
+    monkeypatch.setattr(Installer, "_stop_broker", lambda self: None)
+
+    assert cli.run(parser().parse_args(["doctor", "--json"])) == 0
+    capsys.readouterr()
+    cli.run(parser().parse_args(["uninstall"]))
+
+    assert claude_config.read_bytes() == b"not json{"
+    assert claude_settings.read_bytes() == b"{malformed"
+    assert devin_mcp.read_bytes() == b"not json{"
+    assert "cross-agent-chat" not in (home / ".codex" / "config.toml").read_text()
+
+
 def test_install_script_requires_explicit_approval(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()

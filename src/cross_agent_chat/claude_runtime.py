@@ -548,31 +548,30 @@ REFUSAL_RESULT_KEYS: Final = frozenset({"success", "message", "display"})
 
 
 def _result_text_payload(result: dict[str, object]) -> dict[str, object] | None:
-    """Parse a tool_result's single JSON text block, if it has exactly one."""
+    """Parse a tool_result's one exact text block, or None for anything else.
+
+    The content list must be exactly one dictionary whose keys are exactly
+    ``{type, text}`` -- a measured ``type: "text"`` block carrying a JSON
+    object. Sibling blocks, extra block keys and non-text content are not
+    filtered away: any of them could conceal evidence this contract cannot
+    check, so the payload is unparseable instead.
+    """
     content = result.get("content")
-    if not isinstance(content, list):
+    if not isinstance(content, list) or len(content) != 1:
         return None
-    text_blocks = [
-        item
-        for item in content
-        if isinstance(item, dict)
-        and item.get("type") == "text"
-        and isinstance(item.get("text"), str)
-    ]
-    if len(text_blocks) != 1:
+    block = content[0]
+    if (
+        not isinstance(block, dict)
+        or set(block) != {"type", "text"}
+        or block.get("type") != "text"
+        or not isinstance(block.get("text"), str)
+    ):
         return None
     try:
-        payload = json.loads(cast(str, text_blocks[0]["text"]))
+        payload = json.loads(cast(str, block["text"]))
     except json.JSONDecodeError:
         return None
     return payload if isinstance(payload, dict) else None
-
-
-def _result_payload(result: dict[str, object]) -> dict[str, object] | None:
-    """Parse a tool_result's single JSON text block, if it has exactly one."""
-    if result.get("is_error") is True:
-        return None
-    return _result_text_payload(result)
 
 
 def _refusal_reason_payload(payload: dict[str, object] | None) -> str | None:
@@ -586,11 +585,6 @@ def _refusal_reason_payload(payload: dict[str, object] | None) -> str | None:
     ):
         return None
     return cast(str, payload["message"])
-
-
-def _refusal_reason(result: dict[str, object]) -> str | None:
-    """The reason of a decided provider refusal result, or None for anything else."""
-    return _refusal_reason_payload(_result_payload(result))
 
 
 def parse_sendmessage_receipt(text: str) -> str:
@@ -615,23 +609,10 @@ def parse_sendmessage_receipt(text: str) -> str:
     matches = [item for item in results if item.get("tool_use_id") == tool_id]
     if not isinstance(tool_id, str) or len(matches) != 1 or matches[0].get("is_error") is True:
         raise ChatError("Claude SendMessage receipt is invalid")
-    content = matches[0].get("content")
-    if not isinstance(content, list):
+    result = _result_text_payload(matches[0])
+    if result is None:
         raise ChatError("Claude SendMessage receipt is invalid")
-    text_blocks = [
-        item
-        for item in content
-        if isinstance(item, dict)
-        and item.get("type") == "text"
-        and isinstance(item.get("text"), str)
-    ]
-    if len(text_blocks) != 1:
-        raise ChatError("Claude SendMessage receipt is invalid")
-    try:
-        result = json.loads(cast(str, text_blocks[0]["text"]))
-    except json.JSONDecodeError as error:
-        raise ChatError("Claude SendMessage receipt is invalid") from error
-    reason = _refusal_reason(matches[0])
+    reason = _refusal_reason_payload(result)
     if reason is not None:
         # The provider answered that it did not deliver, and it carries no
         # message id, so nothing was created. Exactly one SendMessage ran and
@@ -728,6 +709,22 @@ DENIAL_REASONS: Final[dict[ClaudeUnknownPhase, str]] = {
 # the shape, not every refusal subtype or value, so names and types are
 # required but values are not enumerated.
 _TERMINAL_INT_FIELDS: Final = ("num_turns", "result_index", "queued_turn_count")
+# The measured semantic record types: `system` metadata, the `assistant` and
+# `user` message records that can carry tool evidence, and `rate_limit_event`
+# (present in the controlled 2.1.278 probe). The terminal `result` record is
+# checked separately. Any other type -- even one carrying no recognized tool
+# block -- could conceal effect evidence in a shape this analyzer cannot
+# check, so it stays unknown. Volatile outer metadata keys are permitted.
+_STREAM_RECORD_TYPES: Final = frozenset({"system", "assistant", "user", "rate_limit_event"})
+# Content block types that cannot carry a SendMessage effect: plain text and
+# the provider's reasoning blocks. Tool blocks are valid only in their
+# measured roles (use in assistant, result in user); any other block type in
+# any record is uncheckable evidence, not inert prose.
+_INERT_BLOCK_TYPES: Final = frozenset({"text", "thinking", "redacted_thinking"})
+# The measured tool_result block: required type/tool_use_id/content plus the
+# provider's optional boolean `is_error` flag. Any other key is uncheckable.
+_TOOL_RESULT_REQUIRED: Final = frozenset({"type", "tool_use_id", "content"})
+_TOOL_RESULT_KEYS: Final = frozenset({"type", "tool_use_id", "content", "is_error"})
 
 
 def _terminal_shape(record: dict[str, object]) -> bool:
@@ -784,15 +781,42 @@ def _stream_tool_records(
     use_ids: set[str] = set()
     answered: set[str] = set()
     for record in records:
+        kind = record.get("type")
+        if kind != "result" and kind not in _STREAM_RECORD_TYPES:
+            # An unknown record type is not inert metadata: ignored records in
+            # an unchecked shape could conceal tool or effect evidence.
+            _unknown("helper_stream_invalid")
         message = record.get("message")
-        blocks = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(blocks, list):
+        blocks: list[object] | None
+        if kind in ("assistant", "user"):
+            # These are the only records that may carry tool evidence, so one
+            # without a checkable message/content shape is uncheckable rather
+            # than inert. A supplied message role must agree with the record.
+            if (
+                not isinstance(message, dict)
+                or ("role" in message and message.get("role") != kind)
+                or not isinstance(message.get("content"), list)
+            ):
+                _unknown("helper_stream_invalid")
+            blocks = cast(list[object], message["content"])
+        else:
+            # Metadata records carry no message in the measured shape; one
+            # that does must still expose only checkable inert content.
+            if isinstance(message, dict) and "content" in message:
+                if not isinstance(message["content"], list):
+                    _unknown("helper_stream_invalid")
+                blocks = cast(list[object], message["content"])
+            else:
+                blocks = None
+        if blocks is None:
             continue
         for block in blocks:
             if not isinstance(block, dict):
                 _unknown("helper_stream_invalid")
-            kind = block.get("type")
-            if kind == "tool_use":
+            block_type = block.get("type")
+            if block_type in _INERT_BLOCK_TYPES:
+                continue
+            if block_type == "tool_use" and kind == "assistant":
                 use_id = block.get("id")
                 if (
                     block.get("name") != "SendMessage"
@@ -803,16 +827,32 @@ def _stream_tool_records(
                     _unknown("helper_stream_invalid")
                 use_ids.add(use_id)
                 uses.append(block)
-            elif kind == "tool_result":
+            elif block_type == "tool_result" and kind == "user" and len(blocks) == 1:
+                # The measured result block is closed: exactly its required
+                # keys plus an optional boolean is_error, one exact text block
+                # of content, and no sibling. An errored result may hide
+                # arbitrary provider output, so it is uncheckable evidence on
+                # both the consumed and denied paths.
+                if not _TOOL_RESULT_REQUIRED <= set(block) <= _TOOL_RESULT_KEYS:
+                    _unknown("helper_stream_invalid")
+                if block.get("is_error") is not None and not isinstance(
+                    block.get("is_error"), bool
+                ):
+                    _unknown("helper_stream_invalid")
+                if block.get("is_error") is True:
+                    _unknown("helper_stream_invalid")
                 result_id = block.get("tool_use_id")
                 if (
                     not isinstance(result_id, str)
                     or result_id not in use_ids
                     or result_id in answered
+                    or _result_text_payload(block) is None
                 ):
                     _unknown("helper_stream_invalid")
                 answered.add(result_id)
                 results.append(block)
+            else:
+                _unknown("helper_stream_invalid")
     return uses, results, records[-1]
 
 

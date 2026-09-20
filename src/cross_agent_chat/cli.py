@@ -61,8 +61,11 @@ from cross_agent_chat.tailnet_broker import broker_server
 MCP_INSTRUCTIONS: Final = (
     "Use Cross Agent Chat only for requested communication. Address chat_send with an exact "
     "opaque handle: the Reply handle on a received envelope, or a handle from chat_peers. An "
-    "exact handle stays valid for the life of that peer session, so call chat_peers to discover "
-    "or when an exact handle stops resolving, not before every send. When requesting work whose "
+    "exact handle is bound to that peer session's route and protocol generation, so call "
+    "chat_peers to discover or when an exact handle stops resolving, not before every send. "
+    "After a CAC upgrade only fresh sessions at both endpoints interoperate: a request sent "
+    "across a mixed pre-/post-upgrade boundary may still be accepted, but its Reply handle "
+    "cannot be answered and must not be replayed. When requesting work whose "
     "result must return, explicitly ask "
     "the peer to send its answer back through CAC; that requested response is not a replay or "
     "unsolicited follow-up. After sending, finish your turn; do not sleep, wait, or poll "
@@ -109,13 +112,6 @@ def _installer(
     claude_config_dir = (
         None if raw_claude_config_dir in {None, ""} else Path(raw_claude_config_dir).expanduser()
     )
-    selected_device = device
-    if selected_device is None:
-        selected_device = installed_device(
-            home=home,
-            codex_home=codex_home,
-            claude_config_dir=claude_config_dir,
-        )
     selected = resolve_providers(
         home=home,
         requested=requested,
@@ -123,6 +119,16 @@ def _installer(
         claude_config_dir=claude_config_dir,
         devin_global=True,
     )
+    selected_device = device
+    if selected_device is None:
+        # Device identity is derived only from the selected roots: an
+        # unselected provider's configuration is never read here.
+        selected_device = installed_device(
+            home=home,
+            codex_home=codex_home,
+            claude_config_dir=claude_config_dir,
+            providers=selected,
+        )
     return Installer(
         home=home,
         executable=discover_executable(Path(sys.argv[0])),
@@ -411,10 +417,13 @@ def _mcp_tools(provider: str, presence_enabled: bool) -> list[dict[str, object]]
                             "Exact opaque handle for the intended "
                             "recipient: the Reply handle carried by a "
                             "received envelope, or a handle from "
-                            "chat_peers. It stays valid for the life of "
-                            "that peer session. Never the visible sender "
-                            "of an incoming message, which is the local "
-                            "delivery helper."
+                            "chat_peers. It is bound to that peer "
+                            "session's route and protocol generation; "
+                            "after a CAC upgrade both endpoints need "
+                            "fresh sessions, and a mixed-generation "
+                            "request cannot be answered. Never the "
+                            "visible sender of an incoming message, "
+                            "which is the local delivery helper."
                         ),
                     },
                     "message": {"type": "string"},
@@ -720,15 +729,6 @@ def run(arguments: argparse.Namespace) -> int:
             if os.environ.get("CLAUDE_CONFIG_DIR") in {None, ""}
             else Path(os.environ["CLAUDE_CONFIG_DIR"]).expanduser()
         )
-        device = arguments.device
-        if device is None:
-            device = installed_device(
-                home=home,
-                codex_home=codex_home,
-                claude_config_dir=claude_config_dir,
-            )
-        if device is None:
-            device = default_device()
         selected = resolve_providers(
             home=home,
             requested=arguments.provider,
@@ -736,6 +736,16 @@ def run(arguments: argparse.Namespace) -> int:
             claude_config_dir=claude_config_dir,
             devin_global=True,
         )
+        device = arguments.device
+        if device is None:
+            device = installed_device(
+                home=home,
+                codex_home=codex_home,
+                claude_config_dir=claude_config_dir,
+                providers=selected,
+            )
+        if device is None:
+            device = default_device()
         installer = Installer(
             home=home,
             executable=arguments.stable_entrypoint,
