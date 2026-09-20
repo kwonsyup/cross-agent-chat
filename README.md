@@ -91,12 +91,31 @@ confirmation before any write; it never reads piped stdin for consent.
 Unrelated settings, hooks, MCP servers, and credentials are preserved.
 
 A failed setup rolls its recorded provider-set metadata,
-provider configuration, and predecessor runtime back transactionally.
-Downgrading to a release that predates schema-5 install metadata is *not*
-automatic after a successful schema-5 install: the older build refuses the
-recorded state instead of rewriting it. Uninstall with the schema-5 build
-first (or remove `~/.config/cross-agent-chat`) before installing an older
-release.
+provider configuration, and predecessor runtime back transactionally. That
+guarded rollback is a different operation from downgrading after a setup
+that already succeeded. Downgrading to a release that predates schema-5
+install metadata is *not* automatic after a successful schema-5 install:
+the older build refuses the recorded state instead of rewriting it. The
+supported preparation is to uninstall with the schema-5 build first —
+`cross-agent-chat uninstall`, on a quiesced Mac, after pending Stop-bound
+deliveries have been consumed — and then install the older release.
+
+Do not delete `~/.config/cross-agent-chat` to get past that refusal. That
+directory holds the install records this build treats as authoritative:
+the prior Claude inbound and Codex hooks values that uninstall restores,
+the recorded provider set and provider paths it verifies before writing,
+and the sibling-profile records that decide last-owner removal. Without
+them an uninstall re-derives ownership from configuration this install has
+already modified, and a Mac carrying a second installed profile looks like
+a sole owner: the shared broker, runtime state and cache are torn down as
+though nothing else used them, and any provider file that profile shares
+with yours is stripped of an integration it still owns. Keep these install
+records intact, along with the delivery intent history, configuration
+backups and runtimes referenced by live routes in their own directories.
+If those records are already gone, a downgrade needs separately planned
+recovery starting from the configuration snapshots in
+`~/.cache/cross-agent-chat/backups/`; no automatic restore for that case
+is implemented.
 
 ## Install
 
