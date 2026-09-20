@@ -20,6 +20,8 @@ from cross_agent_chat.codex import (
 from cross_agent_chat.core import ChatError, Registry, Route, UnknownDeliveryError
 from cross_agent_chat.runtime import MAX_FRAME_BYTES, codex_stop, register, unregister
 
+FAKE_SERVER_READY_SECONDS = 30.0
+
 
 def fake_server_clock(
     ready: Path, anchor: float, observed: list[float] | None = None
@@ -28,7 +30,9 @@ def fake_server_clock(
 
     The app-server subprocess can take seconds to exec under host load; the
     protocol deadline must only measure the exchange that runs after the fake
-    has actually started. ``observed`` records the real ready time.
+    has actually started. The hold is bounded: a fake that never signals
+    readiness fails the fixture instead of freezing the protocol clock
+    forever. ``observed`` records the real ready time.
     """
     real_monotonic = time.monotonic
     marks = observed if observed is not None else []
@@ -37,7 +41,9 @@ def fake_server_clock(
         now = real_monotonic()
         if not marks:
             if not ready.exists():
-                return anchor
+                if now - anchor < FAKE_SERVER_READY_SECONDS:
+                    return anchor
+                pytest.fail("fake Codex app-server did not become ready")
             marks.append(now)
         return anchor + (now - marks[0])
 
@@ -316,7 +322,7 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
             "TEST_READY": str(ready),
         },
         thread_ids=[first, second],
-        deadline=started + 30,
+        deadline=started + 2,
     )
 
     assert titles == {first: f"Canary {first[:8]}", second: f"Canary {second[:8]}"}
@@ -361,7 +367,7 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
             "TEST_READY": str(ready),
         },
         thread_ids=[thread_id],
-        deadline=started + 30,
+        deadline=started + 1,
     )
 
     assert titles == {}
@@ -377,28 +383,39 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
     ]
 
 
-def test_native_thread_titles_stops_at_the_metadata_deadline(tmp_path: Path) -> None:
+def test_native_thread_titles_stops_at_the_metadata_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready = tmp_path / "ready"
     binary = tmp_path / "fake-codex"
     binary.write_text(
         f"#!{sys.executable}\n"
         + r"""
-import time
+import os, time
+from pathlib import Path
+Path(os.environ["TEST_READY"]).touch()
 for _line in __import__("sys").stdin:
     time.sleep(5)
 """
     )
     binary.chmod(0o700)
-    started = time.monotonic()
+    real_monotonic = time.monotonic
+    started = real_monotonic()
+    observed: list[float] = []
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.time.monotonic",
+        fake_server_clock(ready, started, observed),
+    )
 
     titles = native_thread_titles(
         binary=binary,
-        environment={"CODEX_HOME": str(tmp_path)},
+        environment={"CODEX_HOME": str(tmp_path), "TEST_READY": str(ready)},
         thread_ids=[str(uuid4())],
-        deadline=started,
+        deadline=started + 0.5,
     )
 
     assert titles == {}
-    assert time.monotonic() - started < 1.5
+    assert observed and 0.5 <= real_monotonic() - observed[0] < 3
 
 
 def test_native_thread_titles_rejects_a_title_for_another_thread(
@@ -438,7 +455,7 @@ for line in sys.stdin:
                 "TEST_READY": str(ready),
             },
             thread_ids=[requested],
-            deadline=started + 30,
+            deadline=started + 1,
         )
         == {}
     )
@@ -466,7 +483,8 @@ for line in sys.stdin:
 """
     )
     binary.chmod(0o700)
-    started = time.monotonic()
+    real_monotonic = time.monotonic
+    started = real_monotonic()
     observed: list[float] = []
     monkeypatch.setattr(
         "cross_agent_chat.codex.time.monotonic",
@@ -478,11 +496,11 @@ for line in sys.stdin:
             binary=binary,
             environment={"CODEX_HOME": str(tmp_path), "PID_FILE": str(pid_file)},
             thread_ids=[str(uuid4())],
-            deadline=started + 5,
+            deadline=started + 1,
         )
         == {}
     )
-    assert observed and time.monotonic() - observed[0] < 15
+    assert observed and real_monotonic() - observed[0] < 5
     assert pid_file.exists()
     with pytest.raises(ProcessLookupError):
         os.kill(int(pid_file.read_text()), 0)
@@ -673,7 +691,7 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as log:
     real_sleep = time.sleep
 
     def monotonic_after_fake_server_starts() -> float:
-        deadline = real_monotonic() + 5.0
+        deadline = real_monotonic() + FAKE_SERVER_READY_SECONDS
         while not ready.exists():
             if real_monotonic() >= deadline:
                 pytest.fail("fake Codex app-server did not become ready")

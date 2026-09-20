@@ -23,12 +23,17 @@ ACCOUNT_DIGEST = hashlib.sha256(
 ).hexdigest()
 
 
+FAKE_SERVER_READY_SECONDS = 30.0
+
+
 def fake_server_clock(ready: Path, anchor: float) -> Callable[[], float]:
     """Hold the metadata clock at `anchor` until the fake provider is ready.
 
     The app-server subprocess can take seconds to exec under host load; the
     protocol deadline must only measure the exchange that runs after the fake
-    has actually started.
+    has actually started. The hold is bounded: a fake that never signals
+    readiness fails the fixture instead of freezing the protocol clock
+    forever.
     """
     real_monotonic = time.monotonic
     observed: list[float] = []
@@ -37,7 +42,9 @@ def fake_server_clock(ready: Path, anchor: float) -> Callable[[], float]:
         now = real_monotonic()
         if not observed:
             if not ready.exists():
-                return anchor
+                if now - anchor < FAKE_SERVER_READY_SECONDS:
+                    return anchor
+                pytest.fail("fake Codex app-server did not become ready")
             observed.append(now)
         return anchor + (now - observed[0])
 
@@ -114,7 +121,6 @@ def test_native_account_digest_rejects_invalid_nested_account_read(
         "cross_agent_chat.codex.time.monotonic",
         fake_server_clock(ready, time.monotonic()),
     )
-    monkeypatch.setattr("cross_agent_chat.codex.NATIVE_METADATA_TIMEOUT_SECONDS", 30.0)
     with pytest.raises(ChatError) as error:
         native_account_digest(
             binary=binary,
@@ -148,7 +154,6 @@ def test_native_account_digest_reads_exact_chatgpt_account_without_refresh(
         "cross_agent_chat.codex.time.monotonic",
         fake_server_clock(ready, time.monotonic()),
     )
-    monkeypatch.setattr("cross_agent_chat.codex.NATIVE_METADATA_TIMEOUT_SECONDS", 30.0)
     digest = native_account_digest(
         binary=binary,
         environment={

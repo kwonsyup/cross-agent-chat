@@ -5375,6 +5375,8 @@ def test_uninstall_and_reinstall_preserve_foreign_entries_and_durable_intents(
     lock = installer.state / ".intents.lock"
     lock.write_bytes(lock_payload)
     lock.chmod(0o600)
+    lock_stat = lock.stat()
+    lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
 
     monkeypatch.setattr(Installer, "_stop_broker", lambda self: None)
     monkeypatch.setattr(cli, "discover_executable", lambda _: executable)
@@ -5409,7 +5411,9 @@ def test_uninstall_and_reinstall_preserve_foreign_entries_and_durable_intents(
     )
     assert set(devin_mcp["mcpServers"]) == {"foreign-devin-mcp"}
     assert (installer.state / "intents.json").read_bytes() == intents_payload
-    assert (installer.state / ".intents.lock").read_bytes() == lock_payload
+    assert lock.read_bytes() == lock_payload
+    lock_stat = lock.stat()
+    assert (lock_stat.st_dev, lock_stat.st_ino) == lock_identity
     assert not installer.launch_agent.exists()
     assert not installer.install_state.exists()
     assert not installer.verify_configuration()
@@ -5432,7 +5436,9 @@ def test_uninstall_and_reinstall_preserve_foreign_entries_and_durable_intents(
     assert installer.launch_agent.read_bytes() == first_plist
     assert installer.launch_agent.read_bytes() == fresh.launch_agent.read_bytes()
     assert (installer.state / "intents.json").read_bytes() == intents_payload
-    assert (installer.state / ".intents.lock").read_bytes() == lock_payload
+    assert lock.read_bytes() == lock_payload
+    lock_stat = lock.stat()
+    assert (lock_stat.st_dev, lock_stat.st_ino) == lock_identity
     settings = json.loads(installer.claude_settings.read_text())
     assert settings["crossSessionInbound"] == "accept"
     assert canonical(settings["hooks"]["SessionStart"][0]) == canonical(foreign_claude_hook)

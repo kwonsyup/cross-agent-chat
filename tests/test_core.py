@@ -86,7 +86,7 @@ def route(
     )
 
 
-def wait_for_courier_socket(path: Path, timeout: float = 2.0) -> None:
+def wait_for_courier_socket(path: Path, timeout: float = 10.0) -> None:
     """Wait until a courier socket is usable, not merely present.
 
     The path exists between bind() and the 0600 chmod; require_socket rightly
