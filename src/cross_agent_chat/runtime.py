@@ -2245,8 +2245,7 @@ def _send_local_token_target(
     ]
     if len(matches) != 1:
         raise ChatError(
-            "recipient is unavailable or changed; "
-            "call chat_peers and choose the recipient again"
+            "recipient is unavailable or changed; call chat_peers and choose the recipient again"
         )
     return _send_local_target(root, source, matches[0], message, deadline=deadline)
 
@@ -2263,9 +2262,7 @@ def _send_remote_token_target(
         raise ChatError("recipient token is invalid")
     identity = tailnet_identity()
     if identity is None:
-        raise ChatError(
-            "Tailscale is unavailable, so the selected recipient cannot be verified"
-        )
+        raise ChatError("Tailscale is unavailable, so the selected recipient cannot be verified")
     address = identity.peers.get(token.node_id)
     if address is None:
         raise ChatError(
@@ -2291,8 +2288,7 @@ def _send_remote_token_target(
     ]
     if len(claimants) != 1:
         raise ChatError(
-            "recipient is unavailable or changed; "
-            "call chat_peers and choose the recipient again"
+            "recipient is unavailable or changed; call chat_peers and choose the recipient again"
         )
     return _send_remote_target(
         root, source, claimants[0], message, deadline=deadline, self_node_id=self_node_id
@@ -2308,8 +2304,7 @@ def send_local(root: Path, source: Route, target_query: str, message: str) -> di
         return _send_local_token_target(root, source, token, message, deadline=deadline)
     if re.fullmatch(r"[0-9a-f]{64}", target_query) is not None:
         raise ChatError(
-            "recipient handles are now opaque tokens; "
-            "call chat_peers and send to the fresh handle"
+            "recipient handles are now opaque tokens; call chat_peers and send to the fresh handle"
         )
     target = resolve_target(local_targets(root), target_query)
     return _send_local_target(root, source, target, message, deadline=deadline)
@@ -2324,8 +2319,7 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
         return _send_remote_token_target(root, source, token, message, deadline=deadline)
     if re.fullmatch(r"[0-9a-f]{64}", target_query) is not None:
         raise ChatError(
-            "recipient handles are now opaque tokens; "
-            "call chat_peers and send to the fresh handle"
+            "recipient handles are now opaque tokens; call chat_peers and send to the fresh handle"
         )
     local = local_targets(root)
     remote, remote_complete = _remote_discovery()
@@ -2334,9 +2328,7 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
             "remote peer discovery is incomplete; use an exact available recipient handle"
         )
     exact_aliases = [
-        target
-        for target in [*local, *remote]
-        if target.alias.casefold() == target_query.casefold()
+        target for target in [*local, *remote] if target.alias.casefold() == target_query.casefold()
     ]
     if len(exact_aliases) == 1:
         target = exact_aliases[0]
