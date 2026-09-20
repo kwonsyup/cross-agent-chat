@@ -162,7 +162,10 @@ def test_mcp_status_requires_the_trusted_codex_thread_and_current_generation(
     mcp("codex", "studio", str(root))
 
     denied = json.loads(capsys.readouterr().out)
-    assert denied["error"] == {"code": -32602, "message": "event is unavailable"}
+    # The arguments were valid; the executed lookup failed, so this is a tool
+    # result with isError, not a JSON-RPC protocol error.
+    assert denied["result"]["isError"] is True
+    assert denied["result"]["content"][0]["text"] == "event is unavailable"
 
 
 def test_chat_send_target_description_does_not_demand_a_fresh_discovery_call(

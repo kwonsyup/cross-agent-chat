@@ -21,7 +21,11 @@ from cross_agent_chat.install import (
     discover_executable,
     installed_device,
 )
-from cross_agent_chat.mcp_server import normalize_send_arguments
+from cross_agent_chat.mcp_server import (
+    MethodNotFound,
+    normalize_send_arguments,
+    serve,
+)
 from cross_agent_chat.runtime import (
     authenticate_devin_capability,
     authenticate_mcp_sender,
@@ -117,319 +121,314 @@ def _installer(device: str | None, *, codex_native_queue: bool | None = None) ->
     )
 
 
-def _mcp_response(
-    identifier: object, *, result: object | None = None, error: tuple[int, str] | None = None
-) -> None:
-    payload: dict[str, object] = {"jsonrpc": "2.0", "id": identifier}
-    if error is None:
-        payload["result"] = result
-    else:
-        payload["error"] = {"code": error[0], "message": error[1]}
-    print(json.dumps(payload, separators=(",", ":")), flush=True)
+MCP_INTERNAL_TOOLS: Final = frozenset({"native_bootstrap", "native_register", "native_dispatch"})
+MCP_PUBLIC_TOOLS: Final = frozenset({"chat_peers", "chat_send", "chat_status"})
+
+
+def _mcp_tool_error(error: ChatError) -> dict[str, object]:
+    return {"isError": True, "content": [{"type": "text", "text": str(error)}]}
+
+
+def _mcp_tool_result(result: dict[str, object]) -> dict[str, object]:
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(result, sort_keys=True, separators=(",", ":")),
+            }
+        ]
+    }
+
+
+def _mcp_internal_tool(
+    provider: str,
+    root: Path | None,
+    name: str,
+    arguments: dict[str, object],
+    thread_id: str | None,
+) -> dict[str, object]:
+    if provider != "codex":
+        _fail("MCP tool call is invalid")
+    if name == "native_bootstrap":
+        if arguments:
+            _fail("MCP tool call is invalid")
+        if thread_id is None:
+            _fail("Codex host thread identity is required")
+        if not native_desktop_mcp_host():
+            _fail("Codex native Desktop host is required")
+        assert root is not None
+        source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+        return native_bootstrap(root, source)
+    if name == "native_register":
+        if (
+            thread_id is None
+            or set(arguments) != {"token"}
+            or not isinstance(arguments["token"], str)
+        ):
+            _fail("native helper registration is invalid")
+        if not native_desktop_mcp_host():
+            _fail("Codex native Desktop host is required")
+        assert root is not None
+        source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+        return native_register(root, source, arguments["token"])
+    if name == "native_dispatch":
+        if (
+            thread_id is None
+            or set(arguments) != {"event_id"}
+            or not isinstance(arguments["event_id"], str)
+        ):
+            _fail("native helper dispatch is invalid")
+        if not native_desktop_mcp_host():
+            _fail("Codex native Desktop host is required")
+        assert root is not None
+        source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+        return native_dispatch(root, source, arguments["event_id"])
+    _fail("MCP tool call is invalid")
+
+
+def _mcp_call_tool(
+    provider: str,
+    root: Path | None,
+    params: dict[str, object],
+) -> dict[str, object]:
+    if not presence_is_enabled():
+        _fail("Cross Agent Chat presence is disabled")
+    name = params.get("name")
+    arguments = params.get("arguments", {})
+    if not isinstance(name, str) or not isinstance(arguments, dict):
+        _fail("MCP tool call is invalid")
+    typed_arguments = cast(dict[str, object], arguments)
+    metadata = params.get("_meta")
+    thread_id: str | None = None
+    if provider == "codex" and isinstance(metadata, dict):
+        raw_thread = metadata.get("threadId")
+        if isinstance(raw_thread, str):
+            thread_id = raw_thread
+    if name in MCP_INTERNAL_TOOLS:
+        # Internal native lifecycle results are returned verbatim, including
+        # private _meta, and every failure is a tool result, not a protocol error.
+        try:
+            return _mcp_internal_tool(provider, root, name, typed_arguments, thread_id)
+        except ChatError as error:
+            return _mcp_tool_error(error)
+    devin_source = None
+    if provider == "devin" and name in MCP_PUBLIC_TOOLS:
+        assert root is not None
+        devin_source = authenticate_devin_capability(
+            root,
+            parent_pid=os.getppid(),
+            tool_name=name,
+            arguments=typed_arguments,
+        )
+        typed_arguments = {
+            key: value for key, value in typed_arguments.items() if key != "_cac_capability"
+        }
+    # Below this point argument and identity validation failures stay JSON-RPC
+    # errors (-32602); failures raised by the executed operation become
+    # CallToolResult isError results so a client can tell a refused call apart
+    # from an operation whose effect is uncertain.
+    if name == "chat_peers":
+        if typed_arguments:
+            _fail("MCP tool call is invalid")
+        assert root is not None
+        try:
+            result = peers(root, include_delivery_mode=True, include_delivery_mechanism=True)
+            result["sender"] = (
+                sender_readiness_for_route(root, devin_source)
+                if devin_source is not None
+                else sender_readiness(root, provider, os.getppid(), thread_id)
+            )
+        except ChatError as error:
+            return _mcp_tool_error(error)
+        return _mcp_tool_result(result)
+    if name == "chat_send":
+        target, message = normalize_send_arguments(typed_arguments)
+        if provider == "codex":
+            if not isinstance(metadata, dict) or not isinstance(metadata.get("threadId"), str):
+                _fail("Codex host thread identity is required")
+            thread_id = cast(str, metadata["threadId"])
+        assert root is not None
+        source = (
+            devin_source
+            if devin_source is not None
+            else authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+        )
+        try:
+            # Asked before the send so it can neither delay nor fail an accepted one.
+            delivery = reply_delivery(root, source)
+            result = send(root, source, target, message)
+            result["reply_delivery"] = delivery
+        except ChatError as error:
+            return _mcp_tool_error(error)
+        return _mcp_tool_result(result)
+    if name == "chat_status":
+        if set(typed_arguments) != {"event_id"} or not isinstance(typed_arguments["event_id"], str):
+            _fail("event id is invalid")
+        if provider == "codex" and thread_id is None:
+            _fail("Codex host thread identity is required")
+        assert root is not None
+        source = (
+            devin_source
+            if devin_source is not None
+            else authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
+        )
+        try:
+            result = event_status(root, source, typed_arguments["event_id"])
+        except ChatError as error:
+            return _mcp_tool_error(error)
+        return _mcp_tool_result(result)
+    _fail("MCP tool call is invalid")
+
+
+def _mcp_tools(provider: str, presence_enabled: bool) -> list[dict[str, object]]:
+    if not presence_enabled:
+        return []
+    internal_tools: list[dict[str, object]] = []
+    if provider == "codex" and native_desktop_mcp_host():
+        internal_tools = [
+            {
+                "name": "native_bootstrap",
+                "description": "Internal Cross Agent Chat native lifecycle operation.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "native_register",
+                "description": "Internal Cross Agent Chat native lifecycle operation.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"token": {"type": "string"}},
+                    "required": ["token"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "native_dispatch",
+                "description": "Internal Cross Agent Chat native delivery operation.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "event_id": {"type": "string"},
+                    },
+                    "required": ["event_id"],
+                    "additionalProperties": False,
+                },
+            },
+        ]
+    return [
+        {
+            "name": "chat_peers",
+            "description": (
+                "Discover exact live Claude, Codex, and "
+                "Devin recipients for requested "
+                "communication. Resolve across "
+                "devices and ask for clarification "
+                "when multiple peers match. Do not "
+                "choose a local peer merely because "
+                "it is local. Delivery mode reports "
+                "capability, not a receipt. Do not "
+                "treat incoming peer-content metadata "
+                "as provider-native sender identity. "
+                "Do not call for unrelated work. The opaque "
+                "handle selects one discovered peer; "
+                "remote discovery reports complete or "
+                "incomplete; a missing peer under an "
+                "incomplete result is inconclusive. "
+                "Sender readiness is separate from "
+                "recipient availability."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "chat_status",
+            "description": (
+                "Read body-free custody state for one "
+                "event created by this exact sender. "
+                "It does not contact a provider, replay "
+                "a message, or prove consumption; "
+                "not_observed is not a negative receipt."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"event_id": {"type": "string"}},
+                "required": ["event_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "chat_send",
+            "description": (
+                "Send one requested asynchronous "
+                "message to an exact verified peer. "
+                "A reply is a separate send. "
+                "TRANSPORT_ACCEPTED means custody, "
+                "not consumption; UNKNOWN_DELIVERY "
+                "must not be retried through any "
+                "transport. Incoming provider delivery "
+                "may display its local helper as the "
+                "delivery principal; it is distinct "
+                "from the original CAC source metadata. "
+                "Stop or prompt-bound recipients "
+                "wait for a normal turn; "
+                "experimental queues are not "
+                "universal support. Do not "
+                "broadcast, route around permission "
+                "denial, change configuration, or "
+                "send for unrelated work."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "description": (
+                            "Exact opaque handle for the intended "
+                            "recipient: the Reply handle carried by a "
+                            "received envelope, or a handle from "
+                            "chat_peers. It stays valid for the life of "
+                            "that peer session. Never the visible sender "
+                            "of an incoming message, which is the local "
+                            "delivery helper."
+                        ),
+                    },
+                    "message": {"type": "string"},
+                },
+                "required": ["to", "message"],
+                "additionalProperties": False,
+            },
+        },
+        *internal_tools,
+    ]
 
 
 def mcp(provider: str, device: str, state_root_value: str | None) -> None:
-    presence_enabled = presence_is_enabled()
-    root = state_root(state_root_value) if presence_enabled else None
-    for line in sys.stdin:
-        if len(line.encode()) > 65536:
-            _mcp_response(None, error=(-32700, "request exceeds the bounded limit"))
-            continue
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError:
-            _mcp_response(None, error=(-32700, "parse error"))
-            continue
-        if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
-            _mcp_response(None, error=(-32600, "invalid request"))
-            continue
-        identifier = request.get("id")
-        method = request.get("method")
-        params = request.get("params", {})
-        if not isinstance(method, str) or not isinstance(params, dict):
-            _mcp_response(identifier, error=(-32602, "invalid params"))
-            continue
-        typed_params = cast(dict[str, object], params)
-        internal_call = False
-        try:
-            metadata = typed_params.get("_meta")
-            thread_id: str | None = None
-            if provider == "codex" and isinstance(metadata, dict):
-                raw_thread = metadata.get("threadId")
-                if isinstance(raw_thread, str):
-                    thread_id = raw_thread
-            if method == "notifications/initialized":
-                continue
-            if method == "initialize":
-                _mcp_response(
-                    identifier,
-                    result={
-                        "protocolVersion": "2025-03-26",
-                        "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "cross-agent-chat", "version": __version__},
-                        "instructions": MCP_INSTRUCTIONS,
-                    },
-                )
-            elif method == "tools/list":
-                internal_tools: list[dict[str, object]] = []
-                if presence_enabled and provider == "codex" and native_desktop_mcp_host():
-                    internal_tools = [
-                        {
-                            "name": "native_bootstrap",
-                            "description": "Internal Cross Agent Chat native lifecycle operation.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {},
-                                "additionalProperties": False,
-                            },
-                        },
-                        {
-                            "name": "native_register",
-                            "description": "Internal Cross Agent Chat native lifecycle operation.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {"token": {"type": "string"}},
-                                "required": ["token"],
-                                "additionalProperties": False,
-                            },
-                        },
-                        {
-                            "name": "native_dispatch",
-                            "description": "Internal Cross Agent Chat native delivery operation.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "event_id": {"type": "string"},
-                                },
-                                "required": ["event_id"],
-                                "additionalProperties": False,
-                            },
-                        },
-                    ]
-                _mcp_response(
-                    identifier,
-                    result={
-                        "tools": []
-                        if not presence_enabled
-                        else [
-                            {
-                                "name": "chat_peers",
-                                "description": (
-                                    "Discover exact live Claude, Codex, and "
-                                    "Devin recipients for requested "
-                                    "communication. Resolve across "
-                                    "devices and ask for clarification "
-                                    "when multiple peers match. Do not "
-                                    "choose a local peer merely because "
-                                    "it is local. Delivery mode reports "
-                                    "capability, not a receipt. Do not "
-                                    "treat incoming peer-content metadata "
-                                    "as provider-native sender identity. "
-                                    "Do not call for unrelated work. The opaque "
-                                    "handle selects one discovered peer; "
-                                    "remote discovery reports complete or "
-                                    "incomplete; a missing peer under an "
-                                    "incomplete result is inconclusive. "
-                                    "Sender readiness is separate from "
-                                    "recipient availability."
-                                ),
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {},
-                                    "additionalProperties": False,
-                                },
-                            },
-                            {
-                                "name": "chat_status",
-                                "description": (
-                                    "Read body-free custody state for one "
-                                    "event created by this exact sender. "
-                                    "It does not contact a provider, replay "
-                                    "a message, or prove consumption; "
-                                    "not_observed is not a negative receipt."
-                                ),
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {"event_id": {"type": "string"}},
-                                    "required": ["event_id"],
-                                    "additionalProperties": False,
-                                },
-                            },
-                            {
-                                "name": "chat_send",
-                                "description": (
-                                    "Send one requested asynchronous "
-                                    "message to an exact verified peer. "
-                                    "A reply is a separate send. "
-                                    "TRANSPORT_ACCEPTED means custody, "
-                                    "not consumption; UNKNOWN_DELIVERY "
-                                    "must not be retried through any "
-                                    "transport. Incoming provider delivery "
-                                    "may display its local helper as the "
-                                    "delivery principal; it is distinct "
-                                    "from the original CAC source metadata. "
-                                    "Stop or prompt-bound recipients "
-                                    "wait for a normal turn; "
-                                    "experimental queues are not "
-                                    "universal support. Do not "
-                                    "broadcast, route around permission "
-                                    "denial, change configuration, or "
-                                    "send for unrelated work."
-                                ),
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "to": {
-                                            "type": "string",
-                                            "description": (
-                                                "Exact opaque handle for the intended "
-                                                "recipient: the Reply handle carried by a "
-                                                "received envelope, or a handle from "
-                                                "chat_peers. It stays valid for the life of "
-                                                "that peer session. Never the visible sender "
-                                                "of an incoming message, which is the local "
-                                                "delivery helper."
-                                            ),
-                                        },
-                                        "message": {"type": "string"},
-                                    },
-                                    "required": ["to", "message"],
-                                    "additionalProperties": False,
-                                },
-                            },
-                            *internal_tools,
-                        ]
-                    },
-                )
-            elif method == "tools/call":
-                if not presence_enabled:
-                    _fail("Cross Agent Chat presence is disabled")
-                name = typed_params.get("name")
-                arguments = typed_params.get("arguments", {})
-                if not isinstance(name, str) or not isinstance(arguments, dict):
-                    _fail("MCP tool call is invalid")
-                internal_call = name in {"native_bootstrap", "native_register", "native_dispatch"}
-                typed_arguments = cast(dict[str, object], arguments)
-                devin_source = None
-                if provider == "devin" and name in {"chat_peers", "chat_send", "chat_status"}:
-                    assert root is not None
-                    devin_source = authenticate_devin_capability(
-                        root,
-                        parent_pid=os.getppid(),
-                        tool_name=name,
-                        arguments=typed_arguments,
-                    )
-                    typed_arguments = {
-                        key: value
-                        for key, value in typed_arguments.items()
-                        if key != "_cac_capability"
-                    }
-                if name == "chat_peers" and not typed_arguments:
-                    assert root is not None
-                    result = peers(
-                        root, include_delivery_mode=True, include_delivery_mechanism=True
-                    )
-                    result["sender"] = (
-                        sender_readiness_for_route(root, devin_source)
-                        if devin_source is not None
-                        else sender_readiness(root, provider, os.getppid(), thread_id)
-                    )
-                elif name == "chat_send":
-                    target, message = normalize_send_arguments(typed_arguments)
-                    if provider == "codex":
-                        if not isinstance(metadata, dict):
-                            _fail("Codex host thread identity is required")
-                        raw_thread = metadata.get("threadId")
-                        if not isinstance(raw_thread, str):
-                            _fail("Codex host thread identity is required")
-                        thread_id = raw_thread
-                    assert root is not None
-                    source = (
-                        devin_source
-                        if devin_source is not None
-                        else authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
-                    )
-                    # Asked before the send so it can neither delay nor fail an accepted one.
-                    delivery = reply_delivery(root, source)
-                    result = send(root, source, target, message)
-                    result["reply_delivery"] = delivery
-                elif name == "chat_status":
-                    if set(typed_arguments) != {"event_id"} or not isinstance(
-                        typed_arguments["event_id"], str
-                    ):
-                        _fail("event id is invalid")
-                    if provider == "codex" and thread_id is None:
-                        _fail("Codex host thread identity is required")
-                    assert root is not None
-                    source = (
-                        devin_source
-                        if devin_source is not None
-                        else authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
-                    )
-                    result = event_status(root, source, typed_arguments["event_id"])
-                elif name == "native_bootstrap" and provider == "codex" and not typed_arguments:
-                    if thread_id is None:
-                        _fail("Codex host thread identity is required")
-                    if not native_desktop_mcp_host():
-                        _fail("Codex native Desktop host is required")
-                    assert root is not None
-                    source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
-                    result = native_bootstrap(root, source)
-                elif name == "native_register" and provider == "codex":
-                    if (
-                        thread_id is None
-                        or set(typed_arguments) != {"token"}
-                        or not isinstance(typed_arguments["token"], str)
-                    ):
-                        _fail("native helper registration is invalid")
-                    if not native_desktop_mcp_host():
-                        _fail("Codex native Desktop host is required")
-                    assert root is not None
-                    source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
-                    result = native_register(root, source, typed_arguments["token"])
-                elif name == "native_dispatch" and provider == "codex":
-                    if (
-                        thread_id is None
-                        or set(typed_arguments) != {"event_id"}
-                        or not isinstance(typed_arguments["event_id"], str)
-                    ):
-                        _fail("native helper dispatch is invalid")
-                    if not native_desktop_mcp_host():
-                        _fail("Codex native Desktop host is required")
-                    assert root is not None
-                    source = authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
-                    result = native_dispatch(root, source, typed_arguments["event_id"])
-                else:
-                    _fail("MCP tool call is invalid")
-                if internal_call:
-                    _mcp_response(identifier, result=result)
-                else:
-                    _mcp_response(
-                        identifier,
-                        result={
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": json.dumps(
-                                        result, sort_keys=True, separators=(",", ":")
-                                    ),
-                                }
-                            ]
-                        },
-                    )
-            else:
-                _mcp_response(identifier, error=(-32601, "method not found"))
-        except ChatError as error:
-            if internal_call:
-                _mcp_response(
-                    identifier,
-                    result={
-                        "isError": True,
-                        "content": [{"type": "text", "text": str(error)}],
-                    },
-                )
-            else:
-                _mcp_response(identifier, error=(-32602, str(error)))
+    root = state_root(state_root_value) if presence_is_enabled() else None
+
+    def dispatch(method: str, params: dict[str, object]) -> object:
+        if method == "tools/list":
+            return {"tools": _mcp_tools(provider, presence_is_enabled())}
+        if method == "tools/call":
+            return _mcp_call_tool(provider, root, params)
+        raise MethodNotFound(method)
+
+    serve(
+        stream=sys.stdin,
+        emit=lambda payload: print(json.dumps(payload, separators=(",", ":")), flush=True),
+        initialize_result=lambda: {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "cross-agent-chat", "version": __version__},
+            "instructions": MCP_INSTRUCTIONS,
+        },
+        dispatch=dispatch,
+    )
 
 
 def parser() -> argparse.ArgumentParser:
