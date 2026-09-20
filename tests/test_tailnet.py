@@ -29,6 +29,7 @@ from cross_agent_chat.core import (
     bounded_message,
     session_key,
 )
+from cross_agent_chat.recipient import remote_token
 from cross_agent_chat.runtime import (
     ACCEPT_TIMEOUT_SECONDS,
     AUTHORIZE_TIMEOUT_SECONDS,
@@ -42,7 +43,6 @@ from cross_agent_chat.runtime import (
     send,
     wrapped_message,
 )
-from cross_agent_chat.recipient import remote_token
 from cross_agent_chat.tailnet import (
     TailnetIdentity,
     local_tailnet_address,
@@ -578,10 +578,25 @@ def test_remote_node_targets_rich_address_drift_retains_base(
     calls = 0
     original = runtime._targets_from_tailnet
 
-    def parse(address: str, raw: object, **kwargs: bool) -> list[Target]:
+    def parse(
+        address: str,
+        raw: object,
+        *,
+        include_delivery_mode: bool = False,
+        include_title: bool = False,
+        include_devin: bool = False,
+        node_id: str | None = None,
+    ) -> list[Target]:
         nonlocal calls
         calls += 1
-        targets = original(address, raw, **kwargs)
+        targets = original(
+            address,
+            raw,
+            include_delivery_mode=include_delivery_mode,
+            include_title=include_title,
+            include_devin=include_devin,
+            node_id=node_id,
+        )
         if calls == 2:
             targets[0] = replace(targets[0], tailnet_address="100.64.0.2")
         return targets
@@ -2054,9 +2069,7 @@ def test_exact_token_send_never_waits_on_a_silent_unrelated_peer(
 
     monkeypatch.setattr(
         "cross_agent_chat.runtime.tailnet_identity",
-        lambda: TailnetIdentity(
-            self_node_id="nSelf", peers={"nSilent": silent, "nOwner": owner}
-        ),
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nSilent": silent, "nOwner": owner}),
     )
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
     monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 8.0)
@@ -2130,9 +2143,7 @@ def test_exact_token_send_ignores_a_clone_claimant_on_another_node(
 
     monkeypatch.setattr(
         "cross_agent_chat.runtime.tailnet_identity",
-        lambda: TailnetIdentity(
-            self_node_id="nSelf", peers={"nOwner": first, "nClone": clone}
-        ),
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nOwner": first, "nClone": clone}),
     )
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
     monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 8.0)
@@ -2181,9 +2192,7 @@ def test_a_node_that_never_answers_marks_discovery_incomplete(
 
     monkeypatch.setattr(
         "cross_agent_chat.runtime.tailnet_identity",
-        lambda: TailnetIdentity(
-            self_node_id="nSelf", peers={"nOwner": owner, "nLaggard": laggard}
-        ),
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nOwner": owner, "nLaggard": laggard}),
     )
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
     monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 4.0)
@@ -2239,9 +2248,7 @@ def test_alias_send_still_waits_on_silent_unrelated_peer(
 
     monkeypatch.setattr(
         "cross_agent_chat.runtime.tailnet_identity",
-        lambda: TailnetIdentity(
-            self_node_id="nSelf", peers={"nSilent": silent, "nOwner": owner}
-        ),
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nSilent": silent, "nOwner": owner}),
     )
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
     monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 4.0)
@@ -3027,9 +3034,7 @@ def _loaded_broker(
     monkeypatch.setattr(
         runtime,
         "tailnet_identity",
-        lambda: TailnetIdentity(
-            self_node_id="nSelf", peers={"nBroker": "100.64.0.11"}
-        ),
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nBroker": "100.64.0.11"}),
     )
     monkeypatch.setattr(runtime, "REMOTE_DISCOVERY_TIMEOUT_SECONDS", requester_budget_seconds)
     handle = session_key(target.provider, target.session_id)

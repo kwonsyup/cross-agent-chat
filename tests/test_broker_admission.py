@@ -36,6 +36,7 @@ from cross_agent_chat.core import (
     UnknownDeliveryError,
     session_key,
 )
+from cross_agent_chat.recipient import remote_token
 from cross_agent_chat.runtime import (
     BROKER_CAPACITY_REFUSAL,
     Target,
@@ -43,7 +44,7 @@ from cross_agent_chat.runtime import (
     read_frame,
     send,
 )
-from cross_agent_chat.tailnet import TAILNET_PORT
+from cross_agent_chat.tailnet import TAILNET_PORT, TailnetIdentity
 from cross_agent_chat.tailnet_broker import (
     MAX_BROKER_CONNECTIONS,
     MAX_BROKER_CONNECTIONS_PER_PEER,
@@ -58,8 +59,23 @@ _ADDRESS_A = "100.64.0.11"
 _ADDRESS_B = "100.64.0.12"
 _ADDRESS_C = "100.64.0.13"
 _ADDRESS_D = "100.64.0.14"
+_NODE_IDS = {
+    "alpha": "nAlpha",
+    "bravo": "nBravo",
+    "charlie": "nCharlie",
+    "delta": "nDelta",
+}
+_NODE_ADDRESSES = {
+    "nAlpha": _ADDRESS_A,
+    "nBravo": _ADDRESS_B,
+    "nCharlie": _ADDRESS_C,
+    "nDelta": _ADDRESS_D,
+}
 _CAPACITY_LABEL = "ChatError:recipient broker is at capacity; nothing was delivered; send again"
 _PRE_EFFECT_LABEL = "ChatError:remote target rejected the message before provider effect"
+_REVALIDATION_LABEL = (
+    "ChatError:recipient is unavailable or changed; call chat_peers and choose the recipient again"
+)
 
 
 class _PeerListener(socket.socket):
@@ -171,6 +187,7 @@ def _broker_loop(
 class _Machine:
     name: str
     address: str
+    node_id: str
     root: Path
     source: Route
     targets: list[Route]
@@ -184,7 +201,7 @@ class _Machine:
         return int(self.listener.getsockname()[1])
 
 
-def _remote_target(route: Route, address: str) -> Target:
+def _remote_target(route: Route, address: str, node_id: str) -> Target:
     return Target(
         alias=route.alias,
         provider=route.provider,
@@ -194,6 +211,7 @@ def _remote_target(route: Route, address: str) -> Target:
         session_key=session_key(route.provider, route.session_id),
         remote=True,
         tailnet_address=address,
+        tailnet_node_id=node_id,
     )
 
 
@@ -245,6 +263,7 @@ def _build_machine(
     machine = _Machine(
         name=name,
         address=address,
+        node_id=_NODE_IDS[name],
         root=root,
         source=source,
         targets=targets,
@@ -289,7 +308,10 @@ def _run_send(
     release.wait(timeout=10.0)
     started = time.monotonic()
     try:
-        response = send(machine.root, machine.source, target.session_key, "admission trial")
+        if target.tailnet_node_id is None:
+            raise AssertionError("remote trial target lacks a node id")
+        token = remote_token(target.tailnet_node_id, target.session_key, target.generation)
+        response = send(machine.root, machine.source, token, "admission trial")
         label = str(response.get("status"))
     except UnknownDeliveryError:
         label = "UNKNOWN_DELIVERY"
@@ -341,10 +363,19 @@ def _wired_tailnet(
         include_delivery_mode: bool = False,
         include_title: bool = False,
         include_devin: bool = True,
-        handle: str | None = None,
+        identity: TailnetIdentity | None = None,
     ) -> tuple[list[Target], bool]:
         machine = _caller.machine
         return list(machine.remote_targets), True
+
+    def identity() -> TailnetIdentity:
+        # Every thread sees the whole node directory; only the send thread's
+        # own machine supplies the self node id minted into the reply token.
+        machine = getattr(_caller, "machine", None)
+        return TailnetIdentity(
+            self_node_id=None if machine is None else machine.node_id,
+            peers=dict(_NODE_ADDRESSES),
+        )
 
     lock_waits: list[float] = []
 
@@ -356,6 +387,7 @@ def _wired_tailnet(
             yield
 
     monkeypatch.setattr(runtime, "request_tailnet", routed)
+    monkeypatch.setattr(runtime, "tailnet_identity", identity)
     monkeypatch.setattr(runtime, "_remote_discovery", discovered)
     monkeypatch.setattr(core_module, "state_lock", timed_state_lock)
     yield lock_waits
@@ -400,8 +432,12 @@ def _count_labels(results: list[_TrialResult], direction: str) -> dict[str, int]
 def test_reciprocal_admission_levels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     machine_a = _build_machine("alpha", _ADDRESS_A, _ADDRESS_B, tmp_path, MAX_TARGET_COUNT)
     machine_b = _build_machine("bravo", _ADDRESS_B, _ADDRESS_A, tmp_path, MAX_TARGET_COUNT)
-    machine_a.remote_targets = [_remote_target(route, _ADDRESS_B) for route in machine_b.targets]
-    machine_b.remote_targets = [_remote_target(route, _ADDRESS_A) for route in machine_a.targets]
+    machine_a.remote_targets = [
+        _remote_target(route, _ADDRESS_B, "nBravo") for route in machine_b.targets
+    ]
+    machine_b.remote_targets = [
+        _remote_target(route, _ADDRESS_A, "nAlpha") for route in machine_a.targets
+    ]
     ports = {machine.address: machine.port for machine in (machine_a, machine_b)}
     try:
         for level in (1, 3, 6, 12):
@@ -429,6 +465,7 @@ def test_reciprocal_admission_levels(tmp_path: Path, monkeypatch: pytest.MonkeyP
                     "TRANSPORT_ACCEPTED",
                     _CAPACITY_LABEL,
                     _PRE_EFFECT_LABEL,
+                    _REVALIDATION_LABEL,
                 }, f"level {level} {direction} produced an undecided send: {counts}"
             assert wall < 20.0, f"level {level} did not finish in bounded time"
             for machine in (machine_a, machine_b):
@@ -453,8 +490,8 @@ def test_slow_and_offline_peers_amid_reciprocal_traffic(
     dead_port = int(closed.getsockname()[1])
     closed.close()
     machine_a.remote_targets = [
-        _remote_target(machine_b.targets[0], _ADDRESS_B),
-        _remote_target(machine_c.targets[0], _ADDRESS_C),
+        _remote_target(machine_b.targets[0], _ADDRESS_B, "nBravo"),
+        _remote_target(machine_c.targets[0], _ADDRESS_C, "nCharlie"),
         Target(
             alias="codex@delta:delta-work:delta",
             provider="codex",
@@ -464,9 +501,10 @@ def test_slow_and_offline_peers_amid_reciprocal_traffic(
             session_key="d" * 64,
             remote=True,
             tailnet_address=_ADDRESS_D,
+            tailnet_node_id="nDelta",
         ),
     ]
-    machine_b.remote_targets = [_remote_target(machine_a.targets[0], _ADDRESS_A)]
+    machine_b.remote_targets = [_remote_target(machine_a.targets[0], _ADDRESS_A, "nAlpha")]
     ports = {
         _ADDRESS_A: machine_a.port,
         _ADDRESS_B: machine_b.port,
@@ -507,7 +545,13 @@ def test_slow_and_offline_peers_amid_reciprocal_traffic(
             for result in results
             if result.direction == machine_a.name and result.label.startswith("ChatError:")
         ]
-        assert refused == ["ChatError:Tailnet peer is unavailable before delivery"], labels
+        # A token send to a dead endpoint fails re-attestation before any
+        # intent or transport attempt, so its refusal is truthful and no
+        # delivery journal entry can exist for it.
+        assert refused == [
+            "ChatError:recipient is unavailable or changed; "
+            "call chat_peers and choose the recipient again"
+        ], labels
         assert _count_labels(results, machine_b.name) == {"TRANSPORT_ACCEPTED": 1}
         assert 0.5 <= wall < 20.0
         offline_events = [
@@ -515,7 +559,7 @@ def test_slow_and_offline_peers_amid_reciprocal_traffic(
             for intent in IntentStore(machine_a.root).intents()
             if intent.target_key == "d" * 64
         ]
-        assert [intent.status for intent in offline_events] == ["PRE_EFFECT_REJECTED"]
+        assert offline_events == []
     finally:
         _stop_machines([machine_a, machine_b, machine_c])
 

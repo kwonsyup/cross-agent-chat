@@ -15,6 +15,8 @@ import cross_agent_chat.install as install_module
 from cross_agent_chat import runtime
 from cross_agent_chat.core import ChatError, Route
 from cross_agent_chat.install import Installer, SettingsError
+from cross_agent_chat.recipient import local_token, remote_token
+from cross_agent_chat.tailnet import TailnetIdentity
 
 
 def _safe_uninstall(installer: Installer, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -159,7 +161,7 @@ def test_shared_canonical_root_survives_first_uninstall_and_restores_on_last_own
         ).get("mcp_servers", {})
 
 
-def test_exact_local_handle_does_not_wait_for_remote_discovery(
+def test_exact_local_token_does_not_wait_for_remote_discovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = runtime.Target(
@@ -179,6 +181,7 @@ def test_exact_local_handle_does_not_wait_for_remote_discovery(
         pid=os.getpid(),
     )
     expected = {"status": "TRANSPORT_ACCEPTED"}
+    state_root = tmp_path / "state"
     monkeypatch.setattr(runtime, "local_targets", lambda _: [target])
     monkeypatch.setattr(
         runtime,
@@ -187,9 +190,8 @@ def test_exact_local_handle_does_not_wait_for_remote_discovery(
     )
     monkeypatch.setattr(runtime, "_send_local_target", lambda *args, **kwargs: expected)
 
-    assert (
-        runtime.send(tmp_path / "state", source, target.session_key, "synthetic probe") == expected
-    )
+    token = local_token(state_root, target.session_key, target.generation)
+    assert runtime.send(state_root, source, token, "synthetic probe") == expected
 
 
 def test_fuzzy_target_refuses_incomplete_remote_discovery_before_intent(
@@ -219,7 +221,7 @@ def test_fuzzy_target_refuses_incomplete_remote_discovery_before_intent(
     assert not (tmp_path / "state").exists()
 
 
-def test_exact_remote_handle_survives_unrelated_incomplete_discovery(
+def test_remote_token_send_probes_only_the_pinned_node(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = runtime.Target(
@@ -231,6 +233,7 @@ def test_exact_remote_handle_survives_unrelated_incomplete_discovery(
         session_key="a" * 64,
         remote=True,
         tailnet_address="100.64.0.10",
+        tailnet_node_id="nOwner",
     )
     source = Route.create(
         provider="codex",
@@ -240,7 +243,17 @@ def test_exact_remote_handle_survives_unrelated_incomplete_discovery(
         pid=os.getpid(),
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _: [])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([target], False))
+    monkeypatch.setattr(
+        runtime,
+        "_remote_discovery",
+        lambda **_: pytest.fail("a token send must never fan out to unrelated nodes"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nOwner": "100.64.0.10"}),
+    )
+    monkeypatch.setattr(runtime, "_remote_node_targets", lambda *args, **kwargs: ([target], True))
     monkeypatch.setattr(runtime, "canonical_source_alias", lambda *_: source.alias)
     responses: list[dict[str, object]] = []
 
@@ -260,7 +273,8 @@ def test_exact_remote_handle_survives_unrelated_incomplete_discovery(
 
     monkeypatch.setattr(runtime, "request_tailnet", send_remote)
 
-    result = runtime.send(tmp_path / "state", source, target.session_key, "synthetic probe")
+    token = remote_token("nOwner", target.session_key, target.generation)
+    result = runtime.send(tmp_path / "state", source, token, "synthetic probe")
     assert result["to"] == target.alias
     assert len(responses) == 1
 

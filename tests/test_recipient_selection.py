@@ -17,6 +17,7 @@ import json
 import os
 import threading
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -96,9 +97,7 @@ def _accepted(envelope: dict[str, object]) -> dict[str, object]:
 def _identity(
     self_node_id: str | None = SELF_NODE, peers: dict[str, str] | None = None
 ) -> TailnetIdentity:
-    return TailnetIdentity(
-        self_node_id=self_node_id, peers={} if peers is None else dict(peers)
-    )
+    return TailnetIdentity(self_node_id=self_node_id, peers={} if peers is None else dict(peers))
 
 
 def _remote_wire(
@@ -123,9 +122,7 @@ def _live_alias(route: Route) -> str:
     return route.alias if route.provider != "claude" else f"{route.alias}:agent-a1"
 
 
-def _courier(
-    routes: list[Route], accepts: list[dict[str, object]] | None = None
-) -> object:
+def _courier(routes: list[Route], accepts: list[dict[str, object]] | None = None) -> object:
     """A local socket stub answering health checks and accept deliveries."""
     by_generation = {route.generation: route for route in routes}
 
@@ -294,17 +291,15 @@ def test_public_peers_mints_opaque_tokens_and_internal_keeps_raw_keys(
 ) -> None:
     remote_handle = session_key("claude", str(uuid4()))
     remote_generation = str(uuid4())
-    local, calls = _listing_fixture(
+    local, _calls = _listing_fixture(
         tmp_path,
         monkeypatch,
         identity=_identity(peers={OWNER_NODE: OWNER}),
-        rosters={
-            OWNER: [_peer(REMOTE_ALIAS, "studio", remote_handle, remote_generation)]
-        },
+        rosters={OWNER: [_peer(REMOTE_ALIAS, "studio", remote_handle, remote_generation)]},
     )
 
     listing = peers(tmp_path)
-    items = {item["alias"]: item for item in listing["peers"]}
+    items = {item["alias"]: item for item in cast(list[dict[str, str]], listing["peers"])}
     assert listing["remote_discovery"] == "complete"
     assert set(items) == {_live_alias(local), REMOTE_ALIAS}
 
@@ -320,7 +315,7 @@ def test_public_peers_mints_opaque_tokens_and_internal_keeps_raw_keys(
     assert remote_token_value.node_id == OWNER_NODE
 
     internal = peers(tmp_path, include_remote=False, internal=True)
-    (internal_item,) = internal["peers"]
+    (internal_item,) = cast(list[dict[str, str]], internal["peers"])
     assert "handle" not in internal_item
     assert internal_item["session_key"] == session_key("claude", local.session_id)
     assert internal_item["generation"] == local.generation
@@ -335,13 +330,17 @@ def test_public_peers_omits_remote_rows_without_a_verified_self(
         monkeypatch,
         identity=_identity(self_node_id=None, peers={OWNER_NODE: OWNER}),
         rosters={
-            OWNER: [_peer(REMOTE_ALIAS, "studio", session_key("claude", str(uuid4())), str(uuid4()))]
+            OWNER: [
+                _peer(REMOTE_ALIAS, "studio", session_key("claude", str(uuid4())), str(uuid4()))
+            ]
         },
     )
 
     listing = peers(tmp_path)
 
-    assert [item["alias"] for item in listing["peers"]] == [_live_alias(local)]
+    assert [item["alias"] for item in cast(list[dict[str, str]], listing["peers"])] == [
+        _live_alias(local)
+    ]
     # The roster itself was reachable; the rows are withheld, not undiscovered.
     assert listing["remote_discovery"] == "complete"
 
@@ -364,7 +363,7 @@ def test_simultaneous_listings_mint_identical_tokens_without_state(
     def list_peers() -> None:
         try:
             results.append(peers(tmp_path))
-        except BaseException as error:  # noqa: BLE001 - test collects failures
+        except BaseException as error:
             errors.append(error)
 
     threads = [threading.Thread(target=list_peers) for _ in range(4)]
@@ -471,7 +470,9 @@ def test_token_send_refuses_when_the_node_stopped_claiming_the_handle(
         tmp_path,
         monkeypatch,
         identity=_identity(peers={OWNER_NODE: OWNER}),
-        rosters={OWNER: [_peer(REMOTE_ALIAS, "studio", session_key("claude", str(uuid4())), generation)]},
+        rosters={
+            OWNER: [_peer(REMOTE_ALIAS, "studio", session_key("claude", str(uuid4())), generation)]
+        },
     )
 
     with pytest.raises(ChatError, match="unavailable or changed"):
@@ -533,12 +534,16 @@ def test_token_send_survives_another_callers_incomplete_discovery(
     monkeypatch.setattr(runtime, "request_tailnet", wire)
 
     first = peers(tmp_path)
-    (token_item,) = [item for item in first["peers"] if item["alias"] == REMOTE_ALIAS]
+    (token_item,) = [
+        item for item in cast(list[dict[str, str]], first["peers"]) if item["alias"] == REMOTE_ALIAS
+    ]
     token = token_item["handle"]
 
     second = peers(tmp_path)
     assert second["remote_discovery"] == "incomplete"
-    assert all(item["alias"] != REMOTE_ALIAS for item in second["peers"])
+    assert all(
+        item["alias"] != REMOTE_ALIAS for item in cast(list[dict[str, str]], second["peers"])
+    )
 
     result = send(tmp_path, source, token, "hello")
     assert result["status"] == "TRANSPORT_ACCEPTED"
@@ -596,9 +601,7 @@ def test_local_token_send_delivers_to_the_exact_local_route(
         "request_tailnet",
         lambda *_args, **_kwargs: pytest.fail("local send touched the tailnet"),
     )
-    token = local_token(
-        tmp_path, session_key("claude", target.session_id), target.generation
-    )
+    token = local_token(tmp_path, session_key("claude", target.session_id), target.generation)
 
     result = send(tmp_path, source, token, "hello")
 
@@ -625,9 +628,7 @@ def test_local_token_from_another_state_root_is_refused(
     )
     foreign = tmp_path / "other-state"
     foreign.mkdir()
-    token = local_token(
-        foreign, session_key("claude", target.session_id), target.generation
-    )
+    token = local_token(foreign, session_key("claude", target.session_id), target.generation)
 
     with pytest.raises(ChatError, match="different state"):
         send(tmp_path, source, token, "hello")
@@ -644,7 +645,7 @@ def test_local_scope_token_cannot_send_to_a_remote_peer_and_vice_versa(
         rosters={OWNER: [_peer(REMOTE_ALIAS, "studio", handle, generation)]},
     )
 
-    with pytest.raises(ChatError, match="different state|unavailable or changed"):
+    with pytest.raises(ChatError, match=r"different state|unavailable or changed"):
         send(tmp_path, source, local_token(tmp_path, handle, generation), "hi")
     with pytest.raises(ChatError, match="remote device"):
         send_local(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hi")
@@ -993,8 +994,10 @@ def _v2_envelope(
     if head_override is not None:
         body = head_override
     else:
-        exact_token = token if token is not None else remote_token(
-            OTHER_NODE, source_handle, source_generation
+        exact_token = (
+            token
+            if token is not None
+            else remote_token(OTHER_NODE, source_handle, source_generation)
         )
         body = wrapped_message(source_alias, exact_token, "ping", event_id, "claude")
     envelope = remote_envelope(
@@ -1143,9 +1146,7 @@ def test_remote_receive_rejects_a_reply_token_when_tailscale_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     accepts: list[dict[str, object]] = []
-    target = _receive_fixture(
-        tmp_path, monkeypatch, identity=None, accepts=accepts
-    )
+    target = _receive_fixture(tmp_path, monkeypatch, identity=None, accepts=accepts)
     envelope, _sa, _sg, _body = _v2_envelope(target)
     response = receive_remote(tmp_path, envelope, OWNER)
     assert response["status"] == "PRE_EFFECT_REJECTED"

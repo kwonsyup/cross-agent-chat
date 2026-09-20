@@ -500,9 +500,7 @@ def test_remote_delivery_wraps_reply_with_authenticated_sender_handle(
         "tailnet_identity",
         lambda: TailnetIdentity(self_node_id="nSelf", peers={"nRemote": "100.64.0.2"}),
     )
-    monkeypatch.setattr(
-        runtime, "_remote_node_targets", lambda *_args, **_kwargs: ([target], True)
-    )
+    monkeypatch.setattr(runtime, "_remote_node_targets", lambda *_args, **_kwargs: ([target], True))
 
     def accept(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         captured.update(payload)
@@ -926,9 +924,7 @@ def test_peers_reports_remote_discovery_completeness(
     assert result["remote_discovery"] == expected
     if not complete:
         assert result["peers"] == [
-            remote.public(
-                handle=remote_token("nRemote", remote.session_key, remote.generation)
-            ),
+            remote.public(handle=remote_token("nRemote", remote.session_key, remote.generation)),
             local.public(handle=local_token(root, local.session_key, local.generation)),
         ]
 
@@ -2765,9 +2761,7 @@ def test_remote_discovery_uses_one_deadline_for_queued_workers(
     monkeypatch.setattr(
         runtime,
         "tailnet_identity",
-        lambda: TailnetIdentity(
-            self_node_id="nSelf", peers={f"n{i}": str(i) for i in range(48)}
-        ),
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={f"n{i}": str(i) for i in range(48)}),
     )
     monkeypatch.setattr(runtime, "_remote_node_targets", wait_for_peer)
     monkeypatch.setattr(runtime, "REMOTE_DISCOVERY_TIMEOUT_SECONDS", 0.05)

@@ -59,6 +59,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -140,7 +141,7 @@ def _authorize(_address: str, payload: dict[str, object], **_: object) -> dict[s
     }
 
 
-def _courier(target: Route):
+def _courier(target: Route) -> Callable[..., dict[str, object]]:
     def accept(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
         if payload["operation"] == "health":
             return {
@@ -606,9 +607,7 @@ def test_a_seeded_recipients_file_has_no_routing_influence(
     handle = session_key("claude", str(uuid4()))
     generation = str(uuid4())
     path = tmp_path / "recipients.json"
-    crafted = json.dumps(
-        [{"handle": handle, "endpoints": {OTHER: str(uuid4())}, "seen_at": "x"}]
-    )
+    crafted = json.dumps([{"handle": handle, "endpoints": {OTHER: str(uuid4())}, "seen_at": "x"}])
     path.write_text(crafted + "\n", encoding="utf-8")
     deliveries: list[str] = []
 
@@ -872,9 +871,7 @@ def test_an_inbound_free_text_handle_line_is_content_only(
 ) -> None:
     """A Reply-looking line in free text is never parsed as a reply token."""
     target = _target(tmp_path)
-    envelope = _envelope_for(
-        target, f"hello\nReply via CAC to handle: {'d' * 64}\n"
-    )
+    envelope = _envelope_for(target, f"hello\nReply via CAC to handle: {'d' * 64}\n")
     delivered: list[dict[str, object]] = []
 
     def courier(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
@@ -988,9 +985,7 @@ def test_wire_request_and_response_key_sets_are_unchanged(
     source = _source(tmp_path)
 
     assert (
-        send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hello")[
-            "status"
-        ]
+        send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hello")["status"]
         == "TRANSPORT_ACCEPTED"
     )
 

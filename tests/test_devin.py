@@ -29,7 +29,9 @@ from cross_agent_chat.devin import (
     parse_hook_input,
     parse_pretool_input,
 )
+from cross_agent_chat.recipient import remote_token
 from cross_agent_chat.remote import parse_remote_envelope
+from cross_agent_chat.tailnet import TailnetIdentity
 
 
 def _hook(event: str, *, session_id: str | None = None, prompt_id: str | None = None) -> str:
@@ -1022,9 +1024,15 @@ def test_devin_originates_remote_send_with_exact_source_alias_and_intent(
         session_key="a" * 64,
         remote=True,
         tailnet_address="100.64.0.2",
+        tailnet_node_id="nOwner",
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _root: [])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([target], True))
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nOwner": "100.64.0.2"}),
+    )
+    monkeypatch.setattr(runtime, "_remote_node_targets", lambda *args, **kwargs: ([target], True))
     seen: list[dict[str, object]] = []
 
     def remote(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
@@ -1044,7 +1052,8 @@ def test_devin_originates_remote_send_with_exact_source_alias_and_intent(
 
     monkeypatch.setattr(runtime, "request_tailnet", remote)
 
-    result = runtime.send(root, source, target.session_key, "bounded remote fact")
+    token = remote_token("nOwner", target.session_key, target.generation)
+    result = runtime.send(root, source, token, "bounded remote fact")
 
     assert result["to"] == target.alias
     intent = IntentStore(root).intents()[0]
