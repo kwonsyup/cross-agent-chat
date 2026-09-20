@@ -79,11 +79,13 @@ be ambiguous.
 
 ## Install
 
+Install v0.3.8 prerelease with:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.8/install.sh | sh
 ```
 
-This installs the latest published release tag and performs setup in one step.
+This installs the released `v0.3.8` tag and performs setup in one step.
 The stable command is `~/.local/bin/cross-agent-chat`; if your shell does not
 resolve it, put `~/.local/bin` on `PATH` or invoke the absolute path. Re-running
 the installer upgrades and repairs the owned configuration. An existing
