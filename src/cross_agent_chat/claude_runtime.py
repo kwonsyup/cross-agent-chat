@@ -714,16 +714,29 @@ DENIAL_REASONS: Final[dict[ClaudeUnknownPhase, str]] = {
 
 
 def _stream_tool_records(text: str) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """The tool records of a bounded fully-dict stream, else unknown delivery."""
+    """The tool records of a bounded semantically complete stream, else unknown.
+
+    Semantic completeness means the tool graph is closed: every tool_result
+    correlates to an observed tool_use, and every use is SendMessage -- the
+    only tool the courier is given. A result whose use record is missing, or a
+    foreign tool, means the stream lost or reordered records, so nothing in it
+    can support a decided pre-effect conclusion.
+    """
     try:
         if len(text.encode()) > 64 * 1024:
             _unknown("helper_stream_invalid")
         for line in text.splitlines():
             if line and not isinstance(json.loads(line), dict):
                 _unknown("helper_stream_invalid")
-        return _tool_records(text)
     except (UnicodeEncodeError, json.JSONDecodeError):
         _unknown("helper_stream_invalid")
+    uses, results = _tool_records(text)
+    use_ids = {use.get("id") for use in uses if isinstance(use.get("id"), str)}
+    if any(use.get("name") != "SendMessage" for use in uses):
+        _unknown("helper_stream_invalid")
+    if any(result.get("tool_use_id") not in use_ids for result in results):
+        _unknown("helper_stream_invalid")
+    return uses, results
 
 
 def _unconsumed_gate_outcome(gate: Path, text: str) -> NoReturn:
@@ -732,36 +745,34 @@ def _unconsumed_gate_outcome(gate: Path, text: str) -> NoReturn:
     uses, results = _stream_tool_records(text)
     if denied is not None:
         phase = next(phase for phase, value in DENIAL_MARKERS.items() if value == denied)
-        # The marker proves the provider was told to deny the call. A delivered
-        # receipt in the stream would contradict it, so only a stream that
-        # cannot be checked or that shows a success keeps the outcome unknown;
-        # every other recorded result is the denial itself or a decided
+        # The marker proves the provider was told to deny the call. The stream
+        # is already closed and correlated, so every result here answers one of
+        # the observed SendMessage calls. A result that still carries an effect
+        # -- success or a message id -- contradicts the deny and keeps the
+        # outcome unknown; a result that cannot be parsed cannot be checked at
+        # all; every other recorded result is the denial itself or a decided
         # provider refusal carrying its own reason.
-        send_ids = {
-            cast(str, use["id"])
-            for use in uses
-            if use.get("name") == "SendMessage" and isinstance(use.get("id"), str)
-        }
         reasons: list[str] = []
         for result in results:
-            if result.get("tool_use_id") not in send_ids:
-                continue
             payload = _result_payload(result)
-            if payload is not None and payload.get("success") is True:
-                _unknown("pretool_gate_conflict")
-            reason = _refusal_reason(result)
-            if reason is not None:
-                reasons.append(reason)
+            if payload is not None:
+                if payload.get("success") is True or "msg_id" in payload:
+                    _unknown("pretool_gate_conflict")
+                reason = _refusal_reason(result)
+                if reason is not None:
+                    reasons.append(reason)
+            elif result.get("is_error") is not True:
+                _unknown("helper_stream_invalid")
         if reasons:
             raise ClaudeSendMessageRefused(reasons[0])
         raise ClaudeSendMessageRefused(
             f"Claude SendMessage was not delivered: {DENIAL_REASONS[phase]}"
         )
-    if any(item.get("name") != "SendMessage" for item in uses):
-        _unknown("helper_stream_invalid")
     if not uses:
-        # A complete, readable stream without a SendMessage call proves the
-        # courier finished without sending: the tool is the only delivery path.
+        # Semantic completeness already guarantees there are no results here:
+        # a complete, readable stream with no SendMessage call and no result
+        # proves the courier finished without sending: the tool is the only
+        # delivery path.
         raise ClaudeSendMessageRefused("Claude courier finished without a SendMessage call")
     if len(uses) != 1:
         _unknown("multiple_sendmessage_tool_use")
