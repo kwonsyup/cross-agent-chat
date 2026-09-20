@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from uuid import uuid4
 
@@ -11,6 +12,26 @@ from cross_agent_chat import cli
 from cross_agent_chat.cli import mcp
 from cross_agent_chat.core import ChatError, IntentStore, Registry, Route
 from cross_agent_chat.mcp_server import normalize_send_arguments
+
+
+def _handshake(*, identifier: int = 0) -> list[dict[str, object]]:
+    return [
+        {
+            "jsonrpc": "2.0",
+            "id": identifier,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    ]
+
+
+def _feed(requests: Sequence[object]) -> io.StringIO:
+    return io.StringIO("".join(f"{json.dumps(request)}\n" for request in requests))
 
 
 @pytest.mark.parametrize("field", ["to", "recipient", "destination"])
@@ -43,7 +64,7 @@ def test_presence_off_mcp_initializes_without_tools_or_state(
 ) -> None:
     root = tmp_path / "state"
     requests = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+        *_handshake(identifier=1),
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
         {
             "jsonrpc": "2.0",
@@ -53,9 +74,7 @@ def test_presence_off_mcp_initializes_without_tools_or_state(
         },
     ]
     monkeypatch.setenv("CROSS_AGENT_CHAT_PRESENCE", "off")
-    monkeypatch.setattr(
-        "sys.stdin", io.StringIO("".join(f"{json.dumps(item)}\n" for item in requests))
-    )
+    monkeypatch.setattr("sys.stdin", _feed(requests))
 
     mcp("codex", "studio", str(root))
 
@@ -99,6 +118,7 @@ def test_mcp_status_requires_the_trusted_codex_thread_and_current_generation(
     monkeypatch.setattr("cross_agent_chat.cli.os.getppid", lambda: parent_pid)
     monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
     requests = [
+        *_handshake(),
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
         {
             "jsonrpc": "2.0",
@@ -111,26 +131,24 @@ def test_mcp_status_requires_the_trusted_codex_thread_and_current_generation(
             },
         },
     ]
-    monkeypatch.setattr(
-        "sys.stdin", io.StringIO("".join(f"{json.dumps(request)}\n" for request in requests))
-    )
+    monkeypatch.setattr("sys.stdin", _feed(requests))
 
     mcp("codex", "studio", str(root))
 
     responses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert {tool["name"] for tool in responses[0]["result"]["tools"]} == {
+    assert {tool["name"] for tool in responses[1]["result"]["tools"]} == {
         "chat_peers",
         "chat_send",
         "chat_status",
     }
     send_tool = next(
-        tool for tool in responses[0]["result"]["tools"] if tool["name"] == "chat_send"
+        tool for tool in responses[1]["result"]["tools"] if tool["name"] == "chat_send"
     )
     schema = send_tool["inputSchema"]
     assert set(schema["properties"]) == {"to", "message"}
     assert schema["required"] == ["to", "message"]
     assert "opaque handle" in schema["properties"]["to"]["description"]
-    assert json.loads(responses[1]["result"]["content"][0]["text"])["event_id"] == event_id
+    assert json.loads(responses[2]["result"]["content"][0]["text"])["event_id"] == event_id
 
     replacement = Route.create(
         provider="codex",
@@ -142,8 +160,9 @@ def test_mcp_status_requires_the_trusted_codex_thread_and_current_generation(
     Registry(root).upsert(replacement)
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(
-            json.dumps(
+        _feed(
+            [
+                *_handshake(),
                 {
                     "jsonrpc": "2.0",
                     "id": 3,
@@ -153,15 +172,14 @@ def test_mcp_status_requires_the_trusted_codex_thread_and_current_generation(
                         "arguments": {"event_id": event_id},
                         "_meta": {"threadId": session_id},
                     },
-                }
-            )
-            + "\n"
+                },
+            ]
         ),
     )
 
     mcp("codex", "studio", str(root))
 
-    denied = json.loads(capsys.readouterr().out)
+    denied = json.loads(capsys.readouterr().out.splitlines()[-1])
     # The arguments were valid; the executed lookup failed, so this is a tool
     # result with isError, not a JSON-RPC protocol error.
     assert denied["result"]["isError"] is True
@@ -180,12 +198,10 @@ def test_chat_send_target_description_does_not_demand_a_fresh_discovery_call(
     """
     root = tmp_path / "state"
     requests = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+        *_handshake(identifier=1),
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
     ]
-    monkeypatch.setattr(
-        "sys.stdin", io.StringIO("".join(f"{json.dumps(item)}\n" for item in requests))
-    )
+    monkeypatch.setattr("sys.stdin", _feed(requests))
 
     mcp("codex", "studio", str(root))
 
@@ -228,7 +244,7 @@ def test_chat_send_result_says_how_the_answer_returns(
         "method": "tools/call",
         "params": {"name": "chat_send", "arguments": {"to": "a" * 64, "message": "hi"}},
     }
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(request) + "\n"))
+    monkeypatch.setattr("sys.stdin", _feed([*_handshake(), request]))
 
     mcp("claude", "studio", str(root))
 

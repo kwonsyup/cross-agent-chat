@@ -746,6 +746,23 @@ def test_devin_pretool_overwrites_model_capability_field(
     assert build_pretool_callback(parsed, updated[DEVIN_CAPABILITY_FIELD])
 
 
+def _devin_mcp_stdin(*requests: object) -> io.StringIO:
+    handshake: list[object] = [
+        {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "devin", "version": "1.0"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    ]
+    return io.StringIO("".join(json.dumps(request) + "\n" for request in (*handshake, *requests)))
+
+
 def test_devin_mcp_public_tools_require_pretool_capability(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -753,25 +770,22 @@ def test_devin_mcp_public_tools_require_pretool_capability(
 
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "chat_peers",
-                        "arguments": {},
-                    },
-                }
-            )
-            + "\n"
+        _devin_mcp_stdin(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "chat_peers",
+                    "arguments": {},
+                },
+            }
         ),
     )
 
     mcp("devin", "studio", str(tmp_path / "state"))
 
-    response = json.loads(capsys.readouterr().out)
+    response = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert response["error"]["message"] == "Devin sender capability is required"
 
 
@@ -907,25 +921,22 @@ def test_pretool_capability_reaches_public_chat_peers_authentication(
     )
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "chat_peers",
-                        "arguments": {DEVIN_CAPABILITY_FIELD: token},
-                    },
-                }
-            )
-            + "\n"
+        _devin_mcp_stdin(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "chat_peers",
+                    "arguments": {DEVIN_CAPABILITY_FIELD: token},
+                },
+            }
         ),
     )
 
     mcp("devin", "studio", str(state))
 
-    response = json.loads(capsys.readouterr().out)
+    response = json.loads(capsys.readouterr().out.splitlines()[-1])
     result = json.loads(response["result"]["content"][0]["text"])
     assert result["sender"] == {"status": "ready"}
     assert store.capabilities() == []

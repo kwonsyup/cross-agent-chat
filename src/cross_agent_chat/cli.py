@@ -195,7 +195,11 @@ def _mcp_call_tool(
         _fail("Cross Agent Chat presence is disabled")
     name = params.get("name")
     arguments = params.get("arguments", {})
-    if not isinstance(name, str) or not isinstance(arguments, dict):
+    if (
+        not isinstance(name, str)
+        or not isinstance(arguments, dict)
+        or not set(params) <= {"name", "arguments", "_meta"}
+    ):
         _fail("MCP tool call is invalid")
     typed_arguments = cast(dict[str, object], arguments)
     metadata = params.get("_meta")
@@ -413,6 +417,12 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
 
     def dispatch(method: str, params: dict[str, object]) -> object:
         if method == "tools/list":
+            if not set(params) <= {"cursor", "_meta"} or not isinstance(
+                params.get("_meta", {}), dict
+            ):
+                _fail("tools/list params are invalid")
+            if "cursor" in params:
+                _fail("tools/list does not support cursors")
             return {"tools": _mcp_tools(provider, presence_is_enabled())}
         if method == "tools/call":
             return _mcp_call_tool(provider, root, params)

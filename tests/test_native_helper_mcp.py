@@ -19,6 +19,27 @@ from cross_agent_chat.native_helper import NativeHelperStore
 PUBLIC_TOOLS = {"chat_peers", "chat_send", "chat_status"}
 
 
+def mcp_stdin(*requests: object) -> io.StringIO:
+    handshake: list[object] = [
+        {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    ]
+    return io.StringIO("".join(json.dumps(request) + "\n" for request in (*handshake, *requests)))
+
+
+def last_response(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
+    return cast(dict[str, object], json.loads(capsys.readouterr().out.splitlines()[-1]))
+
+
 def route(
     root: Path,
     *,
@@ -49,13 +70,14 @@ def test_normal_provider_tools_list_exposes_only_public_tools(
     monkeypatch.delenv("CROSS_AGENT_CHAT_PRESENCE", raising=False)
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"),
+        mcp_stdin({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
     )
 
     mcp(provider, "studio", str(tmp_path / "state"))
 
-    response = json.loads(capsys.readouterr().out)
-    assert {tool["name"] for tool in response["result"]["tools"]} == PUBLIC_TOOLS
+    response = last_response(capsys)
+    tools = cast(list[dict[str, object]], cast(dict[str, object], response["result"])["tools"])
+    assert {tool["name"] for tool in tools} == PUBLIC_TOOLS
 
 
 def test_verified_desktop_catalog_adds_internal_names_without_list_metadata(
@@ -67,13 +89,13 @@ def test_verified_desktop_catalog_adds_internal_names_without_list_metadata(
     monkeypatch.setattr("cross_agent_chat.cli.native_desktop_mcp_host", lambda: True)
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"),
+        mcp_stdin({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
     )
 
     mcp("codex", "studio", str(tmp_path / "state"))
 
-    response = json.loads(capsys.readouterr().out)
-    tools = response["result"]["tools"]
+    response = last_response(capsys)
+    tools = cast(list[dict[str, object]], cast(dict[str, object], response["result"])["tools"])
     assert {tool["name"] for tool in tools} == PUBLIC_TOOLS | {
         "native_bootstrap",
         "native_register",
@@ -103,13 +125,14 @@ def test_catalog_rejects_bundled_cli_and_counterfeit_originator(
     monkeypatch.setattr("cross_agent_chat.cli.native_desktop_mcp_host", lambda: False)
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"),
+        mcp_stdin({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
     )
 
     mcp("codex", "studio", str(tmp_path / "state"))
 
-    response = json.loads(capsys.readouterr().out)
-    assert {tool["name"] for tool in response["result"]["tools"]} == PUBLIC_TOOLS
+    response = last_response(capsys)
+    tools = cast(list[dict[str, object]], cast(dict[str, object], response["result"])["tools"])
+    assert {tool["name"] for tool in tools} == PUBLIC_TOOLS
 
 
 def test_desktop_catalog_requires_chatgpt_ancestor_binary(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -188,25 +211,24 @@ def test_internal_bootstrap_call_requires_host_thread_identity(
     monkeypatch.delenv("CROSS_AGENT_CHAT_PRESENCE", raising=False)
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {"name": "native_bootstrap", "arguments": {}},
-                }
-            )
-            + "\n"
+        mcp_stdin(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "native_bootstrap", "arguments": {}},
+            }
         ),
     )
 
     mcp("codex", "studio", str(tmp_path / "state"))
 
-    response = json.loads(capsys.readouterr().out)
+    response = last_response(capsys)
+    result = cast(dict[str, object], response["result"])
     assert "error" not in response
-    assert response["result"]["isError"] is True
-    assert response["result"]["content"][0]["text"] == "Codex host thread identity is required"
+    assert result["isError"] is True
+    content = cast(list[dict[str, object]], result["content"])
+    assert content[0]["text"] == "Codex host thread identity is required"
 
 
 def test_internal_bootstrap_mcp_call_preserves_private_create_result(
@@ -230,26 +252,23 @@ def test_internal_bootstrap_mcp_call_preserves_private_create_result(
     monkeypatch.setattr("cross_agent_chat.cli.native_bootstrap", lambda *_args: expected)
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "native_bootstrap",
-                        "arguments": {},
-                        "_meta": {"threadId": thread_id},
-                    },
-                }
-            )
-            + "\n"
+        mcp_stdin(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "native_bootstrap",
+                    "arguments": {},
+                    "_meta": {"threadId": thread_id},
+                },
+            }
         ),
     )
 
     mcp("codex", "studio", str(tmp_path / "state"))
 
-    response = json.loads(capsys.readouterr().out)
+    response = last_response(capsys)
     assert response == {"jsonrpc": "2.0", "id": 1, "result": expected}
 
 
@@ -268,30 +287,29 @@ def test_failed_internal_mcp_call_is_tool_error_and_does_not_become_jsonrpc_erro
     )
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "native_bootstrap",
-                        "arguments": {},
-                        "_meta": {"threadId": thread_id},
-                    },
-                }
-            )
-            + "\n"
+        mcp_stdin(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "native_bootstrap",
+                    "arguments": {},
+                    "_meta": {"threadId": thread_id},
+                },
+            }
         ),
     )
 
     mcp("codex", "studio", str(tmp_path / "state"))
 
-    response = json.loads(capsys.readouterr().out)
+    response = last_response(capsys)
+    result = cast(dict[str, object], response["result"])
     assert "error" not in response
-    assert response["result"]["isError"] is True
-    assert response["result"]["content"][0]["type"] == "text"
-    assert "native helper bootstrap is unavailable" in response["result"]["content"][0]["text"]
+    assert result["isError"] is True
+    content = cast(list[dict[str, object]], result["content"])
+    assert content[0]["type"] == "text"
+    assert "native helper bootstrap is unavailable" in cast(str, content[0]["text"])
 
 
 def test_mcp_bootstrap_register_duplicate_journey_is_single_and_nonrecursive(
@@ -324,13 +342,16 @@ def test_mcp_bootstrap_register_duplicate_journey_is_single_and_nonrecursive(
             "_meta": {"threadId": original.session_id},
         },
     }
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(bootstrap_request) + "\n"))
+    monkeypatch.setattr("sys.stdin", mcp_stdin(bootstrap_request))
     mcp("codex", "studio", str(state_root))
-    bootstrap_response = json.loads(capsys.readouterr().out)
-    bootstrap_result = bootstrap_response["result"]
-    create_thread = bootstrap_result["_meta"]["create_thread"]
-    helper_directory = create_thread["target"]["directoryName"]
-    prompt = create_thread["prompt"]
+    bootstrap_response = last_response(capsys)
+    bootstrap_result = cast(dict[str, object], bootstrap_response["result"])
+    create_thread = cast(
+        dict[str, object],
+        cast(dict[str, object], bootstrap_result["_meta"])["create_thread"],
+    )
+    helper_directory = cast(dict[str, object], create_thread["target"])["directoryName"]
+    prompt = cast(str, create_thread["prompt"])
     token_match = re.search(r"token ([0-9a-f-]{36})", prompt)
     assert token_match is not None
     token = token_match.group(1)
@@ -357,19 +378,21 @@ def test_mcp_bootstrap_register_duplicate_journey_is_single_and_nonrecursive(
             "_meta": {"threadId": helper.session_id},
         },
     }
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(register_request) + "\n"))
+    monkeypatch.setattr("sys.stdin", mcp_stdin(register_request))
     mcp("codex", "studio", str(state_root))
-    register_response = json.loads(capsys.readouterr().out)
+    register_response = last_response(capsys)
     assert register_response["result"] == {
         "content": [{"type": "text", "text": "Native helper is ready."}]
     }
     assert runtime.native_helper_tools(state_root, helper) == ("native_dispatch",)
 
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(bootstrap_request) + "\n"))
+    monkeypatch.setattr("sys.stdin", mcp_stdin(bootstrap_request))
     mcp("codex", "studio", str(state_root))
-    duplicate_response = json.loads(capsys.readouterr().out)
-    assert duplicate_response["result"]["isError"] is True
-    assert "bootstrap is unavailable" in duplicate_response["result"]["content"][0]["text"]
+    duplicate_response = last_response(capsys)
+    duplicate_result = cast(dict[str, object], duplicate_response["result"])
+    assert duplicate_result["isError"] is True
+    duplicate_content = cast(list[dict[str, object]], duplicate_result["content"])
+    assert "bootstrap is unavailable" in cast(str, duplicate_content[0]["text"])
     bindings = NativeHelperStore(state_root).bindings()
     assert len(bindings) == 1
     assert bindings[0].state == "REGISTERED"

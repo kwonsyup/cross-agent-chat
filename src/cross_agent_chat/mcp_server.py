@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 from collections.abc import Callable, Iterator
+from enum import Enum, auto
 from typing import IO, Final, NamedTuple, TextIO, cast
 
 from cross_agent_chat.core import ChatError, bounded_message
@@ -87,6 +88,28 @@ def _valid_request_id(identifier: object) -> bool:
     )
 
 
+class _Phase(Enum):
+    AWAIT_INITIALIZE = auto()
+    AWAIT_INITIALIZED = auto()
+    OPERATIONAL = auto()
+
+
+def _initialize_params_error(params: dict[str, object]) -> str | None:
+    protocol_version = params.get("protocolVersion")
+    if not isinstance(protocol_version, str) or not protocol_version:
+        return "initialize protocolVersion is invalid"
+    if not isinstance(params.get("capabilities"), dict):
+        return "initialize capabilities is invalid"
+    client_info = params.get("clientInfo")
+    if not isinstance(client_info, dict):
+        return "initialize clientInfo is invalid"
+    if not isinstance(client_info.get("name"), str):
+        return "initialize clientInfo name is invalid"
+    if not isinstance(client_info.get("version"), str):
+        return "initialize clientInfo version is invalid"
+    return None
+
+
 class _Session:
     def __init__(
         self,
@@ -98,7 +121,7 @@ class _Session:
         self._emit = emit
         self._initialize_result = initialize_result
         self._dispatch = dispatch
-        self._initialized = False
+        self._phase = _Phase.AWAIT_INITIALIZE
         self._seen_ids: set[object] = set()
 
     def handle(self, message: object) -> None:
@@ -123,11 +146,17 @@ class _Session:
         if not isinstance(element, dict) or element.get("jsonrpc") != "2.0":
             return _error(None, INVALID_REQUEST, "invalid request")
         if "id" not in element:
-            # A notification never gets a response. notifications/initialized,
-            # notifications/cancelled and unknown notifications are all accepted
-            # silently; a cancellation can never undo or authorize replaying an
-            # effect that may already have happened, and an effect-carrying call
-            # with no id would leave no receipt to reconcile.
+            # A notification never gets a response. notifications/initialized
+            # completes the handshake only after a valid initialize; before that,
+            # and for notifications/cancelled and unknown notifications, it is
+            # accepted silently. A cancellation can never undo or authorize
+            # replaying an effect that may already have happened, and an
+            # effect-carrying call with no id would leave no receipt to reconcile.
+            if (
+                element.get("method") == "notifications/initialized"
+                and self._phase is _Phase.AWAIT_INITIALIZED
+            ):
+                self._phase = _Phase.OPERATIONAL
             return None
         identifier = element["id"]
         if not _valid_request_id(identifier):
@@ -144,12 +173,17 @@ class _Session:
         if method == "initialize":
             if in_batch:
                 return _error(identifier, INVALID_REQUEST, "initialize must not be sent in a batch")
-            if self._initialized:
+            if self._phase is not _Phase.AWAIT_INITIALIZE:
                 return _error(identifier, INVALID_REQUEST, "session is already initialized")
-            self._initialized = True
+            params_error = _initialize_params_error(params)
+            if params_error is not None:
+                return _error(identifier, INVALID_PARAMS, params_error)
+            self._phase = _Phase.AWAIT_INITIALIZED
             return _success(identifier, self._initialize_result())
         if method == "ping":
             return _success(identifier, {})
+        if self._phase is not _Phase.OPERATIONAL:
+            return _error(identifier, INVALID_REQUEST, "session is not initialized")
         try:
             return _success(identifier, self._dispatch(method, cast(dict[str, object], params)))
         except MethodNotFound:
@@ -170,10 +204,10 @@ def serve(
     """Run one stdio JSON-RPC session until the input stream ends.
 
     ``emit`` receives one response object, or one array for a batch, per output
-    line. Requests are accepted without a completed handshake because existing
-    provider integrations dispatch single calls directly; lifecycle rules are
-    still enforced where the revision requires them (single initialize, never
-    batched, request-id uniqueness).
+    line. The lifecycle is strict: a valid standalone ``initialize`` request
+    followed by ``notifications/initialized`` opens the operational phase;
+    anything but ``initialize`` and ``ping`` is refused with a protocol error
+    before then and never reaches ``dispatch``, so no effect can occur.
     """
     session = _Session(emit=emit, initialize_result=initialize_result, dispatch=dispatch)
     # Reading the byte buffer keeps each malformed UTF-8 frame to exactly one
