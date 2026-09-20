@@ -640,6 +640,44 @@ def test_is_error_result_is_unknown_on_both_paths(
     _assert_unknown_on_both_paths(monkeypatch, stream)
 
 
+def test_consumed_gate_with_null_is_error_receipt_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An explicit JSON null is_error is a present non-boolean flag, not an
+    # absent one: it may conceal an errored result the payload cannot check,
+    # so an otherwise exact success receipt stays uncheckable.
+    result = _success_receipt("tool-1")
+    result["is_error"] = None
+    stream = _stream(
+        _record(_sendmessage_use()),
+        _record(result, record_type="user"),
+        _terminal_record(),
+    )
+
+    error = _outcome(monkeypatch, stream, consumed=True)
+
+    _assert_unknown(error, "receipt_invalid")
+
+
+def test_denied_marker_with_null_is_error_refusal_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The same present null flag on the canonical refusal payload: the denial
+    # cannot be decided from a result block whose error flag cannot be checked.
+    reason = "No agent named 'API work [ABC123]' is reachable."
+    result = _result("tool-1", {"success": False, "message": reason})
+    result["is_error"] = None
+    stream = _stream(
+        _record(_sendmessage_use()),
+        _record(result, record_type="user"),
+        _terminal_record(),
+    )
+
+    error = _outcome(monkeypatch, stream, denied=DENIAL_MARKERS["pretool_gate_denied"])
+
+    _assert_unknown(error, "helper_stream_invalid")
+
+
 @pytest.mark.parametrize(
     "result",
     [

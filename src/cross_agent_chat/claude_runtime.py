@@ -835,9 +835,7 @@ def _stream_tool_records(
                 # both the consumed and denied paths.
                 if not _TOOL_RESULT_REQUIRED <= set(block) <= _TOOL_RESULT_KEYS:
                     _unknown("helper_stream_invalid")
-                if block.get("is_error") is not None and not isinstance(
-                    block.get("is_error"), bool
-                ):
+                if "is_error" in block and not isinstance(block["is_error"], bool):
                     _unknown("helper_stream_invalid")
                 if block.get("is_error") is True:
                     _unknown("helper_stream_invalid")
