@@ -1,9 +1,8 @@
-"""Pure parsing and bounded callback helpers for Devin lifecycle hooks.
+"""Devin hook parsing, bounded callbacks, and single-use capability storage.
 
-This module deliberately has no provider, process, filesystem, or network
-side effects.  A caller supplies the hook stdin and owns the injected
-consumer.  The consumer is called at most once per invocation; this module
-does not retry or persist delivery state.
+Callers supply hook input and delivery callbacks. Capability records use
+private filesystem state; message delivery is delegated to the caller and
+is never retried here.
 """
 
 from __future__ import annotations

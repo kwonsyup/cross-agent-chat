@@ -26,7 +26,7 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 
 | Module | Responsibility |
 |---|---|
-| `__init__.py` | `__version__` — the single version source. |
+| `__init__.py` | Runtime `__version__`, kept consistent with package and release metadata. |
 | `cli.py` | Argument parsing, public commands (`setup`, `doctor`, `peers`, `resolve`, `uninstall`), hidden provider hook/service entrypoints (`_`-prefixed), and the stdio MCP dispatcher including tool schemas. |
 | `mcp_server.py` | `chat_send` argument normalization only. Despite the name, the actual MCP server loop is `cli.py:mcp` — the naming is a known stale point flagged for a code change, not documentation. |
 | `core.py` | Route identity, recipient bindings, content-free intent records, validation, private atomic persistence, state locks. This is where durable product state is defined. |
@@ -37,7 +37,7 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 | `claude_runtime.py` | Claude Code discovery, constrained helper couriers, the exact argument-supply delivery gate, transient body file, receipt classification. |
 | `codex.py` | Codex CLI process-memory courier and Stop-bound handoff, stdio app-server metadata and experimental queue operations. |
 | `native_helper.py` | Shared provider hook recipes/defaults and the private, body-free binding between original Codex conversations and managed native helpers. |
-| `devin.py` | Devin lifecycle-hook parsing and the filesystem-backed single-use capability store (`atomic_json` + `state_lock`). The module docstring still claims no filesystem side effects — stale, flagged for a code correction. |
+| `devin.py` | Devin lifecycle-hook parsing and the filesystem-backed single-use capability store (`atomic_json` + `state_lock`). |
 | `install.py` | Selected-root resolution, config payload preparation, whole-file backups, guarded transactions/rollback, LaunchAgent lifecycle, install metadata, uninstall/restore. Largest file; most of its size is the ownership/rollback matrix. |
 
 ## Where the boundaries live
