@@ -42,6 +42,9 @@ MAX_BROKER_REFUSAL_WORKERS = 4
 TAILNET_BIND_RETRY_SECONDS = 5.0
 TAILNET_REFRESH_POLL_SECONDS = 0.1
 REFUSAL_WRITE_TIMEOUT_SECONDS = 1.0
+PEEK_REQUEST_DEADLINE_SECONDS = 5.0
+PEEK_STALL_WAIT_MIN_SECONDS = 0.005
+PEEK_STALL_WAIT_MAX_SECONDS = 0.1
 
 
 @dataclass(slots=True)
@@ -187,7 +190,7 @@ def serve_broker_connection(root: Path, connection: socket.socket, peer_address:
     connection.settimeout(5.0)
     try:
         raw: object = json.loads(read_frame(connection))
-    except json.JSONDecodeError as error:
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ChatError("Tailnet broker request is invalid") from error
     emit_frame_safely(connection, handle_broker_request(root, raw, peer_address))
 
@@ -211,30 +214,48 @@ def _ready_request(connection: socket.socket) -> dict[object, object] | None:
     return _parse_peeked(buffered)
 
 
-def _peeked_request(connection: socket.socket) -> dict[object, object] | None:
-    """Copy the buffered request frame without consuming it, or None if undecided."""
-    deadline = time.monotonic() + 5.0
+def _peeked_request(
+    connection: socket.socket,
+) -> tuple[dict[object, object], float] | None:
+    """Copy the buffered request frame and its deadline, or None if undecided."""
+    deadline = time.monotonic() + PEEK_REQUEST_DEADLINE_SECONDS
     buffered = b""
+    stall_wait = PEEK_STALL_WAIT_MIN_SECONDS
     while b"\n" not in buffered and len(buffered) <= MAX_FRAME_BYTES:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None
         connection.settimeout(remaining)
         try:
-            buffered = connection.recv(65536, socket.MSG_PEEK)
+            peeked = connection.recv(65536, socket.MSG_PEEK)
         except OSError:
             return None
-        if not buffered:
+        if not peeked:
             return None
-    return _parse_peeked(buffered)
+        if len(peeked) > len(buffered):
+            buffered = peeked
+            stall_wait = PEEK_STALL_WAIT_MIN_SECONDS
+            continue
+        # The buffered bytes did not grow, so the socket stays readable and an
+        # immediate re-peek would return the same unchanged fragment forever.
+        # Wait a bounded, growing interval -- still inside the same deadline --
+        # for the rest of the frame instead of spinning on it.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(stall_wait, remaining))
+        stall_wait = min(stall_wait * 2, PEEK_STALL_WAIT_MAX_SECONDS)
+    request = _parse_peeked(buffered)
+    return (request, deadline) if request is not None else None
 
 
 def probe_broker_connection(root: Path, connection: socket.socket, peer_address: str) -> None:
     """Serve an overflowed authorize, refuse anything else before reading it."""
-    request = _peeked_request(connection)
-    if request is None:
+    peeked = _peeked_request(connection)
+    if peeked is None:
         # Undecided without consuming a byte: drop silently, as before.
         return
+    request, deadline = peeked
     if request.get("operation") != "authorize":
         # The request was only peeked at, never consumed or dispatched, so the
         # capacity refusal is truthful and cannot be confused with a response
@@ -242,10 +263,11 @@ def probe_broker_connection(root: Path, connection: socket.socket, peer_address:
         connection.settimeout(REFUSAL_WRITE_TIMEOUT_SECONDS)
         emit_frame_safely(connection, BROKER_CAPACITY_REFUSAL)
         return
-    connection.settimeout(5.0)
     try:
-        raw: object = json.loads(read_frame(connection))
-    except json.JSONDecodeError as error:
+        # Consuming the already-peeked frame runs on what remains of the same
+        # probe deadline, not a fresh wait that would double the reserve hold.
+        raw: object = json.loads(read_frame(connection, deadline=deadline))
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ChatError("Tailnet broker request is invalid") from error
     emit_frame_safely(connection, handle_broker_request(root, raw, peer_address))
 

@@ -1,0 +1,37 @@
+name: Bug report
+description: Report a reproducible installation or collaboration problem.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Share only redacted diagnostics. Do not include credentials, account identifiers,
+        full configuration backups, message bodies, or unrelated provider transcripts.
+        If delivery was accepted or unknown, do not resend the same task to reproduce it.
+  - type: input
+    id: version
+    attributes:
+      label: Cross Agent Chat version
+      description: Output of cross-agent-chat --version.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: macOS version, Intel or Apple silicon, provider versions, and CLI or Native App.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and observed behavior
+      description: Include whether this was local or cross-device, and whether the result arrived while idle or at a later prompt.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction and redacted diagnostics
+      description: Describe a fresh harmless case if safe. Include the reported delivery status and receiving boundary; omit message content and identity values.
+    validations:
+      required: true

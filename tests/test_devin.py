@@ -29,7 +29,9 @@ from cross_agent_chat.devin import (
     parse_hook_input,
     parse_pretool_input,
 )
+from cross_agent_chat.recipient import remote_token
 from cross_agent_chat.remote import parse_remote_envelope
+from cross_agent_chat.tailnet import TailnetIdentity
 
 
 def _hook(event: str, *, session_id: str | None = None, prompt_id: str | None = None) -> str:
@@ -746,6 +748,23 @@ def test_devin_pretool_overwrites_model_capability_field(
     assert build_pretool_callback(parsed, updated[DEVIN_CAPABILITY_FIELD])
 
 
+def _devin_mcp_stdin(*requests: object) -> io.StringIO:
+    handshake: list[object] = [
+        {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "devin", "version": "1.0"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    ]
+    return io.StringIO("".join(json.dumps(request) + "\n" for request in (*handshake, *requests)))
+
+
 def test_devin_mcp_public_tools_require_pretool_capability(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -753,25 +772,22 @@ def test_devin_mcp_public_tools_require_pretool_capability(
 
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "chat_peers",
-                        "arguments": {},
-                    },
-                }
-            )
-            + "\n"
+        _devin_mcp_stdin(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "chat_peers",
+                    "arguments": {},
+                },
+            }
         ),
     )
 
     mcp("devin", "studio", str(tmp_path / "state"))
 
-    response = json.loads(capsys.readouterr().out)
+    response = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert response["error"]["message"] == "Devin sender capability is required"
 
 
@@ -907,25 +923,22 @@ def test_pretool_capability_reaches_public_chat_peers_authentication(
     )
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "chat_peers",
-                        "arguments": {DEVIN_CAPABILITY_FIELD: token},
-                    },
-                }
-            )
-            + "\n"
+        _devin_mcp_stdin(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "chat_peers",
+                    "arguments": {DEVIN_CAPABILITY_FIELD: token},
+                },
+            }
         ),
     )
 
     mcp("devin", "studio", str(state))
 
-    response = json.loads(capsys.readouterr().out)
+    response = json.loads(capsys.readouterr().out.splitlines()[-1])
     result = json.loads(response["result"]["content"][0]["text"])
     assert result["sender"] == {"status": "ready"}
     assert store.capabilities() == []
@@ -1011,9 +1024,15 @@ def test_devin_originates_remote_send_with_exact_source_alias_and_intent(
         session_key="a" * 64,
         remote=True,
         tailnet_address="100.64.0.2",
+        tailnet_node_id="nOwner",
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _root: [])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([target], True))
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nOwner": "100.64.0.2"}),
+    )
+    monkeypatch.setattr(runtime, "_remote_node_targets", lambda *args, **kwargs: ([target], True))
     seen: list[dict[str, object]] = []
 
     def remote(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
@@ -1033,7 +1052,8 @@ def test_devin_originates_remote_send_with_exact_source_alias_and_intent(
 
     monkeypatch.setattr(runtime, "request_tailnet", remote)
 
-    result = runtime.send(root, source, target.session_key, "bounded remote fact")
+    token = remote_token("nOwner", target.session_key, target.generation)
+    result = runtime.send(root, source, token, "bounded remote fact")
 
     assert result["to"] == target.alias
     intent = IntentStore(root).intents()[0]

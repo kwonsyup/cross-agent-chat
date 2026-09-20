@@ -29,7 +29,11 @@ from cross_agent_chat.core import (
     bounded_message,
     session_key,
 )
+from cross_agent_chat.recipient import remote_token
 from cross_agent_chat.runtime import (
+    ACCEPT_TIMEOUT_SECONDS,
+    AUTHORIZE_TIMEOUT_SECONDS,
+    MAX_FRAME_BYTES,
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     Target,
     authorize_remote,
@@ -40,11 +44,12 @@ from cross_agent_chat.runtime import (
     wrapped_message,
 )
 from cross_agent_chat.tailnet import (
+    TailnetIdentity,
     local_tailnet_address,
     parse_ifconfig_tailnet_address,
     parse_known_tailnet_address,
     parse_local_tailnet_address,
-    parse_tailnet_nodes,
+    parse_tailnet_identity,
 )
 from cross_agent_chat.tailnet_broker import (
     BrokerAdmission,
@@ -64,14 +69,17 @@ def test_tailnet_discovery_returns_only_online_ipv4_nodes() -> None:
         {
             "Peer": {
                 "node-a": {
+                    "ID": "nNodeA",
                     "Online": True,
                     "TailscaleIPs": ["100.64.0.11", "fd7a:115c:a1e0::1"],
                 },
                 "node-b": {
+                    "ID": "nNodeB",
                     "Online": False,
                     "TailscaleIPs": ["100.64.0.12"],
                 },
                 "node-c": {
+                    "ID": "nNodeC",
                     "Online": True,
                     "TailscaleIPs": ["192.0.2.10", "fd7a:115c:a1e0::2"],
                 },
@@ -79,7 +87,77 @@ def test_tailnet_discovery_returns_only_online_ipv4_nodes() -> None:
         }
     )
 
-    assert parse_tailnet_nodes(payload) == ["100.64.0.11"]
+    identity = parse_tailnet_identity(payload)
+    assert sorted(set(identity.peers.values())) == ["100.64.0.11"]
+
+
+def test_tailnet_identity_maps_stable_node_ids_to_current_addresses() -> None:
+    payload = json.dumps(
+        {
+            "Self": {"ID": "nSelfNode", "TailscaleIPs": ["100.64.0.10"]},
+            "Peer": {
+                "node-a": {
+                    "ID": "nNodeA",
+                    "Online": True,
+                    "TailscaleIPs": ["100.64.0.11"],
+                },
+                "node-b": {
+                    "ID": "nNodeB",
+                    "Online": False,
+                    "TailscaleIPs": ["100.64.0.12"],
+                },
+            },
+        }
+    )
+
+    identity = parse_tailnet_identity(payload)
+
+    assert identity.self_node_id == "nSelfNode"
+    assert identity.peers == {"nNodeA": "100.64.0.11"}
+
+
+def test_tailnet_identity_fails_closed_on_a_duplicate_stable_node_id() -> None:
+    payload = json.dumps(
+        {
+            "Peer": {
+                "node-a": {
+                    "ID": "nNodeA",
+                    "Online": True,
+                    "TailscaleIPs": ["100.64.0.11"],
+                },
+                "node-b": {
+                    "ID": "nNodeA",
+                    "Online": True,
+                    "TailscaleIPs": ["100.64.0.12"],
+                },
+            }
+        }
+    )
+
+    with pytest.raises(ChatError, match="Tailscale status"):
+        parse_tailnet_identity(payload)
+
+
+def test_tailnet_identity_fails_closed_on_a_shared_address() -> None:
+    payload = json.dumps(
+        {
+            "Peer": {
+                "node-a": {
+                    "ID": "nNodeA",
+                    "Online": True,
+                    "TailscaleIPs": ["100.64.0.11"],
+                },
+                "node-b": {
+                    "ID": "nNodeB",
+                    "Online": True,
+                    "TailscaleIPs": ["100.64.0.11"],
+                },
+            }
+        }
+    )
+
+    with pytest.raises(ChatError, match="Tailscale status"):
+        parse_tailnet_identity(payload)
 
 
 def test_legacy_broker_peer_request_filters_new_devin_routes(
@@ -500,10 +578,25 @@ def test_remote_node_targets_rich_address_drift_retains_base(
     calls = 0
     original = runtime._targets_from_tailnet
 
-    def parse(address: str, raw: object, **kwargs: bool) -> list[Target]:
+    def parse(
+        address: str,
+        raw: object,
+        *,
+        include_delivery_mode: bool = False,
+        include_title: bool = False,
+        include_devin: bool = False,
+        node_id: str | None = None,
+    ) -> list[Target]:
         nonlocal calls
         calls += 1
-        targets = original(address, raw, **kwargs)
+        targets = original(
+            address,
+            raw,
+            include_delivery_mode=include_delivery_mode,
+            include_title=include_title,
+            include_devin=include_devin,
+            node_id=node_id,
+        )
         if calls == 2:
             targets[0] = replace(targets[0], tailnet_address="100.64.0.2")
         return targets
@@ -752,7 +845,7 @@ def test_remote_title_and_delivery_mode_are_independent_negotiated_fields() -> N
 
 def test_tailnet_discovery_rejects_malformed_status() -> None:
     with pytest.raises(ChatError, match="Tailscale status"):
-        parse_tailnet_nodes('{"Peer": []}')
+        parse_tailnet_identity('{"Peer": []}')
 
 
 def test_local_tailnet_address_uses_only_running_self_ipv4() -> None:
@@ -1622,6 +1715,130 @@ def test_remote_receive_routes_registered_codex_original_to_its_helper(
     }
 
 
+def _remote_receive_target(tmp_path: Path) -> tuple[Route, Target]:
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(route)
+    return route, Target(
+        alias=route.alias,
+        provider="codex",
+        device=route.device,
+        project=route.project,
+        generation=route.generation,
+        session_key=session_key("codex", route.session_id),
+        remote=False,
+        session_id=route.session_id,
+        cwd=route.cwd,
+        pid=route.pid,
+    )
+
+
+def test_remote_receive_authorization_spend_shrinks_the_accept_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow authorization answer spends from the same budget the accept uses.
+
+    The sender-broker callback and the provider accept draw from one
+    absolute deadline, so time the callback consumed is no longer
+    available to the accept.
+    """
+    route, public_target = _remote_receive_target(tmp_path)
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=str(uuid4()),
+        target_alias=route.alias,
+        generation=route.generation,
+        message="hello",
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    now = [1_000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    authorize_timeouts: list[float] = []
+    accept_timeouts: list[float] = []
+
+    def authorize(
+        _address: str, payload: dict[str, object], *, timeout: float, **_kwargs: object
+    ) -> dict[str, object]:
+        authorize_timeouts.append(timeout)
+        now[0] += 30.0
+        return {key: value for key, value in payload.items() if key != "operation"} | {
+            "status": "AUTHORIZED"
+        }
+
+    def accept(
+        _path: Path, payload: dict[str, object], *, timeout: float, **_kwargs: object
+    ) -> dict[str, object]:
+        accept_timeouts.append(timeout)
+        return {
+            "schema_version": 1,
+            "event_id": event_id,
+            "status": "TRANSPORT_ACCEPTED",
+            "to": route.alias,
+            "provider": "codex",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", authorize)
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", accept)
+
+    assert receive_remote(tmp_path, envelope, "100.64.0.11")["status"] == "TRANSPORT_ACCEPTED"
+    assert authorize_timeouts == [AUTHORIZE_TIMEOUT_SECONDS]
+    assert accept_timeouts == [
+        pytest.approx(AUTHORIZE_TIMEOUT_SECONDS + ACCEPT_TIMEOUT_SECONDS - 30.0)
+    ]
+
+
+def test_remote_receive_spent_budget_refuses_before_any_accept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A budget already spent by authorization leaves nothing for the accept.
+
+    The accept is armed with the shared remainder -- here nothing -- rather
+    than a fresh provider budget, so the receive stays a decided
+    pre-effect refusal.
+    """
+    route, public_target = _remote_receive_target(tmp_path)
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=str(uuid4()),
+        target_alias=route.alias,
+        generation=route.generation,
+        message="hello",
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    now = [1_000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    accept_timeouts: list[float] = []
+
+    def authorize(
+        _address: str, payload: dict[str, object], **_kwargs: object
+    ) -> dict[str, object]:
+        now[0] += AUTHORIZE_TIMEOUT_SECONDS + ACCEPT_TIMEOUT_SECONDS + 1.0
+        return {key: value for key, value in payload.items() if key != "operation"} | {
+            "status": "AUTHORIZED"
+        }
+
+    def accept(
+        _path: Path, payload: dict[str, object], *, timeout: float, **_kwargs: object
+    ) -> dict[str, object]:
+        accept_timeouts.append(timeout)
+        raise ChatError("session courier is unavailable before delivery")
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", authorize)
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", accept)
+
+    assert receive_remote(tmp_path, envelope, "100.64.0.11")["status"] == "PRE_EFFECT_REJECTED"
+    assert accept_timeouts and accept_timeouts[0] <= 0.0
+
+
 def test_remote_claude_receipt_uses_fresh_discovery_alias_after_rename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1712,8 +1929,8 @@ def test_tailnet_client_keeps_write_side_open_for_serve_proxy() -> None:
 def test_remote_targets_are_discovered_without_peer_configuration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def nodes() -> list[str]:
-        return ["100.64.0.11"]
+    def identity() -> TailnetIdentity:
+        return TailnetIdentity(self_node_id="nSelf", peers={"nNodeA": "100.64.0.11"})
 
     def request(address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         assert address == "100.64.0.11"
@@ -1734,7 +1951,7 @@ def test_remote_targets_are_discovered_without_peer_configuration(
             ],
         }
 
-    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", nodes)
+    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_identity", identity)
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_tailnet",
         request,
@@ -1745,6 +1962,7 @@ def test_remote_targets_are_discovered_without_peer_configuration(
     assert len(targets) == 1
     assert targets[0].alias == "claude@studio:api:api-a1"
     assert targets[0].tailnet_address == "100.64.0.11"
+    assert targets[0].tailnet_node_id == "nNodeA"
 
 
 def test_remote_send_uses_tailnet_broker_without_ssh_configuration(
@@ -1753,8 +1971,8 @@ def test_remote_send_uses_tailnet_broker_without_ssh_configuration(
     address = "100.64.0.11"
     target_alias = "claude@studio:api:api-a1"
 
-    def nodes() -> list[str]:
-        return [address]
+    def identity() -> TailnetIdentity:
+        return TailnetIdentity(self_node_id="nSelf", peers={"nNodeA": address})
 
     def request(
         actual_address: str,
@@ -1790,7 +2008,7 @@ def test_remote_send_uses_tailnet_broker_without_ssh_configuration(
             "provider": "claude",
         }
 
-    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", nodes)
+    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_identity", identity)
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
     source = Route.create(
         provider="codex",
@@ -1807,35 +2025,39 @@ def test_remote_send_uses_tailnet_broker_without_ssh_configuration(
     assert "hello" not in (tmp_path / "intents.json").read_text()
 
 
-def test_exact_handle_send_stops_waiting_on_silent_unrelated_peer(
+def test_exact_token_send_never_waits_on_a_silent_unrelated_peer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A scoped token asks only its pinned node; a silent neighbor is never
+    contacted, so it cannot hold the send hostage the way the 19 Sep roster
+    collector did."""
     owner = "100.64.0.11"
     silent = "100.64.0.12"
     handle = session_key("claude", str(uuid4()))
+    generation = str(uuid4())
     peer = {
         "alias": "claude@studio:api:api-a1",
         "provider": "claude",
         "device": "studio",
         "project": "api",
         "status": "available",
-        "generation": str(uuid4()),
+        "generation": generation,
         "session_key": handle,
     }
     release = threading.Event()
-    delivered_at: list[float] = []
+    contacted: list[str] = []
 
     def request(
         address: str, payload: dict[str, object], *, timeout: float = 2.0
     ) -> dict[str, object]:
+        contacted.append(address)
+        if address == silent:
+            # The neighbor would accept the connection and never answer inside
+            # its request budget; the send must never ask it.
+            release.wait(timeout)
+            raise ChatError("silent neighbor never answered")
         if payload.get("operation") == "peers":
-            if address == silent:
-                # The neighbor accepts the connection and never answers inside
-                # its request budget; release only frees the fixture worker.
-                release.wait(timeout)
-                raise ChatError("silent neighbor never answered")
             return {"schema_version": 1, "peers": [peer]}
-        delivered_at.append(time.monotonic())
         envelope = json.loads(str(payload["envelope"]))
         return {
             "schema_version": 1,
@@ -1845,7 +2067,10 @@ def test_exact_handle_send_stops_waiting_on_silent_unrelated_peer(
             "provider": "claude",
         }
 
-    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [silent, owner])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nSilent": silent, "nOwner": owner}),
+    )
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
     monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 8.0)
     source = Route.create(
@@ -1859,25 +2084,27 @@ def test_exact_handle_send_stops_waiting_on_silent_unrelated_peer(
 
     started = time.monotonic()
     try:
-        result = send(tmp_path, source, handle, "hello")
+        result = send(tmp_path, source, remote_token("nOwner", handle, generation), "hello")
     finally:
         release.set()
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     assert result["to"] == peer["alias"]
-    # The old collector held this send for the whole 8-second discovery budget;
-    # the known-handle grace bounds the wait on the unrelated silent node.
-    assert delivered_at[0] - started < 4.0
+    assert time.monotonic() - started < 4.0
+    assert contacted == [owner, owner]
 
 
-def test_exact_handle_duplicate_attestation_within_grace_refuses_send(
+def test_exact_token_send_ignores_a_clone_claimant_on_another_node(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A forged clone attesting the same handle elsewhere is never consulted:
+    the token pins one stable node and only that node is asked."""
     first = "100.64.0.11"
     clone = "100.64.0.12"
     handle = session_key("claude", str(uuid4()))
     generation = str(uuid4())
-    deliveries: list[dict[str, object]] = []
+    deliveries: list[tuple[str, dict[str, object]]] = []
+    contacted: list[str] = []
 
     def peer(alias: str, device: str) -> dict[str, object]:
         return {
@@ -1893,14 +2120,18 @@ def test_exact_handle_duplicate_attestation_within_grace_refuses_send(
     def request(
         address: str, payload: dict[str, object], *, timeout: float = 2.0
     ) -> dict[str, object]:
+        contacted.append(address)
         if payload.get("operation") == "peers":
             if address == clone:
-                # A forged or stale clone attests the same handle inside the
-                # grace window, so it still feeds duplicate detection.
-                time.sleep(0.3)
-                return {"schema_version": 1, "peers": [peer("claude@laptop:api:api-a1", "laptop")]}
-            return {"schema_version": 1, "peers": [peer("claude@studio:api:api-a1", "studio")]}
-        deliveries.append(payload)
+                return {
+                    "schema_version": 1,
+                    "peers": [peer("claude@laptop:api:api-a1", "laptop")],
+                }
+            return {
+                "schema_version": 1,
+                "peers": [peer("claude@studio:api:api-a1", "studio")],
+            }
+        deliveries.append((address, payload))
         envelope = json.loads(str(payload["envelope"]))
         return {
             "schema_version": 1,
@@ -1910,7 +2141,10 @@ def test_exact_handle_duplicate_attestation_within_grace_refuses_send(
             "provider": "claude",
         }
 
-    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [first, clone])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nOwner": first, "nClone": clone}),
+    )
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
     monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 8.0)
     source = Route.create(
@@ -1922,15 +2156,18 @@ def test_exact_handle_duplicate_attestation_within_grace_refuses_send(
     )
     Registry(tmp_path).upsert(source)
 
-    with pytest.raises(ChatError, match="target handle is unavailable"):
-        send(tmp_path, source, handle, "hello")
+    result = send(tmp_path, source, remote_token("nOwner", handle, generation), "hello")
 
-    assert deliveries == []
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+    assert contacted == [first, first]
+    assert [address for address, _ in deliveries] == [first]
 
 
-def test_exact_handle_late_attestation_reports_incomplete(
+def test_a_node_that_never_answers_marks_discovery_incomplete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """An unanswered node reports incomplete: discovery never claims a roster
+    it did not finish reading, and nothing records a selection for it."""
     owner = "100.64.0.11"
     laggard = "100.64.0.12"
     handle = session_key("claude", str(uuid4()))
@@ -1944,39 +2181,31 @@ def test_exact_handle_late_attestation_reports_incomplete(
         "session_key": handle,
     }
     release = threading.Event()
-    answered = threading.Event()
-    late_attestations: list[str] = []
 
     def request(
         address: str, payload: dict[str, object], *, timeout: float = 2.0
     ) -> dict[str, object]:
         if address == laggard:
-            # Answers only after the grace has already closed; its roster would
-            # have attested the same handle, so this is a genuine second
-            # attestation that the collector never consumed.
             release.wait(timeout)
-            late_attestations.append(handle)
-            answered.set()
-            return {"schema_version": 1, "peers": [peer]}
+            raise ChatError("laggard never answered")
         return {"schema_version": 1, "peers": [peer]}
 
-    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [owner, laggard])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nOwner": owner, "nLaggard": laggard}),
+    )
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
-    monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 8.0)
+    monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 4.0)
 
     try:
-        targets, complete = runtime._remote_discovery(handle=handle)
+        targets, complete = runtime._remote_discovery()
     finally:
         release.set()
 
-    # Residual: a duplicate attestation landing after KNOWN_HANDLE_GRACE_SECONDS
-    # is never seen, so send() proceeds on the single in-grace attestation.
-    # complete=False is the signal that an unanswered node may still hold a
-    # claimant; the latency win trades away post-grace duplicate visibility.
     assert complete is False
     assert [target.session_key for target in targets] == [handle]
-    assert answered.wait(2.0)
-    assert late_attestations == [handle]
+    assert targets[0].tailnet_node_id == "nOwner"
+    assert not (tmp_path / "recipients.json").exists()
 
 
 def test_alias_send_still_waits_on_silent_unrelated_peer(
@@ -2017,7 +2246,10 @@ def test_alias_send_still_waits_on_silent_unrelated_peer(
             "provider": "claude",
         }
 
-    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [silent, owner])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nSilent": silent, "nOwner": owner}),
+    )
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
     monkeypatch.setattr("cross_agent_chat.runtime.REMOTE_DISCOVERY_TIMEOUT_SECONDS", 4.0)
     source = Route.create(
@@ -2041,11 +2273,13 @@ def test_alias_send_still_waits_on_silent_unrelated_peer(
     assert time.monotonic() - started >= 3.5
 
 
-def test_exact_handle_send_is_refused_when_attested_generation_is_stale(
+def test_exact_token_send_is_refused_when_attested_generation_is_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The pinned node re-attests handle+generation at dispatch; a stale
+    generation refuses before an intent exists or a receive byte is sent."""
     owner = "100.64.0.11"
-    advertised = str(uuid4())
+    stale = str(uuid4())
     live = str(uuid4())
     handle = session_key("claude", str(uuid4()))
     peer = {
@@ -2054,37 +2288,23 @@ def test_exact_handle_send_is_refused_when_attested_generation_is_stale(
         "device": "studio",
         "project": "api",
         "status": "available",
-        "generation": advertised,
+        "generation": live,
         "session_key": handle,
     }
-    envelope_generations: list[str] = []
+    contacted: list[str] = []
 
     def request(
         address: str, payload: dict[str, object], *, timeout: float = 2.0
     ) -> dict[str, object]:
+        contacted.append(str(payload.get("operation")))
         if payload.get("operation") == "peers":
             return {"schema_version": 1, "peers": [peer]}
-        envelope = json.loads(str(payload["envelope"]))
-        envelope_generations.append(str(envelope["generation"]))
-        if envelope["generation"] != live:
-            # The broker's exact-generation gate refuses a stale attestation the
-            # same way receive_remote rejects a route that has moved on.
-            return {
-                "schema_version": 1,
-                "event_id": envelope["event_id"],
-                "status": "PRE_EFFECT_REJECTED",
-                "provider": "claude",
-                "error": "remote destination rejected before provider effect",
-            }
-        return {
-            "schema_version": 1,
-            "event_id": envelope["event_id"],
-            "status": "TRANSPORT_ACCEPTED",
-            "to": peer["alias"],
-            "provider": "claude",
-        }
+        pytest.fail("a stale selection must not reach the receive boundary")
 
-    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [owner])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nOwner": owner}),
+    )
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
     source = Route.create(
         provider="codex",
@@ -2095,13 +2315,11 @@ def test_exact_handle_send_is_refused_when_attested_generation_is_stale(
     )
     Registry(tmp_path).upsert(source)
 
-    with pytest.raises(ChatError, match="remote target rejected the message"):
-        send(tmp_path, source, handle, "hello")
+    with pytest.raises(ChatError, match="unavailable or changed"):
+        send(tmp_path, source, remote_token("nOwner", handle, stale), "hello")
 
-    # The envelope carried the attested generation; nothing cached or skipped
-    # the broker's validation, so the stale attestation was not accepted.
-    assert envelope_generations == [advertised]
-    assert IntentStore(tmp_path).intents()[0].status == "PRE_EFFECT_REJECTED"
+    assert contacted == ["peers"]
+    assert IntentStore(tmp_path).intents() == []
 
 
 def test_remote_claude_diagnostic_is_body_free_and_marks_one_unknown(
@@ -2136,7 +2354,10 @@ def test_remote_claude_diagnostic_is_body_free_and_marks_one_unknown(
             "diagnostic": "claude_helper_timeout",
         }
 
-    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [address])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nNodeA": address}),
+    )
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
     source = Route.create(
         provider="codex",
@@ -2251,7 +2472,10 @@ def test_remote_pre_effect_rejection_is_safe_and_does_not_block_fresh_send(
             "error": "peer-controlled wording must not escape",
         }
 
-    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [address])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nNodeA": address}),
+    )
     monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
     source = Route.create(
         provider="codex",
@@ -2348,7 +2572,10 @@ def test_wrapped_message_limit_rejects_before_intent_creation(
     target_alias = "claude@studio:api:api-a1"
     generation = str(uuid4())
 
-    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_nodes", lambda: [address])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nNodeA": address}),
+    )
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_tailnet",
         lambda *_args, **_kwargs: {
@@ -2526,7 +2753,7 @@ def test_broker_receive_preserves_proven_rejection_and_post_write_uncertainty(
     monkeypatch.setattr(
         tailnet_broker_module,
         "read_frame",
-        lambda _: json.dumps(
+        lambda _connection, _limit=MAX_FRAME_BYTES, **_kwargs: json.dumps(
             {"schema_version": 1, "operation": "receive", "envelope": envelope}
         ).encode(),
     )
@@ -2640,7 +2867,7 @@ def test_wrapped_message_names_the_exact_budget_at_its_real_boundary() -> None:
     smaller than the limit by however much the envelope costs. Nothing pinned
     that number, so envelope edits moved it silently.
     """
-    alias = "claude@kwons-imac-pro:Projects:E_KLURO_17-Sep-12PM"
+    alias = "claude@studio:api:api-a1"
     handle = "b7" * 32
     event_id = str(uuid4())
     overhead = len(wrapped_message(alias, handle, "", event_id, "claude").encode())
@@ -2679,7 +2906,7 @@ def test_wrapped_message_does_not_restate_other_failures_as_a_size_problem(
     """
     with pytest.raises(ChatError) as caught:
         wrapped_message(
-            "claude@kwons-imac-pro:Projects:E_KLURO_17-Sep-12PM",
+            "claude@studio:api:api-a1",
             "b7" * 32,
             message,
             str(uuid4()),
@@ -2707,7 +2934,7 @@ def test_wrapped_message_keeps_the_frame_budget_reason_when_the_envelope_causes_
 
     with pytest.raises(ChatError) as caught:
         wrapped_message(
-            "claude@kwons-imac-pro:Projects:E_KLURO_17-Sep-12PM",
+            "claude@studio:api:api-a1",
             "b7" * 32,
             message,
             str(uuid4()),
@@ -2727,7 +2954,7 @@ def _loaded_broker(
     route_count: int = 30,
     slow_probe_seconds: float = 1.0,
     requester_budget_seconds: float = 0.4,
-) -> tuple[Path, Route, Route, str, list[dict[str, object]]]:
+) -> tuple[Path, Route, Route, str, str, list[dict[str, object]]]:
     """A broker with many routes whose non-target couriers answer slowly.
 
     The requester keeps a shrunken per-node budget the way the incident's real
@@ -2804,10 +3031,15 @@ def _loaded_broker(
 
     monkeypatch.setattr(runtime, "request_socket", couriers)
     monkeypatch.setattr(runtime, "request_tailnet", wire)
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: ["100.64.0.11"])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nBroker": "100.64.0.11"}),
+    )
     monkeypatch.setattr(runtime, "REMOTE_DISCOVERY_TIMEOUT_SECONDS", requester_budget_seconds)
     handle = session_key(target.provider, target.session_id)
-    return requester_root, source, target, handle, calls
+    token = remote_token("nBroker", handle, target.generation)
+    return requester_root, source, target, handle, token, calls
 
 
 def test_send_to_an_exact_handle_does_not_wait_for_a_full_loaded_roster(
@@ -2821,9 +3053,9 @@ def test_send_to_an_exact_handle_does_not_wait_for_a_full_loaded_roster(
     incomplete" while the target's own courier was healthy. The handle-bound
     variant lets the broker answer after validating only the owning route.
     """
-    root, source, _target, handle, calls = _loaded_broker(tmp_path, monkeypatch)
+    root, source, _target, handle, token, calls = _loaded_broker(tmp_path, monkeypatch)
 
-    result = send(root, source, handle, "hello")
+    result = send(root, source, token, "hello")
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     peers_calls = [payload for payload in calls if payload.get("operation") == "peers"]
@@ -2842,18 +3074,19 @@ def test_send_to_an_exact_handle_does_not_wait_for_a_full_loaded_roster(
     assert complete is False
 
 
-def test_exact_handle_send_falls_back_to_a_full_roster_on_an_old_broker(
+def test_exact_token_send_falls_back_to_a_full_roster_on_an_old_broker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A broker that rejects the unknown variant costs one extra round-trip."""
     handle = session_key("codex", str(uuid4()))
+    generation = str(uuid4())
     peer = {
         "alias": "codex@remote:api:123456789abc",
         "provider": "codex",
         "device": "remote",
         "project": "api",
         "status": "available",
-        "generation": str(uuid4()),
+        "generation": generation,
         "session_key": handle,
     }
     calls: list[dict[str, object]] = []
@@ -2881,7 +3114,11 @@ def test_exact_handle_send_falls_back_to_a_full_roster_on_an_old_broker(
         return {"schema_version": 1, "peers": [peer]}
 
     monkeypatch.setattr(runtime, "request_tailnet", old_broker)
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: ["100.64.0.2"])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nOld": "100.64.0.2"}),
+    )
     source = Route.create(
         provider="codex",
         session_id=str(uuid4()),
@@ -2891,7 +3128,7 @@ def test_exact_handle_send_falls_back_to_a_full_roster_on_an_old_broker(
     )
     Registry(tmp_path).upsert(source)
 
-    result = send(tmp_path, source, handle, "hello")
+    result = send(tmp_path, source, remote_token("nOld", handle, generation), "hello")
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     assert calls[:2] == [
@@ -3048,27 +3285,40 @@ def test_handle_bound_variant_is_rejected_with_any_extra_or_invalid_field(
             handle_broker_request(tmp_path, request, "100.64.0.10")
 
 
-def test_exact_handle_send_still_refuses_duplicate_attestation_across_nodes(
+def test_exact_token_send_refuses_when_the_handle_moved_to_another_node(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The handle reappearing on a different stable node does not retarget:
+    the pinned node stopped claiming it, so the send refuses pre-effect."""
     handle = "a" * 64
+    generation = str(uuid4())
     peer = {
         "alias": "codex@remote:api:123456789abc",
         "provider": "codex",
         "device": "remote",
         "project": "api",
         "status": "available",
-        "generation": str(uuid4()),
+        "generation": generation,
         "session_key": handle,
     }
+    contacted: list[str] = []
 
-    def broker(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+    def broker(address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        contacted.append(address)
         if payload.get("operation") == "peers":
-            return {"schema_version": 1, "peers": [peer]}
+            # The old node no longer claims the handle; the new one is never asked.
+            return {"schema_version": 1, "peers": [] if address == "100.64.0.11" else [peer]}
         pytest.fail("a refused send must not reach the receive boundary")
 
     monkeypatch.setattr(runtime, "request_tailnet", broker)
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: ["100.64.0.11", "100.64.0.12"])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(
+            self_node_id="nSelf",
+            peers={"nOwner": "100.64.0.11", "nNew": "100.64.0.12"},
+        ),
+    )
     source = Route.create(
         provider="codex",
         session_id=str(uuid4()),
@@ -3078,5 +3328,7 @@ def test_exact_handle_send_still_refuses_duplicate_attestation_across_nodes(
     )
     Registry(tmp_path).upsert(source)
 
-    with pytest.raises(ChatError, match="target handle is unavailable"):
-        send(tmp_path, source, handle, "hello")
+    with pytest.raises(ChatError, match="unavailable or changed"):
+        send(tmp_path, source, remote_token("nOwner", handle, generation), "hello")
+
+    assert contacted == ["100.64.0.11"]

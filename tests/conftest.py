@@ -1,4 +1,4 @@
-"""Fixture-only boundary that prevents tests from touching founder services."""
+"""Fixture-only boundary that prevents tests from touching live user services."""
 
 from __future__ import annotations
 
@@ -140,7 +140,7 @@ def _fixture_socket_root(request: pytest.FixtureRequest) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_founder_surfaces(
+def _isolate_live_surfaces(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, tmp_path: Path
 ) -> None:
     """Keep provider profiles, sockets, subprocesses, and network fixture-owned.
@@ -162,6 +162,8 @@ def _isolate_founder_surfaces(
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_CHILD_SESSION", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_MESSAGING_SOCKET", raising=False)
+    monkeypatch.delenv("CLAUDECODE", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
     monkeypatch.delenv("CROSS_AGENT_CHAT_PRESENCE", raising=False)
     monkeypatch.setenv("TMPDIR", str(temporary))
 

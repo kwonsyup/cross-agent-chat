@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cross-agent-chat"
-version = "0.3.8"
+version = "0.4.0"
 description = "Local-first cross-session chat for Claude Code, Codex, and local Devin."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,6 +19,10 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
 ]
 dependencies = ["tomlkit>=0.13,<0.14"]
+
+[project.urls]
+Source = "https://github.com/kwonsyup/cross-agent-chat"
+Issues = "https://github.com/kwonsyup/cross-agent-chat/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -39,8 +43,10 @@ packages = ["src/cross_agent_chat"]
 include = [
   "/src",
   "/tests",
+  "/docs",
   "/README.md",
   "/SECURITY.md",
+  "/CONTRIBUTING.md",
   "/CHANGELOG.md",
   "/LICENSE",
   "/pyproject.toml",

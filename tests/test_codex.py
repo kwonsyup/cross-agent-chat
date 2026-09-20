@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
@@ -18,6 +19,35 @@ from cross_agent_chat.codex import (
 )
 from cross_agent_chat.core import ChatError, Registry, Route, UnknownDeliveryError
 from cross_agent_chat.runtime import MAX_FRAME_BYTES, codex_stop, register, unregister
+
+FAKE_SERVER_READY_SECONDS = 30.0
+
+
+def fake_server_clock(
+    ready: Path, anchor: float, observed: list[float] | None = None
+) -> Callable[[], float]:
+    """Hold the metadata clock at `anchor` until the fake provider is ready.
+
+    The app-server subprocess can take seconds to exec under host load; the
+    protocol deadline must only measure the exchange that runs after the fake
+    has actually started. The hold is bounded: a fake that never signals
+    readiness fails the fixture instead of freezing the protocol clock
+    forever. ``observed`` records the real ready time.
+    """
+    real_monotonic = time.monotonic
+    marks = observed if observed is not None else []
+
+    def clock() -> float:
+        now = real_monotonic()
+        if not marks:
+            if not ready.exists():
+                if now - anchor < FAKE_SERVER_READY_SECONDS:
+                    return anchor
+                pytest.fail("fake Codex app-server did not become ready")
+            marks.append(now)
+        return anchor + (now - marks[0])
+
+    return clock
 
 
 def test_stop_without_registered_route_is_silent_noop(
@@ -254,14 +284,19 @@ def test_queue_has_no_age_expiration() -> None:
     assert courier.peek()[0]["event_id"] == event_id
 
 
-def test_native_thread_titles_are_metadata_only_and_bounded(tmp_path: Path) -> None:
+def test_native_thread_titles_are_metadata_only_and_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     first, second = str(uuid4()), str(uuid4())
     trace = tmp_path / "trace.jsonl"
+    ready = tmp_path / "ready"
     binary = tmp_path / "fake-codex"
     binary.write_text(
         f"#!{sys.executable}\n"
         + r"""
 import json, os, sys
+from pathlib import Path
+Path(os.environ["TEST_READY"]).touch()
 with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
     for line in sys.stdin:
         request = json.loads(line)
@@ -276,12 +311,18 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
 """
     )
     binary.chmod(0o700)
+    started = time.monotonic()
+    monkeypatch.setattr("cross_agent_chat.codex.time.monotonic", fake_server_clock(ready, started))
 
     titles = native_thread_titles(
         binary=binary,
-        environment={"CODEX_HOME": str(tmp_path), "TEST_TRACE": str(trace)},
+        environment={
+            "CODEX_HOME": str(tmp_path),
+            "TEST_TRACE": str(trace),
+            "TEST_READY": str(ready),
+        },
         thread_ids=[first, second],
-        deadline=time.monotonic() + 2,
+        deadline=started + 2,
     )
 
     assert titles == {first: f"Canary {first[:8]}", second: f"Canary {second[:8]}"}
@@ -293,14 +334,19 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
     ]
 
 
-def test_native_thread_titles_rejects_a_different_profile(tmp_path: Path) -> None:
+def test_native_thread_titles_rejects_a_different_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     thread_id = str(uuid4())
     trace = tmp_path / "trace.jsonl"
+    ready = tmp_path / "ready"
     binary = tmp_path / "fake-codex"
     binary.write_text(
         f"#!{sys.executable}\n"
         + r"""
 import json, os, sys
+from pathlib import Path
+Path(os.environ["TEST_READY"]).touch()
 with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
     for line in sys.stdin:
         request = json.loads(line)
@@ -310,12 +356,18 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
 """
     )
     binary.chmod(0o700)
+    started = time.monotonic()
+    monkeypatch.setattr("cross_agent_chat.codex.time.monotonic", fake_server_clock(ready, started))
 
     titles = native_thread_titles(
         binary=binary,
-        environment={"CODEX_HOME": str(tmp_path), "TEST_TRACE": str(trace)},
+        environment={
+            "CODEX_HOME": str(tmp_path),
+            "TEST_TRACE": str(trace),
+            "TEST_READY": str(ready),
+        },
         thread_ids=[thread_id],
-        deadline=time.monotonic() + 1,
+        deadline=started + 1,
     )
 
     assert titles == {}
@@ -324,44 +376,60 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
             "id": 0,
             "method": "initialize",
             "params": {
-                "clientInfo": {"name": "cross-agent-chat", "version": "0.3.8"},
+                "clientInfo": {"name": "cross-agent-chat", "version": "0.4.0"},
                 "capabilities": {"experimentalApi": True},
             },
         }
     ]
 
 
-def test_native_thread_titles_stops_at_the_metadata_deadline(tmp_path: Path) -> None:
+def test_native_thread_titles_stops_at_the_metadata_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready = tmp_path / "ready"
     binary = tmp_path / "fake-codex"
     binary.write_text(
         f"#!{sys.executable}\n"
         + r"""
-import time
+import os, time
+from pathlib import Path
+Path(os.environ["TEST_READY"]).touch()
 for _line in __import__("sys").stdin:
     time.sleep(5)
 """
     )
     binary.chmod(0o700)
-    started = time.monotonic()
+    real_monotonic = time.monotonic
+    started = real_monotonic()
+    observed: list[float] = []
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.time.monotonic",
+        fake_server_clock(ready, started, observed),
+    )
 
     titles = native_thread_titles(
         binary=binary,
-        environment={"CODEX_HOME": str(tmp_path)},
+        environment={"CODEX_HOME": str(tmp_path), "TEST_READY": str(ready)},
         thread_ids=[str(uuid4())],
-        deadline=started + 0.05,
+        deadline=started + 0.5,
     )
 
     assert titles == {}
-    assert time.monotonic() - started < 1.5
+    assert observed and 0.5 <= real_monotonic() - observed[0] < 3
 
 
-def test_native_thread_titles_rejects_a_title_for_another_thread(tmp_path: Path) -> None:
+def test_native_thread_titles_rejects_a_title_for_another_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     requested, wrong = str(uuid4()), str(uuid4())
+    ready = tmp_path / "ready"
     binary = tmp_path / "fake-codex"
     binary.write_text(
         f"#!{sys.executable}\n"
         + r"""
 import json, os, sys
+from pathlib import Path
+Path(os.environ["TEST_READY"]).touch()
 for line in sys.stdin:
     request = json.loads(line)
     if request.get("id") == 0:
@@ -375,19 +443,27 @@ for line in sys.stdin:
 """
     )
     binary.chmod(0o700)
+    started = time.monotonic()
+    monkeypatch.setattr("cross_agent_chat.codex.time.monotonic", fake_server_clock(ready, started))
 
     assert (
         native_thread_titles(
             binary=binary,
-            environment={"CODEX_HOME": str(tmp_path), "WRONG_THREAD": wrong},
+            environment={
+                "CODEX_HOME": str(tmp_path),
+                "WRONG_THREAD": wrong,
+                "TEST_READY": str(ready),
+            },
             thread_ids=[requested],
-            deadline=time.monotonic() + 1,
+            deadline=started + 1,
         )
         == {}
     )
 
 
-def test_native_thread_titles_kills_a_stubborn_metadata_process(tmp_path: Path) -> None:
+def test_native_thread_titles_kills_a_stubborn_metadata_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pid_file = tmp_path / "stubborn.pid"
     binary = tmp_path / "fake-codex"
     binary.write_text(
@@ -407,7 +483,13 @@ for line in sys.stdin:
 """
     )
     binary.chmod(0o700)
-    started = time.monotonic()
+    real_monotonic = time.monotonic
+    started = real_monotonic()
+    observed: list[float] = []
+    monkeypatch.setattr(
+        "cross_agent_chat.codex.time.monotonic",
+        fake_server_clock(pid_file, started, observed),
+    )
 
     assert (
         native_thread_titles(
@@ -418,7 +500,7 @@ for line in sys.stdin:
         )
         == {}
     )
-    assert time.monotonic() - started < 3
+    assert observed and real_monotonic() - observed[0] < 5
     assert pid_file.exists()
     with pytest.raises(ProcessLookupError):
         os.kill(int(pid_file.read_text()), 0)
@@ -609,7 +691,7 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as log:
     real_sleep = time.sleep
 
     def monotonic_after_fake_server_starts() -> float:
-        deadline = real_monotonic() + 5.0
+        deadline = real_monotonic() + FAKE_SERVER_READY_SECONDS
         while not ready.exists():
             if real_monotonic() >= deadline:
                 pytest.fail("fake Codex app-server did not become ready")

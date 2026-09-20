@@ -3,7 +3,74 @@ set -eu
 
 # The default release tag is usable after that tag is published. Before publication, set
 # CROSS_AGENT_CHAT_SOURCE to an available release or local candidate explicitly.
-source_ref=${CROSS_AGENT_CHAT_SOURCE:-git+https://github.com/kwonsyup/cross-agent-chat.git@v0.3.8}
+source_ref=${CROSS_AGENT_CHAT_SOURCE:-git+https://github.com/kwonsyup/cross-agent-chat.git@v0.4.0}
+
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 2
+}
+
+# Prerequisite checks run before any mkdir, staging, or download.
+[ "$(uname -s)" = "Darwin" ] || fail 'Cross Agent Chat supports macOS only.'
+command -v launchctl >/dev/null 2>&1 || fail 'Cross Agent Chat requires launchctl.'
+case "$source_ref" in
+    git+*)
+        command -v git >/dev/null 2>&1 ||
+            fail 'git is required to install Cross Agent Chat from a git source.'
+        ;;
+esac
+if ! command -v uv >/dev/null 2>&1; then
+    if ! {
+        command -v python3 >/dev/null 2>&1 &&
+            python3 -B -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'
+    }; then
+        command -v curl >/dev/null 2>&1 ||
+            fail 'Cross Agent Chat requires uv, python3 >= 3.11, or curl for bootstrap.'
+    fi
+fi
+# shellcheck disable=SC3067 # macOS /bin/sh implements -O; the ownership check is required.
+{ [ -n "${HOME:-}" ] && [ "$HOME" != "/" ] && [ -d "$HOME" ] && [ -O "$HOME" ] &&
+    [ -w "$HOME" ]; } || fail 'Cross Agent Chat requires a safe owned HOME directory.'
+
+provider_args=
+if [ -n "${CROSS_AGENT_CHAT_PROVIDERS:-}" ]; then
+    saved_ifs=$IFS
+    IFS=,
+    for provider in $CROSS_AGENT_CHAT_PROVIDERS; do
+        case "$provider" in
+            claude|codex|devin)
+                provider_args="$provider_args --provider $provider"
+                ;;
+            *)
+                IFS=$saved_ifs
+                fail "unsupported CROSS_AGENT_CHAT_PROVIDERS entry: $provider"
+                ;;
+        esac
+    done
+    IFS=$saved_ifs
+fi
+
+if [ "${CROSS_AGENT_CHAT_APPROVE:-0}" != "1" ]; then
+    cat >&2 <<'EOF'
+Cross Agent Chat setup will:
+- integrate the installed provider roots (or those named by
+  CROSS_AGENT_CHAT_PROVIDERS=claude,codex,devin)
+- Claude: accept inbound cross-session messages, add owned session hooks,
+  and register the cross-agent-chat MCP server
+- Codex: enable hooks and auto-approve only the cross-agent-chat tools
+- Devin: register the cross-agent-chat MCP server and add owned hooks
+- write full local configuration backups under
+  ~/.cache/cross-agent-chat/backups (backup files may contain secrets)
+- install a runtime under ~/.local/share/cross-agent-chat-runtime, repoint the
+  cross-agent-chat entrypoint, and restart the launchd broker (starts at login)
+Approve and re-run, for example:
+  curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.0/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+or from a local copy:
+  CROSS_AGENT_CHAT_APPROVE=1 sh install.sh
+EOF
+    exit 2
+fi
+
 home_root=$(cd "$HOME" && pwd -P)
 mkdir -p "$HOME/.local"
 local_root=$(cd "$HOME/.local" && pwd -P)
@@ -38,12 +105,12 @@ cleanup() {
         expected="cross-agent-chat-runtime-v1:staged:$$:$owner_identity"
         if [ ! -e "$marker" ] ||
             { [ -f "$marker" ] && [ "$(sed -n '1p' "$marker")" = "$expected" ]; }; then
-            rm -rf "$staged_runtime"
+            rm -rf "${staged_runtime:?}"
         fi
     fi
     rmdir "$releases_root" "$product_root" 2>/dev/null || true
     if [ -n "$bootstrap_dir" ]; then
-        rm -rf "$bootstrap_dir"
+        rm -rf "${bootstrap_dir:?}"
     fi
 }
 trap cleanup EXIT
@@ -58,8 +125,10 @@ owner_identity=$(/bin/ps -ww -p "$$" -o lstart= -o command= | shasum -a 256 | aw
 printf '%s:%s:%s\n' 'cross-agent-chat-runtime-v1:staged' "$$" "$owner_identity" > "$staged_runtime/.cross-agent-chat-release"
 chmod 600 "$staged_runtime/.cross-agent-chat-release"
 
+# -B keeps this read-only probe from writing a bytecode cache under HOME; the
+# unapproved and rejected paths must not write anything anywhere.
 python_is_compatible() {
-    command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'
+    command -v python3 >/dev/null 2>&1 && python3 -B -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'
 }
 
 if command -v uv >/dev/null 2>&1; then
@@ -103,7 +172,10 @@ set -- \
 if [ -n "${CROSS_AGENT_CHAT_DEVICE:-}" ]; then
     set -- "$@" --device "$CROSS_AGENT_CHAT_DEVICE"
 fi
-"$staged_runtime/bin/cross-agent-chat" _install-staged "$@"
+# Approval was granted through CROSS_AGENT_CHAT_APPROVE=1; provider_args entries
+# are already validated against the supported provider list.
+# shellcheck disable=SC2086 # provider_args must word-split into separate flags.
+"$staged_runtime/bin/cross-agent-chat" _install-staged "$@" --yes $provider_args
 
 published_executable=$(command -v cross-agent-chat 2>/dev/null || true)
 if [ "$published_executable" != "$stable_entrypoint" ]; then
