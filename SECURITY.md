@@ -25,7 +25,7 @@ prompt, or authorize a retry or bypass.
 
 ## What setup changes
 
-On the candidate installer, nothing changes without
+Nothing changes without
 `CROSS_AGENT_CHAT_APPROVE=1`: run without it and the script prints these
 effects and exits before any staging or write. A fresh install integrates
 only the provider roots that already exist, or the subset named by

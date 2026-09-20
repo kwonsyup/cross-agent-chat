@@ -10,10 +10,6 @@ conversation depends on that provider's receiving mode, and idle receipt is not
 established for every surface. Read the receiving column before relying on a
 reply.
 
-> **Documentation note:** this source tree documents the unreleased candidate.
-> Text marked *(candidate)* describes behavior not yet in the published v0.3.8
-> prerelease; the install command below still installs that released tag.
-
 ## What it does
 
 Inside a supported coding session, the agent gets three local tools over MCP:
@@ -60,8 +56,8 @@ keep exchanging only with other retained sessions.
 
 ## What setup changes
 
-Installation is not just a binary copy, and it is never silent. *(Candidate)*
-the installer requires explicit approval — without `CROSS_AGENT_CHAT_APPROVE=1`
+Installation is not just a binary copy, and it is never silent. The
+installer requires explicit approval — without `CROSS_AGENT_CHAT_APPROVE=1`
 it prints this effect summary and exits before any staging or write. With
 approval it snapshots every affected configuration file into
 `~/.cache/cross-agent-chat/backups/` for rollback, then writes:
@@ -83,7 +79,7 @@ approval it snapshots every affected configuration file into
   `~/.config/cross-agent-chat`, state under `~/.local/state/cross-agent-chat`,
   and staged runtimes under `~/.local/share/cross-agent-chat-runtime`.
 
-*(Candidate)* a fresh install selects only the provider roots that already
+A fresh install selects only the provider roots that already
 exist on the Mac; `CROSS_AGENT_CHAT_PROVIDERS` (a comma-separated subset of
 `claude,codex,devin`) selects explicitly, as does a repeated
 `cross-agent-chat setup --provider NAME`. An upgrade retains the provider set
@@ -94,7 +90,7 @@ selected roots and effects, then requires `--yes` or one interactive
 confirmation before any write; it never reads piped stdin for consent.
 Unrelated settings, hooks, MCP servers, and credentials are preserved.
 
-*(Candidate)* a failed setup rolls its recorded provider-set metadata,
+A failed setup rolls its recorded provider-set metadata,
 provider configuration, and predecessor runtime back transactionally.
 Downgrading to a release that predates schema-5 install metadata is *not*
 automatic after a successful schema-5 install: the older build refuses the
@@ -104,23 +100,22 @@ release.
 
 ## Install
 
-Install v0.3.8 prerelease with:
+Install v0.4.0 prerelease with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.3.8/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.0/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
-`CROSS_AGENT_CHAT_APPROVE=1` is set on `sh`, not on `curl`. On the candidate
-installer it is the required consent surface described above; the published
-v0.3.8 script predates that gate and ignores the variable, so this command is
-safe for both. This installs the released `v0.3.8` tag and performs setup in
-one step. The stable command is `~/.local/bin/cross-agent-chat`; if your shell
-does not resolve it, put `~/.local/bin` on `PATH` or invoke the absolute path.
+`CROSS_AGENT_CHAT_APPROVE=1` is set on `sh`, not on `curl`, and is required:
+it is the consent surface described above, and the script exits without it.
+This installs the released `v0.4.0` tag and performs setup in one step. The
+stable command is `~/.local/bin/cross-agent-chat`; if your shell does not
+resolve it, put `~/.local/bin` on `PATH` or invoke the absolute path.
 Re-running the installer upgrades and repairs the owned configuration.
 
 ### Session compatibility after install or upgrade
 
-*(Candidate)* recipient handles changed to opaque endpoint tokens — see *First
+Recipient handles changed to opaque endpoint tokens — see *First
 use*. **After installing or upgrading on every participating Mac, start fresh
 sender *and* recipient provider sessions.** The supported request/reply scope
 on this release is fresh-session to fresh-session.
@@ -151,7 +146,7 @@ the matrix), does the work, and replies with a separate send. On a Stop-bound
 or prompt-bound requester the answer is handed over at that session's next
 turn — do not mistake that for delivery while it sits idle.
 
-*(Candidate)* the `handle` that `chat_peers` returns is an opaque endpoint
+The `handle` that `chat_peers` returns is an opaque endpoint
 token, not a raw session handle. A token pins the exact session key and route
 generation to the endpoint that presented them — the stable Tailnet node for
 a remote peer, or the local state root on the same Mac — and is
@@ -169,8 +164,8 @@ authorizes resending an accepted or unknown message.
 
 A delivered message arrives through the recipient provider's own inbox, so its
 visible sender is the local delivery helper, not the peer. Replies go to the
-`Reply via CAC to handle:` value in the envelope — on the candidate that
-value is the sender's reply token — not to the visible sender.
+`Reply via CAC to handle:` value in the envelope — the sender's reply
+token — not to the visible sender.
 
 Disposable worker sessions can opt out of the roster with
 `CROSS_AGENT_CHAT_PRESENCE=off`: no route, courier, or peer listing.
@@ -230,7 +225,7 @@ Upgrades briefly restart the shared broker while preserving live couriers,
 pending input, and route identity; runtimes referenced by live routes are
 retained, so an upgrade never removes a running courier's executable. If a
 failed setup finds newer provider settings during rollback, it retains them
-and recovery custody for diagnosis. *(Candidate)* after any upgrade, the
+and recovery custody for diagnosis. After any upgrade, the
 session-compatibility rule under *Install* applies: start fresh sessions on
 every participating Mac.
 

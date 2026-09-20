@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - 2026-09-19
 
 - **Breaking:** `chat_peers` returns an opaque endpoint token (`cac2.…`) in the
   `handle` field, and `chat_send` accepts that token or a unique name against
@@ -33,6 +33,10 @@
 - Public documentation reworked for first use: receiving-mode matrix,
   disclosed setup effects, CONTRIBUTING, a source map, refreshed SECURITY,
   project URLs, and minimal CI permissions with pinned actions.
+- Treat a present non-boolean `is_error` flag on a Claude helper result —
+  including explicit JSON null — as uncheckable: an otherwise exact success
+  receipt or canonical refusal stays an unknown outcome rather than a decided
+  one.
 - This does not add idle delivery for Devin or Stop-bound Codex.
 
 ## 0.3.8 - 2026-09-19
