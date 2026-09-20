@@ -59,7 +59,6 @@ from cross_agent_chat.core import (
     ChatError,
     IntentStore,
     Provider,
-    RecipientBindings,
     Registry,
     Route,
     UnknownDeliveryError,
@@ -97,8 +96,20 @@ from cross_agent_chat.native_helper import (
     native_helper_create_hook_group,
     native_helper_dispatch_hook_group,
 )
+from cross_agent_chat.recipient import (
+    RecipientToken,
+    local_origin,
+    local_token,
+    parse_recipient_token,
+    remote_token,
+)
 from cross_agent_chat.remote import parse_remote_envelope
-from cross_agent_chat.tailnet import TAILNET_PORT, tailnet_nodes, valid_tailnet_address
+from cross_agent_chat.tailnet import (
+    TAILNET_PORT,
+    TailnetIdentity,
+    tailnet_identity,
+    valid_tailnet_address,
+)
 from cross_agent_chat.transport import remote_envelope
 
 MAX_FRAME_BYTES: Final = 64 * 1024
@@ -131,7 +142,6 @@ LOCAL_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS
 NATIVE_TITLE_TIMEOUT_SECONDS: Final = 2.0
 NATIVE_DESKTOP_APPLICATIONS: Final = Path("/Applications")
 NATIVE_DESKTOP_BUNDLE_IDS: Final = ("com.openai.chat", "com.openai.codex")
-KNOWN_HANDLE_GRACE_SECONDS: Final = 2.0
 PRESENCE_ENV_VAR: Final = "CROSS_AGENT_CHAT_PRESENCE"
 PROC_PIDTBSDINFO: Final = 3
 PROC_BSDINFO_SIZE: Final = 136
@@ -205,6 +215,7 @@ class Target:
     cwd: str | None = None
     pid: int | None = None
     tailnet_address: str | None = None
+    tailnet_node_id: str | None = None
     delivery_mode: DeliveryMode | None = None
     delivery_mechanism: DeliveryMechanism | None = None
     title: str | None = None
@@ -215,6 +226,7 @@ class Target:
         include_delivery_mode: bool = False,
         include_delivery_mechanism: bool = False,
         include_handle: bool = True,
+        handle: str | None = None,
         include_title: bool = True,
     ) -> dict[str, str]:
         result = {
@@ -225,7 +237,7 @@ class Target:
             "status": "available",
         }
         if include_handle:
-            result["handle"] = self.session_key
+            result["handle"] = self.session_key if handle is None else handle
         if include_title and self.title is not None:
             result["title"] = self.title
         if include_delivery_mode:
@@ -1672,6 +1684,7 @@ def _targets_from_tailnet(
     include_delivery_mode: bool = False,
     include_title: bool = False,
     include_devin: bool = False,
+    node_id: str | None = None,
 ) -> list[Target]:
     if not isinstance(raw, dict) or set(raw) != {"schema_version", "peers"}:
         raise ChatError("Tailnet peer returned invalid discovery")
@@ -1743,6 +1756,7 @@ def _targets_from_tailnet(
                 session_key=cast(str, item["session_key"]),
                 remote=True,
                 tailnet_address=address,
+                tailnet_node_id=node_id,
                 delivery_mode=(
                     cast(DeliveryMode, observed_mode)
                     if isinstance(observed_mode, str) and observed_mode != "unknown"
@@ -1762,6 +1776,7 @@ def _remote_node_targets(
     include_title: bool = False,
     include_devin: bool = False,
     handle: str | None = None,
+    node_id: str | None = None,
 ) -> tuple[list[Target], bool]:
     if deadline is None:
         deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
@@ -1795,6 +1810,7 @@ def _remote_node_targets(
                 raw,
                 include_delivery_mode=mode_requested,
                 include_devin=include_devin,
+                node_id=node_id,
             )
             break
         except (ChatError, UnknownDeliveryError):
@@ -1827,6 +1843,7 @@ def _remote_node_targets(
             include_delivery_mode=True,
             include_title=True,
             include_devin=include_devin,
+            node_id=node_id,
         )
     except (ChatError, UnknownDeliveryError):
         return base, True
@@ -1848,15 +1865,16 @@ def _remote_discovery(
     include_delivery_mode: bool = False,
     include_title: bool = False,
     include_devin: bool = True,
-    handle: str | None = None,
+    identity: TailnetIdentity | None = None,
 ) -> tuple[list[Target], bool]:
-    addresses = tailnet_nodes()
-    if not addresses:
+    if identity is None:
+        identity = tailnet_identity()
+    if identity is None or not identity.peers:
         return [], False
     targets: list[Target] = []
     complete = True
     deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
-    workers = ThreadPoolExecutor(max_workers=min(16, len(addresses)))
+    workers = ThreadPoolExecutor(max_workers=min(16, len(identity.peers)))
     futures = [
         workers.submit(
             _remote_node_targets,
@@ -1865,67 +1883,23 @@ def _remote_discovery(
             include_delivery_mode=include_delivery_mode,
             include_title=include_title,
             include_devin=include_devin,
-            handle=handle,
+            node_id=node_id,
         )
-        for address in addresses
+        for node_id, address in identity.peers.items()
     ]
-    pending = set(futures)
-    attested = False
     try:
         try:
             for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
-                pending.discard(future)
                 discovered, node_complete = future.result()
                 targets.extend(discovered)
                 complete = complete and node_complete
-                if handle is not None and any(
-                    target.session_key == handle for target in discovered
-                ):
-                    attested = True
-                    break
         except FuturesTimeoutError:
             complete = False
-        if attested:
-            # The first attestation settles an exact handle unless a second
-            # claimant answers; unrelated nodes get a short grace to weigh in.
-            remaining = deadline - time.monotonic()
-            try:
-                for future in as_completed(
-                    pending,
-                    timeout=max(0.0, min(remaining, KNOWN_HANDLE_GRACE_SECONDS)),
-                ):
-                    pending.discard(future)
-                    discovered, node_complete = future.result()
-                    targets.extend(discovered)
-                    complete = complete and node_complete
-            except FuturesTimeoutError:
-                complete = False
     finally:
         for future in futures:
             future.cancel()
         workers.shutdown(wait=False, cancel_futures=True)
     return targets, complete
-
-
-def _record_remote_listing(root: Path, targets: list[Target]) -> None:
-    """Record which endpoint verifiably presented each listed handle.
-
-    Every listed remote Target binds its handle to the node that attested it.
-    A handle attested from two different addresses in one listing is recorded
-    with both endpoints so a later send refuses an ambiguous recipient. Binding
-    state is advisory: a listing must never fail because the record did.
-    """
-    observed: dict[str, dict[str, str]] = {}
-    for target in targets:
-        if target.tailnet_address is None:
-            continue
-        observed.setdefault(target.session_key, {})[target.tailnet_address] = target.generation
-    if not observed:
-        return
-    try:
-        RecipientBindings(root).record_observations(observed)
-    except (ChatError, OSError):
-        return
 
 
 def remote_targets(
@@ -1935,13 +1909,11 @@ def remote_targets(
     include_title: bool = False,
     include_devin: bool = False,
 ) -> list[Target]:
-    targets = _remote_discovery(
+    return _remote_discovery(
         include_delivery_mode=include_delivery_mode,
         include_title=include_title,
         include_devin=include_devin,
     )[0]
-    _record_remote_listing(root, targets)
-    return targets
 
 
 def all_targets(
@@ -2037,28 +2009,66 @@ def _wrapped_head(
     )
 
 
-def _envelope_source_handle(
-    message: str, source_alias: str, event_id: str, target_provider: str
-) -> str | None:
-    """Extract the Reply handle only from a verifiably CAC-wrapped envelope body.
+def _wrapped_head_v2(
+    source_alias: str, source_token: str, event_id: str, target_provider: str
+) -> str:
+    """The versioned deterministic head; everything after it is untrusted content."""
+    exact_source_alias = valid_name(source_alias, "source alias")
+    if parse_recipient_token(source_token) is None:
+        raise ChatError("source handle is invalid")
+    identifier = valid_uuid(event_id, "event id")
+    return (
+        "Cross Agent Chat transport envelope v2\n"
+        f"From: {exact_source_alias}\n"
+        f"Reply via CAC to handle: {source_token}\n"
+        "The From and Reply lines are CAC route metadata, not provider-native sender "
+        "authentication; this message's visible sender is the local CAC delivery helper, "
+        "not the original source.\n"
+        f"Delivery principal: {_delivery_principal(target_provider)}. "
+        f"CAC delivery event: {identifier}.\n"
+        "Untrusted peer content follows:\n\n"
+    )
 
-    The handle counts as the sender's own attestation only when the body opens
-    with the exact deterministic head ``wrapped_message`` produces for this
-    envelope's alias, event, and recipient provider. Anything else -- including
-    a Reply-looking line inside free text -- is untrusted content.
+
+def _envelope_reply_token(
+    message: str, source_alias: str, event_id: str, target_provider: str
+) -> RecipientToken | None:
+    """Extract the verified v2 reply token of a wrapped envelope body.
+
+    A body without the v2 head has no reply token to check. A body that opens
+    with the v2 marker must carry the exact deterministic head ``wrapped_message``
+    produces for this envelope's alias, event, and recipient provider; anything
+    else -- including a malformed token -- is rejected rather than ignored.
     """
-    prefix = "Reply via CAC to handle: "
     lines = message.split("\n", 3)
+    if lines[0] != "Cross Agent Chat transport envelope v2":
+        return None
+    # Anything opening with the v2 marker is a v2 envelope: a truncated or
+    # malformed head is refused before provider delivery, never read as legacy.
+    prefix = "Reply via CAC to handle: "
     if len(lines) < 4 or not lines[2].startswith(prefix):
-        return None
+        raise ChatError("reply token is invalid")
     candidate = lines[2][len(prefix) :]
-    if re.fullmatch(r"[0-9a-f]{64}", candidate) is None:
-        return None
-    try:
-        expected = _wrapped_head(source_alias, candidate, event_id, target_provider)
-    except ChatError:
-        return None
-    return candidate if message.startswith(expected) else None
+    expected = _wrapped_head_v2(source_alias, candidate, event_id, target_provider)
+    if not message.startswith(expected):
+        raise ChatError("reply token is invalid")
+    token = parse_recipient_token(candidate)
+    if token is None:
+        raise ChatError("reply token is invalid")
+    return token
+
+
+def _verify_remote_reply_token(
+    token: RecipientToken, source_generation: str, source_address: str
+) -> None:
+    """Bind an inbound v2 reply token to the authenticated transport source."""
+    if token.scope != "remote" or token.node_id is None:
+        raise ChatError("reply token scope is invalid")
+    if token.generation != source_generation:
+        raise ChatError("reply token does not match the envelope generation")
+    identity = tailnet_identity()
+    if identity is None or identity.peers.get(token.node_id) != source_address:
+        raise ChatError("reply token does not match the authenticated sender")
 
 
 def wrapped_message(
@@ -2068,7 +2078,11 @@ def wrapped_message(
     event_id: str,
     target_provider: str,
 ) -> str:
-    body = _wrapped_head(source_alias, source_handle, event_id, target_provider) + message
+    if parse_recipient_token(source_handle) is not None:
+        head = _wrapped_head_v2(source_alias, source_handle, event_id, target_provider)
+    else:
+        head = _wrapped_head(source_alias, source_handle, event_id, target_provider)
+    body = head + message
     try:
         return bounded_message(body)
     except ChatError as error:
@@ -2138,10 +2152,12 @@ def _send_local_target(
             delivery_route = helper
     source_alias = canonical_source_alias(root, source)
     event_id = str(uuid4())
-    source_handle = session_key(source.provider, source.session_id)
+    source_token = local_token(
+        root, session_key(source.provider, source.session_id), source.generation
+    )
     body = wrapped_message(
         source_alias,
-        source_handle,
+        source_token,
         bounded_message(message),
         event_id,
         target.provider,
@@ -2209,98 +2225,164 @@ def _send_local_target(
     }
 
 
+def _send_local_token_target(
+    root: Path,
+    source: Route,
+    token: RecipientToken,
+    message: str,
+    *,
+    deadline: float,
+) -> dict[str, object]:
+    if token.origin != local_origin(root):
+        raise ChatError(
+            "recipient token was issued for a different state; "
+            "call chat_peers and choose the recipient again"
+        )
+    matches = [
+        target
+        for target in local_targets(root)
+        if target.session_key == token.handle and target.generation == token.generation
+    ]
+    if len(matches) != 1:
+        raise ChatError(
+            "recipient is unavailable or changed; "
+            "call chat_peers and choose the recipient again"
+        )
+    return _send_local_target(root, source, matches[0], message, deadline=deadline)
+
+
+def _send_remote_token_target(
+    root: Path,
+    source: Route,
+    token: RecipientToken,
+    message: str,
+    *,
+    deadline: float,
+) -> dict[str, object]:
+    if token.node_id is None:
+        raise ChatError("recipient token is invalid")
+    identity = tailnet_identity()
+    if identity is None:
+        raise ChatError(
+            "Tailscale is unavailable, so the selected recipient cannot be verified"
+        )
+    address = identity.peers.get(token.node_id)
+    if address is None:
+        raise ChatError(
+            "the selected recipient's device is not on the tailnet; "
+            "call chat_peers and choose the recipient again"
+        )
+    self_node_id = identity.self_node_id
+    if self_node_id is None:
+        raise ChatError("local Tailscale node identity is unavailable")
+    # The token asks only the node that verifiably presented its handle; an
+    # unrelated node is never fanned out to and cannot hold the send hostage.
+    attested, _node_complete = _remote_node_targets(
+        address,
+        min(time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS, deadline),
+        include_devin=True,
+        handle=token.handle,
+        node_id=token.node_id,
+    )
+    claimants = [
+        target
+        for target in attested
+        if target.session_key == token.handle and target.generation == token.generation
+    ]
+    if len(claimants) != 1:
+        raise ChatError(
+            "recipient is unavailable or changed; "
+            "call chat_peers and choose the recipient again"
+        )
+    return _send_remote_target(
+        root, source, claimants[0], message, deadline=deadline, self_node_id=self_node_id
+    )
+
+
 def send_local(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
     deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
+    token = parse_recipient_token(target_query)
+    if token is not None:
+        if token.scope != "local":
+            raise ChatError("recipient token selects a remote device, not a local session")
+        return _send_local_token_target(root, source, token, message, deadline=deadline)
+    if re.fullmatch(r"[0-9a-f]{64}", target_query) is not None:
+        raise ChatError(
+            "recipient handles are now opaque tokens; "
+            "call chat_peers and send to the fresh handle"
+        )
     target = resolve_target(local_targets(root), target_query)
     return _send_local_target(root, source, target, message, deadline=deadline)
 
 
 def send(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
     deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
-    local = local_targets(root)
-    exact_local_handles = [target for target in local if target.session_key == target_query]
-    if len(exact_local_handles) == 1:
-        return _send_local_target(root, source, exact_local_handles[0], message, deadline=deadline)
-    handle_query = target_query if re.fullmatch(r"[0-9a-f]{64}", target_query) is not None else None
-    bindings = RecipientBindings(root)
-    bound_address: str | None = None
-    if handle_query is not None:
-        binding = bindings.binding_for(handle_query)
-        if binding is not None:
-            if len(binding.endpoints) != 1:
-                raise ChatError(
-                    "recipient handle is presented by more than one device; "
-                    "call chat_peers and choose the recipient again"
-                )
-            try:
-                bound_address = valid_tailnet_address(next(iter(binding.endpoints)))
-            except ChatError:
-                bound_address = None
-    target: Target | None = None
-    remote: list[Target] = []
-    remote_complete = True
-    discovered = False
-    if bound_address is not None and handle_query is not None:
-        # A bound handle asks only the endpoint that last verifiably presented
-        # it; unrelated slow or dead nodes cannot hold the recipient hostage.
-        attested, _node_complete = _remote_node_targets(
-            bound_address,
-            min(time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS, deadline),
-            include_devin=True,
-            handle=handle_query,
+    token = parse_recipient_token(target_query)
+    if token is not None:
+        if token.scope == "local":
+            return _send_local_token_target(root, source, token, message, deadline=deadline)
+        return _send_remote_token_target(root, source, token, message, deadline=deadline)
+    if re.fullmatch(r"[0-9a-f]{64}", target_query) is not None:
+        raise ChatError(
+            "recipient handles are now opaque tokens; "
+            "call chat_peers and send to the fresh handle"
         )
-        claimants = [item for item in attested if item.session_key == handle_query]
-        if len(claimants) == 1:
-            target = claimants[0]
-        else:
-            # The bound endpoint no longer attests the handle. Ordinary
-            # discovery decides whether it moved, vanished, or is contested.
-            remote, remote_complete = _remote_discovery(handle=handle_query)
-            discovered = True
-            claimants = [item for item in remote if item.session_key == handle_query]
-            if len(claimants) == 1 and claimants[0].tailnet_address == bound_address:
-                target = claimants[0]
-            elif claimants:
-                if any(item.tailnet_address == bound_address for item in claimants):
-                    raise ChatError("target handle is unavailable")
-                raise ChatError(
-                    "recipient handle is now presented by a different device; "
-                    "call chat_peers and choose the recipient again"
-                )
-    if target is None:
-        if not discovered:
-            remote, remote_complete = _remote_discovery(handle=handle_query)
-        exact_remote_handles = [target for target in remote if target.session_key == target_query]
-        if len(exact_remote_handles) == 1:
-            target = exact_remote_handles[0]
-        else:
-            if not remote_complete:
-                raise ChatError(
-                    "remote peer discovery is incomplete; use an exact available recipient handle"
-                )
-            exact_aliases = [
-                target
-                for target in [*local, *remote]
-                if target.alias.casefold() == target_query.casefold()
-            ]
-            if len(exact_aliases) == 1:
-                target = exact_aliases[0]
-            elif len(exact_aliases) > 1:
-                raise ChatError("target is ambiguous or unavailable")
-            else:
-                target = resolve_target([*local, *remote], target_query)
+    local = local_targets(root)
+    remote, remote_complete = _remote_discovery()
+    if not remote_complete:
+        raise ChatError(
+            "remote peer discovery is incomplete; use an exact available recipient handle"
+        )
+    exact_aliases = [
+        target
+        for target in [*local, *remote]
+        if target.alias.casefold() == target_query.casefold()
+    ]
+    if len(exact_aliases) == 1:
+        target = exact_aliases[0]
+    elif len(exact_aliases) > 1:
+        raise ChatError("target is ambiguous or unavailable")
+    else:
+        target = resolve_target([*local, *remote], target_query)
     if not target.remote:
         return _send_local_target(root, source, target, message, deadline=deadline)
+    if target.tailnet_node_id is None:
+        raise ChatError("remote target route is incomplete")
+    # An alias is only a display-time selector: dispatch revalidates the same
+    # StableNodeID+handle+generation contract a token send does.
+    return _send_remote_token_target(
+        root,
+        source,
+        RecipientToken(
+            scope="remote",
+            handle=target.session_key,
+            generation=target.generation,
+            node_id=target.tailnet_node_id,
+        ),
+        message,
+        deadline=deadline,
+    )
+
+
+def _send_remote_target(
+    root: Path,
+    source: Route,
+    target: Target,
+    message: str,
+    *,
+    deadline: float,
+    self_node_id: str,
+) -> dict[str, object]:
     if target.tailnet_address is None:
         raise ChatError("remote target route is incomplete")
-    with suppress(ChatError, OSError):
-        bindings.record(target.session_key, target.tailnet_address, target.generation)
     source_alias = canonical_source_alias(root, source)
     event_id = str(uuid4())
-    source_handle = session_key(source.provider, source.session_id)
+    source_token = remote_token(
+        self_node_id, session_key(source.provider, source.session_id), source.generation
+    )
     body = wrapped_message(
         source_alias,
-        source_handle,
+        source_token,
         bounded_message(message),
         event_id,
         target.provider,
@@ -2470,13 +2552,12 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         expected_authorization["status"] = "AUTHORIZED"
         if authorization != expected_authorization:
             raise ChatError("remote envelope is not authorized")
-        # The sender's own broker authorized this exact envelope, so its Reply
-        # handle is a verified attestation: a reply can go straight back to the
-        # endpoint that presented it.
-        source_handle = _envelope_source_handle(message, source_alias, event_id, target_provider)
-        if source_handle is not None:
-            with suppress(ChatError, OSError):
-                RecipientBindings(root).record(source_handle, source_address, source_generation)
+        # The sender's own broker authorized this exact envelope. A v2 reply
+        # token inside it must bind to that same authenticated source before
+        # the provider is touched; a malformed head is refused, not ignored.
+        source_token = _envelope_reply_token(message, source_alias, event_id, target_provider)
+        if source_token is not None:
+            _verify_remote_reply_token(source_token, source_generation, source_address)
         routes = [
             route
             for route in Registry(root).routes()
@@ -2545,6 +2626,20 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         }
 
 
+def _target_handle_token(root: Path, target: Target) -> str | None:
+    """Mint the public endpoint token for one discovered target, or none.
+
+    A remote peer can only be offered when the local Tailscale read verified
+    the stable node identity that presented it; without that identity the peer
+    is not selectable and is left out of the public listing.
+    """
+    if target.remote:
+        if target.tailnet_node_id is None:
+            return None
+        return remote_token(target.tailnet_node_id, target.session_key, target.generation)
+    return local_token(root, target.session_key, target.generation)
+
+
 def peers(
     root: Path,
     *,
@@ -2561,17 +2656,21 @@ def peers(
         REMOTE_DISCOVERY_TIMEOUT_SECONDS if include_remote else LOCAL_DISCOVERY_TIMEOUT_SECONDS
     )
     if include_remote:
+        identity = tailnet_identity()
         with ThreadPoolExecutor(max_workers=2) as workers:
             local = workers.submit(local_targets, root, handle=handle)
             remote = workers.submit(
                 _remote_discovery,
                 include_delivery_mode=include_delivery_mode,
                 include_title=display_titles,
-                handle=handle,
+                identity=identity,
             )
             remote_targets, remote_complete = remote.result()
             targets = [*local.result(), *remote_targets]
-            _record_remote_listing(root, remote_targets)
+        # Without a verified local StableNodeID this node cannot mint the source
+        # reply token a remote send needs, so remote rows are unselectable.
+        if not internal and (identity is None or identity.self_node_id is None):
+            targets = [target for target in targets if not target.remote]
         remote_discovery = "complete" if remote_complete else "incomplete"
     else:
         targets = local_targets(root, handle=handle)
@@ -2586,10 +2685,14 @@ def peers(
         targets = _with_codex_titles(root, targets, deadline)
     items: list[dict[str, str]] = []
     for target in targets:
+        token = None if internal else _target_handle_token(root, target)
+        if not internal and token is None:
+            continue
         item = target.public(
             include_delivery_mode=include_delivery_mode,
             include_delivery_mechanism=include_delivery_mechanism,
             include_handle=not internal,
+            handle=token,
             include_title=not internal or include_title,
         )
         if internal:

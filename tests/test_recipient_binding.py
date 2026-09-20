@@ -1,20 +1,64 @@
-"""Exact-recipient endpoint binding: a handle stays owned by its attesting node.
+"""Exact-recipient selection contract regressions.
 
-The 19 Sep incident: ``send()`` returned after the first attestation plus a two
-second grace, so a second claimant on a slower node was never seen and an exact
-handle silently retargeted to whichever endpoint answered first. These tests pin
-the requester-side binding contract: once an endpoint verifiably presents a
-handle, a later send goes only to that endpoint, and a handle that reappears on
-a different device refuses instead of silently moving.
+These tests replace the removed ``recipients.json`` binding-store coverage.
+The store was deleted because discovery is observational only: it can never
+own or mutate a selection. The stronger contract now pinned here is that the
+versioned opaque token carries the selected endpoint (stable Tailnet node id,
+raw session key, route generation), and every send re-attests that selection
+against a fresh local identity read before any intent or provider effect.
+
+Replaced cache tests, mapped:
+
+- bound-recipient send never queries an unrelated slow node -> the token send
+  probes exactly the token's node, so an unrelated node is never contacted at
+  all (``test_a_token_send_asks_only_the_selected_node``).
+- bound send ignores duplicate/late claimants -> a clone claimant on another
+  node cannot influence a token send
+  (``test_a_clone_claimant_cannot_retarget_a_token_send``).
+- ambiguous two-owner listing -> a complete listing showing one handle on two
+  nodes still refuses (``test_a_complete_listing_with_two_claimants_refuses``).
+- ambiguous binding refuses until a listing shows one owner / stale endpoint
+  rebinds on a single-owner listing -> a stale token always refuses; explicit
+  re-selection is a fresh ``peers()`` listing minting a fresh token
+  (``test_a_stale_token_is_replaced_only_by_a_fresh_listing``).
+- namesakes keep independent bindings -> namesakes on different nodes keep
+  independent token selections
+  (``test_namesakes_on_different_nodes_keep_independent_selections``).
+- new generation on the bound endpoint rebinds -> a stale-generation token
+  refuses pre-effect and a fresh token sends
+  (``test_a_stale_token_is_replaced_only_by_a_fresh_listing``).
+- bound owner stops claiming / reappears -> the selected node not claiming
+  refuses with zero effects; the same node reclaiming the handle sends
+  (``test_the_selected_node_not_claiming_refuses_before_any_effect`` and
+  ``test_the_selected_node_may_reclaim_its_handle``).
+- bound owner on a different address / reused bound address -> the token's
+  node serving other keys refuses
+  (``test_the_selected_node_serving_other_keys_refuses``).
+- bound query on an old broker -> the handle-filtered probe still falls back
+  to the legacy roster variant
+  (``test_the_handle_probe_falls_back_to_the_legacy_roster``).
+- corrupt binding file -> a crafted or corrupt ``recipients.json`` has zero
+  routing influence and is never read
+  (``test_a_seeded_recipients_file_has_no_routing_influence``).
+- binding records private/written/pruned -> no ``recipients.json`` is ever
+  created (``test_no_recipients_file_is_ever_created``).
+- inbound delivery binds the reply handle -> the v2 reply token is verified
+  against the authenticated transport source
+  (``test_inbound_v2_reply_token_binds_the_verified_sender``).
+- inbound free-text handle line -> free text stays content
+  (``test_an_inbound_free_text_handle_line_is_content_only``).
+- listing records each remote handle once -> a listing mints one opaque token
+  per remote row and writes nothing
+  (``test_a_listing_mints_one_opaque_token_per_remote_row``).
+- wire request/response key sets -> unchanged
+  (``test_wire_request_and_response_key_sets_are_unchanged``).
 """
 
 from __future__ import annotations
 
 import json
 import os
-import stat
 import threading
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -28,7 +72,10 @@ from cross_agent_chat.core import (
     Registry,
     Route,
     session_key,
-    utc_now,
+)
+from cross_agent_chat.recipient import (
+    parse_recipient_token,
+    remote_token,
 )
 from cross_agent_chat.runtime import (
     peers,
@@ -37,50 +84,14 @@ from cross_agent_chat.runtime import (
     send,
     wrapped_message,
 )
+from cross_agent_chat.tailnet import TailnetIdentity
 from cross_agent_chat.transport import remote_envelope
 
+SELF_NODE = "nSelf"
+OWNER_NODE = "nOwner"
+OTHER_NODE = "nOther"
 OWNER = "100.64.0.11"
 OTHER = "100.64.0.12"
-
-
-def _seed_binding(
-    root: Path,
-    handle: str,
-    endpoints: dict[str, str],
-    *,
-    seen_at: str | None = None,
-) -> None:
-    """Write one binding row in the store's durable shape without the store."""
-    path = root / "recipients.json"
-    entries: list[dict[str, object]] = []
-    if path.exists():
-        raw: object = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            entries = [item for item in raw if isinstance(item, dict)]
-    entries = [item for item in entries if item.get("handle") != handle]
-    entries.append(
-        {
-            "handle": handle,
-            "endpoints": endpoints,
-            "seen_at": seen_at if seen_at is not None else utc_now(),
-        }
-    )
-    path.write_text(json.dumps(entries) + "\n", encoding="utf-8")
-    path.chmod(0o600)
-
-
-def _bound_endpoints(root: Path, handle: str) -> dict[str, str] | None:
-    """Read one handle's bound endpoint map straight from the durable file."""
-    path = root / "recipients.json"
-    if not path.exists():
-        return None
-    raw: object = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, list):
-        return None
-    for item in raw:
-        if isinstance(item, dict) and item.get("handle") == handle:
-            return cast(dict[str, str], item["endpoints"])
-    return None
 
 
 def _source(root: Path, device: str = "imac") -> Route:
@@ -123,16 +134,64 @@ def _unavailable_courier(
     raise ChatError("fixture courier is unavailable")
 
 
-def test_bound_recipient_send_never_queries_an_unrelated_slow_node(
+def _authorize(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+    return {key: value for key, value in payload.items() if key != "operation"} | {
+        "status": "AUTHORIZED"
+    }
+
+
+def _courier(target: Route):
+    def accept(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        if payload["operation"] == "health":
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "alias": target.alias,
+                "generation": target.generation,
+            }
+        return {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": "codex",
+        }
+
+    return accept
+
+
+def _envelope_for(target: Route, message: str, *, source_generation: str | None = None) -> str:
+    return remote_envelope(
+        event_id=str(uuid4()),
+        source_alias="codex@source:api:source-a1",
+        source_generation=source_generation or str(uuid4()),
+        target_alias=target.alias,
+        generation=target.generation,
+        message=message,
+    )
+
+
+def _target(tmp_path: Path) -> Route:
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(target)
+    return target
+
+
+def test_a_token_send_asks_only_the_selected_node(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unrelated 8-second node cannot hold a bound recipient hostage."""
+    """An unrelated 8-second node cannot hold a selected recipient hostage."""
     handle = session_key("claude", str(uuid4()))
     generation = str(uuid4())
-    _seed_binding(tmp_path, handle, {OWNER: generation})
     release = threading.Event()
     slow_calls: list[str] = []
-    roster_queries: list[str] = []
+    deliveries: list[str] = []
 
     def request(
         address: str, payload: dict[str, object], *, timeout: float = 2.0
@@ -140,47 +199,45 @@ def test_bound_recipient_send_never_queries_an_unrelated_slow_node(
         if payload.get("operation") == "peers":
             if address == OTHER:
                 slow_calls.append(address)
-                # The neighbor accepts the connection and never answers inside
-                # its request budget; release only frees the fixture worker.
                 release.wait(timeout)
                 raise ChatError("silent neighbor never answered")
             return {
                 "schema_version": 1,
                 "peers": [_peer("claude@studio:api:api-a1", "studio", handle, generation)],
             }
-        envelope = json.loads(str(payload["envelope"]))
-        return _accepted(envelope)
+        deliveries.append(address)
+        return _accepted(json.loads(str(payload["envelope"])))
 
-    def nodes() -> list[str]:
-        roster_queries.append("tailnet_nodes")
-        return [OTHER, OWNER]
-
-    monkeypatch.setattr(runtime, "tailnet_nodes", nodes)
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(
+            self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER, OTHER_NODE: OTHER}
+        ),
+    )
     monkeypatch.setattr(runtime, "request_tailnet", request)
     monkeypatch.setattr(runtime, "REMOTE_DISCOVERY_TIMEOUT_SECONDS", 8.0)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
     try:
-        result = send(tmp_path, source, handle, "hello")
+        result = send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hello")
     finally:
         release.set()
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     assert result["to"] == "claude@studio:api:api-a1"
-    # The bound endpoint answered, so neither the fan-out roster nor the slow
-    # node was ever asked.
+    assert deliveries == [OWNER]
     assert slow_calls == []
-    assert roster_queries == []
     assert IntentStore(tmp_path).intents()[0].status == "TRANSPORT_ACCEPTED"
 
 
-def test_bound_recipient_send_ignores_a_duplicate_claimant_inside_the_grace(
+def test_a_clone_claimant_cannot_retarget_a_token_send(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A second node presenting the same handle is never even queried."""
     handle = session_key("claude", str(uuid4()))
     generation = str(uuid4())
-    _seed_binding(tmp_path, handle, {OWNER: generation})
     other_queries: list[str] = []
     deliveries: list[str] = []
 
@@ -193,78 +250,37 @@ def test_bound_recipient_send_ignores_a_duplicate_claimant_inside_the_grace(
                 other_queries.append(address)
                 return {
                     "schema_version": 1,
-                    "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))],
+                    "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, generation)],
                 }
             return {
                 "schema_version": 1,
                 "peers": [_peer("claude@studio:api:api-a1", "studio", handle, generation)],
             }
         deliveries.append(address)
-        envelope = json.loads(str(payload["envelope"]))
-        return _accepted(envelope)
+        return _accepted(json.loads(str(payload["envelope"])))
 
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER, OTHER])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(
+            self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER, OTHER_NODE: OTHER}
+        ),
+    )
     monkeypatch.setattr(runtime, "request_tailnet", request)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    result = send(tmp_path, source, handle, "hello")
+    result = send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hello")
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     assert deliveries == [OWNER]
     assert other_queries == []
 
 
-def test_bound_recipient_send_ignores_a_claimant_that_would_answer_late(
+def test_a_complete_listing_with_two_claimants_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The post-grace hole closes for a bound handle: the late node is not asked."""
-    handle = session_key("claude", str(uuid4()))
-    generation = str(uuid4())
-    _seed_binding(tmp_path, handle, {OWNER: generation})
-    delivered = threading.Event()
-    other_queries: list[str] = []
-    deliveries: list[str] = []
-
-    def request(
-        address: str, payload: dict[str, object], *, timeout: float = 2.0
-    ) -> dict[str, object]:
-        if payload.get("operation") == "peers":
-            if address == OTHER:
-                other_queries.append(address)
-                # Answers only once the delivery already happened: a genuine
-                # post-grace claimant that a bound send must not wait for.
-                delivered.wait(timeout)
-                return {
-                    "schema_version": 1,
-                    "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))],
-                }
-            return {
-                "schema_version": 1,
-                "peers": [_peer("claude@studio:api:api-a1", "studio", handle, generation)],
-            }
-        deliveries.append(address)
-        envelope = json.loads(str(payload["envelope"]))
-        delivered.set()
-        return _accepted(envelope)
-
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER, OTHER])
-    monkeypatch.setattr(runtime, "request_tailnet", request)
-    monkeypatch.setattr(runtime, "REMOTE_DISCOVERY_TIMEOUT_SECONDS", 8.0)
-    monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
-    source = _source(tmp_path)
-
-    result = send(tmp_path, source, handle, "hello")
-
-    assert result["status"] == "TRANSPORT_ACCEPTED"
-    assert deliveries == [OWNER]
-    assert other_queries == []
-
-
-def test_unbound_duplicate_claimant_inside_the_grace_still_refuses(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Without a binding the old in-grace duplicate rule is unchanged."""
+    """Same provider session restored on two nodes must refuse, not pick one."""
     handle = session_key("claude", str(uuid4()))
 
     def request(
@@ -277,285 +293,82 @@ def test_unbound_duplicate_claimant_inside_the_grace_still_refuses(
                 "schema_version": 1,
                 "peers": [_peer(f"claude@{device}:api:api-a1", device, handle, str(uuid4()))],
             }
-        pytest.fail("a refused send must not reach the receive boundary")
+        pytest.fail("a refused listing must not reach the receive boundary")
 
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER, OTHER])
-    monkeypatch.setattr(runtime, "request_tailnet", request)
-    monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
-    source = _source(tmp_path)
-
-    with pytest.raises(ChatError, match="target handle is unavailable"):
-        send(tmp_path, source, handle, "hello")
-
-    assert not (tmp_path / "intents.json").exists()
-
-
-def test_unbound_send_binds_the_first_attesting_endpoint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A send without a binding keeps the old behavior and records the winner."""
-    handle = session_key("claude", str(uuid4()))
-    generation = str(uuid4())
-    release = threading.Event()
-    peers_calls: list[str] = []
-
-    def request(
-        address: str, payload: dict[str, object], *, timeout: float = 2.0
-    ) -> dict[str, object]:
-        if payload.get("operation") == "peers":
-            peers_calls.append(address)
-            if address == OTHER:
-                # The second claimant answers after the grace closes; its
-                # attestation is never consumed (residual, documented).
-                release.wait(timeout)
-                return {
-                    "schema_version": 1,
-                    "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))],
-                }
-            return {
-                "schema_version": 1,
-                "peers": [_peer("claude@studio:api:api-a1", "studio", handle, generation)],
-            }
-        envelope = json.loads(str(payload["envelope"]))
-        return _accepted(envelope)
-
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER, OTHER])
-    monkeypatch.setattr(runtime, "request_tailnet", request)
-    monkeypatch.setattr(runtime, "REMOTE_DISCOVERY_TIMEOUT_SECONDS", 8.0)
-    monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
-    source = _source(tmp_path)
-
-    try:
-        result = send(tmp_path, source, handle, "hello")
-    finally:
-        release.set()
-
-    assert result["status"] == "TRANSPORT_ACCEPTED"
-    assert _bound_endpoints(tmp_path, handle) == {OWNER: generation}
-
-    peers_calls.clear()
-    result = send(tmp_path, source, handle, "again")
-
-    assert result["status"] == "TRANSPORT_ACCEPTED"
-    # The second send stayed on the bound endpoint; the late claimant was not
-    # even queried.
-    assert peers_calls == [OWNER]
-
-
-def test_a_complete_listing_with_two_owners_marks_the_handle_ambiguous(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Same provider session restored on two Macs must refuse, not pick one."""
-    handle = session_key("claude", str(uuid4()))
-
-    def request(
-        address: str, payload: dict[str, object], *, timeout: float = 2.0
-    ) -> dict[str, object]:
-        del timeout
-        if payload.get("operation") == "peers":
-            device = "studio" if address == OWNER else "laptop"
-            return {
-                "schema_version": 1,
-                "peers": [_peer(f"claude@{device}:api:api-a1", device, handle, str(uuid4()))],
-            }
-        pytest.fail("a refused send must not reach the receive boundary")
-
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER, OTHER])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(
+            self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER, OTHER_NODE: OTHER}
+        ),
+    )
+    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [])
     monkeypatch.setattr(runtime, "request_tailnet", request)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
 
     with pytest.raises(ChatError, match="duplicate handles"):
         peers(tmp_path)
 
-    endpoints = _bound_endpoints(tmp_path, handle)
-    assert endpoints is not None
-    assert set(endpoints) == {OWNER, OTHER}
 
-    source = _source(tmp_path)
-    with pytest.raises(ChatError, match="more than one device"):
-        send(tmp_path, source, handle, "hello")
-
-    assert not (tmp_path / "intents.json").exists()
-
-
-def test_an_ambiguous_binding_refuses_until_a_listing_shows_one_owner(
+def test_a_stale_token_is_replaced_only_by_a_fresh_listing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    handle = session_key("claude", str(uuid4()))
-    _seed_binding(tmp_path, handle, {OWNER: str(uuid4()), OTHER: str(uuid4())})
-    generation = str(uuid4())
-    peers_calls: list[str] = []
-
-    def request(
-        address: str, payload: dict[str, object], *, timeout: float = 2.0
-    ) -> dict[str, object]:
-        del timeout
-        if payload.get("operation") == "peers":
-            peers_calls.append(address)
-            if address == OTHER:
-                return {"schema_version": 1, "peers": []}
-            return {
-                "schema_version": 1,
-                "peers": [_peer("claude@studio:api:api-a1", "studio", handle, generation)],
-            }
-        envelope = json.loads(str(payload["envelope"]))
-        return _accepted(envelope)
-
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER, OTHER])
-    monkeypatch.setattr(runtime, "request_tailnet", request)
-    monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
-    source = _source(tmp_path)
-
-    with pytest.raises(ChatError, match="more than one device"):
-        send(tmp_path, source, handle, "hello")
-    assert not (tmp_path / "intents.json").exists()
-
-    # A later listing showing exactly one owner is the explicit re-selection.
-    listing = peers(tmp_path)
-    items = cast(list[dict[str, str]], listing["peers"])
-    assert [item["handle"] for item in items] == [handle]
-
-    peers_calls.clear()
-    result = send(tmp_path, source, handle, "hello")
-
-    assert result["status"] == "TRANSPORT_ACCEPTED"
-    assert peers_calls == [OWNER]
-
-
-def test_a_single_owner_listing_rebinds_a_stale_endpoint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """chat_peers is how a user re-picks after a different-device refusal."""
-    handle = session_key("claude", str(uuid4()))
-    generation = str(uuid4())
-    _seed_binding(tmp_path, handle, {OWNER: generation})
-    peers_calls: list[str] = []
-    deliveries: list[str] = []
-
-    def request(
-        address: str, payload: dict[str, object], *, timeout: float = 2.0
-    ) -> dict[str, object]:
-        del timeout
-        if payload.get("operation") == "peers":
-            peers_calls.append(address)
-            if address == OWNER:
-                return {"schema_version": 1, "peers": []}
-            return {
-                "schema_version": 1,
-                "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, generation)],
-            }
-        deliveries.append(address)
-        envelope = json.loads(str(payload["envelope"]))
-        return _accepted(envelope)
-
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER, OTHER])
-    monkeypatch.setattr(runtime, "request_tailnet", request)
-    monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
-    source = _source(tmp_path)
-
-    with pytest.raises(ChatError, match="different device"):
-        send(tmp_path, source, handle, "hello")
-    assert not (tmp_path / "intents.json").exists()
-
-    peers(tmp_path)
-
-    peers_calls.clear()
-    result = send(tmp_path, source, handle, "hello")
-
-    assert result["status"] == "TRANSPORT_ACCEPTED"
-    assert deliveries == [OTHER]
-    assert peers_calls == [OTHER]
-
-
-def test_namesakes_with_different_handles_keep_independent_bindings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Same alias on two devices is unaffected: each handle keeps its owner."""
-    first_handle = session_key("claude", str(uuid4()))
-    second_handle = session_key("claude", str(uuid4()))
-    _seed_binding(tmp_path, first_handle, {OWNER: str(uuid4())})
-    other_queries: list[str] = []
-    deliveries: list[str] = []
-
-    def request(
-        address: str, payload: dict[str, object], *, timeout: float = 2.0
-    ) -> dict[str, object]:
-        del timeout
-        if payload.get("operation") == "peers":
-            if address == OTHER:
-                other_queries.append(address)
-                return {
-                    "schema_version": 1,
-                    "peers": [
-                        _peer(
-                            "claude@shared:api:api-a1",
-                            "laptop",
-                            second_handle,
-                            str(uuid4()),
-                        )
-                    ],
-                }
-            return {
-                "schema_version": 1,
-                "peers": [_peer("claude@shared:api:api-a1", "studio", first_handle, str(uuid4()))],
-            }
-        deliveries.append(address)
-        envelope = json.loads(str(payload["envelope"]))
-        return _accepted(envelope)
-
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER, OTHER])
-    monkeypatch.setattr(runtime, "request_tailnet", request)
-    monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
-    source = _source(tmp_path)
-
-    result = send(tmp_path, source, first_handle, "hello")
-
-    assert result["status"] == "TRANSPORT_ACCEPTED"
-    assert deliveries == [OWNER]
-    assert other_queries == []
-
-
-def test_a_new_generation_on_the_bound_endpoint_rebinds_and_sends(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Same endpoint, restarted provider session: rebind, do not refuse."""
+    """Re-selection is a fresh listing minting a fresh token, never a cache."""
     handle = session_key("claude", str(uuid4()))
     stale = str(uuid4())
     live = str(uuid4())
-    _seed_binding(tmp_path, handle, {OWNER: stale})
-    envelope_generations: list[str] = []
+    deliveries: list[str] = []
 
     def request(
         address: str, payload: dict[str, object], *, timeout: float = 2.0
     ) -> dict[str, object]:
-        del address, timeout
+        del timeout
         if payload.get("operation") == "peers":
             return {
                 "schema_version": 1,
                 "peers": [_peer("claude@studio:api:api-a1", "studio", handle, live)],
             }
-        envelope = json.loads(str(payload["envelope"]))
-        envelope_generations.append(str(envelope["generation"]))
-        return _accepted(envelope)
+        deliveries.append(address)
+        return _accepted(json.loads(str(payload["envelope"])))
 
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER}),
+    )
+    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [])
     monkeypatch.setattr(runtime, "request_tailnet", request)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    result = send(tmp_path, source, handle, "hello")
+    with pytest.raises(ChatError, match="unavailable or changed"):
+        send(tmp_path, source, remote_token(OWNER_NODE, handle, stale), "hello")
+    assert deliveries == []
+    assert not (tmp_path / "intents.json").exists()
+
+    listing = peers(tmp_path)
+    items = cast(list[dict[str, str]], listing["peers"])
+    (item,) = items
+    fresh = parse_recipient_token(item["handle"])
+    assert fresh is not None
+    assert (fresh.scope, fresh.node_id, fresh.handle, fresh.generation) == (
+        "remote",
+        OWNER_NODE,
+        handle,
+        live,
+    )
+
+    result = send(tmp_path, source, item["handle"], "hello")
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
-    assert envelope_generations == [live]
-    assert _bound_endpoints(tmp_path, handle) == {OWNER: live}
+    assert deliveries == [OWNER]
 
 
-def test_a_bound_owner_that_stops_claiming_falls_back_to_discovery(
+def test_the_selected_node_not_claiming_refuses_before_any_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Bound node answers without the handle: discover, then report unavailable."""
+    """The token's node answers but no longer presents the handle: refuse."""
     handle = session_key("claude", str(uuid4()))
-    _seed_binding(tmp_path, handle, {OWNER: str(uuid4())})
     peers_calls: list[str] = []
 
     def request(
@@ -567,27 +380,82 @@ def test_a_bound_owner_that_stops_claiming_falls_back_to_discovery(
             return {"schema_version": 1, "peers": []}
         pytest.fail("a refused send must not reach the receive boundary")
 
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(
+            self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER, OTHER_NODE: OTHER}
+        ),
+    )
     monkeypatch.setattr(runtime, "request_tailnet", request)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    with pytest.raises(ChatError, match="target handle is unavailable"):
-        send(tmp_path, source, handle, "hello")
+    with pytest.raises(ChatError, match="unavailable or changed"):
+        send(tmp_path, source, remote_token(OWNER_NODE, handle, str(uuid4())), "hello")
 
     assert not (tmp_path / "intents.json").exists()
-    # The bound query ran first; the empty answer fell back to ordinary
-    # discovery against the same node before the decided refusal.
-    assert peers_calls.count(OWNER) >= 2
+    # Only the selected node was asked; there is no unrelated-node fallback.
+    assert peers_calls == [OWNER]
 
 
-def test_a_bound_owner_reappearing_on_the_same_address_sends(
+def test_the_selected_node_serving_other_keys_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Owner went away and came back on the bound address: still the owner."""
+    """The token's node now serves unrelated keys; the handle lives elsewhere."""
     handle = session_key("claude", str(uuid4()))
     generation = str(uuid4())
-    _seed_binding(tmp_path, handle, {OWNER: generation})
+    deliveries: list[str] = []
+
+    def request(
+        address: str, payload: dict[str, object], *, timeout: float = 2.0
+    ) -> dict[str, object]:
+        del timeout
+        if payload.get("operation") == "peers":
+            if address == OWNER:
+                return {
+                    "schema_version": 1,
+                    "peers": [
+                        _peer(
+                            "claude@studio:other:other-a1",
+                            "studio",
+                            session_key("claude", str(uuid4())),
+                            str(uuid4()),
+                        )
+                    ],
+                }
+            return {
+                "schema_version": 1,
+                "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, generation)],
+            }
+        deliveries.append(address)
+        return _accepted(json.loads(str(payload["envelope"])))
+
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(
+            self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER, OTHER_NODE: OTHER}
+        ),
+    )
+    monkeypatch.setattr(runtime, "request_tailnet", request)
+    monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
+    source = _source(tmp_path)
+
+    with pytest.raises(ChatError, match="unavailable or changed"):
+        send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hello")
+
+    assert deliveries == []
+    assert not (tmp_path / "intents.json").exists()
+
+
+def test_the_selected_node_may_reclaim_its_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused send leaves no residue: the same token works once the node
+    presents the handle again."""
+    handle = session_key("claude", str(uuid4()))
+    generation = str(uuid4())
     claiming = False
     deliveries: list[str] = []
 
@@ -603,30 +471,35 @@ def test_a_bound_owner_reappearing_on_the_same_address_sends(
                 }
             return {"schema_version": 1, "peers": []}
         deliveries.append(address)
-        envelope = json.loads(str(payload["envelope"]))
-        return _accepted(envelope)
+        return _accepted(json.loads(str(payload["envelope"])))
 
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER}),
+    )
     monkeypatch.setattr(runtime, "request_tailnet", request)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
+    token = remote_token(OWNER_NODE, handle, generation)
 
-    with pytest.raises(ChatError, match="target handle is unavailable"):
-        send(tmp_path, source, handle, "hello")
+    with pytest.raises(ChatError, match="unavailable or changed"):
+        send(tmp_path, source, token, "hello")
 
     claiming = True
-    result = send(tmp_path, source, handle, "hello")
+    result = send(tmp_path, source, token, "hello")
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     assert deliveries == [OWNER]
 
 
-def test_a_bound_owner_reappearing_on_a_different_address_refuses(
+def test_namesakes_on_different_nodes_keep_independent_selections(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The counterexample: the handle moved devices, so nothing may be sent."""
-    handle = session_key("claude", str(uuid4()))
-    _seed_binding(tmp_path, handle, {OWNER: str(uuid4())})
+    """Same alias on two nodes: each token still reaches only its own node."""
+    first_handle = session_key("claude", str(uuid4()))
+    second_handle = session_key("claude", str(uuid4()))
+    first_generation, second_generation = str(uuid4()), str(uuid4())
     deliveries: list[str] = []
 
     def request(
@@ -634,81 +507,60 @@ def test_a_bound_owner_reappearing_on_a_different_address_refuses(
     ) -> dict[str, object]:
         del timeout
         if payload.get("operation") == "peers":
-            if address == OWNER:
-                return {"schema_version": 1, "peers": []}
-            return {
-                "schema_version": 1,
-                "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))],
-            }
-        deliveries.append(address)
-        envelope = json.loads(str(payload["envelope"]))
-        return _accepted(envelope)
-
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER, OTHER])
-    monkeypatch.setattr(runtime, "request_tailnet", request)
-    monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
-    source = _source(tmp_path)
-
-    with pytest.raises(ChatError, match="different device"):
-        send(tmp_path, source, handle, "hello")
-
-    assert deliveries == []
-    assert not (tmp_path / "intents.json").exists()
-
-
-def test_a_reused_bound_address_also_refuses_when_the_handle_moves(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Address reuse: bound node now serves other keys, owner lives elsewhere."""
-    handle = session_key("claude", str(uuid4()))
-    _seed_binding(tmp_path, handle, {OWNER: str(uuid4())})
-    deliveries: list[str] = []
-
-    def request(
-        address: str, payload: dict[str, object], *, timeout: float = 2.0
-    ) -> dict[str, object]:
-        del timeout
-        if payload.get("operation") == "peers":
-            if address == OWNER:
-                # The address now belongs to a node presenting unrelated keys.
+            if address == OTHER:
                 return {
                     "schema_version": 1,
                     "peers": [
                         _peer(
-                            "claude@studio:other:other-a1",
-                            "studio",
-                            session_key("claude", str(uuid4())),
-                            str(uuid4()),
+                            "claude@shared:api:api-a1",
+                            "laptop",
+                            second_handle,
+                            second_generation,
                         )
                     ],
                 }
             return {
                 "schema_version": 1,
-                "peers": [_peer("claude@laptop:api:api-a1", "laptop", handle, str(uuid4()))],
+                "peers": [
+                    _peer(
+                        "claude@shared:api:api-a1",
+                        "studio",
+                        first_handle,
+                        first_generation,
+                    )
+                ],
             }
         deliveries.append(address)
-        envelope = json.loads(str(payload["envelope"]))
-        return _accepted(envelope)
+        return _accepted(json.loads(str(payload["envelope"])))
 
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER, OTHER])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(
+            self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER, OTHER_NODE: OTHER}
+        ),
+    )
     monkeypatch.setattr(runtime, "request_tailnet", request)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    with pytest.raises(ChatError, match="different device"):
-        send(tmp_path, source, handle, "hello")
+    first = send(
+        tmp_path, source, remote_token(OWNER_NODE, first_handle, first_generation), "hello"
+    )
+    second = send(
+        tmp_path, source, remote_token(OTHER_NODE, second_handle, second_generation), "hello"
+    )
 
-    assert deliveries == []
-    assert not (tmp_path / "intents.json").exists()
+    assert first["status"] == second["status"] == "TRANSPORT_ACCEPTED"
+    assert deliveries == [OWNER, OTHER]
 
 
-def test_a_bound_query_on_an_old_broker_falls_back_to_the_legacy_roster(
+def test_the_handle_probe_falls_back_to_the_legacy_roster(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A v0.3.7 broker rejects the handle variant; the bound send still works."""
+    """An old broker rejects the handle variant; the token send still works."""
     handle = session_key("claude", str(uuid4()))
     generation = str(uuid4())
-    _seed_binding(tmp_path, handle, {OWNER: generation})
     calls: list[dict[str, object]] = []
 
     def old_broker(
@@ -717,8 +569,7 @@ def test_a_bound_query_on_an_old_broker_falls_back_to_the_legacy_roster(
         del timeout
         calls.append(payload)
         if payload.get("operation") == "receive":
-            envelope = json.loads(str(payload["envelope"]))
-            return _accepted(envelope)
+            return _accepted(json.loads(str(payload["envelope"])))
         if "handle" in payload:
             raise ChatError("legacy broker rejected unknown field")
         return {
@@ -726,12 +577,16 @@ def test_a_bound_query_on_an_old_broker_falls_back_to_the_legacy_roster(
             "peers": [_peer("claude@studio:api:api-a1", "studio", handle, generation)],
         }
 
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER}),
+    )
     monkeypatch.setattr(runtime, "request_tailnet", old_broker)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    result = send(tmp_path, source, handle, "hello")
+    result = send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hello")
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     assert calls[0] == {
@@ -744,121 +599,138 @@ def test_a_bound_query_on_an_old_broker_falls_back_to_the_legacy_roster(
     assert calls[2].get("operation") == "receive"
 
 
-def test_a_corrupt_binding_file_is_treated_as_no_binding(
+def test_a_seeded_recipients_file_has_no_routing_influence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A crafted recipients.json claiming another owner is never even read."""
     handle = session_key("claude", str(uuid4()))
     generation = str(uuid4())
     path = tmp_path / "recipients.json"
-    path.write_text("{not json\n", encoding="utf-8")
-    path.chmod(0o600)
+    crafted = json.dumps(
+        [{"handle": handle, "endpoints": {OTHER: str(uuid4())}, "seen_at": "x"}]
+    )
+    path.write_text(crafted + "\n", encoding="utf-8")
+    deliveries: list[str] = []
 
     def request(
         address: str, payload: dict[str, object], *, timeout: float = 2.0
     ) -> dict[str, object]:
-        del address, timeout
+        del timeout
         if payload.get("operation") == "peers":
             return {
                 "schema_version": 1,
                 "peers": [_peer("claude@studio:api:api-a1", "studio", handle, generation)],
             }
-        envelope = json.loads(str(payload["envelope"]))
-        return _accepted(envelope)
+        deliveries.append(address)
+        return _accepted(json.loads(str(payload["envelope"])))
 
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(
+            self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER, OTHER_NODE: OTHER}
+        ),
+    )
     monkeypatch.setattr(runtime, "request_tailnet", request)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    result = send(tmp_path, source, handle, "hello")
+    result = send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hello")
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
-    assert _bound_endpoints(tmp_path, handle) == {OWNER: generation}
+    assert deliveries == [OWNER]
+    assert path.read_text(encoding="utf-8") == crafted + "\n"
 
 
-def test_binding_records_are_private_and_written_for_a_send(
+def test_no_recipients_file_is_ever_created(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Listing, sending, and receiving write no durable selection state."""
     handle = session_key("claude", str(uuid4()))
     generation = str(uuid4())
 
     def request(
         address: str, payload: dict[str, object], *, timeout: float = 2.0
     ) -> dict[str, object]:
-        del address, timeout
+        del timeout
         if payload.get("operation") == "peers":
             return {
                 "schema_version": 1,
                 "peers": [_peer("claude@studio:api:api-a1", "studio", handle, generation)],
             }
-        envelope = json.loads(str(payload["envelope"]))
-        return _accepted(envelope)
+        if payload.get("operation") == "authorize":
+            return _authorize(address, payload)
+        return _accepted(json.loads(str(payload["envelope"])))
 
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER}),
+    )
+    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [])
     monkeypatch.setattr(runtime, "request_tailnet", request)
-    monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    assert send(tmp_path, source, handle, "hello")["status"] == "TRANSPORT_ACCEPTED"
+    listing = peers(tmp_path)
+    (item,) = cast(list[dict[str, str]], listing["peers"])
+    assert send(tmp_path, source, item["handle"], "hello")["status"] == "TRANSPORT_ACCEPTED"
 
-    path = tmp_path / "recipients.json"
-    metadata = path.lstat()
-    assert stat.S_ISREG(metadata.st_mode)
-    assert stat.S_IMODE(metadata.st_mode) == 0o600
-    assert "hello" not in path.read_text(encoding="utf-8")
+    target = _target(tmp_path)
+    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [_public_target(target)])
+    monkeypatch.setattr(runtime, "request_socket", _courier(target))
+    event_id = str(uuid4())
+    source_generation = str(uuid4())
+    body = wrapped_message(
+        "codex@source:api:source-a1",
+        remote_token(OWNER_NODE, session_key("codex", str(uuid4())), source_generation),
+        "ping",
+        event_id,
+        "codex",
+    )
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=source_generation,
+        target_alias=target.alias,
+        generation=target.generation,
+        message=body,
+    )
+    result = receive_remote(tmp_path, envelope, OWNER)
 
-
-def test_binding_records_prune_stale_entries_and_stay_bounded(tmp_path: Path) -> None:
-    from cross_agent_chat.core import RecipientBindings
-
-    store = RecipientBindings(tmp_path)
-    entries = []
-    for index in range(650):
-        entries.append(
-            {
-                "handle": f"{index:064x}",
-                "endpoints": {OWNER: str(uuid4())},
-                "seen_at": (
-                    datetime.now(UTC) - timedelta(days=8, minutes=index)
-                    if index < 50
-                    else datetime.now(UTC) - timedelta(minutes=650 - index)
-                ).isoformat(),
-            }
-        )
-    path = tmp_path / "recipients.json"
-    path.write_text(json.dumps(entries) + "\n", encoding="utf-8")
-    path.chmod(0o600)
-
-    handle = "b" * 64
-    store.record(handle, OTHER, str(uuid4()))
-
-    bindings = store.bindings()
-    assert len(bindings) == 512
-    surviving = {binding.handle for binding in bindings}
-    assert handle in surviving
-    fresh = {int(item, 16) for item in surviving if item != handle}
-    # Every entry older than seven days is gone, and the cap kept the newest.
-    assert min(fresh) == 139
-    assert max(fresh) == 649
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+    assert not (tmp_path / "recipients.json").exists()
 
 
-def test_inbound_delivery_binds_the_reply_handle_to_the_verified_sender(
+def _public_target(route: Route) -> runtime.Target:
+    return runtime.Target(
+        alias=route.alias,
+        provider=route.provider,
+        device=route.device,
+        project=route.project,
+        generation=route.generation,
+        session_key=session_key(route.provider, route.session_id),
+        remote=False,
+        session_id=route.session_id,
+        cwd=route.cwd,
+        pid=route.pid,
+    )
+
+
+def test_inbound_v2_reply_token_binds_the_verified_sender(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A reply to a received envelope goes back to the exact sender endpoint."""
-    target = Route.create(
-        provider="codex",
-        session_id=str(uuid4()),
-        device="target",
-        cwd=str(tmp_path),
-        pid=os.getpid(),
-    )
-    Registry(tmp_path).upsert(target)
+    """A v2 reply token must name a node that maps to the authenticated source."""
+    target = _target(tmp_path)
     event_id = str(uuid4())
-    source_handle = session_key("codex", str(uuid4()))
     source_generation = str(uuid4())
     source_alias = "codex@source:api:source-a1"
-    body = wrapped_message(source_alias, source_handle, "ping", event_id, target.provider)
+    body = wrapped_message(
+        source_alias,
+        remote_token(OWNER_NODE, session_key("codex", str(uuid4())), source_generation),
+        "ping",
+        event_id,
+        target.provider,
+    )
     envelope = remote_envelope(
         event_id=event_id,
         source_alias=source_alias,
@@ -868,67 +740,103 @@ def test_inbound_delivery_binds_the_reply_handle_to_the_verified_sender(
         message=body,
     )
 
-    def authorize(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
-        return {key: value for key, value in payload.items() if key != "operation"} | {
-            "status": "AUTHORIZED"
-        }
-
-    def courier(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
-        if payload["operation"] == "health":
-            return {
-                "schema_version": 1,
-                "status": "READY",
-                "alias": target.alias,
-                "generation": target.generation,
-            }
-        return {
-            "schema_version": 1,
-            "event_id": payload["event_id"],
-            "status": "TRANSPORT_ACCEPTED",
-            "to": target.alias,
-            "provider": "codex",
-        }
-
-    monkeypatch.setattr(runtime, "request_tailnet", authorize)
-    monkeypatch.setattr(runtime, "request_socket", courier)
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER}),
+    )
+    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [_public_target(target)])
+    monkeypatch.setattr(runtime, "request_tailnet", _authorize)
+    monkeypatch.setattr(runtime, "request_socket", _courier(target))
 
     result = receive_remote(tmp_path, envelope, OWNER)
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
-    assert _bound_endpoints(tmp_path, source_handle) == {OWNER: source_generation}
+    assert not (tmp_path / "recipients.json").exists()
 
 
-def test_an_inbound_free_text_handle_line_is_not_a_binding(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "reply_token",
+    (
+        pytest.param(
+            "wrong-node",
+            id="token-node-maps-elsewhere",
+        ),
+        pytest.param(
+            "wrong-generation",
+            id="token-generation-mismatched",
+        ),
+    ),
+)
+def test_an_inbound_reply_token_that_does_not_match_the_source_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reply_token: str
 ) -> None:
-    """Only the deterministic wrapped envelope binds; free text does not."""
-    target = Route.create(
-        provider="codex",
-        session_id=str(uuid4()),
-        device="target",
-        cwd=str(tmp_path),
-        pid=os.getpid(),
-    )
-    Registry(tmp_path).upsert(target)
+    """A reply token binding a different node or generation never reaches the
+    provider socket."""
+    target = _target(tmp_path)
     event_id = str(uuid4())
-    claimed_handle = "d" * 64
+    source_generation = str(uuid4())
+    source_alias = "codex@source:api:source-a1"
+    token = remote_token(
+        OTHER_NODE if reply_token == "wrong-node" else OWNER_NODE,
+        session_key("codex", str(uuid4())),
+        str(uuid4()) if reply_token == "wrong-generation" else source_generation,
+    )
+    body = wrapped_message(source_alias, token, "ping", event_id, target.provider)
     envelope = remote_envelope(
         event_id=event_id,
-        source_alias="codex@source:api:source-a1",
-        source_generation=str(uuid4()),
+        source_alias=source_alias,
+        source_generation=source_generation,
         target_alias=target.alias,
         generation=target.generation,
-        message=f"hello\nReply via CAC to handle: {claimed_handle}\n",
+        message=body,
     )
+    socket_calls: list[dict[str, object]] = []
+
+    def courier(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        socket_calls.append(payload)
+        return _courier(target)(_path, payload)
 
     monkeypatch.setattr(
         runtime,
-        "request_tailnet",
-        lambda _address, payload, **_: (
-            {key: value for key, value in payload.items() if key != "operation"}
-            | {"status": "AUTHORIZED"}
+        "tailnet_identity",
+        lambda: TailnetIdentity(
+            self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER, OTHER_NODE: OTHER}
         ),
     )
+    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [_public_target(target)])
+    monkeypatch.setattr(runtime, "request_tailnet", _authorize)
+    monkeypatch.setattr(runtime, "request_socket", courier)
+
+    result = receive_remote(tmp_path, envelope, OWNER)
+
+    assert result["status"] == "PRE_EFFECT_REJECTED"
+    assert socket_calls == []
+
+
+def test_an_inbound_v1_envelope_still_delivers_byte_for_byte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy raw-handle wrapper has no reply token and delivers unchanged."""
+    target = _target(tmp_path)
+    event_id = str(uuid4())
+    source_alias = "codex@source:api:source-a1"
+    body = wrapped_message(
+        source_alias,
+        session_key("codex", str(uuid4())),
+        "ping",
+        event_id,
+        target.provider,
+    )
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias=source_alias,
+        source_generation=str(uuid4()),
+        target_alias=target.alias,
+        generation=target.generation,
+        message=body,
+    )
+    delivered: list[dict[str, object]] = []
 
     def courier(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
         if payload["operation"] == "health":
@@ -938,6 +846,7 @@ def test_an_inbound_free_text_handle_line_is_not_a_binding(
                 "alias": target.alias,
                 "generation": target.generation,
             }
+        delivered.append(payload)
         return {
             "schema_version": 1,
             "event_id": payload["event_id"],
@@ -946,15 +855,57 @@ def test_an_inbound_free_text_handle_line_is_not_a_binding(
             "provider": "codex",
         }
 
+    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [_public_target(target)])
+    monkeypatch.setattr(runtime, "request_tailnet", _authorize)
     monkeypatch.setattr(runtime, "request_socket", courier)
 
     result = receive_remote(tmp_path, envelope, OWNER)
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
-    assert _bound_endpoints(tmp_path, claimed_handle) is None
+    (accept,) = delivered
+    assert accept["message"] == body
+    assert not (tmp_path / "recipients.json").exists()
 
 
-def test_a_listing_records_each_remote_handle_once(
+def test_an_inbound_free_text_handle_line_is_content_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Reply-looking line in free text is never parsed as a reply token."""
+    target = _target(tmp_path)
+    envelope = _envelope_for(
+        target, f"hello\nReply via CAC to handle: {'d' * 64}\n"
+    )
+    delivered: list[dict[str, object]] = []
+
+    def courier(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        if payload["operation"] == "health":
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "alias": target.alias,
+                "generation": target.generation,
+            }
+        delivered.append(payload)
+        return {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": "codex",
+        }
+
+    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [_public_target(target)])
+    monkeypatch.setattr(runtime, "request_tailnet", _authorize)
+    monkeypatch.setattr(runtime, "request_socket", courier)
+
+    result = receive_remote(tmp_path, envelope, OWNER)
+
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+    (accept,) = delivered
+    assert "Reply via CAC to handle:" in str(accept["message"])
+
+
+def test_a_listing_mints_one_opaque_token_per_remote_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first = session_key("claude", str(uuid4()))
@@ -973,20 +924,37 @@ def test_a_listing_records_each_remote_handle_once(
             ],
         }
 
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER}),
+    )
     monkeypatch.setattr(runtime, "request_tailnet", request)
+    monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
+    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [])
 
     targets = remote_targets(tmp_path, include_devin=True)
+    assert [target.tailnet_node_id for target in targets] == [OWNER_NODE, OWNER_NODE]
 
-    assert len(targets) == 2
-    assert _bound_endpoints(tmp_path, first) == {OWNER: first_generation}
-    assert _bound_endpoints(tmp_path, second) == {OWNER: second_generation}
+    listing = peers(tmp_path)
+    items = cast(list[dict[str, str]], listing["peers"])
+    tokens = [parse_recipient_token(item["handle"]) for item in items]
+    assert [(token.scope, token.node_id) for token in tokens if token is not None] == [
+        ("remote", OWNER_NODE),
+        ("remote", OWNER_NODE),
+    ]
+    assert {token.handle for token in tokens if token is not None} == {first, second}
+    assert {token.generation for token in tokens if token is not None} == {
+        first_generation,
+        second_generation,
+    }
+    assert not (tmp_path / "recipients.json").exists()
 
 
 def test_wire_request_and_response_key_sets_are_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The binding file is requester-local: no wire payload may gain a key."""
+    """The token lives inside existing fields: no wire payload gains a key."""
     handle = session_key("claude", str(uuid4()))
     generation = str(uuid4())
     sent: list[dict[str, object]] = []
@@ -1010,12 +978,21 @@ def test_wire_request_and_response_key_sets_are_unchanged(
         }
         return _accepted(envelope)
 
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [OWNER])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER}),
+    )
     monkeypatch.setattr(runtime, "request_tailnet", broker)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    assert send(tmp_path, source, handle, "hello")["status"] == "TRANSPORT_ACCEPTED"
+    assert (
+        send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hello")[
+            "status"
+        ]
+        == "TRANSPORT_ACCEPTED"
+    )
 
     peers_requests = [payload for payload in sent if payload.get("operation") == "peers"]
     assert peers_requests
@@ -1033,16 +1010,9 @@ def test_wire_request_and_response_key_sets_are_unchanged(
         {"schema_version", "operation", "envelope"}
     ]
 
-    # The receiver side asks exactly the v0.3.8 authorize fields and accepts
-    # the same decided refusal keys an old sender validates.
-    target = Route.create(
-        provider="codex",
-        session_id=str(uuid4()),
-        device="target",
-        cwd=str(tmp_path),
-        pid=os.getpid(),
-    )
-    Registry(tmp_path).upsert(target)
+    # The receiver side asks exactly the same authorize fields and accepts the
+    # same decided refusal keys an old sender validates.
+    target = _target(tmp_path)
     event_id = str(uuid4())
     authorize_payloads: list[dict[str, object]] = []
 
@@ -1069,16 +1039,18 @@ def test_wire_request_and_response_key_sets_are_unchanged(
             "payload_digest": payload["payload_digest"],
         }
 
-    def courier(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
-        return {
+    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [_public_target(target)])
+    monkeypatch.setattr(runtime, "request_tailnet", authorize)
+    monkeypatch.setattr(
+        runtime,
+        "request_socket",
+        lambda *_a, **_k: {
             "schema_version": 1,
             "status": "READY",
             "alias": target.alias,
             "generation": target.generation,
-        }
-
-    monkeypatch.setattr(runtime, "request_tailnet", authorize)
-    monkeypatch.setattr(runtime, "request_socket", courier)
+        },
+    )
     envelope = remote_envelope(
         event_id=event_id,
         source_alias="codex@source:api:source-a1",

@@ -5,8 +5,10 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
 
@@ -35,41 +37,79 @@ def valid_tailnet_address(value: str) -> str:
     return str(address)
 
 
-def parse_tailnet_nodes(text: str) -> list[str]:
-    """Return online Tailnet IPv4 nodes from a validated status response."""
-    try:
-        raw: object = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise ChatError("Tailscale status is invalid") from error
-    if not isinstance(raw, dict):
+# tailcfg.StableNodeID renders as a compact alphanumeric id ("n…CNTRL").
+_NODE_ID_RE: Final = re.compile(r"[A-Za-z0-9]{1,64}\Z")
+
+
+def _checked_node_id(value: object) -> str:
+    if not isinstance(value, str) or _NODE_ID_RE.fullmatch(value) is None:
         raise ChatError("Tailscale status is invalid")
-    status = cast(dict[object, object], raw)
+    return value
+
+
+def _peer_tailnet_address(peer: dict[object, object]) -> str | None:
+    raw_addresses = peer.get("TailscaleIPs")
+    if not isinstance(raw_addresses, list) or not all(
+        isinstance(item, str) for item in raw_addresses
+    ):
+        raise ChatError("Tailscale status is invalid")
+    for item in cast(list[str], raw_addresses):
+        try:
+            address = ipaddress.ip_address(item)
+        except ValueError:
+            continue
+        if address.version == 4 and address in TAILNET_NETWORK:
+            return str(address)
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class TailnetIdentity:
+    """The local node's trusted read of its Tailnet world.
+
+    ``self_node_id`` is this node's stable identity from ``tailscale status
+    --json`` (``Self.ID``). ``peers`` maps each online peer's stable node
+    identity (``Peer.*.ID``) to its current Tailnet IPv4. The map is the only
+    authority a recipient token resolves against: a stable id that moved to a
+    new address still resolves, while an address reassigned to a different
+    node can never be claimed by the original token.
+    """
+
+    self_node_id: str | None
+    peers: dict[str, str]
+
+
+def parse_tailnet_identity(text: str) -> TailnetIdentity:
+    """Read self and peer stable node identities from a status response."""
+    status = _parse_status(text)
+    self_value = status.get("Self")
+    self_node_id: str | None = None
+    if self_value is not None:
+        if not isinstance(self_value, dict):
+            raise ChatError("Tailscale status is invalid")
+        self_node_id = _checked_node_id(cast(dict[object, object], self_value).get("ID"))
     peer_value = status.get("Peer")
     if not isinstance(peer_value, dict):
         raise ChatError("Tailscale status is invalid")
-    peers = cast(dict[object, object], peer_value)
-    addresses: set[str] = set()
-    for value in peers.values():
+    peers: dict[str, str] = {}
+    owners: dict[str, str] = {}
+    for value in cast(dict[object, object], peer_value).values():
         if not isinstance(value, dict):
             raise ChatError("Tailscale status is invalid")
         peer = cast(dict[object, object], value)
         online = peer.get("Online")
-        raw_addresses = peer.get("TailscaleIPs")
-        if not isinstance(online, bool) or not isinstance(raw_addresses, list):
+        if not isinstance(online, bool):
             raise ChatError("Tailscale status is invalid")
-        if not all(isinstance(item, str) for item in raw_addresses):
-            raise ChatError("Tailscale status is invalid")
-        if not online:
+        address = _peer_tailnet_address(peer)
+        if not online or address is None:
             continue
-        for item in cast(list[str], raw_addresses):
-            try:
-                address = ipaddress.ip_address(item)
-            except ValueError:
-                continue
-            if address.version == 4 and address in TAILNET_NETWORK:
-                addresses.add(str(address))
-                break
-    return sorted(addresses)
+        node_id = _checked_node_id(peer.get("ID"))
+        # A conflicting read can never silently overwrite the sole identity
+        # authority a recipient token resolves against.
+        if node_id in peers or owners.setdefault(address, node_id) != node_id:
+            raise ChatError("Tailscale status is invalid")
+        peers[node_id] = address
+    return TailnetIdentity(self_node_id=self_node_id, peers=peers)
 
 
 def _parse_status(text: str) -> dict[object, object]:
@@ -211,15 +251,15 @@ def _interface_has_address(text: str, expected_address: str) -> bool:
     return False
 
 
-def tailnet_nodes() -> list[str]:
-    """Return currently online Tailnet nodes, or none when Tailscale is unavailable."""
+def tailnet_identity() -> TailnetIdentity | None:
+    """Return the local node's trusted Tailnet identity read, or none."""
     output = _status_output()
     if output is None:
-        return []
+        return None
     try:
-        return parse_tailnet_nodes(output)
+        return parse_tailnet_identity(output)
     except ChatError:
-        return []
+        return None
 
 
 def local_tailnet_address() -> str | None:

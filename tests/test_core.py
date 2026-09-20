@@ -35,6 +35,11 @@ from cross_agent_chat.core import (
     resolve_target,
     session_key,
 )
+from cross_agent_chat.recipient import (
+    local_token,
+    parse_recipient_token,
+    remote_token,
+)
 from cross_agent_chat.remote import parse_remote_envelope
 from cross_agent_chat.runtime import (
     HEALTH_TIMEOUT_SECONDS,
@@ -64,6 +69,7 @@ from cross_agent_chat.runtime import (
 from cross_agent_chat.runtime import (
     resolve_target as resolve_live_target,
 )
+from cross_agent_chat.tailnet import TailnetIdentity
 
 
 def route(
@@ -447,9 +453,23 @@ def test_local_delivery_wraps_reply_with_authenticated_sender_handle(
         }
 
     monkeypatch.setattr(runtime, "request_socket", accept)
-    send_local(root, source, resolved.session_key, "reply when ready")
+    send_local(
+        root,
+        source,
+        local_token(root, resolved.session_key, resolved.generation),
+        "reply when ready",
+    )
 
-    assert session_key(source.provider, source.session_id) in str(captured["message"])
+    (reply_line,) = [
+        line
+        for line in str(captured["message"]).splitlines()
+        if line.startswith("Reply via CAC to handle: ")
+    ]
+    decoded = parse_recipient_token(reply_line.split(": ", 1)[1])
+    assert decoded is not None
+    assert decoded.scope == "local"
+    assert decoded.handle == session_key(source.provider, source.session_id)
+    assert decoded.generation == source.generation
     assert "Reply with chat_send" not in str(captured["message"])
     assert "configured Cross Agent Chat Codex courier" in str(captured["message"])
 
@@ -471,10 +491,18 @@ def test_remote_delivery_wraps_reply_with_authenticated_sender_handle(
         "a" * 64,
         True,
         tailnet_address="100.64.0.2",
+        tailnet_node_id="nRemote",
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(runtime, "local_targets", lambda _: [])
-    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([target], True))
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nRemote": "100.64.0.2"}),
+    )
+    monkeypatch.setattr(
+        runtime, "_remote_node_targets", lambda *_args, **_kwargs: ([target], True)
+    )
 
     def accept(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         captured.update(payload)
@@ -488,9 +516,25 @@ def test_remote_delivery_wraps_reply_with_authenticated_sender_handle(
         }
 
     monkeypatch.setattr(runtime, "request_tailnet", accept)
-    runtime.send(root, source, target.session_key, "reply when ready")
+    runtime.send(
+        root,
+        source,
+        remote_token("nRemote", target.session_key, target.generation),
+        "reply when ready",
+    )
 
-    assert session_key(source.provider, source.session_id) in str(captured["envelope"])
+    envelope = json.loads(str(captured["envelope"]))
+    (reply_line,) = [
+        line
+        for line in str(envelope["message"]).splitlines()
+        if line.startswith("Reply via CAC to handle: ")
+    ]
+    decoded = parse_recipient_token(reply_line.split(": ", 1)[1])
+    assert decoded is not None
+    assert decoded.scope == "remote"
+    assert decoded.node_id == "nSelf"
+    assert decoded.handle == session_key(source.provider, source.session_id)
+    assert decoded.generation == source.generation
     assert "Reply with chat_send" not in str(captured["envelope"])
     assert "configured Cross Agent Chat Codex courier" in str(captured["envelope"])
 
@@ -860,7 +904,9 @@ def test_peers_reports_remote_discovery_completeness(
         "b" * 64,
         True,
         tailnet_address="100.64.0.2",
+        tailnet_node_id="nRemote",
     )
+    root = tmp_path / "state"
     monkeypatch.setattr(
         runtime,
         "local_targets",
@@ -869,15 +915,25 @@ def test_peers_reports_remote_discovery_completeness(
     monkeypatch.setattr(
         runtime, "_remote_discovery", lambda **_: ([remote] if not complete else [], complete)
     )
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nRemote": "100.64.0.2"}),
+    )
 
-    result = runtime.peers(tmp_path / "state", include_remote=include_remote)
+    result = runtime.peers(root, include_remote=include_remote)
 
     assert result["remote_discovery"] == expected
     if not complete:
-        assert result["peers"] == [remote.public(), local.public()]
+        assert result["peers"] == [
+            remote.public(
+                handle=remote_token("nRemote", remote.session_key, remote.generation)
+            ),
+            local.public(handle=local_token(root, local.session_key, local.generation)),
+        ]
 
 
-def test_local_send_by_exact_handle_skips_remote_discovery_and_title_metadata(
+def test_local_send_by_exact_token_skips_remote_discovery_and_title_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "state"
@@ -917,7 +973,15 @@ def test_local_send_by_exact_handle_skips_remote_discovery_and_title_metadata(
         },
     )
 
-    assert send(root, source, local.session_key, "hello")["status"] == "TRANSPORT_ACCEPTED"
+    assert (
+        send(
+            root,
+            source,
+            local_token(root, local.session_key, local.generation),
+            "hello",
+        )["status"]
+        == "TRANSPORT_ACCEPTED"
+    )
 
 
 def test_new_local_send_after_unknown_keeps_old_event_quarantined(
@@ -955,7 +1019,12 @@ def test_new_local_send_after_unknown_keeps_old_event_quarantined(
         },
     )
 
-    result = send(root, source, resolved.session_key, "independent new request")
+    result = send(
+        root,
+        source,
+        local_token(root, resolved.session_key, resolved.generation),
+        "independent new request",
+    )
     new_event = result["event_id"]
     assert isinstance(new_event, str)
 
@@ -1000,7 +1069,12 @@ def test_local_claude_receipt_uses_fresh_discovery_alias_after_rename(
     )
 
     assert (
-        send(root, source, resolved.session_key, "fresh independent work")["status"]
+        send(
+            root,
+            source,
+            local_token(root, resolved.session_key, resolved.generation),
+            "fresh independent work",
+        )["status"]
         == "TRANSPORT_ACCEPTED"
     )
 
@@ -2688,7 +2762,13 @@ def test_remote_discovery_uses_one_deadline_for_queued_workers(
         release.wait(1)
         return [], True
 
-    monkeypatch.setattr(runtime, "tailnet_nodes", lambda: [str(i) for i in range(48)])
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(
+            self_node_id="nSelf", peers={f"n{i}": str(i) for i in range(48)}
+        ),
+    )
     monkeypatch.setattr(runtime, "_remote_node_targets", wait_for_peer)
     monkeypatch.setattr(runtime, "REMOTE_DISCOVERY_TIMEOUT_SECONDS", 0.05)
     start = time.monotonic()
@@ -2768,7 +2848,12 @@ def test_disappeared_courier_closes_intent_as_pre_effect(
     )
     monkeypatch.setattr(runtime, "local_targets", lambda _: [target])
     with pytest.raises(ChatError) as error:
-        runtime.send(root, source, target.session_key, "never sent")
+        runtime.send(
+            root,
+            source,
+            local_token(root, target.session_key, target.generation),
+            "never sent",
+        )
     assert not isinstance(error.value, UnknownDeliveryError)
     store = IntentStore(root)
     assert [item.status for item in store.intents()] == ["PRE_EFFECT_REJECTED"]
