@@ -285,8 +285,10 @@ def test_install_script_requires_explicit_approval(tmp_path: Path) -> None:
     assert completed.returncode == 2
     assert "CROSS_AGENT_CHAT_APPROVE=1" in completed.stderr
     assert "may contain secrets" in completed.stderr
-    for managed_root in (".local", ".config", ".cache", ".claude", ".codex", ".claude.json"):
-        assert not (home / managed_root).exists()
+    # The unapproved path writes nothing anywhere in HOME -- including probe
+    # side effects like a macOS bytecode cache under Library/Caches.
+    assert _snapshot_tree(home) == {}
+    assert not any(path.is_dir() for path in home.rglob("*"))
 
 
 def test_install_script_rejects_unknown_provider_selection(tmp_path: Path) -> None:
@@ -312,8 +314,8 @@ def test_install_script_rejects_unknown_provider_selection(tmp_path: Path) -> No
 
     assert completed.returncode == 2
     assert "unsupported CROSS_AGENT_CHAT_PROVIDERS entry" in completed.stderr
-    for managed_root in (".local", ".config", ".cache", ".claude", ".codex", ".claude.json"):
-        assert not (home / managed_root).exists()
+    assert _snapshot_tree(home) == {}
+    assert not any(path.is_dir() for path in home.rglob("*"))
 
 
 def test_install_script_forwards_providers_and_yes(tmp_path: Path) -> None:

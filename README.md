@@ -94,6 +94,14 @@ selected roots and effects, then requires `--yes` or one interactive
 confirmation before any write; it never reads piped stdin for consent.
 Unrelated settings, hooks, MCP servers, and credentials are preserved.
 
+*(Candidate)* a failed setup rolls its recorded provider-set metadata,
+provider configuration, and predecessor runtime back transactionally.
+Downgrading to a release that predates schema-5 install metadata is *not*
+automatic after a successful schema-5 install: the older build refuses the
+recorded state instead of rewriting it. Uninstall with the schema-5 build
+first (or remove `~/.config/cross-agent-chat`) before installing an older
+release.
+
 ## Install
 
 Install v0.3.8 prerelease with:

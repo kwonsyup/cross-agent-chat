@@ -3142,6 +3142,8 @@ def test_successive_staged_upgrades_and_rollback_preserve_live_courier_state(
     second = _staged_runtime(installer, "upgrade two", name="two")
     installer.install_staged(second, stable)
 
+    metadata_after_second = installer.install_state.read_bytes()
+    assert json.loads(metadata_after_second)["schema_version"] == 5
     assert original_executable.read_text() == "original live courier executable"
     assert (installer.state / "routes.json").read_bytes() == route_bytes
     assert Registry(installer.state).routes() == [route]
@@ -3161,6 +3163,9 @@ def test_successive_staged_upgrades_and_rollback_preserve_live_courier_state(
     with pytest.raises(SettingsError, match="background broker did not become healthy"):
         installer.install_staged(failed, stable)
 
+    # The transactional rollback restores the predecessor's schema metadata
+    # and provider configuration, not only its runtime link.
+    assert installer.install_state.read_bytes() == metadata_after_second
     assert original_executable.read_text() == "original live courier executable"
     assert (installer.state / "routes.json").read_bytes() == route_bytes
     assert Registry(installer.state).routes() == [route]

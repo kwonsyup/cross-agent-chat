@@ -22,7 +22,7 @@ esac
 if ! command -v uv >/dev/null 2>&1; then
     if ! {
         command -v python3 >/dev/null 2>&1 &&
-            python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'
+            python3 -B -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'
     }; then
         command -v curl >/dev/null 2>&1 ||
             fail 'Cross Agent Chat requires uv, python3 >= 3.11, or curl for bootstrap.'
@@ -125,8 +125,10 @@ owner_identity=$(/bin/ps -ww -p "$$" -o lstart= -o command= | shasum -a 256 | aw
 printf '%s:%s:%s\n' 'cross-agent-chat-runtime-v1:staged' "$$" "$owner_identity" > "$staged_runtime/.cross-agent-chat-release"
 chmod 600 "$staged_runtime/.cross-agent-chat-release"
 
+# -B keeps this read-only probe from writing a bytecode cache under HOME; the
+# unapproved and rejected paths must not write anything anywhere.
 python_is_compatible() {
-    command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'
+    command -v python3 >/dev/null 2>&1 && python3 -B -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'
 }
 
 if command -v uv >/dev/null 2>&1; then
