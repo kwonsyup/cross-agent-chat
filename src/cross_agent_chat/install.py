@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import time
 import tomllib
-from collections.abc import Callable, Iterator, MutableMapping
+from collections.abc import Callable, Iterable, Iterator, MutableMapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -69,6 +69,12 @@ TRANSACTION_RELEASE_MARKER_RE: Final = re.compile(
 OWNED_TOML_RE: Final = re.compile(
     rf"\n?{re.escape(OWNED_TOML_START)}.*?{re.escape(OWNED_TOML_END)}\n?", re.DOTALL
 )
+SUPPORTED_PROVIDERS: Final = ("claude", "codex", "devin")
+_PROVIDER_PATH_NAMES: Final[dict[str, tuple[str, ...]]] = {
+    "claude": ("claude_settings", "claude_config"),
+    "codex": ("codex_config", "codex_hooks"),
+    "devin": ("devin_mcp", "devin_hooks"),
+}
 
 
 class SettingsError(RuntimeError):
@@ -137,6 +143,24 @@ class RuntimeRemovalPlan:
     current: Path | None
     owned_releases: tuple[Path, ...]
     entrypoints: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SetupPlan:
+    providers: tuple[str, ...]
+    roots: dict[str, Path]
+    managed_paths: tuple[Path, ...]
+    effects: tuple[str, ...]
+
+    def describe(self) -> str:
+        return "\n".join(
+            [
+                "Cross Agent Chat setup plan:",
+                *(f"  {effect}" for effect in self.effects),
+                "Managed paths:",
+                *(f"  {path}" for path in self.managed_paths),
+            ]
+        )
 
 
 def default_device() -> str:
@@ -235,6 +259,108 @@ def installed_device(
             "installed Cross Agent Chat device identity is ambiguous; pass --device"
         )
     return next(iter(candidates)) if candidates else None
+
+
+def _profile_install_state(home: Path, codex_home: Path, claude_config_dir: Path | None) -> Path:
+    profile_identity = json.dumps(
+        {
+            "claude_config_dir": None if claude_config_dir is None else str(claude_config_dir),
+            "codex_home": str(codex_home),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    default_profile = claude_config_dir is None and codex_home == home / ".codex"
+    install_name = (
+        "install.json"
+        if default_profile
+        else f"install-{hashlib.sha256(profile_identity).hexdigest()[:16]}.json"
+    )
+    return home / ".config" / SERVER_NAME / install_name
+
+
+def resolve_providers(
+    *,
+    home: Path,
+    requested: Iterable[str] | None = None,
+    codex_home: Path | None = None,
+    claude_config_dir: Path | None = None,
+    devin_global: bool = False,
+) -> tuple[str, ...]:
+    """Resolve the one selected-provider set for the public setup surface.
+
+    A fresh default install selects only provider roots that already exist.
+    An existing installation retains the provider set recorded in its install
+    state, so a compatible update never silently drops an old integration.
+    Explicit requests must name supported providers whose roots exist or are
+    already recorded, and cannot drop a recorded provider.
+    """
+    resolved_home = home.resolve()
+    if claude_config_dir is None:
+        claude_root = None
+    else:
+        expanded = claude_config_dir.expanduser()
+        if not expanded.is_absolute() or expanded == Path("/"):
+            raise SettingsError("CLAUDE_CONFIG_DIR must be an absolute configuration directory")
+        claude_root = expanded.resolve(strict=False)
+    expanded_codex = resolved_home / ".codex" if codex_home is None else codex_home.expanduser()
+    if not expanded_codex.is_absolute() or expanded_codex == Path("/"):
+        raise SettingsError("CODEX_HOME must be an absolute configuration directory")
+    selected_codex_home = expanded_codex.resolve(strict=False)
+    install_state = _profile_install_state(resolved_home, selected_codex_home, claude_root)
+    if install_state.is_symlink() or (install_state.exists() and not install_state.is_file()):
+        raise SettingsError("Cross Agent Chat install state is invalid")
+    recorded: tuple[str, ...] | None = (
+        Installer.recorded_providers(_json_object(install_state))
+        if install_state.is_file()
+        else None
+    )
+    claude_config = (resolved_home if claude_root is None else claude_root) / ".claude.json"
+    claude_settings_root = resolved_home / ".claude" if claude_root is None else claude_root
+    devin_root = devin_profile_root(resolved_home)
+    present = {
+        "claude": claude_settings_root.is_dir() or claude_config.is_file(),
+        "codex": selected_codex_home.is_dir()
+        or (selected_codex_home / "config.toml").is_file()
+        or (selected_codex_home / "hooks.json").is_file(),
+        "devin": devin_global
+        and (
+            devin_root.is_dir()
+            or (devin_root / "mcp_config.json").is_file()
+            or (devin_root / "config.json").is_file()
+        ),
+    }
+    if requested is None:
+        selected = (
+            recorded
+            if recorded is not None
+            else tuple(provider for provider in SUPPORTED_PROVIDERS if present[provider])
+        )
+        if not selected:
+            raise SettingsError(
+                "no supported provider configuration roots exist; "
+                "install a provider or pass --provider"
+            )
+        return selected
+    names = tuple(requested)
+    if not names or any(name not in SUPPORTED_PROVIDERS for name in names):
+        raise SettingsError(
+            "provider selection is invalid; supported providers: " + ", ".join(SUPPORTED_PROVIDERS)
+        )
+    selected = tuple(provider for provider in SUPPORTED_PROVIDERS if provider in names)
+    if "devin" in selected and not devin_global:
+        raise SettingsError("provider devin is not enabled for this installation")
+    if recorded is not None and not set(recorded) <= set(selected):
+        dropped = ", ".join(provider for provider in recorded if provider not in selected)
+        raise SettingsError(f"installed providers cannot be dropped: {dropped}")
+    absent = [
+        provider
+        for provider in selected
+        if not present[provider] and (recorded is None or provider not in recorded)
+    ]
+    if absent:
+        raise SettingsError("provider configuration roots are absent: " + ", ".join(absent))
+    return selected
 
 
 def _json_object(path: Path) -> dict[str, object]:
@@ -1017,6 +1143,7 @@ class Installer:
         claude_config_dir: Path | None = None,
         codex_native_queue: bool | None = None,
         devin_global: bool = False,
+        providers: Iterable[str] | None = None,
     ) -> None:
         self.home = home.resolve()
         self.executable = executable if executable.is_absolute() else executable.absolute()
@@ -1037,26 +1164,27 @@ class Installer:
         self.tailnet_address = (
             None if tailnet_address is None else valid_tailnet_address(tailnet_address)
         )
+        if providers is None:
+            # Direct-fixture default: every provider root this profile manages
+            # today. The public surface resolves an explicit selected set
+            # through resolve_providers instead of relying on this default.
+            selected = ("claude", "codex") + (("devin",) if devin_global else ())
+        else:
+            names = tuple(providers)
+            if not names or any(name not in SUPPORTED_PROVIDERS for name in names):
+                raise SettingsError("provider selection is invalid")
+            selected = tuple(provider for provider in SUPPORTED_PROVIDERS if provider in names)
+        if "devin" in selected and not devin_global:
+            raise SettingsError("provider devin requires the Devin global configuration")
+        if codex_native_queue is not None and "codex" not in selected:
+            raise SettingsError("the Codex native queue mode requires the codex provider")
+        self.providers = selected
         self.codex_native_queue = codex_native_queue
         self.devin_global = devin_global
         self.state = self.home / ".local" / "state" / SERVER_NAME
-        profile_identity = json.dumps(
-            {
-                "claude_config_dir": None
-                if self.claude_config_dir is None
-                else str(self.claude_config_dir),
-                "codex_home": str(self.codex_home),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-        default_profile = self.claude_config_dir is None and self.codex_home == self.home / ".codex"
-        install_name = (
-            "install.json"
-            if default_profile
-            else f"install-{hashlib.sha256(profile_identity).hexdigest()[:16]}.json"
+        self.install_state = _profile_install_state(
+            self.home, self.codex_home, self.claude_config_dir
         )
-        self.install_state = self.home / ".config" / SERVER_NAME / install_name
         self.cache = self.home / ".cache" / SERVER_NAME
         self.legacy_peers = self.state / "peers.json"
         if self.claude_config_dir is None:
@@ -1069,7 +1197,7 @@ class Installer:
         self.codex_hooks = self.codex_home / "hooks.json"
         self.devin_mcp = devin_profile_root(self.home) / "mcp_config.json"
         self.devin_hooks: Path | None = (
-            devin_profile_root(self.home) / "config.json" if self.devin_global else None
+            devin_profile_root(self.home) / "config.json" if "devin" in selected else None
         )
         self.launch_agent = self.home / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
         self.runtime_root = self.home / ".local" / "share" / f"{SERVER_NAME}-runtime"
@@ -1081,15 +1209,81 @@ class Installer:
 
     @property
     def config_paths(self) -> tuple[Path, ...]:
-        base = (
-            self.claude_settings,
-            self.claude_config,
-            self.codex_config,
-            self.codex_hooks,
-            self.launch_agent,
-            self.install_state,
+        paths: list[Path] = []
+        if "claude" in self.providers:
+            paths += [self.claude_settings, self.claude_config]
+        if "codex" in self.providers:
+            paths += [self.codex_config, self.codex_hooks]
+        paths += [self.launch_agent, self.install_state]
+        if self.devin_hooks is not None:
+            paths += [self.devin_mcp, self.devin_hooks]
+        return tuple(paths)
+
+    def _shared_configuration_paths(self) -> set[Path]:
+        paths: set[Path] = set()
+        if "claude" in self.providers:
+            paths |= {self.claude_settings, self.claude_config}
+        if "codex" in self.providers:
+            paths |= {self.codex_config, self.codex_hooks}
+        if self.devin_hooks is not None:
+            paths |= {self.devin_mcp, self.devin_hooks}
+        return paths
+
+    def provider_root(self, provider: str) -> Path:
+        if provider == "claude":
+            return (
+                self.home / ".claude" if self.claude_config_dir is None else self.claude_config_dir
+            )
+        if provider == "codex":
+            return self.codex_home
+        if provider == "devin":
+            return devin_profile_root(self.home)
+        raise SettingsError("unsupported provider")
+
+    def plan(self, *, staged: bool = False) -> SetupPlan:
+        """Read-only setup plan: selected roots and exact effects before any write."""
+        self._reject_incompatible_shared_codex_config()
+        destinations = self._configuration_destinations()
+        self._payloads()
+        roots = {provider: self.provider_root(provider) for provider in self.providers}
+        effects = [
+            "Selected provider roots: "
+            + ", ".join(f"{provider} at {roots[provider]}" for provider in self.providers)
+        ]
+        if "claude" in self.providers:
+            effects.append(
+                "Claude: accept inbound cross-session messages, register the "
+                "cross-agent-chat MCP server, and install owned session hooks."
+            )
+        if "codex" in self.providers:
+            effects.append(
+                "Codex: enable the hooks feature, install owned session and native "
+                "helper hooks, and auto-approve only the chat_peers, chat_send, "
+                "and chat_status tools."
+            )
+        if "devin" in self.providers:
+            effects.append(
+                "Devin: register the cross-agent-chat MCP server and install owned "
+                "session, prompt, and tool-permission hooks."
+            )
+        effects.append(
+            "Write a full local backup of each managed configuration file under "
+            f"{self.cache / 'backups'} (backup files may contain secrets)."
         )
-        return base if self.devin_hooks is None else (*base, self.devin_mcp, self.devin_hooks)
+        if staged:
+            effects.append(
+                f"Install the runtime under {self.runtime_root} and repoint the "
+                "cross-agent-chat entrypoint symlink."
+            )
+        effects.append(
+            f"Restart the launchd broker {LAUNCH_AGENT_LABEL} (starts now and at login)."
+        )
+        return SetupPlan(
+            providers=self.providers,
+            roots=roots,
+            managed_paths=tuple(destinations),
+            effects=tuple(effects),
+        )
 
     def _validate_runtime_roots(self) -> None:
         for root in (self.runtime_root, self.releases, self.transactions):
@@ -1193,14 +1387,14 @@ class Installer:
             hooks_feature = metadata.get("codex_hooks_feature")
             stable_relative = metadata.get("stable_entrypoint")
             if (
-                metadata.get("schema_version") not in {1, 2, 3, 4}
+                metadata.get("schema_version") not in {1, 2, 3, 4, 5}
                 or not isinstance(previous, dict)
                 or set(previous) != {"present", "value"}
                 or not isinstance(previous.get("present"), bool)
                 or (previous.get("present") is False and previous.get("value") is not None)
             ):
                 raise SettingsError("Cross Agent Chat install state is invalid")
-            if metadata.get("schema_version") == 4:
+            if metadata.get("schema_version") in {4, 5}:
                 self._validate_hooks_feature_snapshot(hooks_feature)
             managed: list[Path]
             if metadata["schema_version"] == 1:
@@ -1236,9 +1430,11 @@ class Installer:
                     "stable_entrypoint",
                     "managed_entrypoints",
                 }
-                if metadata["schema_version"] == 4:
+                if metadata["schema_version"] in {4, 5}:
                     expected_fields.add("provider_paths")
                     expected_fields.add("codex_hooks_feature")
+                if metadata["schema_version"] == 5:
+                    expected_fields.add("providers")
                 if (
                     set(metadata) != expected_fields
                     or not isinstance(stable_relative, str)
@@ -1257,7 +1453,7 @@ class Installer:
                     raise SettingsError("Cross Agent Chat install state is invalid") from error
                 if stable not in managed:
                     raise SettingsError("Cross Agent Chat install state is invalid")
-                if metadata["schema_version"] == 4:
+                if metadata["schema_version"] in {4, 5}:
                     recorded_paths = self._metadata_provider_paths(metadata)
                     assert recorded_paths is not None
                     self._require_recorded_provider_paths(recorded_paths)
@@ -1266,16 +1462,17 @@ class Installer:
             if stable not in managed:
                 managed.append(stable)
             return {
-                "schema_version": 4,
+                "schema_version": 5,
                 "claude_cross_session_inbound": previous,
                 "stable_entrypoint": str(stable.relative_to(self.home)),
                 "managed_entrypoints": [
                     str(path.relative_to(self.home)) for path in dict.fromkeys(managed)
                 ],
                 "provider_paths": self._provider_paths(),
+                "providers": list(self.providers),
                 "codex_hooks_feature": (
                     self._validate_hooks_feature_snapshot(hooks_feature)
-                    if metadata["schema_version"] == 4
+                    if metadata["schema_version"] in {4, 5}
                     else self._prior_codex_hooks_feature()
                 ),
             }
@@ -1285,21 +1482,23 @@ class Installer:
         except SettingsError:
             stable = self._validate_stable_entrypoint(self.home / ".local" / "bin" / SERVER_NAME)
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "claude_cross_session_inbound": previous,
             "stable_entrypoint": str(stable.relative_to(self.home)),
             "managed_entrypoints": [str(stable.relative_to(self.home))],
             "provider_paths": self._provider_paths(),
+            "providers": list(self.providers),
             "codex_hooks_feature": self._prior_codex_hooks_feature(),
         }
 
     def _provider_paths(self) -> dict[str, str]:
-        paths = {
-            "claude_settings": str(self.claude_settings.resolve(strict=False)),
-            "claude_config": str(self.claude_config.resolve(strict=False)),
-            "codex_config": str(self.codex_config.resolve(strict=False)),
-            "codex_hooks": str(self.codex_hooks.resolve(strict=False)),
-        }
+        paths: dict[str, str] = {}
+        if "claude" in self.providers:
+            paths["claude_settings"] = str(self.claude_settings.resolve(strict=False))
+            paths["claude_config"] = str(self.claude_config.resolve(strict=False))
+        if "codex" in self.providers:
+            paths["codex_config"] = str(self.codex_config.resolve(strict=False))
+            paths["codex_hooks"] = str(self.codex_hooks.resolve(strict=False))
         if self.devin_hooks is not None:
             paths["devin_mcp"] = str(self.devin_mcp.resolve(strict=False))
             paths["devin_hooks"] = str(self.devin_hooks.resolve(strict=False))
@@ -1307,10 +1506,7 @@ class Installer:
 
     def _require_recorded_provider_paths(self, recorded: dict[str, str]) -> None:
         current = self._provider_paths()
-        if current != recorded:
-            optional_upgrade = set(current) - set(recorded) <= {"devin_mcp", "devin_hooks"}
-            if optional_upgrade and all(current[name] == value for name, value in recorded.items()):
-                return
+        if any(name not in current or current[name] != value for name, value in recorded.items()):
             raise SettingsError("provider configuration ownership changed")
 
     def _update_json_for_uninstall(
@@ -1379,27 +1575,81 @@ class Installer:
             ) from failure
         raise failure
 
-    def _metadata_provider_paths(self, metadata: dict[str, object]) -> dict[str, str] | None:
+    @staticmethod
+    def _providers_for_paths(paths: dict[str, str]) -> tuple[str, ...]:
+        remaining = set(paths)
+        providers: list[str] = []
+        for provider, names in _PROVIDER_PATH_NAMES.items():
+            owned = set(names)
+            if remaining & owned:
+                if not owned <= remaining:
+                    raise SettingsError("Cross Agent Chat install state is invalid")
+                providers.append(provider)
+                remaining -= owned
+        if remaining or not providers:
+            raise SettingsError("Cross Agent Chat install state is invalid")
+        return tuple(providers)
+
+    @staticmethod
+    def _metadata_providers(metadata: dict[str, object]) -> tuple[str, ...]:
+        raw = metadata.get("providers")
+        if (
+            not isinstance(raw, list)
+            or not raw
+            or not all(isinstance(item, str) for item in raw)
+            or any(item not in SUPPORTED_PROVIDERS for item in raw)
+            or len(set(raw)) != len(raw)
+        ):
+            raise SettingsError("Cross Agent Chat install state is invalid")
+        return tuple(provider for provider in SUPPORTED_PROVIDERS if provider in raw)
+
+    @staticmethod
+    def recorded_providers(metadata: dict[str, object]) -> tuple[str, ...]:
+        """Return the provider set established by one install-state record."""
+        schema_version = metadata.get("schema_version")
+        if schema_version in {1, 2, 3}:
+            return ("claude", "codex")
+        if schema_version == 4:
+            paths = Installer._metadata_provider_paths(metadata)
+            assert paths is not None
+            return Installer._providers_for_paths(paths)
+        if schema_version == 5:
+            providers = Installer._metadata_providers(metadata)
+            paths = Installer._metadata_provider_paths(metadata)
+            assert paths is not None
+            if providers != Installer._providers_for_paths(paths):
+                raise SettingsError("Cross Agent Chat install state is invalid")
+            return providers
+        raise SettingsError("Cross Agent Chat install state is invalid")
+
+    @staticmethod
+    def _metadata_provider_paths(metadata: dict[str, object]) -> dict[str, str] | None:
         schema_version = metadata.get("schema_version")
         if schema_version in {1, 2, 3}:
             return None
-        if schema_version != 4:
+        if schema_version not in {4, 5}:
             raise SettingsError("Cross Agent Chat install state is invalid")
-        names = {"claude_settings", "claude_config", "codex_config", "codex_hooks"}
-        allowed_names = names | {"devin_mcp", "devin_hooks"}
+        allowed_names = {name for names in _PROVIDER_PATH_NAMES.values() for name in names}
         raw_paths = metadata.get("provider_paths")
-        if not isinstance(raw_paths, dict) or not names <= set(raw_paths) <= allowed_names:
+        if schema_version == 4:
+            names = {"claude_settings", "claude_config", "codex_config", "codex_hooks"}
+            valid = isinstance(raw_paths, dict) and names <= set(raw_paths) <= allowed_names
+        else:
+            providers = Installer._metadata_providers(metadata)
+            required = {name for provider in providers for name in _PROVIDER_PATH_NAMES[provider]}
+            valid = isinstance(raw_paths, dict) and set(raw_paths) == required
+        if not valid:
             raise SettingsError("Cross Agent Chat install state is invalid")
         paths = cast(dict[str, object], raw_paths)
-        if not all(isinstance(paths[name], str) for name in raw_paths):
+        if not all(isinstance(paths[name], str) for name in paths):
             raise SettingsError("Cross Agent Chat install state is invalid")
         if any(
             not Path(cast(str, paths[name])).is_absolute()
             or os.path.normpath(cast(str, paths[name])) != paths[name]
-            for name in raw_paths
+            for name in paths
         ):
             raise SettingsError("Cross Agent Chat install state is invalid")
-        return {name: cast(str, paths[name]) for name in raw_paths}
+        return {name: cast(str, paths[name]) for name in paths}
 
     def _remaining_profile_metadata(self) -> list[dict[str, object]]:
         if not self.install_state.parent.exists():
@@ -1422,6 +1672,8 @@ class Installer:
                     "provider_paths",
                     "codex_hooks_feature",
                 }
+                if metadata.get("schema_version") == 5:
+                    expected.add("providers")
                 if (
                     set(metadata) != expected
                     or not isinstance(metadata.get("stable_entrypoint"), str)
@@ -1442,23 +1694,27 @@ class Installer:
         return records
 
     def _reject_incompatible_shared_codex_config(self) -> None:
+        if "codex" not in self.providers:
+            return
         current = self._provider_paths()
         for metadata in self._remaining_profile_metadata():
             paths = self._metadata_provider_paths(metadata)
             if paths is None:
                 continue
-            shares_config = paths["codex_config"] == current["codex_config"]
-            shares_hooks = paths["codex_hooks"] == current["codex_hooks"]
+            shares_config = paths.get("codex_config") == current["codex_config"]
+            shares_hooks = paths.get("codex_hooks") == current["codex_hooks"]
             if shares_config != shares_hooks:
                 raise SettingsError(
                     "Codex config.toml and hooks.json must share the same profile ownership"
                 )
 
     def _prior_claude_cross_session_inbound(self, settings: dict[str, object]) -> dict[str, object]:
+        if "claude" not in self.providers:
+            return {"present": False, "value": None}
         claude_settings = self._provider_paths()["claude_settings"]
         for metadata in self._remaining_profile_metadata():
             paths = self._metadata_provider_paths(metadata)
-            if paths is None or paths["claude_settings"] != claude_settings:
+            if paths is None or paths.get("claude_settings") != claude_settings:
                 continue
             previous = metadata.get("claude_cross_session_inbound")
             if (
@@ -1487,10 +1743,12 @@ class Installer:
         return cast(dict[str, object], value)
 
     def _prior_codex_hooks_feature(self) -> dict[str, object]:
+        if "codex" not in self.providers:
+            return {"present": False, "value": None}
         codex_config = self._provider_paths()["codex_config"]
         for metadata in self._remaining_profile_metadata():
             paths = self._metadata_provider_paths(metadata)
-            if paths is None or paths["codex_config"] != codex_config:
+            if paths is None or paths.get("codex_config") != codex_config:
                 continue
             return self._validate_hooks_feature_snapshot(metadata.get("codex_hooks_feature"))
         text = self._codex_config_text()
@@ -1531,74 +1789,81 @@ class Installer:
             raise SettingsError(f"Codex config.toml is invalid: {self.codex_config}") from error
 
     def _payloads(self, stable_entrypoint: Path | None = None) -> dict[Path, bytes]:
-        claude_settings = _json_object(self.claude_settings)
+        claude_settings = _json_object(self.claude_settings) if "claude" in self.providers else {}
         install_metadata = self._install_metadata(claude_settings, stable_entrypoint)
-        claude_settings["crossSessionInbound"] = "accept"
-        for event in ("SessionStart", "SessionEnd"):
-            _merge_hook(
-                claude_settings,
-                event,
-                _hook_group(self.executable, "claude", self.device, event),
-            )
-
-        claude_config = _json_object(self.claude_config)
-        raw_servers = claude_config.get("mcpServers")
-        if raw_servers is None:
-            servers: dict[str, object] = {}
-            claude_config["mcpServers"] = servers
-        elif isinstance(raw_servers, dict):
-            servers = cast(dict[str, object], raw_servers)
-        else:
-            raise SettingsError("Claude mcpServers must be an object")
-        servers[SERVER_NAME] = _mcp_route(self.executable, "claude", self.device)
-
-        codex_hooks = _json_object(self.codex_hooks)
-        codex_native_queue = self._codex_native_queue_enabled()
-        for event in ("SessionStart", "SessionEnd", "Stop"):
-            _merge_hook(
-                codex_hooks,
-                event,
-                _hook_group(
-                    self.executable,
-                    "codex",
-                    self.device,
+        payloads: dict[Path, bytes] = {}
+        if "claude" in self.providers:
+            claude_settings["crossSessionInbound"] = "accept"
+            for event in ("SessionStart", "SessionEnd"):
+                _merge_hook(
+                    claude_settings,
                     event,
-                    codex_native_queue=codex_native_queue,
-                ),
+                    _hook_group(self.executable, "claude", self.device, event),
+                )
+
+            claude_config = _json_object(self.claude_config)
+            raw_servers = claude_config.get("mcpServers")
+            if raw_servers is None:
+                servers: dict[str, object] = {}
+                claude_config["mcpServers"] = servers
+            elif isinstance(raw_servers, dict):
+                servers = cast(dict[str, object], raw_servers)
+            else:
+                raise SettingsError("Claude mcpServers must be an object")
+            servers[SERVER_NAME] = _mcp_route(self.executable, "claude", self.device)
+            payloads[self.claude_settings] = _json_bytes(claude_settings)
+            payloads[self.claude_config] = _json_bytes(claude_config)
+
+        if "codex" in self.providers:
+            codex_hooks = _json_object(self.codex_hooks)
+            codex_native_queue = self._codex_native_queue_enabled()
+            for event in ("SessionStart", "SessionEnd", "Stop"):
+                _merge_hook(
+                    codex_hooks,
+                    event,
+                    _hook_group(
+                        self.executable,
+                        "codex",
+                        self.device,
+                        event,
+                        codex_native_queue=codex_native_queue,
+                    ),
+                )
+            _merge_native_helper_hooks(codex_hooks, self.executable, self.device)
+            raw_hook_map = codex_hooks.get("hooks")
+            if not isinstance(raw_hook_map, dict):
+                raise SettingsError("Codex hooks must be an object")
+            for event in ("SessionStart", "SessionEnd", "Stop"):
+                groups = cast(dict[str, object], raw_hook_map).get(event)
+                if not isinstance(groups, list):
+                    raise SettingsError(f"Codex hook {event} must be a list")
+                indices = [index for index, item in enumerate(groups) if _owned_hook(item)]
+                if len(indices) != 1:
+                    raise SettingsError(f"Codex hook {event} ownership is ambiguous")
+
+            codex_text = self._codex_config_text() or ""
+            codex_text = _strip_owned_toml_block(codex_text)
+            codex_text = _retain_matching_owned_command_hook_trust(
+                codex_text,
+                codex_hooks,
+                self.codex_hooks,
+                self.executable,
+                self.device,
+                codex_native_queue=codex_native_queue,
+            ).rstrip()
+            codex_text = _remove_owned_codex_tool_approval_overrides(codex_text).rstrip()
+            codex_text = _enable_hooks_feature(codex_text).rstrip() + "\n\n"
+            codex_text += _codex_owned_toml(
+                self.executable,
+                self.device,
+                codex_native_queue=codex_native_queue,
             )
-        _merge_native_helper_hooks(codex_hooks, self.executable, self.device)
-        raw_hook_map = codex_hooks.get("hooks")
-        if not isinstance(raw_hook_map, dict):
-            raise SettingsError("Codex hooks must be an object")
-        for event in ("SessionStart", "SessionEnd", "Stop"):
-            groups = cast(dict[str, object], raw_hook_map).get(event)
-            if not isinstance(groups, list):
-                raise SettingsError(f"Codex hook {event} must be a list")
-            indices = [index for index, item in enumerate(groups) if _owned_hook(item)]
-            if len(indices) != 1:
-                raise SettingsError(f"Codex hook {event} ownership is ambiguous")
+            payloads[self.codex_config] = codex_text.encode()
+            payloads[self.codex_hooks] = _json_bytes(codex_hooks)
 
-        codex_text = self._codex_config_text() or ""
-        codex_text = _strip_owned_toml_block(codex_text)
-        codex_text = _retain_matching_owned_command_hook_trust(
-            codex_text,
-            codex_hooks,
-            self.codex_hooks,
-            self.executable,
-            self.device,
-            codex_native_queue=codex_native_queue,
-        ).rstrip()
-        codex_text = _remove_owned_codex_tool_approval_overrides(codex_text).rstrip()
-        codex_text = _enable_hooks_feature(codex_text).rstrip() + "\n\n"
-        codex_text += _codex_owned_toml(
-            self.executable,
-            self.device,
-            codex_native_queue=codex_native_queue,
-        )
+        payloads[self.launch_agent] = self._launch_agent_payload()
+        payloads[self.install_state] = _json_bytes(install_metadata)
 
-        devin_mcp: dict[str, object] | None = None
-        devin_hooks: dict[str, object] | None = None
-        devin_hooks_document: dict[str, object] | None = None
         if self.devin_hooks is not None:
             devin_mcp = _json_object(self.devin_mcp)
             raw_devin_servers = devin_mcp.get("mcpServers")
@@ -1613,7 +1878,7 @@ class Installer:
             devin_hooks_document = _json_object(self.devin_hooks)
             raw_hooks = devin_hooks_document.get("hooks")
             if raw_hooks is None:
-                devin_hooks = {}
+                devin_hooks: dict[str, object] = {}
                 devin_hooks_document["hooks"] = devin_hooks
             elif isinstance(raw_hooks, dict):
                 devin_hooks = cast(dict[str, object], raw_hooks)
@@ -1631,18 +1896,7 @@ class Installer:
                     event,
                     _hook_group(self.executable, "devin", self.device, event),
                 )
-
-        payloads = {
-            self.claude_settings: _json_bytes(claude_settings),
-            self.claude_config: _json_bytes(claude_config),
-            self.codex_config: codex_text.encode(),
-            self.codex_hooks: _json_bytes(codex_hooks),
-            self.launch_agent: self._launch_agent_payload(),
-            self.install_state: _json_bytes(install_metadata),
-        }
-        if devin_mcp is not None:
             payloads[self.devin_mcp] = _json_bytes(devin_mcp)
-        if self.devin_hooks is not None and devin_hooks_document is not None:
             payloads[self.devin_hooks] = _json_bytes(devin_hooks_document)
         return payloads
 
@@ -1722,17 +1976,11 @@ class Installer:
 
     def _setup_candidates(self, transaction: PreparedSetup) -> dict[Path, PathSnapshot]:
         candidates = dict(transaction.originals)
+        shared_paths = self._shared_configuration_paths()
         for path, payload in transaction.payloads.items():
             destination = transaction.destinations[path]
             original = transaction.originals[destination]
-            shared = path in {
-                self.claude_settings,
-                self.claude_config,
-                self.codex_config,
-                self.codex_hooks,
-                self.devin_mcp,
-                self.devin_hooks,
-            }
+            shared = path in shared_paths
             mode = _safe_shared_mode(original.mode) if shared and original.kind == "file" else 0o600
             candidates[destination] = PathSnapshot(
                 path=destination, kind="file", payload=payload, mode=mode
@@ -1764,17 +2012,11 @@ class Installer:
                 for original in transaction.originals.values()
             ):
                 raise ConfigurationChangedError("provider configuration changed before setup write")
+            shared_paths = self._shared_configuration_paths()
             for path, payload in transaction.payloads.items():
                 destination = transaction.destinations[path]
                 original = transaction.originals[destination]
-                shared = path in {
-                    self.claude_settings,
-                    self.claude_config,
-                    self.codex_config,
-                    self.codex_hooks,
-                    self.devin_mcp,
-                    self.devin_hooks,
-                }
+                shared = path in shared_paths
                 mode = (
                     _safe_shared_mode(original.mode)
                     if shared and original.kind == "file"
@@ -2517,43 +2759,67 @@ class Installer:
 
     def verify_configuration(self) -> bool:
         try:
-            claude = _json_object(self.claude_config)
-            servers = claude.get("mcpServers")
-            settings = _json_object(self.claude_settings)
-            codex_hooks = _json_object(self.codex_hooks)
-            codex_text = self._codex_config_text()
-            if codex_text is None:
-                return False
-            parsed_codex: object = tomllib.loads(codex_text)
-            if not isinstance(parsed_codex, dict):
-                return False
-            features = parsed_codex.get("features")
-            if not isinstance(features, dict) or features.get("hooks") is not True:
-                return False
-            codex_servers = parsed_codex.get("mcp_servers")
-            if not isinstance(codex_servers, dict):
-                return False
-            codex_server = codex_servers.get(SERVER_NAME)
-            if not isinstance(codex_server, dict):
-                return False
-            if codex_server.get("default_tools_approval_mode") != "approve":
-                return False
-            codex_tools = codex_server.get("tools")
-            if codex_tools is not None:
-                if not isinstance(codex_tools, dict):
+            settings = _json_object(self.claude_settings) if "claude" in self.providers else {}
+            hook_expectations: list[tuple[dict[str, object], str, tuple[str, ...], bool]] = []
+            if "claude" in self.providers:
+                claude = _json_object(self.claude_config)
+                servers = claude.get("mcpServers")
+                if not isinstance(servers, dict) or SERVER_NAME not in servers:
                     return False
-                for name in OWNED_CODEX_TOOLS:
-                    tool = codex_tools.get(name)
-                    if not isinstance(tool, dict):
-                        continue
-                    if tool.get("approval_mode", "approve") != "approve":
+                if settings.get("crossSessionInbound") != "accept":
+                    return False
+                hook_expectations.append(
+                    (settings, "claude", ("SessionStart", "SessionEnd"), False)
+                )
+            native_hooks: dict[str, object] | None = None
+            if "codex" in self.providers:
+                codex_hooks = _json_object(self.codex_hooks)
+                codex_text = self._codex_config_text()
+                if codex_text is None:
+                    return False
+                parsed_codex: object = tomllib.loads(codex_text)
+                if not isinstance(parsed_codex, dict):
+                    return False
+                features = parsed_codex.get("features")
+                if not isinstance(features, dict) or features.get("hooks") is not True:
+                    return False
+                codex_servers = parsed_codex.get("mcp_servers")
+                if not isinstance(codex_servers, dict):
+                    return False
+                codex_server = codex_servers.get(SERVER_NAME)
+                if not isinstance(codex_server, dict):
+                    return False
+                if codex_server.get("default_tools_approval_mode") != "approve":
+                    return False
+                codex_tools = codex_server.get("tools")
+                if codex_tools is not None:
+                    if not isinstance(codex_tools, dict):
                         return False
-            if not isinstance(servers, dict) or SERVER_NAME not in servers:
-                return False
-            if settings.get("crossSessionInbound") != "accept":
-                return False
-            if OWNED_TOML_START not in codex_text or OWNED_TOML_END not in codex_text:
-                return False
+                    for name in OWNED_CODEX_TOOLS:
+                        tool = codex_tools.get(name)
+                        if not isinstance(tool, dict):
+                            continue
+                        if tool.get("approval_mode", "approve") != "approve":
+                            return False
+                if OWNED_TOML_START not in codex_text or OWNED_TOML_END not in codex_text:
+                    return False
+                hook_expectations.append(
+                    (
+                        codex_hooks,
+                        "codex",
+                        ("SessionStart", "SessionEnd", "Stop"),
+                        self._codex_native_queue_enabled(),
+                    )
+                )
+                raw_native_hooks = codex_hooks.get("hooks")
+                if not isinstance(raw_native_hooks, dict):
+                    return False
+                if (
+                    raw_native_hooks.get("UserPromptSubmit") is None
+                    or raw_native_hooks.get("PostToolUse") is None
+                ):
+                    return False
+                native_hooks = cast(dict[str, object], raw_native_hooks)
             launch_agent = plistlib.loads(self.launch_agent.read_bytes())
             expected_launch_agent: dict[str, object] = plistlib.loads(self._launch_agent_payload())
             if launch_agent != expected_launch_agent:
@@ -2563,15 +2829,7 @@ class Installer:
                 if launch_agent != expected_launch_agent:
                     return False
             self._install_metadata(settings)
-            for config, provider, events, native_queue in (
-                (settings, "claude", ("SessionStart", "SessionEnd"), False),
-                (
-                    codex_hooks,
-                    "codex",
-                    ("SessionStart", "SessionEnd", "Stop"),
-                    self._codex_native_queue_enabled(),
-                ),
-            ):
+            for config, provider, events, native_queue in hook_expectations:
                 raw_hooks = config.get("hooks")
                 if not isinstance(raw_hooks, dict):
                     return False
@@ -2590,14 +2848,6 @@ class Installer:
                         )
                     ]:
                         return False
-            native_hooks = codex_hooks.get("hooks")
-            if not isinstance(native_hooks, dict):
-                return False
-            if (
-                native_hooks.get("UserPromptSubmit") is None
-                or native_hooks.get("PostToolUse") is None
-            ):
-                return False
             if self.devin_hooks is not None:
                 devin_mcp = _json_object(self.devin_mcp)
                 devin_servers = devin_mcp.get("mcpServers")
@@ -2624,22 +2874,27 @@ class Installer:
                         item for item in groups if _owned_hook(item)
                     ] != [_hook_group(self.executable, "devin", self.device, event)]:
                         return False
-            startup = [
-                item
-                for item in cast(list[object], native_hooks["UserPromptSubmit"])
-                if _owned_hook(item)
-            ]
-            post = [
-                item
-                for item in cast(list[object], native_hooks["PostToolUse"])
-                if _owned_hook(item)
-            ]
-            return startup == [
-                _native_helper_startup_hook_group(self.executable, self.device)
-            ] and post == [
-                _native_helper_create_hook_group(),
-                _native_helper_dispatch_hook_group(),
-            ]
+            if native_hooks is not None:
+                startup = [
+                    item
+                    for item in cast(list[object], native_hooks["UserPromptSubmit"])
+                    if _owned_hook(item)
+                ]
+                post = [
+                    item
+                    for item in cast(list[object], native_hooks["PostToolUse"])
+                    if _owned_hook(item)
+                ]
+                if not (
+                    startup == [_native_helper_startup_hook_group(self.executable, self.device)]
+                    and post
+                    == [
+                        _native_helper_create_hook_group(),
+                        _native_helper_dispatch_hook_group(),
+                    ]
+                ):
+                    return False
+            return True
         except (
             OSError,
             plistlib.InvalidFileException,
@@ -3244,25 +3499,28 @@ class Installer:
             return self._uninstall()
 
     def _uninstall(self) -> bool:
-        self._codex_config_text()
+        if "codex" in self.providers:
+            self._codex_config_text()
         self._recover_unfinished_transaction()
         recorded_metadata = _json_object(self.install_state)
         recorded_schema = recorded_metadata.get("schema_version")
         normalized_metadata = self._install_metadata(_json_object(self.claude_settings))
-        metadata = recorded_metadata if recorded_schema == 4 else normalized_metadata
+        metadata = recorded_metadata if recorded_schema in {4, 5} else normalized_metadata
         recorded_paths = self._metadata_provider_paths(metadata)
         if recorded_paths is not None:
             self._require_recorded_provider_paths(recorded_paths)
         destinations = self._configuration_destinations()
-        _json_object(destinations[self.claude_settings])
-        _json_object(destinations[self.claude_config])
-        _json_object(destinations[self.codex_hooks])
+        if "claude" in self.providers:
+            _json_object(destinations[self.claude_settings])
+            _json_object(destinations[self.claude_config])
+        if "codex" in self.providers:
+            _json_object(destinations[self.codex_hooks])
+            codex_preflight = self._codex_config_text()
+            if codex_preflight is not None:
+                _remove_owned_codex_server(_strip_owned_toml_block(codex_preflight))
         if self.devin_hooks is not None:
             _json_object(destinations[self.devin_hooks])
             _json_object(destinations[self.devin_mcp])
-        codex_preflight = self._codex_config_text()
-        if codex_preflight is not None:
-            _remove_owned_codex_server(_strip_owned_toml_block(codex_preflight))
         uninstall_writes: dict[Path, tuple[PathSnapshot, bytes]] = {}
         stable_entrypoint = self.home / cast(str, metadata["stable_entrypoint"])
         managed_entrypoints = tuple(
@@ -3271,17 +3529,25 @@ class Installer:
         )
         remaining_profiles = self._remaining_profile_metadata()
         other_profile_installs = bool(remaining_profiles)
-        claude_settings_has_remaining_owner = self._provider_path_has_remaining_owner(
-            "claude_settings", remaining_profiles
+        claude_settings_has_remaining_owner = (
+            self._provider_path_has_remaining_owner("claude_settings", remaining_profiles)
+            if "claude" in self.providers
+            else False
         )
-        claude_config_has_remaining_owner = self._provider_path_has_remaining_owner(
-            "claude_config", remaining_profiles
+        claude_config_has_remaining_owner = (
+            self._provider_path_has_remaining_owner("claude_config", remaining_profiles)
+            if "claude" in self.providers
+            else False
         )
-        codex_config_has_remaining_owner = self._provider_path_has_remaining_owner(
-            "codex_config", remaining_profiles
+        codex_config_has_remaining_owner = (
+            self._provider_path_has_remaining_owner("codex_config", remaining_profiles)
+            if "codex" in self.providers
+            else False
         )
-        codex_hooks_has_remaining_owner = self._provider_path_has_remaining_owner(
-            "codex_hooks", remaining_profiles
+        codex_hooks_has_remaining_owner = (
+            self._provider_path_has_remaining_owner("codex_hooks", remaining_profiles)
+            if "codex" in self.providers
+            else False
         )
         devin_mcp_has_remaining_owner = (
             self._provider_path_has_remaining_owner("devin_mcp", remaining_profiles)
@@ -3310,7 +3576,7 @@ class Installer:
                 durable_intents_preserved = self._remove_runtime_state()
             if recorded_paths is not None:
                 self._require_recorded_provider_paths(recorded_paths)
-            if not codex_config_has_remaining_owner:
+            if "codex" in self.providers and not codex_config_has_remaining_owner:
                 for attempt in range(5):
                     if recorded_paths is not None:
                         self._require_recorded_provider_paths(recorded_paths)
@@ -3323,7 +3589,7 @@ class Installer:
                     stripped = _strip_owned_toml_block(codex_text)
                     stripped = _remove_owned_codex_server(stripped)
                     stripped = _remove_owned_hook_trust(stripped, owned_trust_keys)
-                    if recorded_schema == 4:
+                    if recorded_schema in {4, 5}:
                         stripped = _restore_hooks_feature(
                             stripped,
                             cast(dict[str, object], metadata["codex_hooks_feature"]),
@@ -3352,14 +3618,14 @@ class Installer:
                         f"Codex config.toml kept changing during uninstall: {self.codex_config}; "
                         "re-run uninstall"
                     )
-            if not codex_hooks_has_remaining_owner:
+            if "codex" in self.providers and not codex_hooks_has_remaining_owner:
                 self._update_json_for_uninstall(
                     current_destinations[self.codex_hooks],
                     _remove_hooks,
                     recorded_paths=recorded_paths,
                     writes=uninstall_writes,
                 )
-            if not claude_settings_has_remaining_owner:
+            if "claude" in self.providers and not claude_settings_has_remaining_owner:
                 previous = cast(dict[str, object], metadata["claude_cross_session_inbound"])
 
                 def remove_claude_settings(value: dict[str, object]) -> None:
@@ -3377,7 +3643,7 @@ class Installer:
                     writes=uninstall_writes,
                 )
 
-            if not claude_config_has_remaining_owner:
+            if "claude" in self.providers and not claude_config_has_remaining_owner:
 
                 def remove_claude_server(value: dict[str, object]) -> None:
                     servers = value.get("mcpServers")

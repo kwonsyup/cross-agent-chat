@@ -702,6 +702,7 @@ def test_install_script_package_failure_leaves_predecessor_untouched(tmp_path: P
         "HOME": str(home),
         "PATH": f"{fake_bin}:{predecessor_bin}:/usr/bin:/bin",
         "CROSS_AGENT_CHAT_SOURCE": "candidate-wheel",
+        "CROSS_AGENT_CHAT_APPROVE": "1",
     }
 
     completed = subprocess.run(
@@ -733,7 +734,12 @@ def test_install_script_rejects_symlinked_product_parent_before_mutation(tmp_pat
 
     completed = subprocess.run(
         ["sh", str(script)],
-        env={**os.environ, "HOME": str(home), "PATH": "/usr/bin:/bin"},
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "CROSS_AGENT_CHAT_APPROVE": "1",
+        },
         capture_output=True,
         text=True,
         timeout=10.0,
@@ -773,6 +779,7 @@ def test_install_script_supports_in_home_symlinked_data_root(tmp_path: Path) -> 
             "HOME": str(home),
             "PATH": f"{fake_bin}:/usr/bin:/bin",
             "CROSS_AGENT_CHAT_SOURCE": "candidate-wheel",
+            "CROSS_AGENT_CHAT_APPROVE": "1",
         },
         capture_output=True,
         text=True,
@@ -829,6 +836,7 @@ def test_install_script_does_not_delete_committed_runtime_after_late_failure(
             "PATH": f"{fake_bin}:/usr/bin:/bin",
             "FAKE_CROSS_AGENT": str(fake_cross_agent),
             "CROSS_AGENT_CHAT_SOURCE": "candidate-wheel",
+            "CROSS_AGENT_CHAT_APPROVE": "1",
         },
         capture_output=True,
         text=True,
@@ -885,6 +893,7 @@ def test_install_script_preserves_transaction_owned_runtime_after_child_failure(
             "PATH": f"{fake_bin}:/usr/bin:/bin",
             "FAKE_CROSS_AGENT": str(fake_cross_agent),
             "CROSS_AGENT_CHAT_SOURCE": "candidate-wheel",
+            "CROSS_AGENT_CHAT_APPROVE": "1",
         },
         capture_output=True,
         text=True,
@@ -944,6 +953,7 @@ def test_install_script_falls_back_from_runtime_internal_entrypoint(tmp_path: Pa
             "PATH": f"{fake_bin}:{runtime_bin}:/usr/bin:/bin",
             "FAKE_CROSS_AGENT": str(fake_cross_agent),
             "CROSS_AGENT_CHAT_SOURCE": "candidate-wheel",
+            "CROSS_AGENT_CHAT_APPROVE": "1",
         },
         capture_output=True,
         text=True,
@@ -3348,7 +3358,7 @@ def test_staged_upgrade_persists_entrypoint_selected_for_transition(
     installer.install_staged(stage, selected_stable)
 
     metadata = json.loads(installer.install_state.read_text())
-    assert metadata["schema_version"] == 4
+    assert metadata["schema_version"] == 5
     assert metadata["stable_entrypoint"] == str(selected_stable.relative_to(home))
     assert set(metadata["managed_entrypoints"]) == {
         str(previous_stable.relative_to(home)),
