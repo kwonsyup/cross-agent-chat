@@ -10,19 +10,18 @@ import plistlib
 import re
 import shutil
 import subprocess
-import tempfile
 import sys
+import tempfile
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Mapping, Sequence
-
+from typing import Final
 
 REPOSITORY: Final = "https://github.com/kwonsyup/cross-agent-chat.git"
 RELEASE_TAG: Final = "v0.4.0"
 RELEASE_COMMIT: Final = "d237d53bebb6abc43b96179af3f9e26e38c59756"
 INSTALLER_URL: Final = (
-    "https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/"
-    f"{RELEASE_COMMIT}/install.sh"
+    f"https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/{RELEASE_COMMIT}/install.sh"
 )
 BROKER_LABEL: Final = "io.github.kwonsyup.cross-agent-chat"
 BROKER_PORT: Final = 47072
@@ -104,22 +103,20 @@ def assert_github_hosted() -> None:
 
 
 def runner_facts(environment: Mapping[str, str]) -> dict[str, object]:
-    product = run_command(
-        ["sw_vers", "-productVersion"], environment, timeout=15.0
-    ).stdout.strip()
-    build = run_command(
-        ["sw_vers", "-buildVersion"], environment, timeout=15.0
-    ).stdout.strip()
+    product = run_command(["sw_vers", "-productVersion"], environment, timeout=15.0).stdout.strip()
+    build = run_command(["sw_vers", "-buildVersion"], environment, timeout=15.0).stdout.strip()
     return {
-        "image_os": os.environ.get("ImageOS"),
-        "image_version": os.environ.get("ImageVersion"),
+        "image_os": os.environ.get("ImageOS"),  # noqa: SIM112 - GitHub-defined spelling.
+        "image_version": os.environ.get("ImageVersion"),  # noqa: SIM112 - GitHub-defined spelling.
         "macos_product": product,
         "macos_build": build,
         "uid": os.getuid(),
     }
 
 
-def launchctl_result(environment: Mapping[str, str], target: str) -> subprocess.CompletedProcess[str]:
+def launchctl_result(
+    environment: Mapping[str, str], target: str
+) -> subprocess.CompletedProcess[str]:
     return run_command(
         ["launchctl", "print", target],
         environment,
@@ -252,15 +249,16 @@ def owned_launch_agent(path: Path, home: Path) -> bool:
     if not isinstance(decoded, dict) or decoded.get("Label") != BROKER_LABEL:
         return False
     arguments = decoded.get("ProgramArguments")
-    if not isinstance(arguments, list) or not arguments or not all(
-        isinstance(item, str) for item in arguments
+    if (
+        not isinstance(arguments, list)
+        or not arguments
+        or not all(isinstance(item, str) for item in arguments)
     ):
         return False
     program = Path(arguments[0])
     try:
-        return (
-            program.name == SERVER_NAME
-            and program.resolve(strict=False).is_relative_to(home.resolve())
+        return program.name == SERVER_NAME and program.resolve(strict=False).is_relative_to(
+            home.resolve()
         )
     except (OSError, RuntimeError):
         return False
@@ -293,9 +291,7 @@ def cleanup_profile(
         if metadata_dir.exists()
         else []
     )
-    should_uninstall = state.is_file() or (
-        entrypoint.is_symlink() and not other_states
-    )
+    should_uninstall = state.is_file() or (entrypoint.is_symlink() and not other_states)
     if should_uninstall:
         try:
             run_cli(base, home, codex_root, profile, ["uninstall"])
@@ -316,7 +312,9 @@ def cleanup_profile(
             else:
                 errors.append(f"owned launchd fallback failed: {result.stderr.strip()[-2000:]}")
         elif not is_known_launchctl_not_found(loaded):
-            errors.append(f"could not establish exact service cleanup: {loaded.stderr.strip()[-2000:]}")
+            errors.append(
+                f"could not establish exact service cleanup: {loaded.stderr.strip()[-2000:]}"
+            )
     return errors
 
 
@@ -337,13 +335,7 @@ def seed_synthetic_roots(home: Path, codex_root: Path, profiles: Sequence[Profil
     codex_config_path.chmod(0o600)
     write_json(
         codex_root / "hooks.json",
-        {
-            "hooks": {
-                "SessionStart": [
-                    {"hooks": [{"type": "command", "command": "/usr/bin/true"}]}
-                ]
-            }
-        },
+        {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "/usr/bin/true"}]}]}},
     )
     for profile in profiles:
         write_json(
@@ -351,19 +343,13 @@ def seed_synthetic_roots(home: Path, codex_root: Path, profiles: Sequence[Profil
             {
                 "crossSessionInbound": "hold",
                 "hooks": {
-                    "SessionStart": [
-                        {"hooks": [{"type": "command", "command": "/usr/bin/true"}]}
-                    ]
+                    "SessionStart": [{"hooks": [{"type": "command", "command": "/usr/bin/true"}]}]
                 },
             },
         )
         write_json(
             profile.claude_root / ".claude.json",
-            {
-                "mcpServers": {
-                    f"foreign-{profile.name}": {"command": "/usr/bin/true", "args": []}
-                }
-            },
+            {"mcpServers": {f"foreign-{profile.name}": {"command": "/usr/bin/true", "args": []}}},
         )
     home.mkdir(parents=True, mode=0o700, exist_ok=True)
 
@@ -625,8 +611,7 @@ def run_probe() -> int:
         cleanup_errors.append(f"final cleanup residue check failed: {error}")
     if cleanup_errors:
         print(
-            f"G03 cleanup failed; preserving temporary root {root}: "
-            + " | ".join(cleanup_errors),
+            f"G03 cleanup failed; preserving temporary root {root}: " + " | ".join(cleanup_errors),
             file=sys.stderr,
         )
         raise ProbeFailure("cleanup failed; inspect the preserved RUNNER_TEMP root")
