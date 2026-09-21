@@ -10,6 +10,7 @@ import plistlib
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -300,17 +301,22 @@ def cleanup_profile(
             run_cli(base, home, codex_root, profile, ["uninstall"])
         except ProbeFailure as error:
             errors.append(f"{profile.name} uninstall failed: {error}")
-    if errors and owned_launch_agent(launch_agent, home) and not other_states:
-        result = run_command(
-            ["launchctl", "bootout", f"gui/{os.getuid()}/{BROKER_LABEL}"],
-            base,
-            timeout=15.0,
-            check=False,
-        )
-        if result.returncode == 0 or is_known_launchctl_not_found(result):
-            launch_agent.unlink(missing_ok=True)
-        else:
-            errors.append(f"owned launchd fallback failed: {result.stderr.strip()[-2000:]}")
+    if not other_states and owned_launch_agent(launch_agent, home):
+        service = f"gui/{os.getuid()}/{BROKER_LABEL}"
+        loaded = launchctl_result(base, service)
+        if loaded.returncode == 0:
+            result = run_command(
+                ["launchctl", "bootout", service],
+                base,
+                timeout=15.0,
+                check=False,
+            )
+            if result.returncode == 0:
+                launch_agent.unlink(missing_ok=True)
+            else:
+                errors.append(f"owned launchd fallback failed: {result.stderr.strip()[-2000:]}")
+        elif not is_known_launchctl_not_found(loaded):
+            errors.append(f"could not establish exact service cleanup: {loaded.stderr.strip()[-2000:]}")
     return errors
 
 
@@ -482,7 +488,12 @@ def assert_claude_prior_values(profiles: Sequence[Profile]) -> None:
     for profile in profiles:
         settings = parsed_json(profile.claude_root / "settings.json")
         claude = parsed_json(profile.claude_root / ".claude.json")
-        if settings.get("crossSessionInbound") != "hold" or SERVER_NAME in json.dumps(settings):
+        serialized_settings = json.dumps(settings)
+        if (
+            settings.get("crossSessionInbound") != "hold"
+            or "/usr/bin/true" not in serialized_settings
+            or SERVER_NAME in serialized_settings
+        ):
             raise ProbeFailure(f"{profile.name} Claude prior settings were not restored")
         if f"foreign-{profile.name}" not in json.dumps(claude) or SERVER_NAME in json.dumps(claude):
             raise ProbeFailure(f"{profile.name} Claude foreign MCP entry was not restored")
@@ -493,6 +504,7 @@ def assert_prior_values(profiles: Sequence[Profile], codex_root: Path) -> None:
     if (
         "[features]\nhooks = false" not in codex_config
         or 'sentinel = "keep"' not in codex_config
+        or SERVER_NAME in codex_config
     ):
         raise ProbeFailure("foreign Codex TOML values were not restored")
     codex_hooks = parsed_json(codex_root / "hooks.json")
@@ -579,26 +591,26 @@ def run_probe() -> int:
         assert_durable_state(intents, lock, intent_bytes, lock_inode)
 
         run_cli(base, home, codex_root, profiles[0], ["uninstall"])
-        remove_cleanup_candidate(cleanup_candidates, profiles[0])
         assert_healthy(base, home, codex_root, profiles[1], "profile-b after shared uninstall")
         assert_shared_owner_state(codex_root)
         assert_claude_prior_values((profiles[0],))
         assert_durable_state(intents, lock, intent_bytes, lock_inode)
+        remove_cleanup_candidate(cleanup_candidates, profiles[0])
 
         run_cli(base, home, codex_root, profiles[1], ["uninstall"])
-        remove_cleanup_candidate(cleanup_candidates, profiles[1])
         assert_unhealthy_removed(base, home)
         assert_durable_state(intents, lock, intent_bytes, lock_inode)
         assert_prior_values(profiles, codex_root)
+        remove_cleanup_candidate(cleanup_candidates, profiles[1])
 
         install_profile(base, home, codex_root, profiles[1], installer, cleanup_candidates)
         assert_healthy(base, home, codex_root, profiles[1], "profile-b canonical reinstall")
         assert_durable_state(intents, lock, intent_bytes, lock_inode)
         run_cli(base, home, codex_root, profiles[1], ["uninstall"])
-        remove_cleanup_candidate(cleanup_candidates, profiles[1])
         assert_unhealthy_removed(base, home)
         assert_durable_state(intents, lock, intent_bytes, lock_inode)
         assert_prior_values(profiles, codex_root)
+        remove_cleanup_candidate(cleanup_candidates, profiles[1])
     except Exception as error:
         failure = error
 
