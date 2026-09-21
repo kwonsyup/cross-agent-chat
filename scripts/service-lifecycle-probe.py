@@ -18,9 +18,9 @@ from pathlib import Path
 from typing import Final
 
 REPOSITORY: Final = "https://github.com/kwonsyup/cross-agent-chat.git"
-SOURCE_LABEL: Final = "candidate-0.4.1"
-SOURCE_REF: Final = "refs/heads/astra/operational-closure-20260921"
-SOURCE_COMMIT: Final = "13f25526f1aece90fd7882f63a90aac816b2ee01"
+SOURCE_LABEL: Final = "v0.4.1"
+SOURCE_REF: Final = "refs/tags/v0.4.1^{}"
+SOURCE_COMMIT: Final = "5f0f46300468dbf776151a435719b544f021e387"
 INSTALLER_URL: Final = (
     f"https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/{SOURCE_COMMIT}/install.sh"
 )
