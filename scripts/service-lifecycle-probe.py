@@ -18,10 +18,11 @@ from pathlib import Path
 from typing import Final
 
 REPOSITORY: Final = "https://github.com/kwonsyup/cross-agent-chat.git"
-RELEASE_TAG: Final = "v0.4.0"
-RELEASE_COMMIT: Final = "d237d53bebb6abc43b96179af3f9e26e38c59756"
+SOURCE_LABEL: Final = "candidate-0.4.1"
+SOURCE_REF: Final = "refs/heads/astra/operational-closure-20260921"
+SOURCE_COMMIT: Final = "13f25526f1aece90fd7882f63a90aac816b2ee01"
 INSTALLER_URL: Final = (
-    f"https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/{RELEASE_COMMIT}/install.sh"
+    f"https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/{SOURCE_COMMIT}/install.sh"
 )
 BROKER_LABEL: Final = "io.github.kwonsyup.cross-agent-chat"
 BROKER_PORT: Final = 47072
@@ -192,15 +193,14 @@ def fetch_immutable_installer(destination: Path, environment: Mapping[str, str])
             "git",
             "ls-remote",
             REPOSITORY,
-            f"refs/tags/{RELEASE_TAG}",
-            f"refs/tags/{RELEASE_TAG}^{{}}",
+            SOURCE_REF,
         ],
         environment,
         timeout=30.0,
     )
     tag_hashes = [line.split()[0] for line in tag_result.stdout.splitlines() if line.split()]
-    if RELEASE_COMMIT not in tag_hashes:
-        raise ProbeFailure(f"{RELEASE_TAG} does not resolve to {RELEASE_COMMIT}: {tag_hashes}")
+    if SOURCE_COMMIT not in tag_hashes:
+        raise ProbeFailure(f"{SOURCE_REF} does not resolve to {SOURCE_COMMIT}: {tag_hashes}")
     payload = run_command(
         ["curl", "-fsSL", INSTALLER_URL],
         environment,
@@ -368,7 +368,7 @@ def install_profile(
         {
             "CROSS_AGENT_CHAT_APPROVE": "1",
             "CROSS_AGENT_CHAT_PROVIDERS": "claude,codex",
-            "CROSS_AGENT_CHAT_SOURCE": f"git+{REPOSITORY}@{RELEASE_COMMIT}",
+            "CROSS_AGENT_CHAT_SOURCE": f"git+{REPOSITORY}@{SOURCE_COMMIT}",
             "CROSS_AGENT_CHAT_DEVICE": "g03-ci-probe",
         }
     )
@@ -426,7 +426,7 @@ def assert_healthy(
     if listener_pids(base) != [str(pid)]:
         raise ProbeFailure(f"{label} listener PID does not match launchd PID {pid}")
     version = run_command([str(program), "--version"], base, timeout=15.0)
-    if version.stdout.strip() != f"{SERVER_NAME} 0.4.0":
+    if version.stdout.strip() != f"{SERVER_NAME} 0.4.1":
         raise ProbeFailure(f"{label} launchd program has unexpected version: {version.stdout}")
 
 
@@ -644,7 +644,7 @@ def run_probe() -> int:
                 "service_lifecycle": "passed",
                 "authenticated_collaboration": "not_tested",
                 "gui_domain": "available",
-                "source": f"{RELEASE_TAG}@{RELEASE_COMMIT}",
+                "source": f"{SOURCE_LABEL}@{SOURCE_COMMIT}",
             },
             sort_keys=True,
         )
@@ -663,7 +663,7 @@ def main() -> int:
                     "reason": str(error),
                     "service_lifecycle": "not_run",
                     "authenticated_collaboration": "not_tested",
-                    "source": f"{RELEASE_TAG}@{RELEASE_COMMIT}",
+                    "source": f"{SOURCE_LABEL}@{SOURCE_COMMIT}",
                 },
                 sort_keys=True,
             ),
