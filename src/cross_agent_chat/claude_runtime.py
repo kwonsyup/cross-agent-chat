@@ -227,7 +227,9 @@ def _parse_targeted_claude_agents(text: str, session_id: str) -> list[ClaudeAgen
     return agents
 
 
-def claude_agents(session_id: str | None = None) -> list[ClaudeAgent]:
+def claude_agents(
+    session_id: str | None = None, *, timeout: float = AGENTS_TIMEOUT_SECONDS
+) -> list[ClaudeAgent]:
     try:
         completed = subprocess.run(
             [str(claude_binary()), "agents", "--json"],
@@ -236,7 +238,7 @@ def claude_agents(session_id: str | None = None) -> list[ClaudeAgent]:
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=AGENTS_TIMEOUT_SECONDS,
+            timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as error:

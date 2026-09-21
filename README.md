@@ -119,15 +119,15 @@ is implemented.
 
 ## Install
 
-Install v0.4.0 prerelease with:
+Install v0.4.1 prerelease with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.0/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.1/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 `CROSS_AGENT_CHAT_APPROVE=1` is set on `sh`, not on `curl`, and is required:
 it is the consent surface described above, and the script exits without it.
-This installs the released `v0.4.0` tag and performs setup in one step. The
+This installs the released `v0.4.1` tag and performs setup in one step. The
 stable command is `~/.local/bin/cross-agent-chat`; if your shell does not
 resolve it, put `~/.local/bin` on `PATH` or invoke the absolute path.
 Re-running the installer upgrades and repairs the owned configuration.

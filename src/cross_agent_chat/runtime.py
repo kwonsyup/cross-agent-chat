@@ -34,6 +34,7 @@ from types import FrameType
 from typing import BinaryIO, Final, Literal, cast
 from uuid import uuid4
 
+from cross_agent_chat import claude_runtime
 from cross_agent_chat.claude_runtime import (
     AGENTS_TIMEOUT_SECONDS,
     COURIER_ENV_KEYS,
@@ -548,6 +549,28 @@ def _registration_sigterm_scope() -> Iterator[None]:
         signal.signal(signal.SIGTERM, previous)
 
 
+def _native_claude_cwd(session_id: str) -> str | None:
+    try:
+        agents = claude_runtime.claude_agents(session_id, timeout=2.0)
+    except TypeError as error:
+        # Preserve compatibility with test/provider shims that predate the optional
+        # timeout while keeping the real provider call bounded above.
+        if "timeout" not in str(error):
+            return None
+        try:
+            agents = claude_runtime.claude_agents(session_id)
+        except (ChatError, TypeError):
+            return None
+    except ChatError:
+        return None
+    supported = [
+        agent
+        for agent in agents
+        if agent["session_id"] == session_id and agent["kind"] in {"interactive", "background"}
+    ]
+    return supported[0]["cwd"] if len(supported) == 1 else None
+
+
 def _spawn_courier(root: Path, route: Route) -> None:
     path = socket_path(root, route)
     owner_binary = recipient_owner_identity(route.provider, route.pid, route.profile_root)[1]
@@ -673,7 +696,24 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
         ):
             registry = Registry(root)
             registry.compact_dead()
-            registered = registry.upsert_or_reuse_live_owner(route)
+            prior_cwd_drift = [
+                item
+                for item in registry.routes()
+                if route.provider == "claude"
+                and item.provider == route.provider
+                and item.session_id == route.session_id
+                and item.device == route.device
+                and item.pid == route.pid
+                and item.owner_identity == route.owner_identity
+                and item.profile_root == route.profile_root
+                and item.cwd != route.cwd
+            ]
+            prior_route = prior_cwd_drift[0] if len(prior_cwd_drift) == 1 else None
+            registered = (
+                prior_route
+                if prior_route is not None
+                else registry.upsert_or_reuse_live_owner(route)
+            )
             if registered != route:
                 try:
                     bootstrap = request_socket(
@@ -696,6 +736,15 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
                     registry.upsert(route)
                 else:
                     if _bootstrap_response(bootstrap, registered):
+                        native_cwd = (
+                            _native_claude_cwd(route.session_id)
+                            if prior_route is not None
+                            else None
+                        )
+                        if prior_route is not None and native_cwd == route.cwd:
+                            registry.upsert(route)
+                            _spawn_courier(root, route)
+                            return route
                         return registered
                     raise ChatError("existing courier ownership could not be verified")
             _spawn_courier(root, route)

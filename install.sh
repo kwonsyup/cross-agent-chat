@@ -3,7 +3,7 @@ set -eu
 
 # The default release tag is usable after that tag is published. Before publication, set
 # CROSS_AGENT_CHAT_SOURCE to an available release or local candidate explicitly.
-source_ref=${CROSS_AGENT_CHAT_SOURCE:-git+https://github.com/kwonsyup/cross-agent-chat.git@v0.4.0}
+source_ref=${CROSS_AGENT_CHAT_SOURCE:-git+https://github.com/kwonsyup/cross-agent-chat.git@v0.4.1}
 
 fail() {
     printf '%s\n' "$1" >&2
@@ -64,7 +64,7 @@ Cross Agent Chat setup will:
 - install a runtime under ~/.local/share/cross-agent-chat-runtime, repoint the
   cross-agent-chat entrypoint, and restart the launchd broker (starts at login)
 Approve and re-run, for example:
-  curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.0/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+  curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.1/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 or from a local copy:
   CROSS_AGENT_CHAT_APPROVE=1 sh install.sh
 EOF
