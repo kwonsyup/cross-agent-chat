@@ -1,0 +1,21 @@
+name: Service lifecycle probe
+
+on:
+  push:
+    branches:
+      - luna/service-lifecycle-probe-20260921
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out probe
+        uses: actions/checkout@v4
+
+      - name: Run isolated G03 service lifecycle probe
+        run: python3 scripts/service-lifecycle-probe.py
