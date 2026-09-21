@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 - 2026-09-21
+
+- Preserve the route generation of a live Claude session when a repeated
+  SessionStart hook reports a different working directory. A responsive courier
+  and a bounded native-session lookup distinguish a valid existing route from
+  an invalid route that needs same-session recovery. Busy or ambiguous custody
+  is retained; existing intent records are never resolved or replayed.
+
 ## 0.4.0 - 2026-09-19
 
 - **Breaking:** `chat_peers` returns an opaque endpoint token (`cac2.…`) in the
