@@ -513,7 +513,24 @@ def create_durable_state(home: Path) -> tuple[Path, Path, bytes, int]:
     state.mkdir(parents=True, mode=0o700, exist_ok=True)
     intents = state / "intents.json"
     lock = state / ".intents.lock"
-    intent_bytes = b"[]\n"
+    # Synthetic metadata, with no accompanying sends. Keeping nonempty history
+    # catches an uninstall that silently resets the file to an empty list.
+    fixture_rows: list[dict[str, str | int]] = [
+        {
+            "schema_version": 1,
+            "event_id": f"00000000-0000-4000-8000-00000000000{index}",
+            "source_key": "1" * 64,
+            "source_generation": "00000000-0000-4000-8000-000000000010",
+            "source_alias": "claude@lifecycle-probe:synthetic",
+            "target_key": "2" * 64,
+            "target_generation": "00000000-0000-4000-8000-000000000020",
+            "payload_digest": hashlib.sha256(b"synthetic lifecycle metadata").hexdigest(),
+            "status": status,
+            "timestamp": "2026-09-01T00:00:00+00:00",
+        }
+        for index, status in enumerate(("TRANSPORT_ACCEPTED", "UNKNOWN_DELIVERY"), 1)
+    ]
+    intent_bytes = (json.dumps(fixture_rows, sort_keys=True) + "\n").encode()
     lock_bytes = b"g03 synthetic lock\n"
     intents.write_bytes(intent_bytes)
     lock.write_bytes(lock_bytes)
