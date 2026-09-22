@@ -26,7 +26,7 @@ terminal window.
 |---|---|
 | Claude Code | Native cross-session delivery through constrained helpers. Recorded working in GUI-hosted terminal sessions (Terminal.app, iTerm2, Ghostty). One SSH-launched session registered and listed, but delivery to it failed; start recipients from the logged-in desktop session. |
 | Codex CLI | Stop-bound by default: a queued message is handed over at the conversation's next natural turn. Reception while idle is not guaranteed, and pending input held only in the courier's memory is lost if it exits first. A profile-local opt-in experimental queue can deliver while idle on tested versions. |
-| Codex Native App | A managed helper bound to the original conversation/profile/account uses Desktop-native task messaging through trusted hooks. |
+| Codex Native App | A managed helper bound to the original conversation/profile/account uses Desktop-native task messaging through trusted hooks; an eligible helper-bound route reports `while_idle` reception. |
 | Local Devin (CLI or App) | Delivered at a prompt or Stop boundary. A conversation becomes discoverable only after its first user prompt. Receiving in an already-idle original conversation is a known gap, not a working feature. |
 
 Peers never need matching provider accounts or a shared coding platform. Remote
@@ -160,10 +160,11 @@ a remote peer, or the local state root on the same Mac — and is
 self-contained: at send time the sender re-reads the Tailscale authority for
 the node's current address and requires that one endpoint to re-attest the
 exact session and generation before any effect. A token whose session
-restarted under a new generation stops resolving; run `chat_peers` again and
-send to the fresh token. A raw pre-upgrade handle is refused with guidance to
-re-list. Display-name and alias selection still work against a complete
-roster; multiple matches or incomplete remote discovery require an exact
+restarted under a new generation stops resolving; that refusal happens before
+any effect, so run `chat_peers` again and send to the fresh token. A raw
+pre-upgrade handle is refused with guidance to re-list. Display-name and
+alias selection still work against a complete roster; multiple matches or
+incomplete remote discovery require an exact
 token. Tokens are selectors, not secrets — their encoding is not
 authentication, and holding one only names a recipient. An incomplete roster
 can be refreshed with another read-only `chat_peers` call, which never
@@ -204,6 +205,11 @@ reach the broker port is inside the peer trust perimeter, and peer message
 content remains untrusted input — it cannot grant owner authority, change
 approvals, or resolve a held permission prompt. See
 [SECURITY.md](SECURITY.md) for the full trust, privacy, and backup disclosure.
+
+Claude users may optionally set `dialogExpiry: "never"` in trusted user
+settings to remove the provider approval-dialog deadline for future held
+inbound messages. Cross Agent Chat does not set it, and it changes neither
+the inbound policy nor any delivery guarantee.
 
 ## Commands
 
@@ -249,7 +255,9 @@ every participating Mac.
   an accepted or unknown message.
 - **A token is refused or stops resolving.** The session restarted under a
   new generation, or the token predates v0.4.0. Call `chat_peers` and send to
-  the fresh token; there is no binding store to repair.
+  the fresh token — safe because a refusal is pre-effect; there is no binding
+  store to repair. Never replay a task whose earlier send was accepted
+  (`TRANSPORT_ACCEPTED`) or left unknown (`UNKNOWN_DELIVERY`).
 - **`TRANSPORT_ACCEPTED` but no answer.** Custody is not consumption — the
   answer still has to cross the recipient's receiving mode and your own
   `reply_delivery` mode. Inspect the recipient yourself; do not resend.
@@ -300,11 +308,6 @@ unresolved deliveries — are kept for owner inspection and are never resolved
 or replayed. Shared provider files keep their integration until their last
 recorded owner is removed. Pending Stop-bound deliveries live in courier
 memory; let them consume before uninstalling.
-
-Claude users may optionally set `dialogExpiry: "never"` in trusted user
-settings to remove the provider approval-dialog deadline for future held
-inbound messages. Cross Agent Chat does not set it, and it changes neither
-the inbound policy nor any delivery guarantee.
 
 ## How it works
 
