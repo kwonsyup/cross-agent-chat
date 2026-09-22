@@ -96,15 +96,15 @@ Prerequisites:
   non-default roots).
 - For remote peers: Tailscale with ACL-permitted reachability between the Macs.
 
-Install v0.4.1 prerelease with:
+Install v0.4.2 prerelease with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.1/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.2/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 `CROSS_AGENT_CHAT_APPROVE=1` is set on `sh`, not on `curl`, and is required:
 it is the consent surface described above, and the script exits without it.
-This installs the released `v0.4.1` tag and performs setup in one step. The
+This installs the released `v0.4.2` tag and performs setup in one step. The
 stable command is `~/.local/bin/cross-agent-chat`; if your shell does not
 resolve it, put `~/.local/bin` on `PATH` or invoke the absolute path.
 Re-running the installer upgrades and repairs the owned configuration.
@@ -125,10 +125,10 @@ that rule, and they are worth separating:
   envelope is unusable by the older side. Do not retry that exchange under a
   new event — start fresh sessions on both ends. Not every mixed-mode
   failure happens before effect.
-- **Loading the v0.4.1 repair.** v0.4.1 changes registration behavior but
-  leaves the endpoint protocol unchanged — it is not a second format break.
-  Fresh sessions are still required because a retained session keeps the MCP
-  and hook code it loaded at startup and never picks up the cwd repair.
+- **Loading the newer repairs.** v0.4.1 and v0.4.2 change runtime behavior
+  but leave the endpoint protocol unchanged — they are not second format
+  breaks. Fresh sessions are still required because a retained session keeps
+  the MCP and hook code it loaded at startup and never picks up the repairs.
   Sessions retained from before an upgrade may keep exchanging with other
   retained sessions through the upgraded broker.
 
