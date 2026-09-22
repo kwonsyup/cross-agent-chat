@@ -33,6 +33,7 @@ from cross_agent_chat.core import (
     UnknownDeliveryError,
     session_key,
 )
+from cross_agent_chat.native_helper import NativeHelperStore
 from cross_agent_chat.recipient import remote_token
 from cross_agent_chat.runtime import (
     OPERATION_TIMEOUT_SECONDS,
@@ -458,6 +459,279 @@ def test_local_send_retries_one_inventory_timeout_and_delivers(
     assert len(socket_calls) == 1
     intents = IntentStore(root).intents()
     assert [intent.status for intent in intents] == ["TRANSPORT_ACCEPTED"]
+
+
+def _local_target_for(route: Route) -> Target:
+    return Target(
+        alias=route.alias,
+        provider=route.provider,
+        device=route.device,
+        project=route.project,
+        generation=route.generation,
+        session_key=session_key(route.provider, route.session_id),
+        remote=False,
+        session_id=route.session_id,
+        cwd=route.cwd,
+        pid=route.pid,
+    )
+
+
+def _codex_pair(tmp_path: Path, root: Path) -> tuple[Route, Route]:
+    """A codex original and its REGISTERED native helper, both registry-live."""
+    profile = tmp_path / "codex-profile"
+    profile.mkdir(exist_ok=True)
+    project = tmp_path / "codex-project"
+    project.mkdir(exist_ok=True)
+    original = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(project),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+        profile_root=str(profile),
+    )
+    store = NativeHelperStore(root)
+    binding, nonce = store.reserve(original, "a" * 64)
+    helper_root = tmp_path / binding.helper_directory
+    helper_root.mkdir()
+    helper = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(helper_root),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+        profile_root=str(profile),
+    )
+    store.register(helper, nonce, original, "a" * 64)
+    Registry(root).upsert(original)
+    Registry(root).upsert(helper)
+    return original, helper
+
+
+@pytest.mark.parametrize("timeout_first", [False, True])
+def test_local_target_replaced_during_inventory_aborts_the_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout_first: bool
+) -> None:
+    """The recipient generation is revalidated after a slow sender inventory."""
+    root = tmp_path / "state"
+    source = _claude_route(tmp_path, project="source")
+    target_route = _claude_route(tmp_path, project="target")
+    Registry(root).upsert(source)
+    Registry(root).upsert(target_route)
+    target = _local_target_for(target_route)
+    agent = _sender_agent(source)
+    attempts: list[float] = []
+
+    def agents(_session_id: str, *, timeout: float) -> list[dict[str, str]]:
+        attempts.append(timeout)
+        if timeout_first and len(attempts) == 1:
+            raise ClaudeAgentsPreflightTimeout("Claude agents preflight timed out")
+        replacement = Route.create(
+            provider="claude",
+            session_id=target_route.session_id,
+            device=target_route.device,
+            cwd=target_route.cwd,
+            pid=target_route.pid,
+        )
+        Registry(root).upsert(replacement)
+        return [agent]
+
+    monkeypatch.setattr(claude_runtime, "claude_agents", agents)
+    monkeypatch.setattr(
+        runtime,
+        "request_socket",
+        lambda *_a, **_k: pytest.fail("accept ran for a superseded target"),
+    )
+
+    with pytest.raises(ChatError, match="target changed before transport acceptance"):
+        runtime._send_local_target(
+            root, source, target, "synthetic reply", deadline=time.monotonic() + 60.0
+        )
+
+    assert len(attempts) == (2 if timeout_first else 1)
+    assert IntentStore(root).intents() == []
+
+
+def test_bound_original_replaced_during_inventory_aborts_the_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale original is not revived through its registered helper binding."""
+    root = tmp_path / "state"
+    source = _claude_route(tmp_path, project="source")
+    Registry(root).upsert(source)
+    original, _helper = _codex_pair(tmp_path, root)
+    target = _local_target_for(original)
+    agent = _sender_agent(source)
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_a, **_k: ("a" * 64, Path("/bin/echo"))
+    )
+
+    def agents(_session_id: str, *, timeout: float) -> list[dict[str, str]]:
+        replacement = Route.create(
+            provider="codex",
+            session_id=original.session_id,
+            device=original.device,
+            cwd=original.cwd,
+            pid=original.pid,
+            owner_identity=original.owner_identity,
+            profile_root=original.profile_root,
+        )
+        Registry(root).upsert(replacement)
+        return [agent]
+
+    monkeypatch.setattr(claude_runtime, "claude_agents", agents)
+    monkeypatch.setattr(
+        runtime,
+        "request_socket",
+        lambda *_a, **_k: pytest.fail("accept ran for a superseded target"),
+    )
+
+    with pytest.raises(ChatError, match="target changed before transport acceptance"):
+        runtime._send_local_target(
+            root, source, target, "synthetic reply", deadline=time.monotonic() + 60.0
+        )
+
+    assert IntentStore(root).intents() == []
+
+
+def test_live_helper_still_delivers_after_the_sender_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A still-current helper binding keeps routing the accept to the helper."""
+    root = tmp_path / "state"
+    source = _claude_route(tmp_path, project="source")
+    Registry(root).upsert(source)
+    original, helper = _codex_pair(tmp_path, root)
+    target = _local_target_for(original)
+    agent = _sender_agent(source)
+    attempts: list[float] = []
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_a, **_k: ("a" * 64, Path("/bin/echo"))
+    )
+
+    def agents(_session_id: str, *, timeout: float) -> list[dict[str, str]]:
+        attempts.append(timeout)
+        if len(attempts) == 1:
+            raise ClaudeAgentsPreflightTimeout("Claude agents preflight timed out")
+        return [agent]
+
+    monkeypatch.setattr(claude_runtime, "claude_agents", agents)
+    socket_calls: list[Path] = []
+
+    def accept(path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        socket_calls.append(path)
+        return {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": helper.alias,
+            "provider": "codex",
+        }
+
+    monkeypatch.setattr(runtime, "request_socket", accept)
+
+    result = runtime._send_local_target(
+        root, source, target, "synthetic reply", deadline=time.monotonic() + 60.0
+    )
+
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+    assert socket_calls == [runtime.socket_path(root, helper)]
+    assert len(attempts) == 2
+    intents = IntentStore(root).intents()
+    assert [intent.status for intent in intents] == ["TRANSPORT_ACCEPTED"]
+
+
+def test_helper_replaced_during_inventory_is_not_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A superseded helper generation is dropped; only the current original delivers."""
+    root = tmp_path / "state"
+    source = _claude_route(tmp_path, project="source")
+    Registry(root).upsert(source)
+    original, helper = _codex_pair(tmp_path, root)
+    target = _local_target_for(original)
+    agent = _sender_agent(source)
+    attempts: list[float] = []
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_a, **_k: ("a" * 64, Path("/bin/echo"))
+    )
+
+    def agents(_session_id: str, *, timeout: float) -> list[dict[str, str]]:
+        attempts.append(timeout)
+        if len(attempts) == 1:
+            raise ClaudeAgentsPreflightTimeout("Claude agents preflight timed out")
+        replacement = Route.create(
+            provider="codex",
+            session_id=helper.session_id,
+            device=helper.device,
+            cwd=helper.cwd,
+            pid=helper.pid,
+            owner_identity=helper.owner_identity,
+            profile_root=helper.profile_root,
+        )
+        Registry(root).upsert(replacement)
+        return [agent]
+
+    monkeypatch.setattr(claude_runtime, "claude_agents", agents)
+    socket_calls: list[Path] = []
+
+    def accept(path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        socket_calls.append(path)
+        return {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": original.alias,
+            "provider": "codex",
+        }
+
+    monkeypatch.setattr(runtime, "request_socket", accept)
+
+    result = runtime._send_local_target(
+        root, source, target, "synthetic reply", deadline=time.monotonic() + 60.0
+    )
+
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+    assert socket_calls == [runtime.socket_path(root, original)]
+    assert len(attempts) == 2
+    intents = IntentStore(root).intents()
+    assert [intent.status for intent in intents] == ["TRANSPORT_ACCEPTED"]
+
+
+def test_local_send_fails_closed_when_the_inventory_consumes_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spent budget keeps the decided timeout without a second provider spawn."""
+    now = [1_000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    root = tmp_path / "state"
+    source = _claude_route(tmp_path, project="source")
+    target_route = _claude_route(tmp_path, project="target")
+    Registry(root).upsert(source)
+    Registry(root).upsert(target_route)
+    target = _local_target_for(target_route)
+    attempts: list[float] = []
+    deadline = now[0] + 60.0
+
+    def agents(_session_id: str, *, timeout: float) -> list[dict[str, str]]:
+        attempts.append(timeout)
+        now[0] += 60.0
+        raise ClaudeAgentsPreflightTimeout("Claude agents preflight timed out")
+
+    monkeypatch.setattr(claude_runtime, "claude_agents", agents)
+    socket_calls: list[Path] = []
+    monkeypatch.setattr(
+        runtime, "request_socket", lambda path, *_a, **_k: socket_calls.append(path)
+    )
+
+    with pytest.raises(ClaudeAgentsPreflightTimeout, match="timed out"):
+        runtime._send_local_target(root, source, target, "synthetic reply", deadline=deadline)
+
+    assert attempts == [AGENTS_TIMEOUT_SECONDS]
+    assert socket_calls == []
+    assert IntentStore(root).intents() == []
 
 
 def test_inventory_timeout_is_typed_and_carries_no_provider_output(
