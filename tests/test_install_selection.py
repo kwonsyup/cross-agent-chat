@@ -111,11 +111,11 @@ def test_real_cli_doctor_reports_fresh_profile_without_writes(
             "local_broker": "unavailable",
             "next": "cross-agent-chat setup",
             "remote_trust": "tailscale_acl",
-            "version": "0.4.1",
+            "version": "0.4.2",
         }
     else:
         assert result.stdout == (
-            "version: 0.4.1\n"
+            "version: 0.4.2\n"
             "integration: needs setup\n"
             "codex_native_queue: stop-bound\n"
             "local_broker: unavailable\n"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -126,6 +127,15 @@ class ClaudeSendMessageRefused(ChatError):
     """The provider reported a decided non-delivery before any effect."""
 
 
+class ClaudeAgentsPreflightTimeout(ChatError):
+    """The read-only `claude agents --json` inventory exceeded its bound.
+
+    The type itself carries the classification: senders may retry this one
+    bounded, pre-intent, pre-effect stage once inside the original operation
+    deadline. Every other preflight failure stays a plain decided ChatError.
+    """
+
+
 class ClaudeSendMessageUnknownDelivery(UnknownDeliveryError):
     """A body-free local phase for an otherwise unknown Claude delivery."""
 
@@ -227,6 +237,17 @@ def _parse_targeted_claude_agents(text: str, session_id: str) -> list[ClaudeAgen
     return agents
 
 
+def _spawn_failure_category(error: OSError) -> str:
+    """Reduce a spawn failure to its errno name or bare exception category.
+
+    The provider's stderr, resolved binary path and environment never enter
+    the message; an errno name or exception class is the whole diagnostic.
+    """
+    if error.errno is not None:
+        return errno.errorcode.get(error.errno, str(error.errno))
+    return type(error).__name__
+
+
 def claude_agents(
     session_id: str | None = None, *, timeout: float = AGENTS_TIMEOUT_SECONDS
 ) -> list[ClaudeAgent]:
@@ -241,20 +262,26 @@ def claude_agents(
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise ChatError("Claude agents preflight failed") from error
+    except subprocess.TimeoutExpired as error:
+        raise ClaudeAgentsPreflightTimeout("Claude agents preflight timed out") from error
+    except OSError as error:
+        raise ChatError(
+            f"Claude agents preflight failed (spawn {_spawn_failure_category(error)})"
+        ) from error
+    except subprocess.SubprocessError as error:
+        raise ChatError(f"Claude agents preflight failed ({type(error).__name__})") from error
     if completed.returncode != 0:
-        raise ChatError("Claude agents preflight failed")
+        raise ChatError(f"Claude agents preflight failed (exit {completed.returncode})")
     if session_id is None:
         return parse_claude_agents(completed.stdout)
     return _parse_targeted_claude_agents(completed.stdout, session_id)
 
 
-def exact_agent(session_id: str, cwd: str) -> ClaudeAgent:
+def exact_agent(session_id: str, cwd: str, timeout: float = AGENTS_TIMEOUT_SECONDS) -> ClaudeAgent:
     valid_uuid(session_id, "Claude session id")
     matches = [
         agent
-        for agent in claude_agents(session_id)
+        for agent in claude_agents(session_id, timeout=timeout)
         if agent["session_id"] == session_id
         and agent["kind"] in {"interactive", "background"}
         and agent["cwd"] == cwd

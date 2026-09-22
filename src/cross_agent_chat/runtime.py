@@ -40,6 +40,7 @@ from cross_agent_chat.claude_runtime import (
     COURIER_ENV_KEYS,
     DISCOVERY_TIMEOUT_SECONDS,
     SEND_TIMEOUT_SECONDS,
+    ClaudeAgentsPreflightTimeout,
     ClaudeSendMessageUnknownDelivery,
     claude_alias,
     claude_binary,
@@ -126,6 +127,7 @@ BROKER_CAPACITY_REFUSAL: Final[dict[str, object]] = {
 SOCKET_TIMEOUT_SECONDS: Final = 5.0
 MCP_TOOL_TIMEOUT_SECONDS: Final = 270.0
 OPERATION_TIMEOUT_SECONDS: Final = 260.0
+SOURCE_INVENTORY_RETRY_MINIMUM_SECONDS: Final = 1.0
 HEALTH_TIMEOUT_SECONDS: Final = AGENTS_TIMEOUT_SECONDS + 2.0
 REMOTE_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS + 5.0
 ACCEPT_TIMEOUT_SECONDS: Final = (
@@ -2153,13 +2155,28 @@ def wrapped_message(
         ) from error
 
 
-def canonical_source_alias(root: Path, source: Route) -> str:
+def canonical_source_alias(root: Path, source: Route, *, deadline: float | None = None) -> str:
     """Return the exact currently live public alias for an authenticated sender."""
     if not _route_current(root, source):
         raise ChatError("sender route changed before transport acceptance")
     if source.provider in {"codex", "devin"}:
         return source.alias
-    agent = exact_agent(source.session_id, source.cwd)
+    attempt_timeout = (
+        AGENTS_TIMEOUT_SECONDS
+        if deadline is None
+        else _remaining_operation_timeout(deadline, AGENTS_TIMEOUT_SECONDS)
+    )
+    try:
+        agent = exact_agent(source.session_id, source.cwd, attempt_timeout)
+    except ClaudeAgentsPreflightTimeout:
+        if deadline is None:
+            raise
+        remaining = deadline - time.monotonic()
+        if remaining < SOURCE_INVENTORY_RETRY_MINIMUM_SECONDS:
+            raise
+        agent = exact_agent(source.session_id, source.cwd, min(AGENTS_TIMEOUT_SECONDS, remaining))
+    if not _route_current(root, source):
+        raise ChatError("sender route changed before transport acceptance")
     return claude_alias(source.device, source.project, agent)
 
 
@@ -2180,6 +2197,7 @@ def _send_local_target(
 ) -> dict[str, object]:
     if target.session_id is None or target.pid is None or target.cwd is None:
         raise ChatError("target route is incomplete")
+    source_alias = canonical_source_alias(root, source, deadline=deadline)
     current_routes = Registry(root).routes()
     route_matches = [
         route
@@ -2199,7 +2217,6 @@ def _send_local_target(
             if not _route_current(root, helper):
                 raise ChatError("native helper is unavailable")
             delivery_route = helper
-    source_alias = canonical_source_alias(root, source)
     event_id = str(uuid4())
     source_token = local_token(
         root, session_key(source.provider, source.session_id), source.generation
@@ -2416,7 +2433,7 @@ def _send_remote_target(
 ) -> dict[str, object]:
     if target.tailnet_address is None:
         raise ChatError("remote target route is incomplete")
-    source_alias = canonical_source_alias(root, source)
+    source_alias = canonical_source_alias(root, source, deadline=deadline)
     event_id = str(uuid4())
     source_token = remote_token(
         self_node_id, session_key(source.provider, source.session_id), source.generation

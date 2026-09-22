@@ -312,7 +312,7 @@ def test_claude_agents_skip_an_unrelated_disappeared_workspace(
             "cwd": str(tmp_path.resolve()),
         }
     ]
-    monkeypatch.setattr(claude_runtime, "claude_agents", lambda *_: agents)
+    monkeypatch.setattr(claude_runtime, "claude_agents", lambda *_, **__: agents)
     with pytest.raises(ChatError, match="exact live supported"):
         claude_runtime.exact_agent(stale_session, str(stale_workspace))
 
@@ -1854,7 +1854,9 @@ def test_local_claude_diagnostic_marks_one_unknown_without_body_leakage(
         cwd=target_route.cwd,
         pid=target_route.pid,
     )
-    monkeypatch.setattr("cross_agent_chat.runtime.canonical_source_alias", lambda *_: source.alias)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.canonical_source_alias", lambda *_, **__: source.alias
+    )
 
     def response(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
         value: dict[str, object] = {
@@ -1930,7 +1932,7 @@ def test_supported_claude_kind_preserves_exact_native_target(
 
     session_id = str(uuid4())
     agent = {"session_id": session_id, "name": "Exact target", "kind": kind, "cwd": str(tmp_path)}
-    monkeypatch.setattr(claude_runtime, "claude_agents", lambda *_: [agent])
+    monkeypatch.setattr(claude_runtime, "claude_agents", lambda *_, **__: [agent])
     assert claude_runtime.exact_agent(session_id, str(tmp_path)) == agent
     with pytest.raises(ChatError):
         claude_runtime.exact_agent(str(uuid4()), str(tmp_path))

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.2 - 2026-09-22
+
+- The sender's read-only `claude agents` session-inventory preflight now
+  classifies failures instead of collapsing them — a typed timeout for the
+  subprocess bound, an errno/exception category for spawn failures, and the
+  exit status for nonzero exits — never provider stderr, env, or config.
+- A typed inventory timeout may be retried exactly once inside the caller's
+  unchanged absolute operation deadline, each attempt capped by the remaining
+  budget; a sub-floor remainder fails closed. Every other failure stays
+  decided: nonzero exit, spawn, malformed, authentication, ambiguous session,
+  and wrong-profile errors are never retried, and no possible-effect path
+  (`courier_accept`, `sendmessage`, `request_tailnet`, or any accepted or
+  unknown send) gains a retry.
+- After a slow or retried inventory, both the source route generation and the
+  local recipient snapshot are revalidated against fresh registry state
+  before an intent is created or a socket is opened, so a superseded target
+  cannot receive an intent after replacement.
+- README first-use path reorganized: material setup effects, consent, and
+  backups precede the install command; the pre-v0.4.0 token break is
+  separated from the code-loading rule; a per-failure cause/next-action list
+  keeps `doctor` scoped to configuration and broker health.
+
 ## 0.4.1 - 2026-09-21
 
 - Preserve the route generation of a live Claude session when a repeated

@@ -254,7 +254,7 @@ def test_remote_token_send_probes_only_the_pinned_node(
         lambda: TailnetIdentity(self_node_id="nSelf", peers={"nOwner": "100.64.0.10"}),
     )
     monkeypatch.setattr(runtime, "_remote_node_targets", lambda *args, **kwargs: ([target], True))
-    monkeypatch.setattr(runtime, "canonical_source_alias", lambda *_: source.alias)
+    monkeypatch.setattr(runtime, "canonical_source_alias", lambda *_, **__: source.alias)
     responses: list[dict[str, object]] = []
 
     def send_remote(
