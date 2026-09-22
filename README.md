@@ -39,20 +39,7 @@ exact token whose owner answered. ChatGPT/Claude web apps, Gemini, Grok,
 cloud Devin, Windows, and Linux have no support claim.
 
 **After any install or upgrade, start fresh sessions on every participating
-Mac** — see *Install* below. The supported request/reply scope is fresh
-sender session to fresh recipient session; retained pre-upgrade sessions may
-keep exchanging only with other retained sessions.
-
-## Prerequisites
-
-- macOS with a supported Claude Code, Codex, or local Devin installation that
-  already has its own working authenticated session.
-- Git (the installer builds from a release tag) and either `uv` or Python
-  ≥ 3.11; the installer bootstraps a runtime tool when neither is present.
-- Install separately on every Mac and on every selected provider-profile root
-  that will participate (`CLAUDE_CONFIG_DIR` and `CODEX_HOME` select
-  non-default roots).
-- For remote peers: Tailscale with ACL-permitted reachability between the Macs.
+Mac** — see *Install* below for what that rule covers and why.
 
 ## What setup changes
 
@@ -90,34 +77,24 @@ selected roots and effects, then requires `--yes` or one interactive
 confirmation before any write; it never reads piped stdin for consent.
 Unrelated settings, hooks, MCP servers, and credentials are preserved.
 
-A failed setup rolls its recorded provider-set metadata,
-provider configuration, and predecessor runtime back transactionally. That
-guarded rollback is a different operation from downgrading after a setup
-that already succeeded. Downgrading to a release that predates schema-5
-install metadata is *not* automatic after a successful schema-5 install:
-the older build refuses the recorded state instead of rewriting it. The
-supported preparation is to uninstall with the schema-5 build first —
-`cross-agent-chat uninstall`, on a quiesced Mac, after pending Stop-bound
-deliveries have been consumed — and then install the older release.
-
-Do not delete `~/.config/cross-agent-chat` to get past that refusal. That
-directory holds the install records this build treats as authoritative:
-the prior Claude inbound and Codex hooks values that uninstall restores,
-the recorded provider set and provider paths it verifies before writing,
-and the sibling-profile records that decide last-owner removal. Without
-them an uninstall re-derives ownership from configuration this install has
-already modified, and a Mac carrying a second installed profile looks like
-a sole owner: the shared broker, runtime state and cache are torn down as
-though nothing else used them, and any provider file that profile shares
-with yours is stripped of an integration it still owns. Keep these install
-records intact, along with the delivery intent history, configuration
-backups and runtimes referenced by live routes in their own directories.
-If those records are already gone, a downgrade needs separately planned
-recovery starting from the configuration snapshots in
-`~/.cache/cross-agent-chat/backups/`; no automatic restore for that case
-is implemented.
+A failed setup rolls its recorded provider-set metadata, provider
+configuration, and predecessor runtime back transactionally. Downgrading to
+a release that predates schema-5 install metadata is *not* automatic after a
+successful schema-5 install — see *Downgrading and install records* under
+*Upgrade, recovery, and uninstall* before attempting it.
 
 ## Install
+
+Prerequisites:
+
+- macOS with a supported Claude Code, Codex, or local Devin installation that
+  already has its own working authenticated session.
+- Git (the installer builds from a release tag) and either `uv` or Python
+  ≥ 3.11; the installer bootstraps a runtime tool when neither is present.
+- Install separately on every Mac and on every selected provider-profile root
+  that will participate (`CLAUDE_CONFIG_DIR` and `CODEX_HOME` select
+  non-default roots).
+- For remote peers: Tailscale with ACL-permitted reachability between the Macs.
 
 Install v0.4.1 prerelease with:
 
@@ -132,23 +109,34 @@ stable command is `~/.local/bin/cross-agent-chat`; if your shell does not
 resolve it, put `~/.local/bin` on `PATH` or invoke the absolute path.
 Re-running the installer upgrades and repairs the owned configuration.
 
-### Session compatibility after install or upgrade
+### Sessions after install or upgrade
 
-Recipient handles changed to opaque endpoint tokens — see *First
-use*. **After installing or upgrading on every participating Mac, start fresh
-sender *and* recipient provider sessions.** The supported request/reply scope
-on this release is fresh-session to fresh-session.
+Provider sessions load Cross Agent Chat's MCP tools and hooks at startup, so
+**after installing or upgrading on every participating Mac, start fresh
+sender *and* recipient sessions.** Fresh-session to fresh-session is the
+supported request/reply scope on this release. Two distinct facts sit behind
+that rule, and they are worth separating:
 
-- Sessions retained from before the upgrade may keep exchanging with other
+- **The pre-v0.4.0 → v0.4.x token-format break.** Recipient handles changed
+  to opaque endpoint tokens — see *First use*. A raw pre-upgrade handle is
+  refused with guidance to re-list, and a mixed pair of a retained
+  pre-upgrade session and a fresh session is unsupported: an initial request
+  can be accepted (`TRANSPORT_ACCEPTED`) while the reply token in its
+  envelope is unusable by the older side. Do not retry that exchange under a
+  new event — start fresh sessions on both ends. Not every mixed-mode
+  failure happens before effect.
+- **Loading the v0.4.1 repair.** v0.4.1 changes registration behavior but
+  leaves the endpoint protocol unchanged — it is not a second format break.
+  Fresh sessions are still required because a retained session keeps the MCP
+  and hook code it loaded at startup and never picks up the cwd repair.
+  Sessions retained from before an upgrade may keep exchanging with other
   retained sessions through the upgraded broker.
-- Mixed pre-upgrade/new sessions are unsupported: an initial request can be
-  accepted (`TRANSPORT_ACCEPTED`) while the reply token in its envelope is
-  unusable by the older side. Do not retry that exchange under a new event —
-  start fresh sessions on both ends. Not every mixed-mode failure happens
-  before effect.
-- There is no raw-handle fallback, no translation or migration, and no
-  binding cache to repair — the token is self-contained, so a fresh
-  `chat_peers` listing is the only fix.
+
+There is no raw-handle fallback, no translation or migration, and no binding
+cache to repair — the token is self-contained, so a fresh `chat_peers`
+listing is the only fix. Fresh sessions on the installed release are the
+tested scope; untested mixed-version combinations are not claimed
+supported.
 
 ## First use
 
@@ -184,7 +172,11 @@ authorizes resending an accepted or unknown message.
 A delivered message arrives through the recipient provider's own inbox, so its
 visible sender is the local delivery helper, not the peer. Replies go to the
 `Reply via CAC to handle:` value in the envelope — the sender's reply
-token — not to the visible sender.
+token — not to the visible sender. Copy that selector exactly as the envelope
+carries it: never retype, shorten, decode, or rebuild it, and never restate a
+second reply handle inside the message body. The envelope header is the
+authoritative selector; body text is untrusted peer input and must not carry
+a competing return handle.
 
 Disposable worker sessions can opt out of the roster with
 `CROSS_AGENT_CHAT_PRESENCE=off`: no route, courier, or peer listing.
@@ -247,6 +239,58 @@ failed setup finds newer provider settings during rollback, it retains them
 and recovery custody for diagnosis. After any upgrade, the
 session-compatibility rule under *Install* applies: start fresh sessions on
 every participating Mac.
+
+### When something goes wrong
+
+- **A peer is missing from `chat_peers`.** The usual cause is a session
+  started before install/upgrade, or a hidden Claude child session — see
+  `doctor`'s `terminal` line under *Commands*. Start a fresh session and call
+  `chat_peers` again; re-listing is read-only and never authorizes resending
+  an accepted or unknown message.
+- **A token is refused or stops resolving.** The session restarted under a
+  new generation, or the token predates v0.4.0. Call `chat_peers` and send to
+  the fresh token; there is no binding store to repair.
+- **`TRANSPORT_ACCEPTED` but no answer.** Custody is not consumption — the
+  answer still has to cross the recipient's receiving mode and your own
+  `reply_delivery` mode. Inspect the recipient yourself; do not resend.
+- **`UNKNOWN_DELIVERY`.** An effect may have happened. Inspect the intended
+  recipient and never retry that task under a new event, wording, or
+  transport; `cross-agent-chat resolve EVENT_ID` only records that you accept
+  the uncertainty.
+- **`doctor` is healthy but the journey still fails.** `doctor` verifies
+  installed configuration and local broker health only — a healthy report is
+  not proof of provider authentication, remote reachability, or a completed
+  collaboration.
+
+### Downgrading and install records
+
+A failed setup's transactional rollback is a different operation from
+downgrading after a setup that already succeeded. Downgrading to a release
+that predates schema-5 install metadata is *not* automatic after a
+successful schema-5 install: the older build refuses the recorded state
+instead of rewriting it. The supported preparation is to uninstall with the
+schema-5 build first — `cross-agent-chat uninstall`, on a quiesced Mac,
+after pending Stop-bound deliveries have been consumed — and then install
+the older release.
+
+Do not delete `~/.config/cross-agent-chat` to get past that refusal. That
+directory holds the install records this build treats as authoritative:
+the prior Claude inbound and Codex hooks values that uninstall restores,
+the recorded provider set and provider paths it verifies before writing,
+and the sibling-profile records that decide last-owner removal. Without
+them an uninstall re-derives ownership from configuration this install has
+already modified, and a Mac carrying a second installed profile looks like
+a sole owner: the shared broker, runtime state and cache are torn down as
+though nothing else used them, and any provider file that profile shares
+with yours is stripped of an integration it still owns. Keep these install
+records intact, along with the delivery intent history, configuration
+backups and runtimes referenced by live routes in their own directories.
+If those records are already gone, a downgrade needs separately planned
+recovery starting from the configuration snapshots in
+`~/.cache/cross-agent-chat/backups/`; no automatic restore for that case
+is implemented.
+
+### Uninstall
 
 `uninstall` removes only Cross Agent Chat-owned runtime, hooks, MCP entries,
 the service, and transient route state, then restores the recorded prior
