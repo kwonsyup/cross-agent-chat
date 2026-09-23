@@ -64,9 +64,9 @@ Reviews reject changes that weaken these, even to make a test pass:
 - No replay of accepted or uncertain work. `TRANSPORT_ACCEPTED` is custody,
   `UNKNOWN_DELIVERY` means an effect may have happened; neither may be retried
   by the product.
-- Exact-recipient selection. Ambiguous names, incomplete discovery, a raw
-  pre-upgrade handle, and a token whose session or generation no longer
-  re-attests all refuse before any effect. Endpoint tokens are self-contained;
+- Exact-recipient selection. Ambiguous names, name selection against an
+  incomplete roster, a raw pre-upgrade handle, and a token whose session or
+  generation no longer re-attests all refuse before any effect. Endpoint tokens are self-contained;
   there is no binding store to migrate.
 - Bound sender identity. Codex thread metadata, Claude process/profile checks,
   and Devin's single-use trusted-hook capability — the model never nominates

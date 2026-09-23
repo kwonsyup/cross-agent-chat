@@ -51,7 +51,8 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 - **Exact recipient selection:** `recipient.py` mints/parses endpoint tokens;
   `runtime.py` re-attests session key + generation + presenting endpoint at
   send time. Raw pre-upgrade handles, stale generations, ambiguous names, and
-  incomplete discovery refuse before effect. There is no binding store —
+  name selection against an incomplete roster refuse before effect; an exact
+  token needs only its own endpoint to answer. There is no binding store —
   tokens are self-contained.
 - **Durable effects:** `core.py` intent store — event IDs, digests, statuses;
   `resolve_by_owner` is the only owner disposition and never proves delivery.
