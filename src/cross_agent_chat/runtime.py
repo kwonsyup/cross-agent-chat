@@ -1150,6 +1150,36 @@ def courier_accept(
         }
 
 
+FORWARDABLE_PRE_EFFECT_REASONS: Final = frozenset(
+    {
+        "Claude ListAgents discovery timed out",
+        "Claude ListAgents discovery failed",
+        "Claude target discovery is not one exact supported match",
+        "Claude target is not one exact live supported session",
+        "Claude target changed during discovery",
+        "Claude agents preflight timed out",
+        "Claude Code executable is unavailable",
+        "Claude agents response is invalid",
+        "Claude target reference is invalid",
+        "Claude SendMessage courier setup failed",
+        "Claude courier finished without a SendMessage call",
+        "session courier is still bootstrapping",
+        "Codex courier is unavailable",
+        "Codex courier queue is full",
+        "Codex native queue is unavailable",
+        "Codex native queue response exceeds the bounded limit",
+        "Codex native queue profile changed",
+        "Codex native queue preflight failed",
+        "Codex native queue rejected the message before acceptance",
+        "Devin inbox is unavailable",
+        "message is invalid",
+        "message must not be empty",
+        "message exceeds the 16 KiB limit",
+        "message exceeds the encoded frame budget",
+    }
+)
+
+
 def pre_effect_error(response: dict[str, object], event_id: str, provider: Provider) -> str | None:
     if set(response) != {"schema_version", "event_id", "status", "provider", "error"}:
         return None
@@ -2656,13 +2686,18 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
             "to": target.alias if delivery_route is routes[0] else delivery_route.alias,
             "provider": delivery_route.provider,
         }
-        if pre_effect_error(response, event_id, target.provider) is not None:
+        courier_rejection = pre_effect_error(response, event_id, target.provider)
+        if courier_rejection is not None:
             return {
                 "schema_version": SCHEMA_VERSION,
                 "event_id": event_id,
                 "status": "PRE_EFFECT_REJECTED",
                 "provider": target.provider,
-                "error": "remote destination rejected before provider effect",
+                "error": (
+                    courier_rejection
+                    if courier_rejection in FORWARDABLE_PRE_EFFECT_REASONS
+                    else "remote destination rejected before provider effect"
+                ),
             }
         if unknown_delivery_diagnostic(response, event_id, target.provider) is not None:
             return response

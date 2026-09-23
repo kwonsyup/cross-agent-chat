@@ -2568,6 +2568,111 @@ def test_remote_receiver_sanitizes_pre_effect_provider_error(
     }
 
 
+def test_remote_send_surfaces_allowlisted_courier_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sender_root = tmp_path / "sender"
+    receiver_root = tmp_path / "receiver"
+    sender_root.mkdir(mode=0o700)
+    receiver_root.mkdir(mode=0o700)
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="source",
+        cwd=str(sender_root),
+        pid=os.getpid(),
+    )
+    Registry(sender_root).upsert(source)
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="target",
+        cwd=str(receiver_root),
+        pid=os.getpid(),
+    )
+    Registry(receiver_root).upsert(target)
+    public_target = Target(
+        alias=target.alias,
+        provider=target.provider,
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=session_key(target.provider, target.session_id),
+        remote=False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    original_local_targets = runtime.local_targets
+
+    def select_targets(root: Path, *, handle: str | None = None) -> list[Target]:
+        if root == receiver_root:
+            return [public_target]
+        return original_local_targets(root, handle=handle)
+
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", select_targets)
+    sender_address = "100.64.0.10"
+    receiver_address = "100.64.0.11"
+
+    def request(address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        if payload.get("operation") == "peers":
+            if address != receiver_address:
+                return {"schema_version": 1, "peers": []}
+            return {
+                "schema_version": 1,
+                "peers": [
+                    {
+                        "alias": target.alias,
+                        "provider": "codex",
+                        "device": "target",
+                        "project": target.project,
+                        "status": "available",
+                        "generation": target.generation,
+                        "session_key": session_key(target.provider, target.session_id),
+                    }
+                ],
+            }
+        if "envelope" in payload:
+            return receive_remote(receiver_root, str(payload["envelope"]), sender_address)
+        return {key: value for key, value in payload.items() if key != "operation"} | {
+            "status": "AUTHORIZED"
+        }
+
+    def courier(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        if payload.get("operation") == "accept":
+            return {
+                "schema_version": 1,
+                "event_id": payload["event_id"],
+                "status": "PRE_EFFECT_REJECTED",
+                "provider": "codex",
+                "error": "session courier is still bootstrapping",
+            }
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": payload.get("generation"),
+        }
+
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.tailnet_identity",
+        lambda: TailnetIdentity(
+            self_node_id="nSelf",
+            peers={"nSelf": sender_address, "nNodeA": receiver_address},
+        ),
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.request_tailnet", request)
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", courier)
+
+    with pytest.raises(ChatError, match="session courier is still bootstrapping") as caught:
+        send(sender_root, source, target.alias, "hello")
+
+    assert str(caught.value) == (
+        "remote target rejected the message before provider effect: "
+        "session courier is still bootstrapping; nothing was delivered"
+    )
+    assert IntentStore(sender_root).intents()[0].status == "PRE_EFFECT_REJECTED"
+
+
 def test_wrapped_message_limit_rejects_before_intent_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
