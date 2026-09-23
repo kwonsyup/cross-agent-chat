@@ -13,8 +13,9 @@ the same Mac.
   Tailscale network. Sessions on the same Mac need nothing extra.
 - **Keep your setup.** It uses the provider logins, terminal apps, and projects
   you already have. There are no new accounts, peer lists, or terminal plugins.
-- **Get exactly one delivery.** Every message goes to one exact session, once.
-  Replies return to the session that asked.
+- **Reach one exact session.** Every message goes to the one session you
+  picked, and Cross Agent Chat never re-sends a message on its own. Replies
+  return to the session that asked.
 
 ## How you use it
 
@@ -113,7 +114,7 @@ To keep a short-lived worker session off the peer list, start it with
 | Result | Meaning | What to do |
 |---|---|---|
 | `TRANSPORT_ACCEPTED` | The exact recipient has the message. | Wait for the reply. Don't send it again. |
-| Refused before delivery | Nothing was delivered, and the reason is included. | Fix the reason, then send again. |
+| Refused before delivery | Nothing was delivered. The result carries the recipient's reason, such as a discovery timeout on a busy Mac. | Fix the cause, then send again. |
 | `UNKNOWN_DELIVERY` | The message may have been delivered. | Check the recipient yourself. Don't send it again. |
 
 `chat_send` also reports `reply_delivery`, which says how an answer reaches
@@ -179,8 +180,9 @@ current Codex profile receive while idle, and
   inside a Claude session. Quit it and open it again normally.
 - **A send says the handle no longer resolves.** The recipient restarted. Run
   `chat_peers` and send to the new handle.
-- **A send was refused before delivery.** The reason is included in the
-  result. Fix it and send again.
+- **A send was refused before delivery.** Nothing was delivered, so sending
+  again is safe once the cause is fixed. The result carries the recipient's
+  reason, such as a discovery timeout on a busy Mac.
 - **`TRANSPORT_ACCEPTED` but no answer yet.** The recipient has the request.
   Check on it directly rather than sending it again.
 

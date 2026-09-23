@@ -9,10 +9,12 @@
   unchanged, so existing Codex hook trust carries over.
 - Provider hooks and couriers start faster. They no longer load the
   installer module, which cuts Cross Agent Chat's import time by about 30%.
-- A remote refusal now tells the sender why: "remote target rejected the
-  message before provider effect: <reason>; nothing was delivered". A
-  Claude discovery that runs out of time reports "Claude ListAgents
-  discovery timed out".
+- A remote refusal now carries the recipient's reason for its known
+  refusal causes, such as "Claude ListAgents discovery timed out", in the
+  form "remote target rejected the message before provider effect:
+  <reason>; nothing was delivered". Other causes keep the generic reason.
+- Hook and courier errors are reported without loading the installer
+  module.
 - The README is rewritten around first use. It shows each collaborating
   session getting its job in its own first message, and it lists delivery
   results and troubleshooting.
