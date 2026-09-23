@@ -70,6 +70,22 @@ def test_claude_session_start_discards_registration_output() -> None:
     assert command.endswith('--pid "$PPID" >/dev/null')
 
 
+def test_hook_and_courier_entrypoints_do_not_import_install() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "import cross_agent_chat.cli\n"
+            "assert 'cross_agent_chat.install' not in sys.modules\n",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_native_helper_create_hook_reads_private_mcp_metadata() -> None:
     hook = _native_helper_create_hook_group()
     hooks = cast(list[object], hook["hooks"])
