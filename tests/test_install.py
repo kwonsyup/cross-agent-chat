@@ -249,7 +249,7 @@ def test_published_install_references_match_package_version() -> None:
         in (root / "install.sh").read_text()
     )
     readme = (root / "README.md").read_text()
-    assert f"Install v{version} prerelease with:" in readme
+    assert f"Install v{version} with:" in readme
     install_url = (
         f"https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v{version}/install.sh"
     )
@@ -616,7 +616,7 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "local_broker": "healthy",
         "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
-        "version": "0.4.2",
+        "version": "0.4.3",
     }
 
 
@@ -713,7 +713,7 @@ def test_doctor_omits_the_terminal_diagnostic_without_the_marker(
         "local_broker": "healthy",
         "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
-        "version": "0.4.2",
+        "version": "0.4.3",
     }
 
     assert cli.run(parser().parse_args(["doctor"])) == 0
@@ -3602,7 +3602,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.4.2')\n"
+        "    print('cross-agent-chat 0.4.3')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -3628,7 +3628,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.4.2"
+    assert completed.stdout.strip() == "cross-agent-chat 0.4.3"
     assert stage.exists()
 
 
@@ -5070,7 +5070,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.4.2",
+            "version": "0.4.3",
             "module_path": str(module),
         },
     )
@@ -5248,7 +5248,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.4.2",
+            "version": "0.4.3",
             "module_path": str(module),
         }
 

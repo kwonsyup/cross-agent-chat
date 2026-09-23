@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.3 - 2026-09-23
+
+- Fresh sessions register reliably on busy Macs. A session's courier now
+  gets up to 15 seconds to start, as long as it is still running. Claude
+  and Devin registration hooks get 30 seconds. A courier that exits still
+  fails at once, and the identity checks are unchanged. Codex hooks are
+  unchanged, so existing Codex hook trust carries over.
+- Provider hooks and couriers start faster. They no longer load the
+  installer module, which cuts Cross Agent Chat's import time by about 30%.
+- A remote refusal now tells the sender why: "remote target rejected the
+  message before provider effect: <reason>; nothing was delivered". A
+  Claude discovery that runs out of time reports "Claude ListAgents
+  discovery timed out".
+- The README is rewritten around first use. It shows each collaborating
+  session getting its job in its own first message, and it lists delivery
+  results and troubleshooting.
+- The agent instructions now separate the code-loading rule from pre-v0.4.0
+  reply handles. They tell a session that has been assigned to answer a
+  peer to do that work within its task.
+- Cross-Mac collaboration is verified end to end: a fresh Claude session on
+  one Mac asked a fresh Claude session on another Mac for a source review
+  over the Tailnet. The answer came back into the original conversation
+  with no manual step.
+
 ## 0.4.2 - 2026-09-22
 
 - The sender's read-only `claude agents` session-inventory preflight now
