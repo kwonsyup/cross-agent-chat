@@ -16,6 +16,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -1430,7 +1431,7 @@ def test_failed_courier_bootstrap_reaps_the_exact_owned_child(
     )
     monkeypatch.setattr("cross_agent_chat.runtime.subprocess.Popen", spawn)
     monkeypatch.setattr(runtime, "request_socket", unavailable)
-    monkeypatch.setattr(runtime, "COURIER_READY_SECONDS", 0.0)
+    monkeypatch.setattr(runtime, "COURIER_STARTUP_SECONDS", 0.0)
 
     with pytest.raises(ChatError, match="local bootstrap"):
         runtime._spawn_courier(tmp_path / "state", item)
@@ -1483,7 +1484,7 @@ def test_failed_bootstrap_reaps_a_socket_bound_during_exact_child_termination(
     )
     monkeypatch.setattr("cross_agent_chat.runtime.subprocess.Popen", spawn)
     monkeypatch.setattr(runtime, "request_socket", unavailable)
-    monkeypatch.setattr(runtime, "COURIER_READY_SECONDS", 0.0)
+    monkeypatch.setattr(runtime, "COURIER_STARTUP_SECONDS", 0.0)
 
     try:
         with pytest.raises(ChatError, match="local bootstrap"):
@@ -1539,6 +1540,136 @@ def test_cancelled_courier_bootstrap_reaps_the_exact_owned_child(
 
     assert process.terminated
     assert process.waited
+
+
+class _OwnedCourierProcess:
+    def __init__(self, exit_code: int | None = None) -> None:
+        self.exit_code = exit_code
+        self.terminated = False
+        self.waited = False
+
+    def poll(self) -> int | None:
+        return self.exit_code
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.terminated = True
+
+    def wait(self, timeout: float) -> int:
+        self.waited = True
+        return 0
+
+
+def test_live_courier_may_bootstrap_past_the_legacy_ready_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+    process = _OwnedCourierProcess()
+    now = [0.0]
+
+    def monotonic() -> float:
+        now[0] += 1.5
+        return now[0]
+
+    attempts = 0
+
+    def bootstrap(_path: Path, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise ChatError("local listener is unavailable")
+        return {
+            "schema_version": 1,
+            "status": "BOOTSTRAPPED",
+            "generation": item.generation,
+        }
+
+    monkeypatch.setattr(runtime, "executable", lambda: Path("/bin/echo"))
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_: ("a" * 64, Path("/bin/echo"))
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.subprocess.Popen", lambda *_a, **_k: process)
+    monkeypatch.setattr(runtime, "request_socket", bootstrap)
+    monkeypatch.setattr(
+        runtime, "time", SimpleNamespace(monotonic=monotonic, sleep=lambda _seconds: None)
+    )
+
+    runtime._spawn_courier(tmp_path / "state", item)
+
+    assert attempts == 3
+    assert now[0] > 3.0
+    assert not process.terminated
+    assert not process.waited
+
+
+def test_live_courier_bootstrap_still_fails_after_the_startup_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+    process = _OwnedCourierProcess()
+    now = [0.0]
+
+    def monotonic() -> float:
+        now[0] += 1.5
+        return now[0]
+
+    attempts = 0
+
+    def unavailable(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        raise ChatError("local listener is unavailable")
+
+    monkeypatch.setattr(runtime, "executable", lambda: Path("/bin/echo"))
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_: ("a" * 64, Path("/bin/echo"))
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.subprocess.Popen", lambda *_a, **_k: process)
+    monkeypatch.setattr(runtime, "request_socket", unavailable)
+    monkeypatch.setattr(
+        runtime, "time", SimpleNamespace(monotonic=monotonic, sleep=lambda _seconds: None)
+    )
+
+    with pytest.raises(ChatError, match="did not complete local bootstrap"):
+        runtime._spawn_courier(tmp_path / "state", item)
+
+    assert attempts > 1
+    assert now[0] >= runtime.COURIER_STARTUP_SECONDS
+    assert process.terminated
+    assert process.waited
+
+
+def test_dead_courier_still_fails_before_probing_the_startup_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import runtime
+
+    item = route(tmp_path, provider="claude", pid=os.getpid())
+    process = _OwnedCourierProcess(exit_code=1)
+    attempts = 0
+
+    def bootstrap(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        return {}
+
+    monkeypatch.setattr(runtime, "executable", lambda: Path("/bin/echo"))
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_: ("a" * 64, Path("/bin/echo"))
+    )
+    monkeypatch.setattr("cross_agent_chat.runtime.subprocess.Popen", lambda *_a, **_k: process)
+    monkeypatch.setattr(runtime, "request_socket", bootstrap)
+
+    with pytest.raises(ChatError, match="exited before local bootstrap"):
+        runtime._spawn_courier(tmp_path / "state", item)
+
+    assert attempts == 0
 
 
 def test_cancelled_registration_removes_its_exact_generation(

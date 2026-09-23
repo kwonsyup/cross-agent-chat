@@ -31,6 +31,7 @@ from cross_agent_chat.install import (
     BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
     BROKER_HEALTH_WAIT_SECONDS,
     OWNED_TOML_START,
+    REGISTRATION_HOOK_TIMEOUT_SECONDS,
     BrokerService,
     ConfigurationChangedError,
     Installer,
@@ -39,6 +40,8 @@ from cross_agent_chat.install import (
     SettingsError,
     SetupRollbackError,
     _hook_command,
+    _hook_group,
+    _hook_timeout,
     _hook_trust_hash,
     _native_helper_create_hook_group,
     _native_helper_dispatch_hook_group,
@@ -68,6 +71,55 @@ def test_claude_session_start_discards_registration_output() -> None:
     command = _hook_command(Path("/opt/cross-agent-chat"), "claude", "studio", "SessionStart")
 
     assert command.endswith('--pid "$PPID" >/dev/null')
+
+
+def test_registration_hooks_cover_the_courier_startup_budget() -> None:
+    assert REGISTRATION_HOOK_TIMEOUT_SECONDS > runtime.COURIER_STARTUP_SECONDS
+    executable = Path("/opt/cross-agent-chat")
+    for provider in ("claude", "codex", "devin"):
+        group = _hook_group(executable, provider, "studio", "SessionStart")
+        hook = cast(dict[str, object], cast(list[object], group["hooks"])[0])
+        assert hook["timeout"] == REGISTRATION_HOOK_TIMEOUT_SECONDS
+    prompt = _hook_group(executable, "devin", "studio", "UserPromptSubmit")
+    prompt_hook = cast(dict[str, object], cast(list[object], prompt["hooks"])[0])
+    assert prompt_hook["timeout"] == REGISTRATION_HOOK_TIMEOUT_SECONDS
+
+
+def test_non_registration_hooks_keep_their_timeouts() -> None:
+    executable = Path("/opt/cross-agent-chat")
+    for provider, event, expected in (
+        ("claude", "SessionEnd", 3),
+        ("codex", "SessionEnd", 3),
+        ("codex", "Stop", 3),
+        ("devin", "SessionEnd", 3),
+        ("devin", "Stop", 3),
+        ("devin", "UserPromptSubmit", REGISTRATION_HOOK_TIMEOUT_SECONDS),
+        ("devin", "PreToolUse", 5),
+    ):
+        group = _hook_group(executable, provider, "studio", event)
+        hook = cast(dict[str, object], cast(list[object], group["hooks"])[0])
+        assert hook["timeout"] == expected
+
+
+def test_setup_rewrites_an_owned_hook_with_an_older_registration_timeout(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    settings = json.loads(installer.claude_settings.read_text())
+    owned = next(item for item in settings["hooks"]["SessionStart"] if _owned_hook(item))
+    owned["hooks"][0]["timeout"] = 5
+    installer.claude_settings.write_text(json.dumps(settings))
+
+    assert not installer.verify_configuration()
+
+    installer.setup()
+
+    settings = json.loads(installer.claude_settings.read_text())
+    owned = next(item for item in settings["hooks"]["SessionStart"] if _owned_hook(item))
+    assert owned["hooks"][0]["timeout"] == REGISTRATION_HOOK_TIMEOUT_SECONDS
+    assert installer.verify_configuration()
 
 
 def test_hook_and_courier_entrypoints_do_not_import_install() -> None:
@@ -5328,7 +5380,7 @@ def test_uninstall_and_reinstall_preserve_foreign_entries_and_durable_intents(
             "trusted_hash": _hook_trust_hash(
                 _hook_command(executable, "codex", "studio", "SessionStart"),
                 "SessionStart",
-                5,
+                _hook_timeout("codex", "SessionStart"),
             )
         },
         f"{hooks_path}:session_end:0:0": {

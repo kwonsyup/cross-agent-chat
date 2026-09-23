@@ -134,7 +134,7 @@ ACCEPT_TIMEOUT_SECONDS: Final = (
     2 * AGENTS_TIMEOUT_SECONDS + DISCOVERY_TIMEOUT_SECONDS + SEND_TIMEOUT_SECONDS + 5.0
 )
 AUTHORIZE_TIMEOUT_SECONDS: Final = 20.0
-COURIER_READY_SECONDS: Final = 3.0
+COURIER_STARTUP_SECONDS: Final = 15.0
 MAX_COURIER_DIAGNOSTIC_BYTES: Final = 1024
 BOOTSTRAP_FRAME_TIMEOUT_SECONDS: Final = 0.1
 REMOTE_TIMEOUT_SECONDS: Final = (
@@ -639,7 +639,7 @@ def _spawn_courier(root: Path, route: Route) -> None:
             os.close(write_descriptor)
     captured = bytearray()
     try:
-        deadline = time.monotonic() + COURIER_READY_SECONDS
+        deadline = time.monotonic() + COURIER_STARTUP_SECONDS
         while time.monotonic() < deadline:
             _drain_courier_stderr(stderr, captured)
             if process.poll() is not None:

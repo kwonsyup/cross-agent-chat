@@ -70,6 +70,7 @@ OWNED_TOML_RE: Final = re.compile(
     rf"\n?{re.escape(OWNED_TOML_START)}.*?{re.escape(OWNED_TOML_END)}\n?", re.DOTALL
 )
 SUPPORTED_PROVIDERS: Final = ("claude", "codex", "devin")
+REGISTRATION_HOOK_TIMEOUT_SECONDS: Final = 30
 _PROVIDER_PATH_NAMES: Final[dict[str, tuple[str, ...]]] = {
     "claude": ("claude_settings", "claude_config"),
     "codex": ("codex_config", "codex_hooks"),
@@ -688,6 +689,14 @@ def _owned_hook_native_queue(value: object) -> bool:
     return bool(tokens) and tokens[0] == f"{NATIVE_QUEUE_ENV_VAR}={NATIVE_QUEUE_ENV_VALUE}"
 
 
+def _hook_timeout(provider: str, event: str) -> int:
+    if event in {"SessionEnd", "Stop"}:
+        return 3
+    if event == "SessionStart" or (provider, event) == ("devin", "UserPromptSubmit"):
+        return REGISTRATION_HOOK_TIMEOUT_SECONDS
+    return 5
+
+
 def _hook_group(
     executable: Path,
     provider: str,
@@ -696,9 +705,7 @@ def _hook_group(
     *,
     codex_native_queue: bool = False,
 ) -> dict[str, object]:
-    timeout = 10 if (provider, event) == ("claude", "SessionStart") else 5
-    if event in {"SessionEnd", "Stop"}:
-        timeout = 3
+    timeout = _hook_timeout(provider, event)
     group: dict[str, object] = {
         "hooks": [
             {
@@ -1116,14 +1123,14 @@ def _retain_matching_owned_command_hook_trust(
     if not isinstance(state, MutableMapping) or not isinstance(raw_hooks, dict):
         return tomlkit.dumps(document)
     hook_map = cast(dict[str, object], raw_hooks)
-    for event, timeout in (("SessionStart", 5), ("SessionEnd", 3), ("Stop", 3)):
+    for event in ("SessionStart", "SessionEnd", "Stop"):
         groups = hook_map.get(event)
         if not isinstance(groups, list):
             continue
         command = _hook_command(
             executable, "codex", device, event, codex_native_queue=codex_native_queue
         )
-        expected = _hook_trust_hash(command, event, timeout)
+        expected = _hook_trust_hash(command, event, _hook_timeout("codex", event))
         for index, group in enumerate(groups):
             if not _owned_hook(group):
                 continue
