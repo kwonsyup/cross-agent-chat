@@ -2497,7 +2497,10 @@ def _send_remote_target(
     rejection = pre_effect_error(response, event_id, target.provider)
     if rejection is not None:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
-        raise ChatError("remote target rejected the message before provider effect")
+        raise ChatError(
+            "remote target rejected the message before provider effect: "
+            f"{rejection}; nothing was delivered"
+        )
     diagnostic = unknown_delivery_diagnostic(response, event_id, target.provider)
     if diagnostic is not None:
         store.mark(event_id, "UNKNOWN_DELIVERY")

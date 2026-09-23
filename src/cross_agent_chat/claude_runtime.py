@@ -343,6 +343,8 @@ def discover_target_ref(session_name: str) -> str:
             check=False,
         )
         records = [json.loads(line) for line in completed.stdout.splitlines() if line]
+    except subprocess.TimeoutExpired as error:
+        raise ChatError("Claude ListAgents discovery timed out") from error
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
         raise ChatError("Claude ListAgents discovery failed") from error
     listings: list[str] = []

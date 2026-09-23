@@ -2469,7 +2469,7 @@ def test_remote_pre_effect_rejection_is_safe_and_does_not_block_fresh_send(
             "event_id": envelope["event_id"],
             "status": "PRE_EFFECT_REJECTED",
             "provider": "claude",
-            "error": "peer-controlled wording must not escape",
+            "error": "remote destination rejected before provider effect",
         }
 
     monkeypatch.setattr(
@@ -2489,7 +2489,10 @@ def test_remote_pre_effect_rejection_is_safe_and_does_not_block_fresh_send(
     with pytest.raises(ChatError, match="remote target rejected") as caught:
         send(tmp_path, source, target_alias, "hello")
 
-    assert "peer-controlled" not in str(caught.value)
+    assert str(caught.value) == (
+        "remote target rejected the message before provider effect: "
+        "remote destination rejected before provider effect; nothing was delivered"
+    )
     intent = IntentStore(tmp_path).intents()[0]
     assert intent.status == "PRE_EFFECT_REJECTED"
     assert IntentStore(tmp_path).begin_identity(
