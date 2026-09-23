@@ -138,6 +138,42 @@ def test_hook_and_courier_entrypoints_do_not_import_install() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+def test_register_failure_does_not_import_install() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "import cross_agent_chat.cli as cli\n"
+            "def _raise(*args, **kwargs):\n"
+            "    raise OSError('state root is not writable')\n"
+            "cli.register = _raise\n"
+            "code = cli.main(['_register', '--provider', 'claude', '--device',"
+            " 'studio', '--pid', '123', '--state-root', '/tmp/cac-state'])\n"
+            "assert code == 2, code\n"
+            "assert 'cross_agent_chat.install' not in sys.modules\n",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "state root is not writable" in completed.stderr
+
+
+def test_settings_error_from_setup_prints_cleanly(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _raise(*args: object, **kwargs: object) -> Installer:
+        raise SettingsError("install root is unsafe")
+
+    monkeypatch.setattr(cli, "_installer", _raise)
+    assert cli.main(["setup", "--device", "studio"]) == 2
+    captured = capsys.readouterr()
+    assert "cross-agent-chat: install root is unsafe" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_native_helper_create_hook_reads_private_mcp_metadata() -> None:
     hook = _native_helper_create_hook_group()
     hooks = cast(list[object], hook["hooks"])

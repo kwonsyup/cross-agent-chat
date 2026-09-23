@@ -824,13 +824,12 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
         return run(arguments)
-    except ChatError as error:
+    except (ChatError, OSError) as error:
         print(f"cross-agent-chat: {error}", file=sys.stderr)
         return 1 if arguments.command == "_devin-prompt" else 2
     except Exception as error:
-        from cross_agent_chat.install import SettingsError
-
-        if not isinstance(error, (OSError, SettingsError)):
+        install = sys.modules.get("cross_agent_chat.install")
+        if install is None or not isinstance(error, install.SettingsError):
             raise
         print(f"cross-agent-chat: {error}", file=sys.stderr)
         return 1 if arguments.command == "_devin-prompt" else 2
