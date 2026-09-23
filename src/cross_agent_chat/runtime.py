@@ -134,7 +134,7 @@ ACCEPT_TIMEOUT_SECONDS: Final = (
     2 * AGENTS_TIMEOUT_SECONDS + DISCOVERY_TIMEOUT_SECONDS + SEND_TIMEOUT_SECONDS + 5.0
 )
 AUTHORIZE_TIMEOUT_SECONDS: Final = 20.0
-COURIER_READY_SECONDS: Final = 3.0
+COURIER_STARTUP_SECONDS: Final = 15.0
 MAX_COURIER_DIAGNOSTIC_BYTES: Final = 1024
 BOOTSTRAP_FRAME_TIMEOUT_SECONDS: Final = 0.1
 REMOTE_TIMEOUT_SECONDS: Final = (
@@ -639,7 +639,7 @@ def _spawn_courier(root: Path, route: Route) -> None:
             os.close(write_descriptor)
     captured = bytearray()
     try:
-        deadline = time.monotonic() + COURIER_READY_SECONDS
+        deadline = time.monotonic() + COURIER_STARTUP_SECONDS
         while time.monotonic() < deadline:
             _drain_courier_stderr(stderr, captured)
             if process.poll() is not None:
@@ -1148,6 +1148,36 @@ def courier_accept(
             "provider": route.provider,
             "error": str(error),
         }
+
+
+FORWARDABLE_PRE_EFFECT_REASONS: Final = frozenset(
+    {
+        "Claude ListAgents discovery timed out",
+        "Claude ListAgents discovery failed",
+        "Claude target discovery is not one exact supported match",
+        "Claude target is not one exact live supported session",
+        "Claude target changed during discovery",
+        "Claude agents preflight timed out",
+        "Claude Code executable is unavailable",
+        "Claude agents response is invalid",
+        "Claude target reference is invalid",
+        "Claude SendMessage courier setup failed",
+        "Claude courier finished without a SendMessage call",
+        "session courier is still bootstrapping",
+        "Codex courier is unavailable",
+        "Codex courier queue is full",
+        "Codex native queue is unavailable",
+        "Codex native queue response exceeds the bounded limit",
+        "Codex native queue profile changed",
+        "Codex native queue preflight failed",
+        "Codex native queue rejected the message before acceptance",
+        "Devin inbox is unavailable",
+        "message is invalid",
+        "message must not be empty",
+        "message exceeds the 16 KiB limit",
+        "message exceeds the encoded frame budget",
+    }
+)
 
 
 def pre_effect_error(response: dict[str, object], event_id: str, provider: Provider) -> str | None:
@@ -2497,7 +2527,10 @@ def _send_remote_target(
     rejection = pre_effect_error(response, event_id, target.provider)
     if rejection is not None:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
-        raise ChatError("remote target rejected the message before provider effect")
+        raise ChatError(
+            "remote target rejected the message before provider effect: "
+            f"{rejection}; nothing was delivered"
+        )
     diagnostic = unknown_delivery_diagnostic(response, event_id, target.provider)
     if diagnostic is not None:
         store.mark(event_id, "UNKNOWN_DELIVERY")
@@ -2653,13 +2686,18 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
             "to": target.alias if delivery_route is routes[0] else delivery_route.alias,
             "provider": delivery_route.provider,
         }
-        if pre_effect_error(response, event_id, target.provider) is not None:
+        courier_rejection = pre_effect_error(response, event_id, target.provider)
+        if courier_rejection is not None:
             return {
                 "schema_version": SCHEMA_VERSION,
                 "event_id": event_id,
                 "status": "PRE_EFFECT_REJECTED",
                 "provider": target.provider,
-                "error": "remote destination rejected before provider effect",
+                "error": (
+                    courier_rejection
+                    if courier_rejection in FORWARDABLE_PRE_EFFECT_REASONS
+                    else "remote destination rejected before provider effect"
+                ),
             }
         if unknown_delivery_diagnostic(response, event_id, target.provider) is not None:
             return response

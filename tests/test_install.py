@@ -31,6 +31,7 @@ from cross_agent_chat.install import (
     BROKER_HEALTH_REQUEST_TIMEOUT_SECONDS,
     BROKER_HEALTH_WAIT_SECONDS,
     OWNED_TOML_START,
+    REGISTRATION_HOOK_TIMEOUT_SECONDS,
     BrokerService,
     ConfigurationChangedError,
     Installer,
@@ -39,6 +40,8 @@ from cross_agent_chat.install import (
     SettingsError,
     SetupRollbackError,
     _hook_command,
+    _hook_group,
+    _hook_timeout,
     _hook_trust_hash,
     _native_helper_create_hook_group,
     _native_helper_dispatch_hook_group,
@@ -68,6 +71,107 @@ def test_claude_session_start_discards_registration_output() -> None:
     command = _hook_command(Path("/opt/cross-agent-chat"), "claude", "studio", "SessionStart")
 
     assert command.endswith('--pid "$PPID" >/dev/null')
+
+
+def test_registration_hooks_cover_the_courier_startup_budget() -> None:
+    assert REGISTRATION_HOOK_TIMEOUT_SECONDS > runtime.COURIER_STARTUP_SECONDS
+    executable = Path("/opt/cross-agent-chat")
+    for provider in ("claude", "devin"):
+        group = _hook_group(executable, provider, "studio", "SessionStart")
+        hook = cast(dict[str, object], cast(list[object], group["hooks"])[0])
+        assert hook["timeout"] == REGISTRATION_HOOK_TIMEOUT_SECONDS
+    prompt = _hook_group(executable, "devin", "studio", "UserPromptSubmit")
+    prompt_hook = cast(dict[str, object], cast(list[object], prompt["hooks"])[0])
+    assert prompt_hook["timeout"] == REGISTRATION_HOOK_TIMEOUT_SECONDS
+
+
+def test_non_registration_hooks_keep_their_timeouts() -> None:
+    executable = Path("/opt/cross-agent-chat")
+    for provider, event, expected in (
+        ("claude", "SessionEnd", 3),
+        ("codex", "SessionStart", 5),
+        ("codex", "SessionEnd", 3),
+        ("codex", "Stop", 3),
+        ("devin", "SessionEnd", 3),
+        ("devin", "Stop", 3),
+        ("devin", "PreToolUse", 5),
+    ):
+        group = _hook_group(executable, provider, "studio", event)
+        hook = cast(dict[str, object], cast(list[object], group["hooks"])[0])
+        assert hook["timeout"] == expected
+
+
+def test_setup_rewrites_an_owned_hook_with_an_older_registration_timeout(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    settings = json.loads(installer.claude_settings.read_text())
+    owned = next(item for item in settings["hooks"]["SessionStart"] if _owned_hook(item))
+    owned["hooks"][0]["timeout"] = 5
+    installer.claude_settings.write_text(json.dumps(settings))
+
+    assert not installer.verify_configuration()
+
+    installer.setup()
+
+    settings = json.loads(installer.claude_settings.read_text())
+    owned = next(item for item in settings["hooks"]["SessionStart"] if _owned_hook(item))
+    assert owned["hooks"][0]["timeout"] == REGISTRATION_HOOK_TIMEOUT_SECONDS
+    assert installer.verify_configuration()
+
+
+def test_hook_and_courier_entrypoints_do_not_import_install() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "import cross_agent_chat.cli\n"
+            "assert 'cross_agent_chat.install' not in sys.modules\n",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_register_failure_does_not_import_install() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "import cross_agent_chat.cli as cli\n"
+            "def _raise(*args, **kwargs):\n"
+            "    raise OSError('state root is not writable')\n"
+            "cli.register = _raise\n"
+            "code = cli.main(['_register', '--provider', 'claude', '--device',"
+            " 'studio', '--pid', '123', '--state-root', '/tmp/cac-state'])\n"
+            "assert code == 2, code\n"
+            "assert 'cross_agent_chat.install' not in sys.modules\n",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "state root is not writable" in completed.stderr
+
+
+def test_settings_error_from_setup_prints_cleanly(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _raise(*args: object, **kwargs: object) -> Installer:
+        raise SettingsError("install root is unsafe")
+
+    monkeypatch.setattr(cli, "_installer", _raise)
+    assert cli.main(["setup", "--device", "studio"]) == 2
+    captured = capsys.readouterr()
+    assert "cross-agent-chat: install root is unsafe" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_native_helper_create_hook_reads_private_mcp_metadata() -> None:
@@ -181,7 +285,7 @@ def test_published_install_references_match_package_version() -> None:
         in (root / "install.sh").read_text()
     )
     readme = (root / "README.md").read_text()
-    assert f"Install v{version} prerelease with:" in readme
+    assert f"Install v{version} with:" in readme
     install_url = (
         f"https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v{version}/install.sh"
     )
@@ -548,7 +652,7 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "local_broker": "healthy",
         "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
-        "version": "0.4.2",
+        "version": "0.4.3",
     }
 
 
@@ -645,7 +749,7 @@ def test_doctor_omits_the_terminal_diagnostic_without_the_marker(
         "local_broker": "healthy",
         "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
-        "version": "0.4.2",
+        "version": "0.4.3",
     }
 
     assert cli.run(parser().parse_args(["doctor"])) == 0
@@ -2007,6 +2111,38 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     assert isinstance(uninstalled_trust, dict)
     assert matching_key not in uninstalled_trust
     assert uninstalled_trust[unrelated_key] == {"trusted_hash": unrelated_hash}
+
+
+def test_setup_retains_codex_session_start_trust_written_for_the_v042_hook(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    config = home / ".codex" / "config.toml"
+    hooks = json.loads(installer.codex_hooks.read_text())["hooks"]
+    session_start_index = next(
+        index for index, item in enumerate(hooks["SessionStart"]) if _owned_hook(item)
+    )
+    session_start_key = f"{installer.codex_hooks}:session_start:{session_start_index}:0"
+    v042_hash = _hook_trust_hash(
+        _hook_command(Path("/opt/cross-agent-chat"), "codex", "studio", "SessionStart"),
+        "SessionStart",
+        5,
+    )
+    config.write_text(
+        config.read_text()
+        + f"\n[hooks.state.{json.dumps(session_start_key)}]\n"
+        + f"trusted_hash = {json.dumps(v042_hash)}\n"
+    )
+
+    installer.setup()
+
+    repaired = tomllib.loads(config.read_text())
+    repaired_trust = repaired["hooks"]["state"]
+    assert isinstance(repaired_trust, dict)
+    assert repaired_trust[session_start_key] == {"trusted_hash": v042_hash}
+    assert installer.verify_configuration()
 
 
 def test_setup_preserves_owned_hook_position_when_unrelated_hook_follows(
@@ -3502,7 +3638,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.4.2')\n"
+        "    print('cross-agent-chat 0.4.3')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -3528,7 +3664,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.4.2"
+    assert completed.stdout.strip() == "cross-agent-chat 0.4.3"
     assert stage.exists()
 
 
@@ -4970,7 +5106,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.4.2",
+            "version": "0.4.3",
             "module_path": str(module),
         },
     )
@@ -5148,7 +5284,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.4.2",
+            "version": "0.4.3",
             "module_path": str(module),
         }
 
@@ -5312,7 +5448,7 @@ def test_uninstall_and_reinstall_preserve_foreign_entries_and_durable_intents(
             "trusted_hash": _hook_trust_hash(
                 _hook_command(executable, "codex", "studio", "SessionStart"),
                 "SessionStart",
-                5,
+                _hook_timeout("codex", "SessionStart"),
             )
         },
         f"{hooks_path}:session_end:0:0": {

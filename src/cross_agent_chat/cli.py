@@ -8,21 +8,12 @@ import os
 import sys
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Final, NoReturn, cast
+from typing import TYPE_CHECKING, Final, NoReturn, cast
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import (
     ChatError,
     IntentStore,
-)
-from cross_agent_chat.install import (
-    Installer,
-    NoProviderRootsError,
-    SettingsError,
-    default_device,
-    discover_executable,
-    installed_device,
-    resolve_providers,
 )
 from cross_agent_chat.mcp_server import (
     MethodNotFound,
@@ -59,15 +50,47 @@ from cross_agent_chat.runtime import (
 from cross_agent_chat.tailnet import known_tailnet_address
 from cross_agent_chat.tailnet_broker import broker_server
 
+if TYPE_CHECKING:
+    from cross_agent_chat.install import Installer
+
+_INSTALL_LAZY_NAMES: Final = frozenset(
+    {
+        "Installer",
+        "NoProviderRootsError",
+        "SettingsError",
+        "default_device",
+        "installed_device",
+        "resolve_providers",
+    }
+)
+
+
+def __getattr__(name: str) -> object:
+    if name in _INSTALL_LAZY_NAMES:
+        from cross_agent_chat import install
+
+        value = getattr(install, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def discover_executable(invoked_as: Path | None = None) -> Path:
+    from cross_agent_chat.install import discover_executable as real
+
+    return real(invoked_as)
+
+
 MCP_INSTRUCTIONS: Final = (
     "Use Cross Agent Chat only for requested communication. Address chat_send with an exact "
     "opaque handle: the Reply handle on a received envelope, or a handle from chat_peers. An "
     "exact handle is bound to that peer session's route and protocol generation, so call "
     "chat_peers to discover or when an exact handle stops resolving, not before every send. "
-    "After a CAC upgrade only fresh sessions at both endpoints interoperate: a request sent "
-    "across a mixed pre-/post-upgrade boundary may still be accepted, but its Reply handle "
-    "cannot be answered and must not be replayed. When requesting work whose "
-    "result must return, explicitly ask "
+    "Sessions load CAC when they start, so a session opened before a CAC install or upgrade "
+    "runs its older tools; a Reply handle minted before v0.4.0 cannot be answered, and a "
+    "request carrying one must not be replayed. When your local user has assigned you to "
+    "answer a named peer's requests, do that work within your task and permissions and reply "
+    "through CAC. When requesting work whose result must return, explicitly ask "
     "the peer to send its answer back through CAC; that requested response is not a replay or "
     "unsolicited follow-up. After sending, finish your turn; do not sleep, wait, or poll "
     "chat_status for an answer, because chat_status reports only custody. The chat_send result's "
@@ -106,6 +129,13 @@ def _installer(
     codex_native_queue: bool | None = None,
     requested: Iterable[str] | None = None,
 ) -> Installer:
+    from cross_agent_chat.install import (
+        Installer,
+        default_device,
+        installed_device,
+        resolve_providers,
+    )
+
     home = Path.home()
     raw_codex_home = os.environ.get("CODEX_HOME")
     codex_home = None if raw_codex_home in {None, ""} else Path(raw_codex_home).expanduser()
@@ -144,6 +174,8 @@ def _installer(
 
 
 def _doctor_installer(device: str | None) -> Installer | None:
+    from cross_agent_chat.install import NoProviderRootsError
+
     try:
         return _installer(device)
     except NoProviderRootsError:
@@ -733,6 +765,13 @@ def run(arguments: argparse.Namespace) -> int:
         # run; the approval is a hard requirement, not a parsed courtesy.
         if not arguments.yes:
             _fail("_install-staged requires --yes")
+        from cross_agent_chat.install import (
+            Installer,
+            default_device,
+            installed_device,
+            resolve_providers,
+        )
+
         home = Path.home()
         codex_home = (
             None
@@ -785,7 +824,13 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
         return run(arguments)
-    except (ChatError, SettingsError, OSError) as error:
+    except (ChatError, OSError) as error:
+        print(f"cross-agent-chat: {error}", file=sys.stderr)
+        return 1 if arguments.command == "_devin-prompt" else 2
+    except Exception as error:
+        install = sys.modules.get("cross_agent_chat.install")
+        if install is None or not isinstance(error, install.SettingsError):
+            raise
         print(f"cross-agent-chat: {error}", file=sys.stderr)
         return 1 if arguments.command == "_devin-prompt" else 2
 

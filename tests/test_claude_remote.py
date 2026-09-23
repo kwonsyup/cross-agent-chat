@@ -2387,6 +2387,36 @@ def test_discover_target_ref_skips_stale_and_malformed_neighbors(
     assert discover_target_ref("API work") == "API work [a1b2c3]"
 
 
+def test_discover_target_ref_timeout_is_a_distinct_bounded_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cross_agent_chat import claude_runtime
+
+    monkeypatch.setattr(claude_runtime, "claude_binary", lambda: Path("/opt/claude"))
+
+    def expired(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(["claude"], DISCOVERY_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(subprocess, "run", expired)
+    with pytest.raises(ChatError, match=r"^Claude ListAgents discovery timed out$"):
+        discover_target_ref("API work")
+
+
+def test_discover_target_ref_subprocess_failure_keeps_the_generic_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cross_agent_chat import claude_runtime
+
+    monkeypatch.setattr(claude_runtime, "claude_binary", lambda: Path("/opt/claude"))
+
+    def failed(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(subprocess, "run", failed)
+    with pytest.raises(ChatError, match=r"^Claude ListAgents discovery failed$"):
+        discover_target_ref("API work")
+
+
 def test_targeted_claude_agents_selects_the_exact_session_over_a_namesake(
     tmp_path: Path,
 ) -> None:

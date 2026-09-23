@@ -72,7 +72,7 @@ _NODE_ADDRESSES = {
     "nDelta": _ADDRESS_D,
 }
 _CAPACITY_LABEL = "ChatError:recipient broker is at capacity; nothing was delivered; send again"
-_PRE_EFFECT_LABEL = "ChatError:remote target rejected the message before provider effect"
+_PRE_EFFECT_LABEL_PREFIX = "ChatError:remote target rejected the message before provider effect"
 _REVALIDATION_LABEL = (
     "ChatError:recipient is unavailable or changed; call chat_peers and choose the recipient again"
 )
@@ -461,12 +461,16 @@ def test_reciprocal_admission_levels(tmp_path: Path, monkeypatch: pytest.MonkeyP
                     f"callback path, got {counts}"
                 )
                 assert sum(counts.values()) == level
-                assert set(counts) <= {
-                    "TRANSPORT_ACCEPTED",
-                    _CAPACITY_LABEL,
-                    _PRE_EFFECT_LABEL,
-                    _REVALIDATION_LABEL,
-                }, f"level {level} {direction} produced an undecided send: {counts}"
+                assert all(
+                    label.startswith(_PRE_EFFECT_LABEL_PREFIX)
+                    or label
+                    in {
+                        "TRANSPORT_ACCEPTED",
+                        _CAPACITY_LABEL,
+                        _REVALIDATION_LABEL,
+                    }
+                    for label in counts
+                ), f"level {level} {direction} produced an undecided send: {counts}"
             assert wall < 20.0, f"level {level} did not finish in bounded time"
             for machine in (machine_a, machine_b):
                 unresolved = [
