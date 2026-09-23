@@ -692,7 +692,11 @@ def _owned_hook_native_queue(value: object) -> bool:
 def _hook_timeout(provider: str, event: str) -> int:
     if event in {"SessionEnd", "Stop"}:
         return 3
-    if event == "SessionStart" or (provider, event) == ("devin", "UserPromptSubmit"):
+    if (provider, event) in {
+        ("claude", "SessionStart"),
+        ("devin", "SessionStart"),
+        ("devin", "UserPromptSubmit"),
+    }:
         return REGISTRATION_HOOK_TIMEOUT_SECONDS
     return 5
 

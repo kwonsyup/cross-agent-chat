@@ -76,7 +76,7 @@ def test_claude_session_start_discards_registration_output() -> None:
 def test_registration_hooks_cover_the_courier_startup_budget() -> None:
     assert REGISTRATION_HOOK_TIMEOUT_SECONDS > runtime.COURIER_STARTUP_SECONDS
     executable = Path("/opt/cross-agent-chat")
-    for provider in ("claude", "codex", "devin"):
+    for provider in ("claude", "devin"):
         group = _hook_group(executable, provider, "studio", "SessionStart")
         hook = cast(dict[str, object], cast(list[object], group["hooks"])[0])
         assert hook["timeout"] == REGISTRATION_HOOK_TIMEOUT_SECONDS
@@ -89,11 +89,11 @@ def test_non_registration_hooks_keep_their_timeouts() -> None:
     executable = Path("/opt/cross-agent-chat")
     for provider, event, expected in (
         ("claude", "SessionEnd", 3),
+        ("codex", "SessionStart", 5),
         ("codex", "SessionEnd", 3),
         ("codex", "Stop", 3),
         ("devin", "SessionEnd", 3),
         ("devin", "Stop", 3),
-        ("devin", "UserPromptSubmit", REGISTRATION_HOOK_TIMEOUT_SECONDS),
         ("devin", "PreToolUse", 5),
     ):
         group = _hook_group(executable, provider, "studio", event)
@@ -2075,6 +2075,38 @@ def test_setup_removes_stale_owned_hook_trust_and_preserves_unrelated_trust(
     assert isinstance(uninstalled_trust, dict)
     assert matching_key not in uninstalled_trust
     assert uninstalled_trust[unrelated_key] == {"trusted_hash": unrelated_hash}
+
+
+def test_setup_retains_codex_session_start_trust_written_for_the_v042_hook(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    config = home / ".codex" / "config.toml"
+    hooks = json.loads(installer.codex_hooks.read_text())["hooks"]
+    session_start_index = next(
+        index for index, item in enumerate(hooks["SessionStart"]) if _owned_hook(item)
+    )
+    session_start_key = f"{installer.codex_hooks}:session_start:{session_start_index}:0"
+    v042_hash = _hook_trust_hash(
+        _hook_command(Path("/opt/cross-agent-chat"), "codex", "studio", "SessionStart"),
+        "SessionStart",
+        5,
+    )
+    config.write_text(
+        config.read_text()
+        + f"\n[hooks.state.{json.dumps(session_start_key)}]\n"
+        + f"trusted_hash = {json.dumps(v042_hash)}\n"
+    )
+
+    installer.setup()
+
+    repaired = tomllib.loads(config.read_text())
+    repaired_trust = repaired["hooks"]["state"]
+    assert isinstance(repaired_trust, dict)
+    assert repaired_trust[session_start_key] == {"trusted_hash": v042_hash}
+    assert installer.verify_configuration()
 
 
 def test_setup_preserves_owned_hook_position_when_unrelated_hook_follows(
