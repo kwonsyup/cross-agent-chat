@@ -11,7 +11,7 @@ import stat
 import tempfile
 import unicodedata
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +35,9 @@ MAX_NAME_CODEPOINTS: Final = 128
 MAX_ALIAS_CODEPOINTS: Final = 128
 SAFE_DEVICE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}\Z")
 UUID_RE: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+OWNER_ANCHOR_RE: Final = re.compile(
+    r"owner-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json\Z"
+)
 DEVIN_SESSION_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}\Z")
 # Devin documents this as an opaque session id. Keep a bounded, path-safe
 # representation so hooks can bind it without assuming UUIDs or exposing it.
@@ -360,6 +363,11 @@ class Route:
             return False
 
 
+def owner_anchor_path(root: Path, generation: str) -> Path:
+    """Return the private sidecar binding one route generation to its image."""
+    return root / f"owner-{valid_uuid(generation, 'route generation')}.json"
+
+
 def ensure_private_dir(path: Path) -> None:
     path.mkdir(parents=True, mode=0o700, exist_ok=True)
     metadata = path.stat()
@@ -456,6 +464,20 @@ class Registry:
             atomic_json(self.devin_path, [item.to_dict() for item in devin])
         else:
             self.devin_path.unlink(missing_ok=True)
+        self._prune_owner_anchors(routes)
+
+    def _prune_owner_anchors(self, retained: list[Route]) -> None:
+        """Drop image anchors whose generation no registry entry still owns."""
+        generations = {item.generation for item in retained}
+        try:
+            entries = list(self.root.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            match = OWNER_ANCHOR_RE.fullmatch(entry.name)
+            if match is not None and match.group(1) not in generations:
+                with suppress(OSError):
+                    entry.unlink()
 
     def upsert(self, route: Route) -> None:
         with state_lock(self.root, "routes"):
@@ -514,6 +536,8 @@ class Registry:
             retained = [item for item in existing if item.process_is_live()]
             if len(retained) != len(existing):
                 self._write(retained)
+            else:
+                self._prune_owner_anchors(retained)
             return retained
 
 

@@ -64,10 +64,13 @@ from cross_agent_chat.core import (
     Registry,
     Route,
     UnknownDeliveryError,
+    atomic_json,
     authenticate_sender,
     bounded_message,
     canonical_cwd,
     ensure_private_dir,
+    owner_anchor_path,
+    require_private_file,
     session_key,
     state_lock,
     stored_cwd,
@@ -148,6 +151,12 @@ NATIVE_DESKTOP_BUNDLE_IDS: Final = ("com.openai.chat", "com.openai.codex")
 PRESENCE_ENV_VAR: Final = "CROSS_AGENT_CHAT_PRESENCE"
 PROC_PIDTBSDINFO: Final = 3
 PROC_BSDINFO_SIZE: Final = 136
+PROC_PIDREGIONPATHINFO2: Final = 22
+PROC_REGIONWITHPATHINFO_SIZE: Final = 1272
+# Inside proc_regionwithpathinfo the 96-byte proc_regioninfo is followed by
+# vnode_info_path, whose vi_stat carries vst_dev (u32) and vst_ino (u64).
+REGION_VSTAT_DEV_OFFSET: Final = 96
+REGION_VSTAT_INO_OFFSET: Final = 104
 DeliveryMode = Literal[
     "claude_native_cross_session",
     "codex_stop_bound",
@@ -181,14 +190,9 @@ def recipient_profile_root(provider: str) -> str:
     return str(root.expanduser().resolve(strict=False))
 
 
-def recipient_owner_identity(
-    provider: str, pid: int, profile_root: str | None = None
-) -> tuple[str, Path]:
-    """Bind a route to the provider executable, process birth, uid, and selected root."""
+def _process_identity_facts(pid: int) -> tuple[int, int, int]:
+    """Return uid and BSD start time for one same-uid live process."""
     libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
-    path_buffer = ctypes.create_string_buffer(4096)
-    if libproc.proc_pidpath(pid, path_buffer, len(path_buffer)) <= 0:
-        raise ChatError("provider process identity is unavailable")
     info = ctypes.create_string_buffer(PROC_BSDINFO_SIZE)
     if libproc.proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, info, len(info)) != PROC_BSDINFO_SIZE:
         raise ChatError("provider process identity is unavailable")
@@ -197,12 +201,240 @@ def recipient_owner_identity(
         raise ChatError("provider process identity is unavailable")
     start_seconds = int.from_bytes(info.raw[120:128], sys.byteorder)
     start_microseconds = int.from_bytes(info.raw[128:136], sys.byteorder)
+    return uid, start_seconds, start_microseconds
+
+
+def recipient_owner_identity(
+    provider: str, pid: int, profile_root: str | None = None
+) -> tuple[str, Path]:
+    """Bind a route to the provider executable, process birth, uid, and selected root."""
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+    path_buffer = ctypes.create_string_buffer(4096)
+    if libproc.proc_pidpath(pid, path_buffer, len(path_buffer)) <= 0:
+        raise ChatError("provider process identity is unavailable")
+    uid, start_seconds, start_microseconds = _process_identity_facts(pid)
     binary = Path(path_buffer.value.decode()).resolve(strict=True)
     if provider == "devin" and binary != devin_binary():
         raise ChatError("provider process identity is unavailable")
     root = Path(profile_root or recipient_profile_root(provider)).expanduser().resolve(strict=False)
     payload = f"{provider}\0{binary}\0{uid}\0{start_seconds}\0{start_microseconds}\0{root}".encode()
     return hashlib.sha256(payload).hexdigest(), binary
+
+
+def _owner_image_observation(pid: int) -> tuple[int, int, int, int, int]:
+    """Return (dev, ino, uid, start sec, start usec) of the process's text vnode.
+
+    The lowest vnode-backed region is the main executable's __TEXT; its vnode
+    stays bound to the mapped file object even after every path to it is
+    renamed aside or unlinked, which is exactly what a path cannot observe.
+    """
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+    region = ctypes.create_string_buffer(PROC_REGIONWITHPATHINFO_SIZE)
+    observed = libproc.proc_pidinfo(pid, PROC_PIDREGIONPATHINFO2, 0, region, len(region))
+    if observed != PROC_REGIONWITHPATHINFO_SIZE:
+        raise ChatError("provider process identity is unavailable")
+    device = int.from_bytes(
+        region.raw[REGION_VSTAT_DEV_OFFSET : REGION_VSTAT_DEV_OFFSET + 4], sys.byteorder
+    )
+    inode = int.from_bytes(
+        region.raw[REGION_VSTAT_INO_OFFSET : REGION_VSTAT_INO_OFFSET + 8], sys.byteorder
+    )
+    uid, start_seconds, start_microseconds = _process_identity_facts(pid)
+    return device, inode, uid, start_seconds, start_microseconds
+
+
+def _owner_image_identity(
+    provider: str,
+    device: int,
+    inode: int,
+    uid: int,
+    start_seconds: int,
+    start_microseconds: int,
+    profile_root: str,
+) -> str:
+    root = Path(profile_root).expanduser().resolve(strict=False)
+    payload = (
+        f"{provider}\0{device}\0{inode}\0{uid}\0{start_seconds}\0{start_microseconds}\0{root}"
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def recipient_owner_image_identity(provider: str, pid: int, profile_root: str | None = None) -> str:
+    """Bind a route to the running image's vnode rather than its executable path."""
+    device, inode, uid, start_seconds, start_microseconds = _owner_image_observation(pid)
+    return _owner_image_identity(
+        provider,
+        device,
+        inode,
+        uid,
+        start_seconds,
+        start_microseconds,
+        profile_root or recipient_profile_root(provider),
+    )
+
+
+OWNER_ANCHOR_FIELDS: Final = frozenset(
+    {"provider", "pid", "generation", "owner_identity", "profile_root", "image_identity"}
+)
+
+
+def _write_owner_anchor(root: Path, route: Route, owner_binary: Path) -> None:
+    """Bind this generation to its running image when kernel and path agree.
+
+    The anchor is written only while the observed text vnode is the same file
+    object as the resolved provider path. Any disagreement or failure leaves
+    the route legacy-only rather than failing its registration.
+    """
+    if route.owner_identity is None or route.profile_root is None:
+        return
+    try:
+        device, inode, uid, start_seconds, start_microseconds = _owner_image_observation(route.pid)
+        metadata = owner_binary.stat()
+    except (ChatError, OSError):
+        return
+    if (device, inode) != (metadata.st_dev, metadata.st_ino):
+        return
+    anchor = {
+        "provider": route.provider,
+        "pid": route.pid,
+        "generation": route.generation,
+        "owner_identity": route.owner_identity,
+        "profile_root": route.profile_root,
+        "image_identity": _owner_image_identity(
+            route.provider,
+            device,
+            inode,
+            uid,
+            start_seconds,
+            start_microseconds,
+            route.profile_root,
+        ),
+    }
+    with suppress(OSError, ChatError):
+        atomic_json(owner_anchor_path(root, route.generation), anchor)
+
+
+def _route_owner_anchor(root: Path, route: Route) -> str | None:
+    """Return the image identity bound to this route's anchor, or None if absent.
+
+    A present anchor must stay private, parse exactly, and bind this route's
+    provider, pid, generation, owner identity, and profile root. Anything else
+    raises so callers fail closed instead of falling back to the path check.
+    """
+    path = owner_anchor_path(root, route.generation)
+    try:
+        require_private_file(path)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ChatError("route owner anchor is invalid") from error
+    image_identity = raw.get("image_identity") if isinstance(raw, dict) else None
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != OWNER_ANCHOR_FIELDS
+        or raw["provider"] != route.provider
+        or raw["pid"] != route.pid
+        or raw["generation"] != route.generation
+        or raw["owner_identity"] != route.owner_identity
+        or raw["profile_root"] != route.profile_root
+        or not isinstance(image_identity, str)
+        or re.fullmatch(r"[0-9a-f]{64}", image_identity) is None
+    ):
+        raise ChatError("route owner anchor is invalid")
+    return image_identity
+
+
+def _anchored_owner_current(root: Path, route: Route) -> bool:
+    """Decide owner currency only from this route's bound image anchor."""
+    if route.owner_identity is None:
+        return False
+    try:
+        bound = _route_owner_anchor(root, route)
+    except ChatError:
+        return False
+    if bound is None:
+        return False
+    try:
+        return (
+            recipient_owner_image_identity(route.provider, route.pid, route.profile_root) == bound
+        )
+    except (ChatError, OSError):
+        return False
+
+
+def _route_owner_current(root: Path, route: Route) -> bool:
+    """Decide owner currency for one route: anchor-bound when anchored, else path.
+
+    An anchored route proves itself against the running image's vnode, which
+    survives the provider's package directory being renamed aside or deleted.
+    An unanchored route keeps the exact legacy path-bound check; a malformed,
+    foreign, or non-private anchor fails the route closed. A route with no
+    bound owner identity has nothing to prove and is never owner-current.
+    """
+    if route.owner_identity is None:
+        return False
+    try:
+        bound = _route_owner_anchor(root, route)
+    except ChatError:
+        return False
+    if bound is not None:
+        try:
+            return (
+                recipient_owner_image_identity(route.provider, route.pid, route.profile_root)
+                == bound
+            )
+        except (ChatError, OSError):
+            return False
+    profile = route.profile_root or recipient_profile_root(route.provider)
+    try:
+        return (
+            recipient_owner_identity(route.provider, route.pid, profile)[0] == route.owner_identity
+        )
+    except (ChatError, OSError):
+        return False
+
+
+def _reusable_anchored_route(root: Path, provider: str, session_id: str, pid: int) -> Route | None:
+    """Reuse one live anchored route when the provider path cannot be read again."""
+    matches = [
+        route
+        for route in Registry(root).routes()
+        if route.provider == provider and route.session_id == session_id and route.pid == pid
+    ]
+    if len(matches) != 1:
+        return None
+    route = matches[0]
+    if not route.process_is_live() or not _anchored_owner_current(root, route):
+        return None
+    return route
+
+
+def _provider_binary(provider: str) -> Path | None:
+    """Discover the provider executable through the installed lookup path."""
+    if provider == "claude":
+        try:
+            return claude_binary()
+        except ChatError:
+            return None
+    if provider == "devin":
+        try:
+            return devin_binary()
+        except ChatError:
+            return None
+    found = shutil.which("codex")
+    return None if found is None else Path(found)
+
+
+def _courier_owner_binary(root: Path, route: Route) -> Path | None:
+    """Resolve the owner's executable, using provider discovery only when its
+    bound image anchor proves the same process still owns the route."""
+    try:
+        return recipient_owner_identity(route.provider, route.pid, route.profile_root)[1]
+    except (ChatError, OSError):
+        if _anchored_owner_current(root, route):
+            return _provider_binary(route.provider)
+        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,7 +807,7 @@ def _native_claude_cwd(session_id: str) -> str | None:
 
 def _spawn_courier(root: Path, route: Route) -> None:
     path = socket_path(root, route)
-    owner_binary = recipient_owner_identity(route.provider, route.pid, route.profile_root)[1]
+    owner_binary = _courier_owner_binary(root, route)
     if path.exists() or path.is_symlink():
         raise ChatError("session courier socket already exists")
     command = [
@@ -680,7 +912,18 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
     if isinstance(pid, bool) or pid <= 0:
         raise ChatError("provider process is invalid")
     raw = hook_input("SessionStart")
-    owner_identity, _owner_binary = recipient_owner_identity(provider, pid)
+    try:
+        owner_identity, owner_binary = recipient_owner_identity(provider, pid)
+    except (ChatError, OSError):
+        # The provider updater may have unlinked the still-running image. Only
+        # an existing route whose own image anchor validates may be reused; a
+        # missing path never mints a new owner identity.
+        reused = _reusable_anchored_route(
+            state_root(state_root_value), provider, cast(str, raw["session_id"]), pid
+        )
+        if reused is None:
+            raise
+        return reused
     route = Route.create(
         provider=provider,
         session_id=cast(str, raw["session_id"]),
@@ -745,10 +988,12 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
                         )
                         if prior_route is not None and native_cwd == route.cwd:
                             registry.upsert(route)
+                            _write_owner_anchor(root, route, owner_binary)
                             _spawn_courier(root, route)
                             return route
                         return registered
                     raise ChatError("existing courier ownership could not be verified")
+            _write_owner_anchor(root, route, owner_binary)
             _spawn_courier(root, route)
             return route
     except BaseException:
@@ -828,7 +1073,13 @@ def _register_devin_prompt(device: str, pid: int, root: Path, event: DevinHookEv
     """Register the first trusted prompt for one exact local Devin session."""
 
     cwd = devin_hook_cwd()
-    owner_identity, _ = recipient_owner_identity("devin", pid)
+    try:
+        owner_identity, owner_binary = recipient_owner_identity("devin", pid)
+    except (ChatError, OSError):
+        reused = _reusable_anchored_route(root, "devin", event.session_id, pid)
+        if reused is None:
+            raise
+        return reused
     route = Route.create(
         provider="devin",
         session_id=event.session_id,
@@ -881,6 +1132,7 @@ def _register_devin_prompt(device: str, pid: int, root: Path, event: DevinHookEv
                     if _bootstrap_response(bootstrap, registered):
                         return registered
                     raise ChatError("existing courier ownership could not be verified")
+            _write_owner_anchor(root, route, owner_binary)
             _spawn_courier(root, route)
             return route
     except BaseException:
@@ -897,9 +1149,16 @@ def register_devin(device: str, pid: int, state_root_value: str | None) -> Route
         return None
     if isinstance(pid, bool) or pid <= 0:
         raise ChatError("provider process is invalid")
-    parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="SessionStart")
+    event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="SessionStart")
     devin_hook_cwd()
-    recipient_owner_identity("devin", pid)
+    try:
+        recipient_owner_identity("devin", pid)
+    except (ChatError, OSError):
+        if (
+            _reusable_anchored_route(state_root(state_root_value), "devin", event.session_id, pid)
+            is None
+        ):
+            raise
     valid_device(device)
     return None
 
@@ -1077,18 +1336,9 @@ def devin_user_prompt(pid: int, state_root_value: str | None, device: str | None
 
 
 def _route_current(root: Path, expected: Route) -> bool:
-    if expected.owner_identity is not None:
-        profile = expected.profile_root or recipient_profile_root(expected.provider)
-        try:
-            if (
-                recipient_owner_identity(expected.provider, expected.pid, profile)[0]
-                != expected.owner_identity
-            ):
-                return False
-        except (ChatError, OSError):
-            return False
     return (
-        Registry(root).current(expected)
+        (expected.owner_identity is None or _route_owner_current(root, expected))
+        and Registry(root).current(expected)
         and expected.process_is_live()
         and expected.cwd_is_available()
     )
@@ -1340,12 +1590,8 @@ def courier_server(
     helper_lineage = provider == "codex" and NativeHelperStore(root).is_helper_lineage(route)
     helper_queue = False
     if helper_lineage:
-        try:
-            identity, _ = recipient_owner_identity("codex", route.pid, route.profile_root)
-        except (ChatError, OSError):
-            identity = ""
         helper_queue = (
-            identity == route.owner_identity and native_desktop_bundle(route.pid) is not None
+            _route_owner_current(root, route) and native_desktop_bundle(route.pid) is not None
         )
     native_enabled = os.environ.get(NATIVE_QUEUE_ENV_VAR) == NATIVE_QUEUE_ENV_VALUE or helper_queue
     if provider == "codex" and native_enabled:
@@ -1732,12 +1978,15 @@ def _with_codex_titles(root: Path, targets: list[Target], deadline: float) -> li
         if len(route_matches) != 1:
             continue
         profile = route_matches[0].profile_root or recipient_profile_root("codex")
+        if not _route_owner_current(root, route_matches[0]):
+            continue
         try:
-            identity, binary = recipient_owner_identity("codex", target.pid, profile)
+            binary = recipient_owner_identity("codex", target.pid, profile)[1]
         except (ChatError, OSError):
-            continue
-        if route_matches[0].owner_identity != identity:
-            continue
+            fallback = _provider_binary("codex")
+            if fallback is None:
+                continue
+            binary = fallback
         groups.setdefault((binary, profile), []).append(target)
     titles: dict[str, str] = {}
     for (binary, profile), group in groups.items():
@@ -2935,7 +3184,7 @@ def native_startup(root: Path, device: str, pid: int) -> dict[str, object]:
     ]
     if len(candidates) != 1 or not _route_current(root, candidates[0]):
         return {}
-    if not _native_desktop_route(candidates[0]):
+    if not _native_desktop_route(root, candidates[0]):
         return {}
     return native_bootstrap_context(root, candidates[0], "UserPromptSubmit")
 
@@ -2944,7 +3193,7 @@ def native_bootstrap_context(root: Path, source: Route, event_name: str) -> dict
     """Emit the provider-shaped one-time bootstrap instruction for an eligible Desktop route."""
 
     if (
-        not _native_desktop_route(source)
+        not _native_desktop_route(root, source)
         or event_name not in {"SessionStart", "UserPromptSubmit"}
         or native_helper_tools(root, source) != ("native_bootstrap",)
         or not _native_hook_ready(source, _native_create_hook_group())
@@ -2960,16 +3209,12 @@ def native_bootstrap_context(root: Path, source: Route, event_name: str) -> dict
     }
 
 
-def _native_desktop_route(route: Route) -> bool:
+def _native_desktop_route(root: Path, route: Route) -> bool:
     """Recognize a route owned by the bundled Native Codex process."""
 
-    try:
-        identity, _ = recipient_owner_identity("codex", route.pid, route.profile_root)
-    except (ChatError, OSError):
-        return False
     return (
         route.provider == "codex"
-        and identity == route.owner_identity
+        and _route_owner_current(root, route)
         and native_desktop_bundle(route.pid) is not None
     )
 
@@ -3065,17 +3310,13 @@ def native_desktop_mcp_host() -> bool:
     return native_desktop_process(os.getppid())
 
 
-def _native_account_binary(route: Route) -> Path:
+def _native_account_binary(root: Path, route: Route) -> Path:
     """Select only the bundled app-server client of the bound Desktop process."""
 
     if route.profile_root is None:
         raise ChatError("Codex account identity is unavailable")
-    try:
-        identity, _ = recipient_owner_identity("codex", route.pid, route.profile_root)
-    except (ChatError, OSError) as error:
-        raise ChatError("Codex account identity is unavailable") from error
     bundle = native_desktop_bundle(route.pid)
-    if identity != route.owner_identity or bundle is None:
+    if not _route_owner_current(root, route) or bundle is None:
         raise ChatError("Codex account identity is unavailable")
     try:
         return (bundle / "Contents" / "Resources" / "codex").resolve(strict=True)
@@ -3083,12 +3324,13 @@ def _native_account_binary(route: Route) -> Path:
         raise ChatError("Codex account identity is unavailable") from error
 
 
-def _native_account_digest(route: Route) -> str:
+def _native_account_digest(root: Path, route: Route) -> str:
     """Bind lifecycle operations to the selected provider account without refresh."""
 
     assert route.profile_root is not None
     return native_account_digest(
-        binary=_native_account_binary(route), environment={"CODEX_HOME": route.profile_root}
+        binary=_native_account_binary(root, route),
+        environment={"CODEX_HOME": route.profile_root},
     )
 
 
@@ -3156,7 +3398,7 @@ def native_bootstrap(root: Path, source: Route) -> dict[str, object]:
     ):
         raise ChatError("native helper bootstrap is unavailable")
     binding, nonce = NativeHelperStore(root).reserve(
-        source, _native_account_digest(source), Registry(root).routes()
+        source, _native_account_digest(root, source), Registry(root).routes()
     )
     return {
         "content": [{"type": "text", "text": "Native delivery helper setup was submitted."}],
@@ -3183,7 +3425,7 @@ def native_register(root: Path, helper: Route, token: str) -> dict[str, object]:
     original = store.original_for_nonce(token, Registry(root).routes())
     if not _route_current(root, original) or not _route_current(root, helper):
         raise ChatError("native helper registration is unavailable")
-    store.register(helper, token, original, _native_account_digest(helper))
+    store.register(helper, token, original, _native_account_digest(root, helper))
     return {"content": [{"type": "text", "text": "Native helper is ready."}]}
 
 
@@ -3206,8 +3448,8 @@ def native_dispatch(root: Path, helper: Route, event_id: str) -> dict[str, objec
         )
     )
     if (
-        _native_account_digest(helper) != bound_account
-        or _native_account_digest(original) != bound_account
+        _native_account_digest(root, helper) != bound_account
+        or _native_account_digest(root, original) != bound_account
     ):
         raise ChatError("native helper dispatch is unavailable")
     dispatch_store = NativeDispatchStore(root)
