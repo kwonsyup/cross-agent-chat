@@ -479,16 +479,31 @@ class Registry:
                 with suppress(OSError):
                     entry.unlink()
 
-    def upsert(self, route: Route) -> None:
+    def _publish_owner_anchor(self, route: Route, anchor: dict[str, object] | None) -> None:
+        """Write an image anchor inside the routes lock, before the route.
+
+        Keeping this in the same critical section as _write means another
+        session's compaction can never prune an anchor between its write and
+        the route's publication.
+        """
+        if anchor is None:
+            return
+        with suppress(OSError, ChatError):
+            atomic_json(owner_anchor_path(self.root, route.generation), anchor)
+
+    def upsert(self, route: Route, *, anchor: dict[str, object] | None = None) -> None:
         with state_lock(self.root, "routes"):
             existing = [
                 item
                 for item in self.routes()
                 if (item.provider, item.session_id) != (route.provider, route.session_id)
             ]
+            self._publish_owner_anchor(route, anchor)
             self._write([*existing, route])
 
-    def upsert_or_reuse_live_owner(self, route: Route) -> Route:
+    def upsert_or_reuse_live_owner(
+        self, route: Route, *, anchor: dict[str, object] | None = None
+    ) -> Route:
         """Preserve a live generation when an identical provider hook repeats."""
         with state_lock(self.root, "routes"):
             existing = self.routes()
@@ -510,6 +525,7 @@ class Registry:
                 for item in existing
                 if (item.provider, item.session_id) != (route.provider, route.session_id)
             ]
+            self._publish_owner_anchor(route, anchor)
             self._write([*retained, route])
             return route
 
