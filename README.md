@@ -59,13 +59,13 @@ You need:
   runtime if you have neither.
 - Tailscale on each Mac, if you want sessions on different Macs to talk.
 
-Install v0.4.3 with:
+Install v0.4.4 with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.3/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.4/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
-This builds the released `v0.4.3` tag, sets up the providers already on the
+This builds the released `v0.4.4` tag, sets up the providers already on the
 Mac, installs the command at `~/.local/bin/cross-agent-chat`, and starts the
 broker. Run it once on each Mac that should take part; re-running the installer
 upgrades or repairs the setup.
@@ -132,7 +132,7 @@ To keep a short-lived worker session off the peer list, start it with
 | Result | Meaning | What to do |
 |---|---|---|
 | `TRANSPORT_ACCEPTED` | Accepted for delivery into the recipient's courier or inbox. Not a read receipt — it does not confirm the model saw the message or did the work. | Wait for the reply. Do not send again. |
-| Refused before delivery | Nothing was handed over. The refusal applies only to that one attempted send. | Fix the reported cause (e.g. a discovery timeout), then send again. |
+| Refused before delivery | Nothing was handed over. The refusal applies only to that one attempted send. | Fix the reported cause (e.g. a discovery timeout), then send again — safe only for that refused attempt, and only if no earlier attempt of the same task was `TRANSPORT_ACCEPTED` or `UNKNOWN_DELIVERY`. |
 | `UNKNOWN_DELIVERY` | The send's outcome could not be confirmed; the message may or may not have been delivered. | Check the recipient session directly. Do not re-send. |
 
 `chat_send` also reports `reply_delivery`, how an answer can return to your
@@ -208,7 +208,9 @@ current Codex profile receive while idle, and
 - **A send says the handle no longer resolves.** The recipient restarted. Run
   `chat_peers` to get the new handle.
 - **A send was refused before delivery.** That attempt delivered nothing; once
-  the reported cause is fixed, sending that task again is safe.
+  the reported cause is fixed, sending again is safe only for that refused
+  attempt — a later refusal never authorizes replaying an earlier attempt of
+  the same task that was `TRANSPORT_ACCEPTED` or `UNKNOWN_DELIVERY`.
 - **`TRANSPORT_ACCEPTED` but no answer yet.** The recipient's courier accepted
   the request. Check the recipient session directly rather than re-sending.
 
