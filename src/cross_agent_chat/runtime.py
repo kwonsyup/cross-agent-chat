@@ -529,27 +529,16 @@ def _reusable_anchored_route(root: Path, provider: str, session_id: str, pid: in
     return route
 
 
-def _handover_anchored_route(root: Path, route: Route, hook_cwd: str) -> Route:
-    """Carry a validated anchored route through courier recovery and cwd drift.
+def _handover_anchored_route(root: Path, route: Route) -> Route:
+    """Carry a validated anchored route through courier recovery only.
 
-    Same decisions as the minted-path bootstrap block in register(): a gone
-    courier respawns, a busy or answering courier is left alone, and a claude
-    cwd drift is applied only when the native session confirms it. The one
-    deliberate difference: the anchored generation is always kept -- a cwd
-    update reuses it instead of minting a new route, because the anchor binds
-    the generation and no fresh owner identity can be computed while the
-    provider path is unreadable.
+    The route is returned exactly as published -- generation, cwd, project,
+    and alias all stay bound to the original record, so a hook reporting a
+    different cwd inside an updated session keeps the original route's cwd
+    until the session restarts. A gone courier respawns on the same
+    generation-keyed socket; a busy or answering courier is left alone; an
+    unverifiable one refuses exactly like the minted path.
     """
-    hook_cwd = canonical_cwd(hook_cwd)
-    drifted = hook_cwd != route.cwd
-    updated = replace(route, cwd=hook_cwd) if drifted else route
-    registry = Registry(root)
-    if drifted and route.provider != "claude":
-        # Non-claude drift replaces the record outright, same as the minted
-        # path publishing a new route without consulting the courier.
-        registry.upsert(updated)
-        _spawn_courier(root, updated)
-        return updated
     try:
         bootstrap = request_socket(
             socket_path(root, route),
@@ -567,18 +556,11 @@ def _handover_anchored_route(root: Path, route: Route, hook_cwd: str) -> Route:
         if not missing and not refused:
             # A busy courier may still own an accepted provider effect.
             return route
-        registry.upsert(updated)
-        _spawn_courier(root, updated)
-        return updated
+        _spawn_courier(root, route)
+        return route
     if not _bootstrap_response(bootstrap, route):
         raise ChatError("existing courier ownership could not be verified")
-    if not drifted:
-        return route
-    if _native_claude_cwd(route.session_id) != hook_cwd:
-        return route
-    registry.upsert(updated)
-    _spawn_courier(root, updated)
-    return updated
+    return route
 
 
 def _provider_binary(provider: str) -> Path | None:
@@ -1098,7 +1080,7 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
         # missing path then mints nothing.
         reused = _reusable_anchored_route(root, provider, session_id, pid)
         if reused is not None:
-            return _handover_anchored_route(root, reused, cast(str, raw["cwd"]))
+            return _handover_anchored_route(root, reused)
         owner_identity, owner_binary = recipient_owner_identity(provider, pid)
         route = Route.create(
             provider=provider,
@@ -1259,7 +1241,7 @@ def _register_devin_prompt(device: str, pid: int, root: Path, event: DevinHookEv
         if reused is not None:
             if reused.cwd != cwd:
                 raise ChatError("exact Devin session route is unavailable")
-            return _handover_anchored_route(root, reused, cwd)
+            return _handover_anchored_route(root, reused)
         owner_identity, owner_binary = recipient_owner_identity("devin", pid)
         route = Route.create(
             provider="devin",
