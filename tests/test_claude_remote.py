@@ -330,6 +330,40 @@ def test_claude_binary_uses_fixed_user_local_fallback(
     assert claude_binary() == binary.resolve()
 
 
+def test_claude_binary_ignores_a_pinned_path_removed_by_an_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    removed = tmp_path / "pkg" / "claude.exe"
+    discovered = tmp_path / "bin" / "claude"
+    discovered.parent.mkdir(parents=True)
+    discovered.write_text("#!/bin/sh\n")
+    discovered.chmod(0o700)
+    monkeypatch.setenv("CROSS_AGENT_CHAT_CLAUDE_BINARY", str(removed))
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.shutil.which",
+        lambda name: str(discovered) if name == "claude" else None,
+    )
+
+    assert claude_binary() == discovered.resolve()
+
+
+def test_claude_binary_keeps_a_pinned_path_that_still_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pinned = tmp_path / "pkg" / "claude.exe"
+    pinned.parent.mkdir(parents=True)
+    pinned.write_text("#!/bin/sh\n")
+    pinned.chmod(0o700)
+    other = tmp_path / "bin" / "claude"
+    monkeypatch.setenv("CROSS_AGENT_CHAT_CLAUDE_BINARY", str(pinned))
+    monkeypatch.setattr(
+        "cross_agent_chat.claude_runtime.shutil.which",
+        lambda name: str(other) if name == "claude" else None,
+    )
+
+    assert claude_binary() == pinned.resolve()
+
+
 def test_exact_agent_ignores_unrelated_noncanonical_roster_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

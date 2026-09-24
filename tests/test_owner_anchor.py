@@ -42,8 +42,21 @@ REEXEC_SOURCE = (
     "int main(int argc, char **argv){"
     "if(argc<4)return 2;"
     "while(access(argv[3],F_OK)!=0)usleep(20000);"
-    "execl(argv[1],argv[2],(char*)0);"
-    "return 3;}\n"
+    "if(argc>5)return execl(argv[1],argv[2],argv[4],argv[5],(char*)0);"
+    "return execl(argv[1],argv[2],(char*)0);}\n"
+)
+KEEPER_SOURCE = (
+    "#include <unistd.h>\n"
+    "#include <fcntl.h>\n"
+    "#include <sys/mman.h>\n"
+    "int main(int argc, char **argv){"
+    "if(argc>1){"
+    "int fd=open(argv[1],O_RDONLY);"
+    "if(fd>=0){(void)mmap(0,4096,PROT_READ,MAP_PRIVATE,fd,0);}"
+    "}"
+    "if(argc>2){int m=open(argv[2],O_WRONLY|O_CREAT|O_TRUNC,0600);"
+    'if(m>=0){(void)write(m,"mapped\\n",7);close(m);}}'
+    "pause();return 0;}\n"
 )
 
 
@@ -54,11 +67,14 @@ def compiled(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     sleeper_source.write_text(SLEEPER_SOURCE, encoding="utf-8")
     reexec_source = root / "reexec.c"
     reexec_source.write_text(REEXEC_SOURCE, encoding="utf-8")
+    keeper_source = root / "keeper.c"
+    keeper_source.write_text(KEEPER_SOURCE, encoding="utf-8")
     binaries: dict[str, Path] = {}
     for name, source in (
         ("sleeper", sleeper_source),
         ("other", sleeper_source),
         ("reexec", reexec_source),
+        ("keeper", keeper_source),
     ):
         binary = root / name
         result = _REAL_RUN(
@@ -86,7 +102,8 @@ def _spawn(binary: Path, *extra: str) -> subprocess.Popen[bytes]:
     deadline = time.monotonic() + 3
     while process.poll() is None:
         try:
-            runtime._owner_image_observation(process.pid)
+            runtime._owner_image_vnode(process.pid)
+            runtime._owner_exec_facts(process.pid)
         except ChatError:
             if time.monotonic() > deadline:
                 break
@@ -255,7 +272,7 @@ def test_process_execing_a_different_image_loses_the_anchor(
     process = _spawn(binary, str(other), "other", str(gate))
     try:
         route = _register(root, "claude", process.pid, cwd, monkeypatch, str(uuid4()))
-        before = runtime._owner_image_observation(process.pid)
+        before = runtime._owner_exec_facts(process.pid)
         assert runtime._route_current(root, route)
 
         gate.touch()
@@ -264,10 +281,11 @@ def test_process_execing_a_different_image_loses_the_anchor(
             if time.monotonic() > deadline:
                 pytest.fail("exec'd image kept the original anchor")
             time.sleep(0.02)
-        after = runtime._owner_image_observation(process.pid)
-        # Same process, same uid and birth; only the mapped image changed.
-        assert before[2:] == after[2:]
-        assert before[:2] != after[:2]
+        after = runtime._owner_exec_facts(process.pid)
+        # Same process, same uid and birth; only the exec generation changed.
+        assert before[3:] == after[3:]
+        assert before[0] != after[0]
+        assert before[2] != after[2]
         assert process.poll() is None
     finally:
         process.kill()
@@ -305,7 +323,7 @@ def test_renamed_over_path_keeps_anchor_for_old_image_only(
                 runtime.recipient_owner_image_identity(
                     "claude", replacement.pid, route.profile_root
                 )
-                != bound
+                != bound[2]
             )
             foreign_pid_route = replace(route, pid=replacement.pid)
             assert not runtime._route_owner_current(root, foreign_pid_route)
@@ -357,17 +375,22 @@ def test_anchor_binding_mismatches_fail_closed(
         elif mutation == "profile_root":
             raw["profile_root"] = str(tmp_path / "elsewhere")
         else:
-            device, inode, uid, start_seconds, start_microseconds = (
-                runtime._owner_image_observation(process.pid)
+            device, inode = runtime._owner_image_vnode(process.pid)
+            p_uuid, uniqueid, idversion, uid, start_seconds, start_microseconds = (
+                runtime._owner_exec_facts(process.pid)
             )
             if mutation == "wrong-uid-image":
                 uid += 1
             else:
                 start_seconds += 1
+            assert route.profile_root is not None
             raw["image_identity"] = runtime._owner_image_identity(
                 "claude",
                 device,
                 inode,
+                uniqueid,
+                idversion,
+                p_uuid,
                 uid,
                 start_seconds,
                 start_microseconds,
@@ -545,13 +568,11 @@ def test_anchor_not_written_when_region_and_path_disagree(
     cwd.mkdir()
     process = _spawn(binary)
     try:
-        device, inode, uid, start_seconds, start_microseconds = runtime._owner_image_observation(
-            process.pid
-        )
+        device, inode = runtime._owner_image_vnode(process.pid)
         monkeypatch.setattr(
             runtime,
-            "_owner_image_observation",
-            lambda _pid: (device, inode + 1, uid, start_seconds, start_microseconds),
+            "_owner_image_vnode",
+            lambda _pid, _target=None: (device, inode + 1),
         )
         route = _register(root, "claude", process.pid, cwd, monkeypatch, str(uuid4()))
         assert not owner_anchor_path(root, route.generation).exists()
@@ -563,4 +584,156 @@ def test_anchor_not_written_when_region_and_path_disagree(
 
 def test_image_observation_refuses_unknown_process() -> None:
     with pytest.raises(ChatError):
-        runtime._owner_image_observation(2**22)
+        runtime._owner_image_vnode(2**22)
+    with pytest.raises(ChatError):
+        runtime._owner_exec_facts(2**22)
+
+
+def test_execed_image_still_mapping_the_old_executable_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    package = tmp_path / "pkg"
+    binary = _install(compiled["reexec"], package)
+    keeper = _install(compiled["keeper"], tmp_path / "keeper-pkg")
+    gate = tmp_path / "gate"
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    # argv[4]/argv[5] are forwarded to the exec'd image, which mmaps the
+    # registered executable's own file and then writes a marker: the anchored
+    # vnode stays present inside a *different* image's address space. The exec
+    # generation is what must reject the anchor, not the region scan. Waiting
+    # on the marker file keeps the sequencing deterministic instead of polling
+    # kernel state.
+    marker = tmp_path / "mapped"
+    process = _spawn(binary, str(keeper), "keeper", str(gate), str(binary), str(marker))
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, str(uuid4()))
+        bound = runtime._route_owner_anchor(root, route)
+        assert bound is not None
+        before = runtime._owner_exec_facts(process.pid)
+
+        gate.touch()
+        deadline = time.monotonic() + 10
+        while not marker.exists():
+            if time.monotonic() > deadline:
+                pytest.fail("exec'd image never mapped the old executable")
+            if process.poll() is not None:
+                pytest.fail("exec'd image exited before mapping")
+            time.sleep(0.02)
+
+        # The new image holds the old vnode mapped; the exec generation is
+        # what rejects the route.
+        assert process.poll() is None
+        found = runtime._owner_image_vnode(process.pid, (bound[0], bound[1]))
+        assert found == (bound[0], bound[1])
+        after = runtime._owner_exec_facts(process.pid)
+        assert before[3:] == after[3:]
+        assert before[0] != after[0]
+        assert before[2] != after[2]
+        assert not runtime._anchored_owner_current(root, route)
+        assert not runtime._route_owner_current(root, route)
+        assert process.poll() is None
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_reregistration_during_renamed_update_reuses_the_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    process = _spawn(binary)
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        _npm_update_aside(package)
+        # Mid-update the path resolves to a different pathname, so a fresh
+        # legacy identity would differ; the anchored route is reused instead.
+        assert (
+            runtime.recipient_owner_identity("claude", process.pid, route.profile_root)[0]
+            != route.owner_identity
+        )
+        reused = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        assert reused == route
+        assert reused.generation == route.generation
+        assert Registry(root).routes() == [route]
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_anchor_is_written_before_the_route_is_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    process = _spawn(binary)
+    anchored_at_publish: list[bool] = []
+    original_reuse = Registry.upsert_or_reuse_live_owner
+    original_upsert = Registry.upsert
+
+    def spy_reuse(self: Registry, route: Route) -> Route:
+        anchored_at_publish.append(owner_anchor_path(self.root, route.generation).is_file())
+        return original_reuse(self, route)
+
+    def spy_upsert(self: Registry, route: Route) -> None:
+        anchored_at_publish.append(owner_anchor_path(self.root, route.generation).is_file())
+        original_upsert(self, route)
+
+    monkeypatch.setattr(Registry, "upsert_or_reuse_live_owner", spy_reuse)
+    monkeypatch.setattr(Registry, "upsert", spy_upsert)
+    try:
+        _register(root, "claude", process.pid, cwd, monkeypatch, str(uuid4()))
+        assert anchored_at_publish == [True]
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_validation_scans_regions_for_the_anchored_vnode_mocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    """MOCKED-BRANCH test: no fixture can place an unrelated vnode below the
+    executable's own __TEXT, so the A6 scan branch is scripted."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    process = _spawn(binary)
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, str(uuid4()))
+        bound = runtime._route_owner_anchor(root, route)
+        assert bound is not None
+        image_dev, image_ino, _ = bound
+
+        regions = {
+            0: (image_dev + 1, image_ino + 1, 0x3000),
+            0x3000: (image_dev, image_ino, 0x4000),
+        }
+        monkeypatch.setattr(
+            runtime, "_owner_vnode_region", lambda _pid, address: regions.get(address)
+        )
+        # The lowest region no longer holds the image vnode; the bounded scan
+        # finds it higher in the address space and the exec facts still match.
+        assert runtime._anchored_owner_current(root, route)
+        assert runtime._route_current(root, route)
+
+        monkeypatch.setattr(
+            runtime,
+            "_owner_vnode_region",
+            lambda _pid, address: {0: (image_dev + 1, image_ino + 1, 0x3000)}.get(address),
+        )
+        assert not runtime._anchored_owner_current(root, route)
+        assert not runtime._route_current(root, route)
+    finally:
+        process.kill()
+        process.wait()

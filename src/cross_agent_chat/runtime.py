@@ -76,6 +76,7 @@ from cross_agent_chat.core import (
     stored_cwd,
     valid_device,
     valid_name,
+    valid_session_id,
     valid_uuid,
 )
 from cross_agent_chat.devin import (
@@ -153,10 +154,21 @@ PROC_PIDTBSDINFO: Final = 3
 PROC_BSDINFO_SIZE: Final = 136
 PROC_PIDREGIONPATHINFO2: Final = 22
 PROC_REGIONWITHPATHINFO_SIZE: Final = 1272
-# Inside proc_regionwithpathinfo the 96-byte proc_regioninfo is followed by
-# vnode_info_path, whose vi_stat carries vst_dev (u32) and vst_ino (u64).
+# Inside proc_regionwithpathinfo the 96-byte proc_regioninfo carries
+# pri_address (u64) and pri_size (u64), then vnode_info_path whose vi_stat
+# carries vst_dev (u32) and vst_ino (u64).
+REGION_ADDRESS_OFFSET: Final = 80
+REGION_SIZE_OFFSET: Final = 88
 REGION_VSTAT_DEV_OFFSET: Final = 96
 REGION_VSTAT_INO_OFFSET: Final = 104
+REGION_SCAN_MAX: Final = 4096
+PROC_PIDUNIQIDENTIFIERINFO: Final = 17
+PROC_UNIQIDENTIFIERINFO_SIZE: Final = 56
+# proc_uniqidentifierinfo: p_uuid[16], p_uniqueid (u64), p_puniqueid (u64),
+# p_idversion (i32); both fields change on exec and survive a package delete.
+UNIQ_UUID_OFFSET: Final = 0
+UNIQ_UNIQUEID_OFFSET: Final = 16
+UNIQ_IDVERSION_OFFSET: Final = 32
 DeliveryMode = Literal[
     "claude_native_cross_session",
     "codex_stop_bound",
@@ -221,32 +233,98 @@ def recipient_owner_identity(
     return hashlib.sha256(payload).hexdigest(), binary
 
 
-def _owner_image_observation(pid: int) -> tuple[int, int, int, int, int]:
-    """Return (dev, ino, uid, start sec, start usec) of the process's text vnode.
+def _owner_vnode_region(pid: int, address: int) -> tuple[int, int, int] | None:
+    """Return (dev, ino, next address) of the region at-or-after ``address``.
 
-    The lowest vnode-backed region is the main executable's __TEXT; its vnode
-    stays bound to the mapped file object even after every path to it is
-    renamed aside or unlinked, which is exactly what a path cannot observe.
+    The call answers one exact-size region record or nothing; there is no
+    partial or synthesized region to mistake for an observation.
     """
     libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+    libproc.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
     region = ctypes.create_string_buffer(PROC_REGIONWITHPATHINFO_SIZE)
-    observed = libproc.proc_pidinfo(pid, PROC_PIDREGIONPATHINFO2, 0, region, len(region))
+    observed = libproc.proc_pidinfo(pid, PROC_PIDREGIONPATHINFO2, address, region, len(region))
     if observed != PROC_REGIONWITHPATHINFO_SIZE:
-        raise ChatError("provider process identity is unavailable")
+        return None
     device = int.from_bytes(
         region.raw[REGION_VSTAT_DEV_OFFSET : REGION_VSTAT_DEV_OFFSET + 4], sys.byteorder
     )
     inode = int.from_bytes(
         region.raw[REGION_VSTAT_INO_OFFSET : REGION_VSTAT_INO_OFFSET + 8], sys.byteorder
     )
+    base = int.from_bytes(
+        region.raw[REGION_ADDRESS_OFFSET : REGION_ADDRESS_OFFSET + 8], sys.byteorder
+    )
+    size = int.from_bytes(region.raw[REGION_SIZE_OFFSET : REGION_SIZE_OFFSET + 8], sys.byteorder)
+    return device, inode, base + size
+
+
+def _owner_image_vnode(pid: int, target: tuple[int, int] | None = None) -> tuple[int, int]:
+    """Return the process's image vnode, or the ``target`` vnode when anchored.
+
+    The lowest vnode-backed region is the running image's __TEXT. When a target
+    is bound (an anchor), a bounded scan of the remaining regions tolerates an
+    unrelated file mapped below the image after registration; the exec
+    generation bound into the image identity still rejects any exec.
+    """
+    address = 0
+    for _ in range(REGION_SCAN_MAX):
+        observed = _owner_vnode_region(pid, address)
+        if observed is None:
+            break
+        device, inode, next_address = observed
+        if target is None or (device, inode) == target:
+            return device, inode
+        if next_address <= address:
+            break
+        address = next_address
+    raise ChatError("provider process identity is unavailable")
+
+
+def _owner_exec_facts(pid: int) -> tuple[bytes, int, int, int, int, int]:
+    """Return the kernel exec generation and birth facts for one live process.
+
+    ``p_uuid`` and ``p_idversion`` change on exec while ``p_uniqueid``, uid,
+    and the BSD start time stay bound to the process; a package update changes
+    none of them. An unavailable flavor raises rather than defaulting.
+    """
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+    libproc.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    info = ctypes.create_string_buffer(PROC_UNIQIDENTIFIERINFO_SIZE)
+    if (
+        libproc.proc_pidinfo(pid, PROC_PIDUNIQIDENTIFIERINFO, 0, info, len(info))
+        != PROC_UNIQIDENTIFIERINFO_SIZE
+    ):
+        raise ChatError("provider process identity is unavailable")
+    p_uuid = info.raw[UNIQ_UUID_OFFSET : UNIQ_UUID_OFFSET + 16]
+    uniqueid = int.from_bytes(
+        info.raw[UNIQ_UNIQUEID_OFFSET : UNIQ_UNIQUEID_OFFSET + 8], sys.byteorder
+    )
+    idversion = int.from_bytes(
+        info.raw[UNIQ_IDVERSION_OFFSET : UNIQ_IDVERSION_OFFSET + 4], sys.byteorder, signed=True
+    )
     uid, start_seconds, start_microseconds = _process_identity_facts(pid)
-    return device, inode, uid, start_seconds, start_microseconds
+    return p_uuid, uniqueid, idversion, uid, start_seconds, start_microseconds
 
 
 def _owner_image_identity(
     provider: str,
     device: int,
     inode: int,
+    uniqueid: int,
+    idversion: int,
+    p_uuid: bytes,
     uid: int,
     start_seconds: int,
     start_microseconds: int,
@@ -254,27 +332,50 @@ def _owner_image_identity(
 ) -> str:
     root = Path(profile_root).expanduser().resolve(strict=False)
     payload = (
-        f"{provider}\0{device}\0{inode}\0{uid}\0{start_seconds}\0{start_microseconds}\0{root}"
+        f"{provider}\0{device}\0{inode}\0{uniqueid}\0{idversion}\0{p_uuid.hex()}\0{uid}"
+        f"\0{start_seconds}\0{start_microseconds}\0{root}"
     ).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
-def recipient_owner_image_identity(provider: str, pid: int, profile_root: str | None = None) -> str:
-    """Bind a route to the running image's vnode rather than its executable path."""
-    device, inode, uid, start_seconds, start_microseconds = _owner_image_observation(pid)
+def _owner_image_identity_for_vnode(
+    provider: str, pid: int, device: int, inode: int, profile_root: str
+) -> str:
+    """Recompute the image identity around one already-observed vnode."""
+    p_uuid, uniqueid, idversion, uid, start_seconds, start_microseconds = _owner_exec_facts(pid)
     return _owner_image_identity(
         provider,
         device,
         inode,
+        uniqueid,
+        idversion,
+        p_uuid,
         uid,
         start_seconds,
         start_microseconds,
-        profile_root or recipient_profile_root(provider),
+        profile_root,
+    )
+
+
+def recipient_owner_image_identity(provider: str, pid: int, profile_root: str | None = None) -> str:
+    """Bind a route to the running image's vnode rather than its executable path."""
+    device, inode = _owner_image_vnode(pid)
+    return _owner_image_identity_for_vnode(
+        provider, pid, device, inode, profile_root or recipient_profile_root(provider)
     )
 
 
 OWNER_ANCHOR_FIELDS: Final = frozenset(
-    {"provider", "pid", "generation", "owner_identity", "profile_root", "image_identity"}
+    {
+        "provider",
+        "pid",
+        "generation",
+        "owner_identity",
+        "profile_root",
+        "image_dev",
+        "image_ino",
+        "image_identity",
+    }
 )
 
 
@@ -282,13 +383,14 @@ def _write_owner_anchor(root: Path, route: Route, owner_binary: Path) -> None:
     """Bind this generation to its running image when kernel and path agree.
 
     The anchor is written only while the observed text vnode is the same file
-    object as the resolved provider path. Any disagreement or failure leaves
-    the route legacy-only rather than failing its registration.
+    object as the resolved provider path and the exec generation is readable.
+    Any disagreement or failure leaves the route legacy-only rather than
+    failing its registration.
     """
     if route.owner_identity is None or route.profile_root is None:
         return
     try:
-        device, inode, uid, start_seconds, start_microseconds = _owner_image_observation(route.pid)
+        device, inode = _owner_image_vnode(route.pid)
         metadata = owner_binary.stat()
     except (ChatError, OSError):
         return
@@ -300,22 +402,18 @@ def _write_owner_anchor(root: Path, route: Route, owner_binary: Path) -> None:
         "generation": route.generation,
         "owner_identity": route.owner_identity,
         "profile_root": route.profile_root,
-        "image_identity": _owner_image_identity(
-            route.provider,
-            device,
-            inode,
-            uid,
-            start_seconds,
-            start_microseconds,
-            route.profile_root,
+        "image_dev": device,
+        "image_ino": inode,
+        "image_identity": _owner_image_identity_for_vnode(
+            route.provider, route.pid, device, inode, route.profile_root
         ),
     }
     with suppress(OSError, ChatError):
         atomic_json(owner_anchor_path(root, route.generation), anchor)
 
 
-def _route_owner_anchor(root: Path, route: Route) -> str | None:
-    """Return the image identity bound to this route's anchor, or None if absent.
+def _route_owner_anchor(root: Path, route: Route) -> tuple[int, int, str] | None:
+    """Return the bound (dev, ino, image identity) for this route, or None.
 
     A present anchor must stay private, parse exactly, and bind this route's
     provider, pid, generation, owner identity, and profile root. Anything else
@@ -330,6 +428,8 @@ def _route_owner_anchor(root: Path, route: Route) -> str | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ChatError("route owner anchor is invalid") from error
     image_identity = raw.get("image_identity") if isinstance(raw, dict) else None
+    image_dev = raw.get("image_dev") if isinstance(raw, dict) else None
+    image_ino = raw.get("image_ino") if isinstance(raw, dict) else None
     if (
         not isinstance(raw, dict)
         or set(raw) != OWNER_ANCHOR_FIELDS
@@ -338,11 +438,31 @@ def _route_owner_anchor(root: Path, route: Route) -> str | None:
         or raw["generation"] != route.generation
         or raw["owner_identity"] != route.owner_identity
         or raw["profile_root"] != route.profile_root
+        or not isinstance(image_dev, int)
+        or isinstance(image_dev, bool)
+        or not isinstance(image_ino, int)
+        or isinstance(image_ino, bool)
+        or image_dev < 0
+        or image_ino < 0
         or not isinstance(image_identity, str)
         or re.fullmatch(r"[0-9a-f]{64}", image_identity) is None
     ):
         raise ChatError("route owner anchor is invalid")
-    return image_identity
+    return image_dev, image_ino, image_identity
+
+
+def _anchored_owner_image_current(
+    pid: int, provider: str, profile_root: str | None, bound: tuple[int, int, str]
+) -> bool:
+    """Recompute the bound image identity against the live process."""
+    image_dev, image_ino, image_identity = bound
+    device, inode = _owner_image_vnode(pid, (image_dev, image_ino))
+    return (
+        _owner_image_identity_for_vnode(
+            provider, pid, device, inode, profile_root or recipient_profile_root(provider)
+        )
+        == image_identity
+    )
 
 
 def _anchored_owner_current(root: Path, route: Route) -> bool:
@@ -356,9 +476,7 @@ def _anchored_owner_current(root: Path, route: Route) -> bool:
     if bound is None:
         return False
     try:
-        return (
-            recipient_owner_image_identity(route.provider, route.pid, route.profile_root) == bound
-        )
+        return _anchored_owner_image_current(route.pid, route.provider, route.profile_root, bound)
     except (ChatError, OSError):
         return False
 
@@ -380,9 +498,8 @@ def _route_owner_current(root: Path, route: Route) -> bool:
         return False
     if bound is not None:
         try:
-            return (
-                recipient_owner_image_identity(route.provider, route.pid, route.profile_root)
-                == bound
+            return _anchored_owner_image_current(
+                route.pid, route.provider, route.profile_root, bound
             )
         except (ChatError, OSError):
             return False
@@ -912,35 +1029,33 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
     if isinstance(pid, bool) or pid <= 0:
         raise ChatError("provider process is invalid")
     raw = hook_input("SessionStart")
-    try:
-        owner_identity, owner_binary = recipient_owner_identity(provider, pid)
-    except (ChatError, OSError):
-        # The provider updater may have unlinked the still-running image. Only
-        # an existing route whose own image anchor validates may be reused; a
-        # missing path never mints a new owner identity.
-        reused = _reusable_anchored_route(
-            state_root(state_root_value), provider, cast(str, raw["session_id"]), pid
-        )
-        if reused is None:
-            raise
-        return reused
-    route = Route.create(
-        provider=provider,
-        session_id=cast(str, raw["session_id"]),
-        device=valid_device(device),
-        cwd=cast(str, raw["cwd"]),
-        pid=pid,
-        owner_identity=owner_identity,
-        profile_root=recipient_profile_root(provider),
-    )
+    session_id = valid_session_id(provider, cast(str, raw["session_id"]))
     root = state_root(state_root_value)
-    try:
-        with (
-            _registration_sigterm_scope(),
-            state_lock(root, "register-" + session_key(route.provider, route.session_id)),
-        ):
-            registry = Registry(root)
-            registry.compact_dead()
+    with (
+        _registration_sigterm_scope(),
+        state_lock(root, "register-" + session_key(cast(Provider, provider), session_id)),
+    ):
+        registry = Registry(root)
+        registry.compact_dead()
+        # Under the session lock, before any mint: an existing live route whose
+        # anchor validates is reused with its generation, whether the owner
+        # path is merely changed (renamed aside) or already gone. Only when no
+        # such anchored route exists does the legacy path compute run, and a
+        # missing path then mints nothing.
+        reused = _reusable_anchored_route(root, provider, session_id, pid)
+        if reused is not None:
+            return reused
+        owner_identity, owner_binary = recipient_owner_identity(provider, pid)
+        route = Route.create(
+            provider=provider,
+            session_id=session_id,
+            device=valid_device(device),
+            cwd=cast(str, raw["cwd"]),
+            pid=pid,
+            owner_identity=owner_identity,
+            profile_root=recipient_profile_root(provider),
+        )
+        try:
             prior_cwd_drift = [
                 item
                 for item in registry.routes()
@@ -954,6 +1069,10 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
                 and item.cwd != route.cwd
             ]
             prior_route = prior_cwd_drift[0] if len(prior_cwd_drift) == 1 else None
+            if prior_route is None:
+                # The anchor precedes publication: a reader that takes no lock
+                # either sees the route with its anchor or sees no route.
+                _write_owner_anchor(root, route, owner_binary)
             registered = (
                 prior_route
                 if prior_route is not None
@@ -978,6 +1097,7 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
                         # A busy courier may still own an accepted provider effect. A
                         # health timeout is not evidence authorizing queue replacement.
                         return registered
+                    _write_owner_anchor(root, route, owner_binary)
                     registry.upsert(route)
                 else:
                     if _bootstrap_response(bootstrap, registered):
@@ -987,20 +1107,19 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
                             else None
                         )
                         if prior_route is not None and native_cwd == route.cwd:
-                            registry.upsert(route)
                             _write_owner_anchor(root, route, owner_binary)
+                            registry.upsert(route)
                             _spawn_courier(root, route)
                             return route
                         return registered
                     raise ChatError("existing courier ownership could not be verified")
-            _write_owner_anchor(root, route, owner_binary)
             _spawn_courier(root, route)
             return route
-    except BaseException:
-        Registry(root).remove(
-            route.provider, route.session_id, route.pid, generation=route.generation
-        )
-        raise
+        except BaseException:
+            Registry(root).remove(
+                route.provider, route.session_id, route.pid, generation=route.generation
+            )
+            raise
 
 
 def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
@@ -1073,29 +1192,28 @@ def _register_devin_prompt(device: str, pid: int, root: Path, event: DevinHookEv
     """Register the first trusted prompt for one exact local Devin session."""
 
     cwd = devin_hook_cwd()
-    try:
-        owner_identity, owner_binary = recipient_owner_identity("devin", pid)
-    except (ChatError, OSError):
+    with (
+        _registration_sigterm_scope(),
+        state_lock(root, "register-" + session_key("devin", event.session_id)),
+    ):
+        registry = Registry(root)
+        registry.compact_dead()
+        # Same rule as register(): a validated anchored route for this exact
+        # session and pid is reused with its generation before any mint.
         reused = _reusable_anchored_route(root, "devin", event.session_id, pid)
-        if reused is None:
-            raise
-        return reused
-    route = Route.create(
-        provider="devin",
-        session_id=event.session_id,
-        device=valid_device(device),
-        cwd=cwd,
-        pid=pid,
-        owner_identity=owner_identity,
-        profile_root=recipient_profile_root("devin"),
-    )
-    try:
-        with (
-            _registration_sigterm_scope(),
-            state_lock(root, "register-" + session_key(route.provider, route.session_id)),
-        ):
-            registry = Registry(root)
-            registry.compact_dead()
+        if reused is not None:
+            return reused
+        owner_identity, owner_binary = recipient_owner_identity("devin", pid)
+        route = Route.create(
+            provider="devin",
+            session_id=event.session_id,
+            device=valid_device(device),
+            cwd=cwd,
+            pid=pid,
+            owner_identity=owner_identity,
+            profile_root=recipient_profile_root("devin"),
+        )
+        try:
             existing_session = [
                 item
                 for item in registry.routes()
@@ -1109,6 +1227,7 @@ def _register_devin_prompt(device: str, pid: int, root: Path, event: DevinHookEv
                 for item in existing_session
             ):
                 raise ChatError("exact Devin session route is unavailable")
+            _write_owner_anchor(root, route, owner_binary)
             registered = registry.upsert_or_reuse_live_owner(route)
             if registered != route:
                 try:
@@ -1132,14 +1251,13 @@ def _register_devin_prompt(device: str, pid: int, root: Path, event: DevinHookEv
                     if _bootstrap_response(bootstrap, registered):
                         return registered
                     raise ChatError("existing courier ownership could not be verified")
-            _write_owner_anchor(root, route, owner_binary)
             _spawn_courier(root, route)
             return route
-    except BaseException:
-        Registry(root).remove(
-            route.provider, route.session_id, route.pid, generation=route.generation
-        )
-        raise
+        except BaseException:
+            Registry(root).remove(
+                route.provider, route.session_id, route.pid, generation=route.generation
+            )
+            raise
 
 
 def register_devin(device: str, pid: int, state_root_value: str | None) -> Route | None:
