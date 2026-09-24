@@ -900,11 +900,13 @@ def test_anchored_reregistration_keeps_courier_when_it_answers(
         process.wait()
 
 
-def test_anchored_reregistration_applies_cwd_drift_keeping_generation(
+def test_anchored_reregistration_keeps_route_when_hook_cwd_drifts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
 ) -> None:
-    """Hook reporting a new cwd runs the same courier-verified drift logic:
-    the route updates cwd but keeps the anchored generation."""
+    """A drifted hook cwd inside an updated session keeps the original route
+    exactly as published -- generation, cwd, project, alias -- and only runs
+    courier health. The occupied generation socket means any respawn attempt
+    would raise; none may happen, and nothing may be left mutated."""
     package = tmp_path / "pkg"
     binary = _install(compiled["sleeper"], package)
     root = tmp_path / "state"
@@ -919,43 +921,47 @@ def test_anchored_reregistration_applies_cwd_drift_keeping_generation(
         aside = _npm_update_aside(package)
         shutil.rmtree(aside)
 
-        monkeypatch.setattr(
-            runtime,
-            "hook_input",
-            lambda _event: {"session_id": session_id, "cwd": str(moved)},
-        )
-        monkeypatch.setattr(
-            runtime,
-            "request_socket",
-            lambda *_args, **_kwargs: {
-                "schema_version": 1,
-                "status": "BOOTSTRAPPED",
-                "generation": route.generation,
-            },
-        )
-        monkeypatch.setattr(
-            claude_runtime,
-            "claude_agents",
-            lambda _session_id, timeout=2.0: [
-                {
-                    "session_id": session_id,
-                    "name": "Probe",
-                    "kind": "interactive",
-                    "cwd": str(moved.resolve()),
-                }
-            ],
-        )
-        spawned: list[Route] = []
-        monkeypatch.setattr(runtime, "_spawn_courier", lambda _root, item: spawned.append(item))
-
-        reused = runtime.register("claude", "studio", process.pid, str(root))
-        assert reused is not None
-        assert reused.generation == route.generation
-        assert reused.owner_identity == route.owner_identity
-        assert reused.cwd == str(moved.resolve())
-        assert spawned == [reused]
-        assert Registry(root).routes() == [reused]
-        assert runtime._anchored_owner_current(root, reused)
+        # The generation-keyed socket belongs to the live courier: if the
+        # handover mutated the route and respawned, the real _spawn_courier
+        # would collide with this occupied path after the route changed.
+        occupied = runtime.socket_path(root, route)
+        occupied.touch(mode=0o600)
+        try:
+            monkeypatch.setattr(
+                runtime,
+                "hook_input",
+                lambda _event: {"session_id": session_id, "cwd": str(moved)},
+            )
+            monkeypatch.setattr(
+                runtime,
+                "request_socket",
+                lambda *_args, **_kwargs: {
+                    "schema_version": 1,
+                    "status": "BOOTSTRAPPED",
+                    "generation": route.generation,
+                },
+            )
+            # The native session confirms the drifted cwd: any code still
+            # applying drift would now mutate the route and collide with the
+            # occupied socket on the real spawn path.
+            monkeypatch.setattr(
+                claude_runtime,
+                "claude_agents",
+                lambda _session_id, timeout=2.0: [
+                    {
+                        "session_id": session_id,
+                        "name": "Probe",
+                        "kind": "interactive",
+                        "cwd": str(moved.resolve()),
+                    }
+                ],
+            )
+            # Deliberately no _spawn_courier stub: a healthy courier is kept.
+            reused = runtime.register("claude", "studio", process.pid, str(root))
+            assert reused == route
+            assert Registry(root).routes() == [route]
+        finally:
+            occupied.unlink(missing_ok=True)
     finally:
         process.kill()
         process.wait()
