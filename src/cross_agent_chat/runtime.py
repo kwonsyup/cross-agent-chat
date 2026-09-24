@@ -64,7 +64,6 @@ from cross_agent_chat.core import (
     Registry,
     Route,
     UnknownDeliveryError,
-    atomic_json,
     authenticate_sender,
     bounded_message,
     canonical_cwd,
@@ -379,24 +378,31 @@ OWNER_ANCHOR_FIELDS: Final = frozenset(
 )
 
 
-def _write_owner_anchor(root: Path, route: Route, owner_binary: Path) -> None:
-    """Bind this generation to its running image when kernel and path agree.
+def _owner_anchor_document(
+    root: Path, route: Route, owner_binary: Path
+) -> dict[str, object] | None:
+    """Build this generation's image anchor when kernel and path agree.
 
-    The anchor is written only while the observed text vnode is the same file
+    The document exists only while the observed text vnode is the same file
     object as the resolved provider path and the exec generation is readable.
-    Any disagreement or failure leaves the route legacy-only rather than
-    failing its registration.
+    Any disagreement or failure -- including an unavailable exec-facts read --
+    yields None, so the caller publishes a legacy-only route instead of
+    failing the registration. The document is written by the registry publish
+    methods, inside the routes lock.
     """
     if route.owner_identity is None or route.profile_root is None:
-        return
+        return None
     try:
         device, inode = _owner_image_vnode(route.pid)
         metadata = owner_binary.stat()
+        if (device, inode) != (metadata.st_dev, metadata.st_ino):
+            return None
+        image_identity = _owner_image_identity_for_vnode(
+            route.provider, route.pid, device, inode, route.profile_root
+        )
     except (ChatError, OSError):
-        return
-    if (device, inode) != (metadata.st_dev, metadata.st_ino):
-        return
-    anchor = {
+        return None
+    return {
         "provider": route.provider,
         "pid": route.pid,
         "generation": route.generation,
@@ -404,12 +410,8 @@ def _write_owner_anchor(root: Path, route: Route, owner_binary: Path) -> None:
         "profile_root": route.profile_root,
         "image_dev": device,
         "image_ino": inode,
-        "image_identity": _owner_image_identity_for_vnode(
-            route.provider, route.pid, device, inode, route.profile_root
-        ),
+        "image_identity": image_identity,
     }
-    with suppress(OSError, ChatError):
-        atomic_json(owner_anchor_path(root, route.generation), anchor)
 
 
 def _route_owner_anchor(root: Path, route: Route) -> tuple[int, int, str] | None:
@@ -525,6 +527,58 @@ def _reusable_anchored_route(root: Path, provider: str, session_id: str, pid: in
     if not route.process_is_live() or not _anchored_owner_current(root, route):
         return None
     return route
+
+
+def _handover_anchored_route(root: Path, route: Route, hook_cwd: str) -> Route:
+    """Carry a validated anchored route through courier recovery and cwd drift.
+
+    Same decisions as the minted-path bootstrap block in register(): a gone
+    courier respawns, a busy or answering courier is left alone, and a claude
+    cwd drift is applied only when the native session confirms it. The one
+    deliberate difference: the anchored generation is always kept -- a cwd
+    update reuses it instead of minting a new route, because the anchor binds
+    the generation and no fresh owner identity can be computed while the
+    provider path is unreadable.
+    """
+    hook_cwd = canonical_cwd(hook_cwd)
+    drifted = hook_cwd != route.cwd
+    updated = replace(route, cwd=hook_cwd) if drifted else route
+    registry = Registry(root)
+    if drifted and route.provider != "claude":
+        # Non-claude drift replaces the record outright, same as the minted
+        # path publishing a new route without consulting the courier.
+        registry.upsert(updated)
+        _spawn_courier(root, updated)
+        return updated
+    try:
+        bootstrap = request_socket(
+            socket_path(root, route),
+            {
+                "schema_version": SCHEMA_VERSION,
+                "operation": "bootstrap",
+                "generation": route.generation,
+            },
+            timeout=0.5,
+        )
+    except ChatError as error:
+        cause = error.__cause__
+        missing = not socket_path(root, route).exists()
+        refused = isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
+        if not missing and not refused:
+            # A busy courier may still own an accepted provider effect.
+            return route
+        registry.upsert(updated)
+        _spawn_courier(root, updated)
+        return updated
+    if not _bootstrap_response(bootstrap, route):
+        raise ChatError("existing courier ownership could not be verified")
+    if not drifted:
+        return route
+    if _native_claude_cwd(route.session_id) != hook_cwd:
+        return route
+    registry.upsert(updated)
+    _spawn_courier(root, updated)
+    return updated
 
 
 def _provider_binary(provider: str) -> Path | None:
@@ -1044,7 +1098,7 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
         # missing path then mints nothing.
         reused = _reusable_anchored_route(root, provider, session_id, pid)
         if reused is not None:
-            return reused
+            return _handover_anchored_route(root, reused, cast(str, raw["cwd"]))
         owner_identity, owner_binary = recipient_owner_identity(provider, pid)
         route = Route.create(
             provider=provider,
@@ -1069,14 +1123,12 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
                 and item.cwd != route.cwd
             ]
             prior_route = prior_cwd_drift[0] if len(prior_cwd_drift) == 1 else None
-            if prior_route is None:
-                # The anchor precedes publication: a reader that takes no lock
-                # either sees the route with its anchor or sees no route.
-                _write_owner_anchor(root, route, owner_binary)
             registered = (
                 prior_route
                 if prior_route is not None
-                else registry.upsert_or_reuse_live_owner(route)
+                else registry.upsert_or_reuse_live_owner(
+                    route, anchor=_owner_anchor_document(root, route, owner_binary)
+                )
             )
             if registered != route:
                 try:
@@ -1097,8 +1149,7 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
                         # A busy courier may still own an accepted provider effect. A
                         # health timeout is not evidence authorizing queue replacement.
                         return registered
-                    _write_owner_anchor(root, route, owner_binary)
-                    registry.upsert(route)
+                    registry.upsert(route, anchor=_owner_anchor_document(root, route, owner_binary))
                 else:
                     if _bootstrap_response(bootstrap, registered):
                         native_cwd = (
@@ -1107,8 +1158,10 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
                             else None
                         )
                         if prior_route is not None and native_cwd == route.cwd:
-                            _write_owner_anchor(root, route, owner_binary)
-                            registry.upsert(route)
+                            registry.upsert(
+                                route,
+                                anchor=_owner_anchor_document(root, route, owner_binary),
+                            )
                             _spawn_courier(root, route)
                             return route
                         return registered
@@ -1199,10 +1252,14 @@ def _register_devin_prompt(device: str, pid: int, root: Path, event: DevinHookEv
         registry = Registry(root)
         registry.compact_dead()
         # Same rule as register(): a validated anchored route for this exact
-        # session and pid is reused with its generation before any mint.
+        # session and pid is reused with its generation before any mint, and
+        # still goes through courier recovery. Devin keeps its strict cwd
+        # binding: a drifted workspace is refused exactly like a minted route.
         reused = _reusable_anchored_route(root, "devin", event.session_id, pid)
         if reused is not None:
-            return reused
+            if reused.cwd != cwd:
+                raise ChatError("exact Devin session route is unavailable")
+            return _handover_anchored_route(root, reused, cwd)
         owner_identity, owner_binary = recipient_owner_identity("devin", pid)
         route = Route.create(
             provider="devin",
@@ -1227,8 +1284,9 @@ def _register_devin_prompt(device: str, pid: int, root: Path, event: DevinHookEv
                 for item in existing_session
             ):
                 raise ChatError("exact Devin session route is unavailable")
-            _write_owner_anchor(root, route, owner_binary)
-            registered = registry.upsert_or_reuse_live_owner(route)
+            registered = registry.upsert_or_reuse_live_owner(
+                route, anchor=_owner_anchor_document(root, route, owner_binary)
+            )
             if registered != route:
                 try:
                     bootstrap = request_socket(
@@ -1246,7 +1304,7 @@ def _register_devin_prompt(device: str, pid: int, root: Path, event: DevinHookEv
                     refused = isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
                     if not missing and not refused:
                         return registered
-                    registry.upsert(route)
+                    registry.upsert(route, anchor=_owner_anchor_document(root, route, owner_binary))
                 else:
                     if _bootstrap_response(bootstrap, registered):
                         return registered

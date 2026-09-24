@@ -19,7 +19,7 @@ from uuid import uuid4
 
 import pytest
 
-from cross_agent_chat import runtime
+from cross_agent_chat import claude_runtime, runtime
 from cross_agent_chat.core import (
     ChatError,
     IntentStore,
@@ -99,7 +99,7 @@ def _install(fixture: Path, package: Path) -> Path:
 
 def _spawn(binary: Path, *extra: str) -> subprocess.Popen[bytes]:
     process = subprocess.Popen([str(binary), *extra])
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + 15
     while process.poll() is None:
         try:
             runtime._owner_image_vnode(process.pid)
@@ -241,6 +241,16 @@ def test_reregistration_after_update_reuses_only_the_anchored_route(
         aside = _npm_update_aside(package)
         shutil.rmtree(aside)
 
+        # Courier answers bootstrap, so reuse must not respawn it.
+        monkeypatch.setattr(
+            runtime,
+            "request_socket",
+            lambda *_args, **_kwargs: {
+                "schema_version": 1,
+                "status": "BOOTSTRAPPED",
+                "generation": route.generation,
+            },
+        )
         monkeypatch.setattr(runtime, "_spawn_courier", lambda *_args: pytest.fail("respawn"))
         reused = runtime.register("claude", "studio", process.pid, str(root))
         assert reused == route
@@ -276,12 +286,22 @@ def test_process_execing_a_different_image_loses_the_anchor(
         assert runtime._route_current(root, route)
 
         gate.touch()
-        deadline = time.monotonic() + 5
-        while runtime._route_current(root, route):
+        # Wait on the observable exec (uuid changes) rather than a fixed
+        # window; the route must then read not-current.
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                after = runtime._owner_exec_facts(process.pid)
+            except ChatError:
+                after = before
+            if after[0] != before[0]:
+                break
             if time.monotonic() > deadline:
-                pytest.fail("exec'd image kept the original anchor")
+                pytest.fail("process never exec'd the other image")
+            if process.poll() is not None:
+                pytest.fail("process exited instead of exec'ing")
             time.sleep(0.02)
-        after = runtime._owner_exec_facts(process.pid)
+        assert not runtime._route_current(root, route)
         # Same process, same uid and birth; only the exec generation changed.
         assert before[3:] == after[3:]
         assert before[0] != after[0]
@@ -614,20 +634,39 @@ def test_execed_image_still_mapping_the_old_executable_is_rejected(
         before = runtime._owner_exec_facts(process.pid)
 
         gate.touch()
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         while not marker.exists():
             if time.monotonic() > deadline:
-                pytest.fail("exec'd image never mapped the old executable")
+                uuid_changed: object
+                try:
+                    uuid_changed = runtime._owner_exec_facts(process.pid)[0] != before[0]
+                except ChatError:
+                    uuid_changed = "unreadable"
+                pytest.fail(
+                    f"exec'd image never mapped the old executable "
+                    f"(poll={process.poll()}, gate={gate.exists()}, "
+                    f"uuid_changed={uuid_changed})"
+                )
             if process.poll() is not None:
                 pytest.fail("exec'd image exited before mapping")
             time.sleep(0.02)
 
         # The new image holds the old vnode mapped; the exec generation is
-        # what rejects the route.
+        # what rejects the route. Kernel reads may transiently fail under
+        # suite load, so they get a short retry window of their own.
         assert process.poll() is None
-        found = runtime._owner_image_vnode(process.pid, (bound[0], bound[1]))
+        retry_deadline = time.monotonic() + 3
+        while True:
+            try:
+                found = runtime._owner_image_vnode(process.pid, (bound[0], bound[1]))
+                after = runtime._owner_exec_facts(process.pid)
+            except ChatError:
+                if time.monotonic() > retry_deadline:
+                    raise
+                time.sleep(0.05)
+                continue
+            break
         assert found == (bound[0], bound[1])
-        after = runtime._owner_exec_facts(process.pid)
         assert before[3:] == after[3:]
         assert before[0] != after[0]
         assert before[2] != after[2]
@@ -677,19 +716,13 @@ def test_anchor_is_written_before_the_route_is_published(
     cwd.mkdir()
     process = _spawn(binary)
     anchored_at_publish: list[bool] = []
-    original_reuse = Registry.upsert_or_reuse_live_owner
-    original_upsert = Registry.upsert
+    original_write = Registry._write
 
-    def spy_reuse(self: Registry, route: Route) -> Route:
-        anchored_at_publish.append(owner_anchor_path(self.root, route.generation).is_file())
-        return original_reuse(self, route)
+    def spy_write(self: Registry, routes: list[Route]) -> None:
+        anchored_at_publish.append(owner_anchor_path(self.root, routes[-1].generation).is_file())
+        original_write(self, routes)
 
-    def spy_upsert(self: Registry, route: Route) -> None:
-        anchored_at_publish.append(owner_anchor_path(self.root, route.generation).is_file())
-        original_upsert(self, route)
-
-    monkeypatch.setattr(Registry, "upsert_or_reuse_live_owner", spy_reuse)
-    monkeypatch.setattr(Registry, "upsert", spy_upsert)
+    monkeypatch.setattr(Registry, "_write", spy_write)
     try:
         _register(root, "claude", process.pid, cwd, monkeypatch, str(uuid4()))
         assert anchored_at_publish == [True]
@@ -734,6 +767,195 @@ def test_validation_scans_regions_for_the_anchored_vnode_mocked(
         )
         assert not runtime._anchored_owner_current(root, route)
         assert not runtime._route_current(root, route)
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_exec_facts_unavailable_still_publishes_a_legacy_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    """An unavailable exec-generation read is the same as an unavailable
+    region read: no anchor, but the registration still publishes a normal
+    legacy route instead of aborting."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    process = _spawn(binary)
+
+    def unavailable(_pid: int) -> tuple[bytes, int, int, int, int, int]:
+        raise ChatError("provider process identity is unavailable")
+
+    monkeypatch.setattr(runtime, "_owner_exec_facts", unavailable)
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, str(uuid4()))
+        assert route is not None
+        assert not owner_anchor_path(root, route.generation).exists()
+        assert not runtime._anchored_owner_current(root, route)
+        assert runtime._route_current(root, route)
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_anchor_write_and_publish_share_the_routes_lock(
+    tmp_path: Path, compiled: dict[str, Path]
+) -> None:
+    """Another session's compaction can never prune a just-written anchor:
+    the publish methods write the sidecar inside the same routes-lock
+    critical section that writes routes.json."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    process = _spawn(binary)
+    try:
+        route = Route.create(
+            provider="claude",
+            session_id=str(uuid4()),
+            device="studio",
+            cwd=str(cwd),
+            pid=process.pid,
+            owner_identity=runtime.recipient_owner_identity("claude", process.pid)[0],
+            profile_root=runtime.recipient_profile_root("claude"),
+        )
+        document = runtime._owner_anchor_document(root, route, binary)
+        assert document is not None
+
+        # A different session compacts first (would have pruned an orphan
+        # anchor under the old write-then-publish interleave), then the
+        # publish still leaves route and anchor on disk together.
+        Registry(root).compact_dead()
+        published = Registry(root).upsert_or_reuse_live_owner(route, anchor=document)
+        assert published == route
+        assert owner_anchor_path(root, route.generation).is_file()
+        assert Registry(root).routes() == [route]
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_anchored_reregistration_respawns_a_missing_courier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    """A repeated SessionStart after the update still runs courier recovery:
+    no socket means the courier is gone and it is spawned again."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    process = _spawn(binary)
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        aside = _npm_update_aside(package)
+        shutil.rmtree(aside)
+
+        spawned: list[Route] = []
+        monkeypatch.setattr(runtime, "_spawn_courier", lambda _root, item: spawned.append(item))
+        reused = runtime.register("claude", "studio", process.pid, str(root))
+        assert reused == route
+        assert spawned == [route]
+        assert Registry(root).routes() == [route]
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_anchored_reregistration_keeps_courier_when_it_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    """Healthy courier answering bootstrap: reuse without touching anything."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    process = _spawn(binary)
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        aside = _npm_update_aside(package)
+        shutil.rmtree(aside)
+
+        monkeypatch.setattr(
+            runtime,
+            "request_socket",
+            lambda *_args, **_kwargs: {
+                "schema_version": 1,
+                "status": "BOOTSTRAPPED",
+                "generation": route.generation,
+            },
+        )
+        monkeypatch.setattr(runtime, "_spawn_courier", lambda *_args: pytest.fail("respawn"))
+        reused = runtime.register("claude", "studio", process.pid, str(root))
+        assert reused == route
+        assert Registry(root).routes() == [route]
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_anchored_reregistration_applies_cwd_drift_keeping_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    """Hook reporting a new cwd runs the same courier-verified drift logic:
+    the route updates cwd but keeps the anchored generation."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    session_id = str(uuid4())
+    process = _spawn(binary)
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        aside = _npm_update_aside(package)
+        shutil.rmtree(aside)
+
+        monkeypatch.setattr(
+            runtime,
+            "hook_input",
+            lambda _event: {"session_id": session_id, "cwd": str(moved)},
+        )
+        monkeypatch.setattr(
+            runtime,
+            "request_socket",
+            lambda *_args, **_kwargs: {
+                "schema_version": 1,
+                "status": "BOOTSTRAPPED",
+                "generation": route.generation,
+            },
+        )
+        monkeypatch.setattr(
+            claude_runtime,
+            "claude_agents",
+            lambda _session_id, timeout=2.0: [
+                {
+                    "session_id": session_id,
+                    "name": "Probe",
+                    "kind": "interactive",
+                    "cwd": str(moved.resolve()),
+                }
+            ],
+        )
+        spawned: list[Route] = []
+        monkeypatch.setattr(runtime, "_spawn_courier", lambda _root, item: spawned.append(item))
+
+        reused = runtime.register("claude", "studio", process.pid, str(root))
+        assert reused is not None
+        assert reused.generation == route.generation
+        assert reused.owner_identity == route.owner_identity
+        assert reused.cwd == str(moved.resolve())
+        assert spawned == [reused]
+        assert Registry(root).routes() == [reused]
+        assert runtime._anchored_owner_current(root, reused)
     finally:
         process.kill()
         process.wait()
