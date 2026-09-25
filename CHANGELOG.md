@@ -12,6 +12,11 @@
   lock is held.
 - Couriers started before this version hold no lifetime lock, so their
   leftover sockets are not reclaimed automatically; restart the session.
+- Documentation and tool text: clarified `next_turn` (an answer is handed
+  over at the next turn boundary — the current turn's end or the next
+  prompt), and `chat_peers` now advises listing once more when an expected
+  peer is missing from one listing, since a fresh session or a slow health
+  probe can skip a single result. The source map documents the owner anchor.
 
 ## 0.4.4 - 2026-09-24
 
