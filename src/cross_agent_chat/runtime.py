@@ -540,7 +540,8 @@ def _handover_anchored_route(root: Path, route: Route) -> Route:
     generation-keyed socket; a busy or answering courier is left alone; an
     unverifiable one refuses exactly like the minted path. A dead courier's
     leftover socket is removed only after the courier lifetime lock proves
-    no same-generation courier can still own it.
+    no same-generation courier can still own it and the lock records that
+    exact socket's inode.
     """
     try:
         bootstrap = request_socket(
@@ -875,8 +876,10 @@ def _acquire_courier_lock(path: Path) -> int:
     The returned descriptor must stay open for the courier's whole lifetime:
     the kernel drops the flock on any exit, including SIGKILL, so a held lock
     is the only proof a same-generation courier still owns its socket. The
-    lock file is never unlinked -- a 0-byte leftover is harmless, and removal
-    could race a handover that already opened the old inode.
+    lock file records the inode of the socket its holder bound, and only
+    that exact inode may later be reclaimed; it is never unlinked -- a
+    leftover is harmless, and removal could race a handover that already
+    opened the old inode.
     """
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
@@ -893,28 +896,29 @@ def _acquire_courier_lock(path: Path) -> int:
     return descriptor
 
 
-def _reclaim_dead_courier_socket(root: Path, route: Route) -> bool:
-    """Unlink a dead courier's leftover socket; True only when death is proven.
+def _record_courier_socket(descriptor: int, path: Path) -> None:
+    """Record the bound socket's inode in the held lifetime lock file.
 
-    Runs under the per-session registration lock held by every caller of
-    ``_handover_anchored_route`` (``register`` and ``_register_devin_prompt``
-    are its only callers).
+    The lock file records the inode of the socket its holder bound; only
+    that exact inode may later be reclaimed. ``descriptor`` is the lock's
+    own open file, already held under LOCK_EX for the courier's life.
+    """
+    metadata = path.lstat()
+    os.ftruncate(descriptor, 0)
+    os.write(descriptor, f"{metadata.st_dev} {metadata.st_ino}\n".encode())
 
-    ECONNREFUSED cannot separate a dead courier from a live one whose listen
-    backlog is full, so liveness is proven by the lifetime lock instead: a
-    live courier holds LOCK_EX for its whole life and the kernel drops it on
-    any exit, including SIGKILL. A lock that cannot be taken means the
-    courier is alive and the route must be left untouched. A missing lock
-    file means the courier predates this version and holds no lock; its
-    death is unprovable, the socket is left alone, and the session recovers
-    on restart. Only a lock taken here permits removal: the socket must still
-    satisfy the ``require_socket`` ownership invariant, and the lock is
-    released before returning True so the replacement courier can take it.
+
+def _open_courier_lock(path: Path, flags: int) -> int | None:
+    """Open a courier lifetime lock that is present and privately owned.
+
+    Returns None when no lock file exists -- the courier predates this
+    version and nothing can be proven about it. Any occupant that is not
+    this uid's own 0600 regular file fails closed.
     """
     try:
-        descriptor = os.open(courier_lock_path(root, route), os.O_WRONLY | os.O_NOFOLLOW)
+        descriptor = os.open(path, flags | os.O_NOFOLLOW)
     except FileNotFoundError:
-        return False
+        return None
     except OSError as error:
         raise ChatError("session courier socket is unsafe") from error
     try:
@@ -925,12 +929,83 @@ def _reclaim_dead_courier_socket(root: Path, route: Route) -> bool:
             or stat.S_IMODE(metadata.st_mode) != 0o600
         ):
             raise ChatError("session courier socket is unsafe")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            if error.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
-                return False
-            raise
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _try_courier_lock(descriptor: int) -> bool:
+    """Take LOCK_EX without blocking; False while a live courier holds it."""
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+            return False
+        raise
+    return True
+
+
+def _courier_lock_is_held(root: Path, route: Route) -> bool:
+    """True while a same-generation courier demonstrably still lives.
+
+    A courier holds LOCK_EX on its lifetime lock for its whole life and the
+    kernel drops it on any exit, including SIGKILL. A missing lock file
+    means the courier predates this version, so False: nothing can be proven
+    either way and callers keep their pre-lock behaviour.
+    """
+    descriptor = _open_courier_lock(courier_lock_path(root, route), os.O_RDWR)
+    if descriptor is None:
+        return False
+    try:
+        return not _try_courier_lock(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _recorded_socket_identity(descriptor: int) -> tuple[int, int] | None:
+    """Parse the (dev, ino) a courier recorded in its lock; None if absent."""
+    try:
+        content = os.pread(descriptor, 128, 0).decode("ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    parts = content.strip().split(" ")
+    if len(parts) != 2:
+        return None
+    try:
+        device, inode = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if device < 0 or inode <= 0:
+        return None
+    return device, inode
+
+
+def _reclaim_dead_courier_socket(root: Path, route: Route) -> bool:
+    """Unlink a dead courier's leftover socket; True only when death is proven.
+
+    Runs under the per-session registration lock held by every caller of
+    ``_handover_anchored_route`` (``register`` and ``_register_devin_prompt``
+    are its only callers).
+
+    ECONNREFUSED cannot separate a dead courier from a live one whose listen
+    backlog is full, so liveness is proven by the lifetime lock: a courier
+    holds LOCK_EX for its whole life and the kernel drops it on any exit,
+    including SIGKILL. A held lock, a missing lock file (a courier that
+    predates this version), or a socket the lock does not record all return
+    False: the lock file records the inode of the socket its holder bound,
+    and only that exact inode may be reclaimed, so a socket some other
+    courier rebound is left alone and the session recovers on restart. With
+    the lock taken and the recorded inode matching an owned private socket,
+    the socket is unlinked and the lock released before returning True so
+    the replacement courier can take it.
+    """
+    descriptor = _open_courier_lock(courier_lock_path(root, route), os.O_RDWR)
+    if descriptor is None:
+        return False
+    try:
+        if not _try_courier_lock(descriptor):
+            return False
         path = socket_path(root, route)
         try:
             socket_metadata = path.lstat()
@@ -940,6 +1015,11 @@ def _reclaim_dead_courier_socket(root: Path, route: Route) -> bool:
             raise ChatError("session courier socket is unsafe") from error
         if not _is_owned_private_socket(socket_metadata):
             raise ChatError("session courier socket is unsafe")
+        if _recorded_socket_identity(descriptor) != (
+            socket_metadata.st_dev,
+            socket_metadata.st_ino,
+        ):
+            return False
         path.unlink()
         return True
     finally:
@@ -1226,6 +1306,9 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
                         # A busy courier may still own an accepted provider effect. A
                         # health timeout is not evidence authorizing queue replacement.
                         return registered
+                    if refused and _courier_lock_is_held(root, registered):
+                        # A live courier with a full backlog refuses connects too.
+                        return registered
                     registry.upsert(route, anchor=_owner_anchor_document(root, route, owner_binary))
                 else:
                     if _bootstrap_response(bootstrap, registered):
@@ -1380,6 +1463,9 @@ def _register_devin_prompt(device: str, pid: int, root: Path, event: DevinHookEv
                     missing = not socket_path(root, registered).exists()
                     refused = isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
                     if not missing and not refused:
+                        return registered
+                    if refused and _courier_lock_is_held(root, registered):
+                        # A live courier with a full backlog refuses connects too.
                         return registered
                     registry.upsert(route, anchor=_owner_anchor_document(root, route, owner_binary))
                 else:
@@ -1844,6 +1930,16 @@ def courier_server(
         raise
     finally:
         os.umask(old_umask)
+    try:
+        _record_courier_socket(lock_descriptor, path)
+    except BaseException:
+        # A bound socket its lock never recorded could never be reclaimed,
+        # so a courier that fails here must not leave the path behind.
+        server.close()
+        os.close(lock_descriptor)
+        with suppress(OSError):
+            path.unlink()
+        raise
     native_queue: tuple[Path, dict[str, str], str] | None = None
     helper_lineage = provider == "codex" and NativeHelperStore(root).is_helper_lineage(route)
     helper_queue = False
