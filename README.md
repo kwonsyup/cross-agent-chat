@@ -59,13 +59,13 @@ You need:
   runtime if you have neither.
 - Tailscale on each Mac, if you want sessions on different Macs to talk.
 
-Install v0.4.4 with:
+Install v0.4.5 with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.4/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.5/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
-This builds the released `v0.4.4` tag, sets up the providers already on the
+This builds the released `v0.4.5` tag, sets up the providers already on the
 Mac, installs the command at `~/.local/bin/cross-agent-chat`, and starts the
 broker. Run it once on each Mac that should take part; re-running the installer
 upgrades or repairs the setup.
@@ -139,7 +139,7 @@ To keep a short-lived worker session off the peer list, start it with
 session:
 
 - `while_idle`: an answer can arrive as a new message after your turn ends.
-- `next_turn`: an answer appears only when your next turn starts.
+- `next_turn`: an answer appears at your next turn boundary — when your current turn ends or your next prompt starts.
 - `unknown`: the return path cannot be confirmed.
 
 `chat_status EVENT_ID` shows the stored custody record for a message you sent.
@@ -200,11 +200,13 @@ current Codex profile receive while idle, and
 
 ## Troubleshooting
 
-- **A session is missing from `chat_peers`.** Start a fresh session. If
-  `doctor` prints a `terminal` note it is process-local: the marker is
-  expected inside Claude tool and hook subprocesses, and a normally opened
-  terminal app showing it was launched from inside a Claude session —
-  relaunch that one instance.
+- **A session is missing from `chat_peers`.** A session that just started, or
+  one whose courier did not answer its health probe in time, can be absent
+  from one listing — list again (the call is read-only) before concluding it
+  is gone. If it stays missing, start a fresh session. If `doctor` prints a
+  `terminal` note it is process-local: the marker is expected inside Claude
+  tool and hook subprocesses, and a normally opened terminal app showing it
+  was launched from inside a Claude session — relaunch that one instance.
 - **A send says the handle no longer resolves.** The recipient restarted. Run
   `chat_peers` to get the new handle.
 - **A send was refused before delivery.** That attempt delivered nothing; once

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.5 - 2026-09-25
+
+- A session whose courier died and left its socket behind now recovers at
+  its next registration: the courier's lifetime lock proves the courier is
+  gone and records the exact socket it guarded, so only that stale socket
+  is reclaimed before a fresh courier takes over the same route generation.
+- A courier that briefly refuses connections because its listener backlog
+  is full keeps its socket and its route generation: re-registration no
+  longer unlinks its socket or mints a replacement generation while its
+  lock is held.
+- Couriers started before this version hold no lifetime lock, so their
+  leftover sockets are not reclaimed automatically; restart the session.
+  The same applies to a courier killed during its own startup, before it
+  could record the socket it bound.
+- Documentation and tool text: clarified `next_turn` (an answer is handed
+  over at the next turn boundary — the current turn's end or the next
+  prompt), and `chat_peers` now advises listing once more when an expected
+  peer is missing from one listing, since a fresh session or a slow health
+  probe can skip a single result. The source map documents the owner anchor.
+
 ## 0.4.4 - 2026-09-24
 
 - A Claude Code session keeps Cross Agent Chat in both directions when an

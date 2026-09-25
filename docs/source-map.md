@@ -32,8 +32,8 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 | `cli.py` | Argument parsing, public commands (`setup`, `doctor`, `peers`, `resolve`, `uninstall`), hidden provider hook/service entrypoints (`_`-prefixed), and per-tool MCP dispatch including tool schemas. |
 | `mcp_server.py` | The stdio MCP surface itself: bounded frame reading, JSON-RPC batch handling, strict initialize lifecycle, request-ID validation, ping, and `chat_send` argument normalization. |
 | `recipient.py` | Versioned opaque recipient endpoint tokens (`cac2.`): minting and strict parsing. A remote token pins session key + route generation to a stable Tailnet node; a local token pins them to the issuing state root. |
-| `core.py` | Route identity, content-free intent records, validation, private atomic persistence, state locks. This is where durable product state is defined. |
-| `runtime.py` | Hook registration, sender authentication, peer discovery, token minting during listing and re-attestation during send, local couriers, socket framing/transport, Codex native queue plumbing, reply-readiness reporting. Largest module; several responsibilities share it. |
+| `core.py` | Route identity, content-free intent records, validation, private atomic persistence, state locks, and the private per-generation owner image anchor sidecar (`owner-<generation>.json`). This is where durable product state is defined. |
+| `runtime.py` | Hook registration, sender authentication, peer discovery, token minting during listing and re-attestation during send, local couriers, socket framing/transport, Codex native queue plumbing, owner image anchors (built at registration; read by the anchored owner checks), reply-readiness reporting. Largest module; several responsibilities share it. |
 | `tailnet.py` | Tailscale IPv4 discovery/validation and port constants (`47071` product, `47072` local health). |
 | `tailnet_broker.py` | Owner-local broker: listener, admission, per-request authorization dispatch, refusal lane. |
 | `remote.py` / `transport.py` | Strict parsing and serialization of the trusted Tailnet envelope (`remote` parses inbound, `transport` builds outbound). |
@@ -48,6 +48,20 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 - **Sender identity:** `runtime.py` (`authenticate_mcp_sender`), Codex host
   `threadId` `_meta` in `cli.py:mcp`, Devin capability issuance/consumption in
   `devin.py`.
+- **Owner image anchor (update continuity):** `runtime.py`
+  `_owner_anchor_document` builds the private per-generation sidecar
+  `owner-<generation>.json` in the state root at registration, only when the
+  observed image vnode is the resolved executable; `core.py`
+  `Registry._publish_owner_anchor` writes it inside the routes lock before the
+  route is published. Anchored readers (`_route_owner_current`,
+  `_anchored_owner_current`, `_reusable_anchored_route`) validate the bound
+  image device/inode and exec generation rather than the executable path;
+  `Registry._prune_owner_anchors` drops anchors whose generation no route
+  still owns. A route without an anchor keeps the legacy path-based owner
+  check, and a malformed, foreign, or non-private anchor fails closed. The
+  sidecar lives outside `routes.json` and the Route schema is unchanged, so
+  older readers ignore it; continuity is best-effort and applies only to
+  routes whose anchor was created.
 - **Exact recipient selection:** `recipient.py` mints/parses endpoint tokens;
   `runtime.py` re-attests session key + generation + presenting endpoint at
   send time. Raw pre-upgrade handles, stale generations, ambiguous names, and
@@ -66,11 +80,12 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 
 | Area | Files |
 |---|---|
-| State/identity/recipient tokens | `test_core.py`, `test_recipient_binding.py`, `test_issue9_regressions.py` |
+| State/identity/recipient tokens | `test_core.py`, `test_recipient_binding.py`, `test_recipient_selection.py`, `test_issue9_regressions.py` |
+| Owner anchor / update continuity | `test_owner_anchor.py` |
 | MCP protocol/tools | `test_mcp.py`, `test_mcp_protocol.py`, `test_native_helper_mcp.py` |
-| Broker/transport | `test_broker_admission.py`, `test_broker_peek.py`, `test_tailnet.py`, `test_transport.py` |
-| Providers | `test_claude_remote.py`, `test_codex.py`, `test_devin.py`, `test_native_*.py` |
-| Installer | `test_install.py` |
+| Broker/transport | `test_broker_admission.py`, `test_broker_peek.py`, `test_tailnet.py`, `test_transport.py`, `test_transport_deadlines.py` |
+| Providers | `test_claude_remote.py`, `test_claude_runtime.py`, `test_claude_registration_cwd.py`, `test_codex.py`, `test_devin.py`, `test_native_*.py`, `test_sender_preflight_retry.py` |
+| Installer | `test_install.py`, `test_install_selection.py` |
 | Misc | `conftest.py` (containment boundary), `bench_intent_history.py` |
 
 Fixtures monkeypatch module attributes by name; renaming a module or moving a

@@ -125,7 +125,15 @@ def _fixture_socket_root(request: pytest.FixtureRequest) -> Path:
     if configured is None:
         root = Path(tempfile.mkdtemp(prefix="cac-tests-", dir="/tmp"))
         root.chmod(0o700)
-        request.addfinalizer(lambda: root.rmdir())
+
+        def remove_socket_root() -> None:
+            # Couriers deliberately leave their lifetime lock file behind:
+            # removal could race a handover that already opened the inode.
+            for leftover in root.glob("*.lock"):
+                leftover.unlink()
+            root.rmdir()
+
+        request.addfinalizer(remove_socket_root)
     else:
         root = Path(configured)
     metadata = root.stat()
