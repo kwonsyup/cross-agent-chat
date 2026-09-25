@@ -12,6 +12,8 @@
   lock is held.
 - Couriers started before this version hold no lifetime lock, so their
   leftover sockets are not reclaimed automatically; restart the session.
+  The same applies to a courier killed during its own startup, before it
+  could record the socket it bound.
 - Documentation and tool text: clarified `next_turn` (an answer is handed
   over at the next turn boundary — the current turn's end or the next
   prompt), and `chat_peers` now advises listing once more when an expected

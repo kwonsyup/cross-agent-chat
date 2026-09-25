@@ -1675,6 +1675,93 @@ def test_reclaim_refuses_a_lock_inode_the_path_no_longer_names(
         path.unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize("padding", ["padded", "overlong"])
+def test_reclaim_leaves_a_socket_whose_lock_record_is_malformed(
+    tmp_path: Path, padding: str
+) -> None:
+    """A record that is not the exact canonical ``"<dev> <ino>\\n"`` form is
+    not attributable to a courier's own write, so nothing is reclaimed."""
+    root = tmp_path / "state"
+    root.mkdir()
+    item = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+    )
+    path = runtime.socket_path(root, item)
+    lock_path = runtime.courier_lock_path(root, item)
+    _dead_courier_socket(path)
+    metadata = path.lstat()
+    record = f"{metadata.st_dev} {metadata.st_ino}\n".encode()
+    record = record[:-1] + b"   \n" if padding == "padded" else record + b"0" * 200
+    descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    os.fchmod(descriptor, 0o600)
+    os.write(descriptor, record)
+    os.close(descriptor)
+    try:
+        reader = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            assert runtime._recorded_socket_identity(reader) is None
+        finally:
+            os.close(reader)
+        assert not runtime._reclaim_dead_courier_socket(root, item)
+        assert path.exists()
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_courier_binds_its_socket_private_from_the_start(tmp_path: Path) -> None:
+    """A live courier's socket must be 0600 the moment it appears: a courier
+    killed before a post-bind chmod would strand a socket no reclaim could
+    ever clear, so the umask creates it private outright."""
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    item = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(cwd),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(item)
+    path = runtime.socket_path(root, item)
+    worker = threading.Thread(
+        target=runtime.courier_server,
+        kwargs={
+            "provider": "claude",
+            "state_root_value": str(root),
+            "session_id": item.session_id,
+            "cwd": str(cwd),
+            "generation": item.generation,
+            "pid": os.getpid(),
+        },
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + 5.0
+    try:
+        while not path.exists():
+            assert time.monotonic() < deadline and worker.is_alive()
+            time.sleep(0.005)
+        metadata = path.lstat()
+        assert stat.S_ISSOCK(metadata.st_mode)
+        assert stat.S_IMODE(metadata.st_mode) == 0o600
+        lock_path = runtime.courier_lock_path(root, item)
+        while not lock_path.exists() or not lock_path.read_bytes():
+            assert time.monotonic() < deadline and worker.is_alive()
+            time.sleep(0.005)
+        assert lock_path.read_bytes() == f"{metadata.st_dev} {metadata.st_ino}\n".encode()
+    finally:
+        Registry(root).remove(item.provider, item.session_id, item.pid)
+        worker.join(timeout=5)
+        path.unlink(missing_ok=True)
+
+
 def test_reclaim_never_touches_a_socket_while_the_lock_is_held(
     tmp_path: Path,
 ) -> None:
