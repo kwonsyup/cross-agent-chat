@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -537,7 +538,9 @@ def _handover_anchored_route(root: Path, route: Route) -> Route:
     different cwd inside an updated session keeps the original route's cwd
     until the session restarts. A gone courier respawns on the same
     generation-keyed socket; a busy or answering courier is left alone; an
-    unverifiable one refuses exactly like the minted path.
+    unverifiable one refuses exactly like the minted path. A dead courier's
+    leftover socket is removed only after the courier lifetime lock proves
+    no same-generation courier can still own it.
     """
     try:
         bootstrap = request_socket(
@@ -555,6 +558,11 @@ def _handover_anchored_route(root: Path, route: Route) -> Route:
         refused = isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
         if not missing and not refused:
             # A busy courier may still own an accepted provider effect.
+            return route
+        # Refusal is not proof of death: a live courier with a full listen
+        # backlog refuses connects too. Only the released lifetime lock
+        # proves the courier is gone and its leftover socket is stale.
+        if refused and not _reclaim_dead_courier_socket(root, route):
             return route
         _spawn_courier(root, route)
         return route
@@ -668,16 +676,26 @@ def socket_path(root: Path, route: Route) -> Path:
     return directory / f"{digest[:32]}.sock"
 
 
+def courier_lock_path(root: Path, route: Route) -> Path:
+    """Return the lifetime lock proving one courier owns a generation socket."""
+    return socket_path(root, route).with_suffix(".lock")
+
+
+def _is_owned_private_socket(metadata: os.stat_result) -> bool:
+    """Apply the single ownership invariant for a generation socket path."""
+    return (
+        stat.S_ISSOCK(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+    )
+
+
 def require_socket(path: Path) -> None:
     try:
         metadata = path.lstat()
     except OSError as error:
         raise ChatError("session courier is unavailable") from error
-    if (
-        not stat.S_ISSOCK(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-    ):
+    if not _is_owned_private_socket(metadata):
         raise ChatError("session courier socket is unsafe")
 
 
@@ -849,6 +867,83 @@ def _owned_socket_identity(path: Path) -> tuple[int, int] | None:
     if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.getuid():
         return None
     return metadata.st_dev, metadata.st_ino
+
+
+def _acquire_courier_lock(path: Path) -> int:
+    """Take the exclusive nonblocking flock proving this courier is alive.
+
+    The returned descriptor must stay open for the courier's whole lifetime:
+    the kernel drops the flock on any exit, including SIGKILL, so a held lock
+    is the only proof a same-generation courier still owns its socket. The
+    lock file is never unlinked -- a 0-byte leftover is harmless, and removal
+    could race a handover that already opened the old inode.
+    """
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(descriptor)
+        if error.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+            raise ChatError("session courier is already running") from error
+        raise
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _reclaim_dead_courier_socket(root: Path, route: Route) -> bool:
+    """Unlink a dead courier's leftover socket; True only when death is proven.
+
+    Runs under the per-session registration lock held by every caller of
+    ``_handover_anchored_route`` (``register`` and ``_register_devin_prompt``
+    are its only callers).
+
+    ECONNREFUSED cannot separate a dead courier from a live one whose listen
+    backlog is full, so liveness is proven by the lifetime lock instead: a
+    live courier holds LOCK_EX for its whole life and the kernel drops it on
+    any exit, including SIGKILL. A lock that cannot be taken means the
+    courier is alive and the route must be left untouched. A missing lock
+    file means the courier predates this version and holds no lock; its
+    death is unprovable, the socket is left alone, and the session recovers
+    on restart. Only a lock taken here permits removal: the socket must still
+    satisfy the ``require_socket`` ownership invariant, and the lock is
+    released before returning True so the replacement courier can take it.
+    """
+    try:
+        descriptor = os.open(courier_lock_path(root, route), os.O_WRONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ChatError("session courier socket is unsafe") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ChatError("session courier socket is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                return False
+            raise
+        path = socket_path(root, route)
+        try:
+            socket_metadata = path.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError as error:
+            raise ChatError("session courier socket is unsafe") from error
+        if not _is_owned_private_socket(socket_metadata):
+            raise ChatError("session courier socket is unsafe")
+        path.unlink()
+        return True
+    finally:
+        os.close(descriptor)
 
 
 def _drain_courier_stderr(stream: BinaryIO, captured: bytearray) -> None:
@@ -1738,10 +1833,15 @@ def courier_server(
         raise ChatError("courier route is not current")
     route = candidates[0]
     path = socket_path(root, route)
+    lock_descriptor = _acquire_courier_lock(courier_lock_path(root, route))
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     old_umask = os.umask(0o077)
     try:
         server.bind(str(path))
+    except BaseException:
+        server.close()
+        os.close(lock_descriptor)
+        raise
     finally:
         os.umask(old_umask)
     native_queue: tuple[Path, dict[str, str], str] | None = None
@@ -1971,6 +2071,7 @@ def courier_server(
                 path.unlink()
         except FileNotFoundError:
             pass
+        os.close(lock_descriptor)
 
 
 def shutdown_couriers(root: Path) -> None:
