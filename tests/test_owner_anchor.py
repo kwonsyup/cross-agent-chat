@@ -1617,6 +1617,64 @@ def test_reclaim_leaves_a_socket_whose_lock_record_is_empty(
         path.unlink(missing_ok=True)
 
 
+def test_locked_courier_inode_must_still_be_the_lock_path_entry(tmp_path: Path) -> None:
+    """Once the directory entry no longer names the inode a descriptor
+    locked, the lock proves nothing: a live courier could still hold the
+    orphaned old inode after an unlink-and-recreate swap."""
+    lock_path = tmp_path / "swapped.lock"
+    _dead_courier_lock(lock_path)
+    descriptor = runtime._open_courier_lock(lock_path, os.O_RDWR)
+    assert descriptor is not None
+    try:
+        assert runtime._try_courier_lock(descriptor)
+        assert runtime._lock_path_is_current(descriptor, lock_path)
+        # Swap the path for a fresh inode while the old one is locked.
+        lock_path.unlink()
+        _dead_courier_lock(lock_path)
+        assert not runtime._lock_path_is_current(descriptor, lock_path)
+    finally:
+        os.close(descriptor)
+
+
+def test_reclaim_refuses_a_lock_inode_the_path_no_longer_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even a lock recording this exact socket must not reclaim it once the
+    locked inode was orphaned by a path swap: the flock was taken on an
+    inode no directory entry names."""
+    root = tmp_path / "state"
+    root.mkdir()
+    item = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+    )
+    path = runtime.socket_path(root, item)
+    lock_path = runtime.courier_lock_path(root, item)
+    _dead_courier_socket(path)
+    _dead_courier_lock(lock_path, path)
+
+    real_open = runtime._open_courier_lock
+
+    def swapped_open(lock: Path, flags: int) -> int | None:
+        descriptor = real_open(lock, flags)
+        # The path is recreated between open and flock: the descriptor locks
+        # the orphaned inode even though it still records this socket.
+        lock.unlink()
+        _dead_courier_lock(lock)
+        return descriptor
+
+    monkeypatch.setattr(runtime, "_open_courier_lock", swapped_open)
+    try:
+        assert not runtime._reclaim_dead_courier_socket(root, item)
+        assert path.exists()
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def test_reclaim_never_touches_a_socket_while_the_lock_is_held(
     tmp_path: Path,
 ) -> None:

@@ -946,6 +946,24 @@ def _try_courier_lock(descriptor: int) -> bool:
     return True
 
 
+def _lock_path_is_current(descriptor: int, path: Path) -> bool:
+    """True only while the locked inode is still the lock path's entry.
+
+    A same-uid process could unlink and recreate the lock file while a live
+    courier still holds the orphaned old inode; taking a lock on an inode
+    the path no longer names must never count as proof the courier is gone.
+    """
+    try:
+        current = path.lstat()
+    except OSError:
+        return False
+    held = os.fstat(descriptor)
+    return current.st_nlink >= 1 and (current.st_dev, current.st_ino) == (
+        held.st_dev,
+        held.st_ino,
+    )
+
+
 def _courier_lock_is_held(root: Path, route: Route) -> bool:
     """True while a same-generation courier demonstrably still lives.
 
@@ -1000,11 +1018,14 @@ def _reclaim_dead_courier_socket(root: Path, route: Route) -> bool:
     the socket is unlinked and the lock released before returning True so
     the replacement courier can take it.
     """
-    descriptor = _open_courier_lock(courier_lock_path(root, route), os.O_RDWR)
+    lock_path = courier_lock_path(root, route)
+    descriptor = _open_courier_lock(lock_path, os.O_RDWR)
     if descriptor is None:
         return False
     try:
         if not _try_courier_lock(descriptor):
+            return False
+        if not _lock_path_is_current(descriptor, lock_path):
             return False
         path = socket_path(root, route)
         try:
