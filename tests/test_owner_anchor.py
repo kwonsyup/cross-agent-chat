@@ -916,14 +916,18 @@ def test_anchored_reregistration_keeps_route_when_hook_cwd_drifts(
     moved.mkdir()
     session_id = str(uuid4())
     process = _spawn(binary)
+    real_spawn = runtime._spawn_courier
     try:
         route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
         aside = _npm_update_aside(package)
         shutil.rmtree(aside)
 
-        # The generation-keyed socket belongs to the live courier: if the
-        # handover mutated the route and respawned, the real _spawn_courier
-        # would collide with this occupied path after the route changed.
+        # _register stubbed _spawn_courier; restore the real function so any
+        # spawn the handover attempts runs the true socket-exists check. The
+        # generation-keyed socket belongs to the live courier: if the handover
+        # mutated the route and respawned, the real spawn would collide with
+        # this occupied path after the route changed.
+        monkeypatch.setattr(runtime, "_spawn_courier", real_spawn)
         occupied = runtime.socket_path(root, route)
         occupied.touch(mode=0o600)
         try:
@@ -956,7 +960,9 @@ def test_anchored_reregistration_keeps_route_when_hook_cwd_drifts(
                     }
                 ],
             )
-            # Deliberately no _spawn_courier stub: a healthy courier is kept.
+            # The courier answers bootstrap, so the real _spawn_courier is
+            # never called; had it run, the occupied socket above would have
+            # raised ChatError("session courier socket already exists").
             reused = runtime.register("claude", "studio", process.pid, str(root))
             assert reused == route
             assert Registry(root).routes() == [route]
