@@ -1800,7 +1800,7 @@ runtime.hook_input = lambda _event: {{
 }}
 runtime.recipient_owner_identity = lambda *_args: ("a" * 64, Path("/bin/echo"))
 runtime.recipient_profile_root = lambda _provider: str(root / "profile")
-def wait_before_publish(self, _route):
+def wait_before_publish(self, _route, **_kwargs):
     print("BEFORE_PUBLISH", flush=True)
     while True:
         time.sleep(1)

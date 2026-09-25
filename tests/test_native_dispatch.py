@@ -272,7 +272,7 @@ def test_account_digest_mismatch_is_rejected_before_socket(
         operations.append("unexpected")
         raise AssertionError("wrong-account helper reached helper socket")
 
-    def digest(route: Route) -> str:
+    def digest(_root: Path, route: Route) -> str:
         return "b" * 64 if route.session_id == fixture.helper.session_id else ACCOUNT_DIGEST
 
     patch_dispatch_environment(monkeypatch, fixture, request_socket=request_socket)

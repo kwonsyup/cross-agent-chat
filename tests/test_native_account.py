@@ -198,7 +198,7 @@ def test_native_account_binary_returns_the_bound_bundle_client(
     )
     monkeypatch.setattr(runtime, "native_desktop_process", lambda *_args: True)
 
-    assert runtime._native_account_binary(route) == executable.resolve(strict=True)
+    assert runtime._native_account_binary(tmp_path, route) == executable.resolve(strict=True)
 
 
 def test_native_account_binary_rejects_missing_bundle_client(
@@ -225,7 +225,7 @@ def test_native_account_binary_rejects_missing_bundle_client(
     monkeypatch.setattr(runtime, "native_desktop_process", lambda *_args: True)
 
     with pytest.raises(ChatError, match="account identity is unavailable"):
-        runtime._native_account_binary(route)
+        runtime._native_account_binary(tmp_path, route)
 
 
 def startup_route(root: Path, *, session_id: str | None = None) -> Route:

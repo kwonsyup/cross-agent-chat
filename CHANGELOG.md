@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.4 - 2026-09-24
+
+- A Claude Code session keeps Cross Agent Chat in both directions when an
+  npm-installed Claude Code updates itself while the session runs (issue
+  #39). At registration CAC also records a private, path-independent
+  identity of the exact executable image and process incarnation; after an
+  update deletes the old files the same session stays current,
+  re-registers onto its existing route, and its courier keeps running.
+- A process that switched to a different executable image, a reused
+  process ID, a different user/profile/provider, or a fresh process whose
+  executable path is missing still gets no identity.
+- Sessions started before 0.4.4 is installed keep the earlier path-based
+  check and need a restart after such an update. No route schema change;
+  downgrading to 0.4.3 ignores the new identity files.
+- A courier whose recorded Claude executable path disappeared uses the
+  current `claude` found on PATH.
+- README first-use corrections: provider selection in one command, guarded
+  rollback, idle-capable first-use pairing, per-attempt refusal, delivery
+  modes, profile selection, and a provider-update note.
+
 ## 0.4.3 - 2026-09-23
 
 - Fresh sessions register reliably on busy Macs. A session's courier now

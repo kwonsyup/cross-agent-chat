@@ -167,7 +167,14 @@ def _environment() -> dict[str, str]:
 
 def claude_binary() -> Path:
     configured = os.environ.get(BOUND_CLAUDE_BINARY_ENV)
-    candidate = configured if configured else shutil.which("claude")
+    # A courier pins its registration-time binary through this variable; an
+    # in-place provider update can delete that path while a discovered
+    # replacement exists, so a vanished pin falls back to fresh discovery.
+    candidate = (
+        configured
+        if configured is not None and Path(configured).exists()
+        else shutil.which("claude")
+    )
     if candidate is None:
         fallback = Path.home() / ".local" / "bin" / "claude"
         candidate = str(fallback) if fallback.exists() else None

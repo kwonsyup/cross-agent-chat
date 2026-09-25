@@ -85,7 +85,7 @@ def test_system_applications_layout_is_recognized(
     resolved = bundle.resolve(strict=True)
     assert runtime.native_desktop_bundle(300) == resolved
     assert runtime.native_desktop_process(300)
-    assert runtime._native_desktop_route(codex_route(tmp_path, 300))
+    assert runtime._native_desktop_route(tmp_path, codex_route(tmp_path, 300))
 
 
 def test_home_applications_layout_is_recognized(
@@ -96,7 +96,7 @@ def test_home_applications_layout_is_recognized(
     patch_process_chain(monkeypatch, executables, parents)
 
     assert runtime.native_desktop_bundle(300) == bundle.resolve(strict=True)
-    assert runtime._native_desktop_route(codex_route(tmp_path, 300))
+    assert runtime._native_desktop_route(tmp_path, codex_route(tmp_path, 300))
 
 
 def test_applications_subfolder_layout_is_recognized(
@@ -144,7 +144,7 @@ def test_child_and_desktop_ancestor_must_share_one_bundle(
 
     assert runtime.native_desktop_process(300)
     assert runtime.native_desktop_bundle(300) is None
-    assert not runtime._native_desktop_route(codex_route(tmp_path, 300))
+    assert not runtime._native_desktop_route(tmp_path, codex_route(tmp_path, 300))
 
 
 def test_foreign_bundle_identifier_is_rejected(
@@ -239,7 +239,7 @@ def test_account_binary_returns_the_bound_bundle_client(
     patch_process_chain(monkeypatch, executables, parents)
     route = codex_route(tmp_path, 300)
 
-    assert runtime._native_account_binary(route) == (
+    assert runtime._native_account_binary(tmp_path, route) == (
         bundle / "Contents" / "Resources" / "codex"
     ).resolve(strict=True)
 
@@ -258,4 +258,4 @@ def test_account_binary_rejects_route_bound_to_another_owner(
     )
 
     with pytest.raises(ChatError, match="account identity is unavailable"):
-        runtime._native_account_binary(route)
+        runtime._native_account_binary(tmp_path, route)
