@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.5 - 2026-09-25
 
 - A session whose courier died and left its socket behind now recovers at
   its next registration: the courier's lifetime lock proves the courier is
