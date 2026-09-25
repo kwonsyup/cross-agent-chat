@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- A session whose courier died and left its socket behind now recovers at
+  its next registration: the courier's lifetime lock proves the courier is
+  gone and records the exact socket it guarded, so only that stale socket
+  is reclaimed before a fresh courier takes over the same route generation.
+- A courier that briefly refuses connections because its listener backlog
+  is full keeps its socket and its route generation: re-registration no
+  longer unlinks its socket or mints a replacement generation while its
+  lock is held.
+- Couriers started before this version hold no lifetime lock, so their
+  leftover sockets are not reclaimed automatically; restart the session.
+
 ## 0.4.4 - 2026-09-24
 
 - A Claude Code session keeps Cross Agent Chat in both directions when an

@@ -7,11 +7,15 @@ and deleted, which is the exact npm-update failure these tests exercise.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -971,3 +975,878 @@ def test_anchored_reregistration_keeps_route_when_hook_cwd_drifts(
     finally:
         process.kill()
         process.wait()
+
+
+def _dead_courier_socket(path: Path) -> None:
+    """Leave a bound-then-orphaned 0600 socket, like a SIGKILLed courier."""
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(path))
+        path.chmod(0o600)
+        listener.listen(1)
+    finally:
+        listener.close()
+
+
+def _dead_courier_lock(path: Path, socket_file: Path | None = None) -> None:
+    """Leave the released lifetime lock a SIGKILLed courier held.
+
+    ``socket_file`` records the bound socket's inode exactly like a live
+    courier does; without it the lock stays empty like a courier killed
+    before it could record, or one that predates the inode binding.
+    """
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    os.fchmod(descriptor, 0o600)
+    if socket_file is not None:
+        metadata = socket_file.lstat()
+        os.write(descriptor, f"{metadata.st_dev} {metadata.st_ino}\n".encode())
+    os.close(descriptor)
+
+
+def _backlogged_listener(path: Path) -> tuple[socket.socket, socket.socket]:
+    """Bind a live listener whose single-slot backlog is already full.
+
+    Returns the listener and the client occupying its backlog: on macOS the
+    next connect to it is refused with ECONNREFUSED, which is exactly what a
+    busy courier costs a probe.
+    """
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    path.chmod(0o600)
+    listener.listen(1)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(path))
+    return listener, client
+
+
+def _held_courier_lock(path: Path) -> int:
+    """Hold LOCK_EX on the lifetime lock exactly like a live courier does.
+
+    A second descriptor inside this process still conflicts, because flock
+    locks are per open-file-description.
+    """
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    os.fchmod(descriptor, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return descriptor
+
+
+def _bootstrap_listener(path: Path, generation: str, *, answer: bool = True) -> socket.socket:
+    """Bind a real courier-style listener on the generation socket.
+
+    With ``answer`` it replies BOOTSTRAPPED to every probe; without it the
+    listener accepts each connection and holds it silently past the 0.5s
+    handover probe deadline, which is exactly what a busy courier costs.
+    """
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    path.chmod(0o600)
+    server.listen(4)
+
+    def serve() -> None:
+        while True:
+            try:
+                connection, _ = server.accept()
+            except OSError:
+                return
+            try:
+                connection.settimeout(5.0)
+                runtime.read_frame(connection)
+                if answer:
+                    runtime.emit_frame(
+                        connection,
+                        {
+                            "schema_version": 1,
+                            "status": "BOOTSTRAPPED",
+                            "generation": generation,
+                        },
+                    )
+                else:
+                    time.sleep(2.0)
+            except (OSError, ChatError):
+                pass
+            finally:
+                connection.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return server
+
+
+class _FakeCourierProcess:
+    """Live-child stand-in for a spawned courier; never a real process."""
+
+    def poll(self) -> None:
+        return None
+
+    def terminate(self) -> None:
+        pass
+
+    def kill(self) -> None:
+        pass
+
+    def wait(self, timeout: float = 0.0) -> int:
+        return 0
+
+
+def test_anchored_reregistration_respawns_past_a_stale_courier_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    """A SIGKILLed courier leaves its bound 0600 socket behind and the kernel
+    has already dropped its lifetime lock: the bootstrap connect is refused,
+    and reuse must clear that dead path and spawn a courier on the SAME
+    generation instead of dying on the occupied-path guard."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    process = _spawn(binary)
+    real_spawn = runtime._spawn_courier
+    servers: list[socket.socket] = []
+    stale: Path | None = None
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        aside = _npm_update_aside(package)
+        shutil.rmtree(aside)
+        stale = runtime.socket_path(root, route)
+        _dead_courier_socket(stale)
+        _dead_courier_lock(runtime.courier_lock_path(root, route), stale)
+
+        spawned: list[Route] = []
+
+        def fake_popen(_command: list[str], **_kwargs: object) -> _FakeCourierProcess:
+            # The stale socket must already be gone: the real spawn guard
+            # would refuse an occupied generation path. The replacement
+            # courier binds the same socket and answers the bootstrap probe.
+            assert not stale.exists()
+            spawned.append(route)
+            servers.append(_bootstrap_listener(stale, route.generation))
+            return _FakeCourierProcess()
+
+        # _register stubbed _spawn_courier; restore the real one so its true
+        # occupied-path guard stays under test while Popen is fixture-bound.
+        monkeypatch.setattr(runtime, "_spawn_courier", real_spawn)
+        monkeypatch.setattr(runtime, "claude_binary", lambda: Path("/bin/echo"))
+        monkeypatch.setattr("cross_agent_chat.runtime.subprocess.Popen", fake_popen)
+
+        reused = runtime.register("claude", "studio", process.pid, str(root))
+        assert reused == route
+        assert reused.generation == route.generation
+        assert spawned == [route]
+        assert Registry(root).routes() == [route]
+    finally:
+        for server in servers:
+            server.close()
+        if stale is not None:
+            stale.unlink(missing_ok=True)
+        process.kill()
+        process.wait()
+
+
+def test_anchored_handover_never_replaces_a_live_courier_with_a_full_backlog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    """A live courier whose listen backlog is full also answers ECONNREFUSED:
+    refusal alone never proves death. While its lifetime lock stays held the
+    handover must leave socket and route untouched and spawn nothing."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    process = _spawn(binary)
+    listener: socket.socket | None = None
+    backlog: socket.socket | None = None
+    lock_descriptor: int | None = None
+    occupied: Path | None = None
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        aside = _npm_update_aside(package)
+        shutil.rmtree(aside)
+        occupied = runtime.socket_path(root, route)
+
+        # A busy live courier: listening, but one unaccepted client already
+        # fills its backlog so the next connect is refused.
+        listener, backlog = _backlogged_listener(occupied)
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            with pytest.raises(OSError) as refused:
+                probe.connect(str(occupied))
+            assert refused.value.errno == errno.ECONNREFUSED
+        finally:
+            probe.close()
+        lock_descriptor = _held_courier_lock(runtime.courier_lock_path(root, route))
+
+        monkeypatch.setattr(runtime, "_spawn_courier", lambda *_args: pytest.fail("respawn"))
+        reused = runtime.register("claude", "studio", process.pid, str(root))
+        assert reused == route
+        assert occupied.exists()
+        assert Registry(root).routes() == [route]
+    finally:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+        if backlog is not None:
+            backlog.close()
+        if listener is not None:
+            listener.close()
+        if occupied is not None:
+            occupied.unlink(missing_ok=True)
+        process.kill()
+        process.wait()
+
+
+def test_anchored_handover_leaves_a_socket_the_lock_does_not_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    """A free lock is not proof the socket belongs to its former holder: a
+    courier spawned by a version that never took the lock can sit on the same
+    generation path while the recorded inode belongs to a long-gone socket.
+    The live listener must survive -- no unlink, no spawn, route returned."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    process = _spawn(binary)
+    listener: socket.socket | None = None
+    backlog: socket.socket | None = None
+    occupied: Path | None = None
+    decoy: Path | None = None
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        aside = _npm_update_aside(package)
+        shutil.rmtree(aside)
+        occupied = runtime.socket_path(root, route)
+
+        # The socket now belongs to a courier that never took the lock; the
+        # released lock file still records an inode that is not this one.
+        listener, backlog = _backlogged_listener(occupied)
+        decoy = occupied.with_name("decoy.sock")
+        _dead_courier_socket(decoy)
+        _dead_courier_lock(runtime.courier_lock_path(root, route), decoy)
+        decoy.unlink()
+        decoy = None
+
+        monkeypatch.setattr(runtime, "_spawn_courier", lambda *_args: pytest.fail("respawn"))
+        reused = runtime.register("claude", "studio", process.pid, str(root))
+        assert reused == route
+        assert occupied.exists()
+        assert Registry(root).routes() == [route]
+    finally:
+        if backlog is not None:
+            backlog.close()
+        if listener is not None:
+            listener.close()
+        if occupied is not None:
+            occupied.unlink(missing_ok=True)
+        if decoy is not None:
+            decoy.unlink(missing_ok=True)
+        process.kill()
+        process.wait()
+
+
+def test_anchored_handover_leaves_a_legacy_couriers_stale_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    """A courier started before the lifetime lock existed holds no lock, so a
+    refused connect cannot prove it dead: the stale socket stays, nothing
+    spawns, and the session recovers on restart."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    process = _spawn(binary)
+    stale: Path | None = None
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        aside = _npm_update_aside(package)
+        shutil.rmtree(aside)
+        stale = runtime.socket_path(root, route)
+        _dead_courier_socket(stale)
+
+        monkeypatch.setattr(runtime, "_spawn_courier", lambda *_args: pytest.fail("respawn"))
+        reused = runtime.register("claude", "studio", process.pid, str(root))
+        assert reused == route
+        assert stale.exists()
+        assert Registry(root).routes() == [route]
+    finally:
+        if stale is not None:
+            stale.unlink(missing_ok=True)
+        process.kill()
+        process.wait()
+
+
+@pytest.mark.parametrize("occupant", ["symlink", "loose-mode", "directory"])
+def test_anchored_handover_refuses_an_unsafe_courier_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compiled: dict[str, Path],
+    occupant: str,
+) -> None:
+    """A lifetime lock path that is not this uid's own 0600 regular file --
+    a symlink, a loose-mode file, or a directory -- fails closed: the
+    registration refuses, the stale socket stays, nothing spawns."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    process = _spawn(binary)
+    stale: Path | None = None
+    lock_path: Path | None = None
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        aside = _npm_update_aside(package)
+        shutil.rmtree(aside)
+        stale = runtime.socket_path(root, route)
+        _dead_courier_socket(stale)
+        lock_path = runtime.courier_lock_path(root, route)
+        if occupant == "symlink":
+            target = lock_path.with_name("lock-target.lock")
+            _dead_courier_lock(target)
+            lock_path.symlink_to(target)
+        elif occupant == "loose-mode":
+            _dead_courier_lock(lock_path)
+            lock_path.chmod(0o644)
+        else:
+            lock_path.mkdir()
+
+        monkeypatch.setattr(runtime, "_spawn_courier", lambda *_args: pytest.fail("respawn"))
+        with pytest.raises(ChatError, match="unsafe"):
+            runtime.register("claude", "studio", process.pid, str(root))
+        assert stale.exists()
+        assert Registry(root).routes() == [route]
+    finally:
+        if lock_path is not None:
+            if lock_path.is_symlink() or lock_path.is_file():
+                lock_path.unlink(missing_ok=True)
+            elif lock_path.is_dir():
+                lock_path.rmdir()
+            target = lock_path.with_name("lock-target.lock")
+            target.unlink(missing_ok=True)
+        if stale is not None:
+            stale.unlink(missing_ok=True)
+        process.kill()
+        process.wait()
+
+
+def test_anchored_handover_keeps_the_route_for_answering_or_busy_couriers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    """Real listeners must never be respawned: a courier answering bootstrap
+    keeps the route, and a busy courier whose probe times out keeps it too,
+    with its socket left exactly in place."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    process = _spawn(binary)
+    real_spawn = runtime._spawn_courier
+    servers: list[socket.socket] = []
+    stale: Path | None = None
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        aside = _npm_update_aside(package)
+        shutil.rmtree(aside)
+        stale = runtime.socket_path(root, route)
+
+        monkeypatch.setattr(runtime, "_spawn_courier", real_spawn)
+        monkeypatch.setattr(
+            "cross_agent_chat.runtime.subprocess.Popen",
+            lambda *_args, **_kwargs: pytest.fail("respawn"),
+        )
+
+        servers.append(_bootstrap_listener(stale, route.generation))
+        assert runtime.register("claude", "studio", process.pid, str(root)) == route
+        assert stale.exists()
+
+        # Busy courier: accepts but cannot answer inside the probe deadline.
+        servers[-1].close()
+        stale.unlink()
+        servers.append(_bootstrap_listener(stale, route.generation, answer=False))
+        assert runtime.register("claude", "studio", process.pid, str(root)) == route
+        assert stale.exists()
+        assert Registry(root).routes() == [route]
+    finally:
+        for server in servers:
+            server.close()
+        if stale is not None:
+            stale.unlink(missing_ok=True)
+        process.kill()
+        process.wait()
+
+
+@pytest.mark.parametrize("occupant", ["regular-file", "symlink", "loose-socket"])
+def test_anchored_handover_never_removes_an_unsafe_socket_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compiled: dict[str, Path],
+    occupant: str,
+) -> None:
+    """Anything at the generation path that fails the require_socket
+    ownership invariant -- a plain file, a symlink, or a socket with loose
+    mode -- is left on disk and never respawned over."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    process = _spawn(binary)
+    stale: Path | None = None
+    target: Path | None = None
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        aside = _npm_update_aside(package)
+        shutil.rmtree(aside)
+        stale = runtime.socket_path(root, route)
+
+        if occupant == "regular-file":
+            stale.touch()
+            stale.chmod(0o600)
+        elif occupant == "symlink":
+            # Keep the target inside the short fixture socket dir; tmp_path
+            # names can exceed the AF_UNIX bind limit.
+            target = stale.with_name("fixture-target.sock")
+            _dead_courier_socket(target)
+            stale.symlink_to(target)
+        else:
+            _dead_courier_socket(stale)
+            stale.chmod(0o644)
+
+        monkeypatch.setattr(runtime, "_spawn_courier", lambda *_args: pytest.fail("respawn"))
+        reused = runtime.register("claude", "studio", process.pid, str(root))
+        assert reused == route
+        assert stale.is_symlink() or stale.exists()
+        if occupant == "symlink":
+            assert target is not None and target.exists()
+        assert Registry(root).routes() == [route]
+    finally:
+        if stale is not None:
+            stale.unlink(missing_ok=True)
+        if target is not None:
+            target.unlink(missing_ok=True)
+        process.kill()
+        process.wait()
+
+
+def test_courier_lock_is_exclusive_and_released_on_close(tmp_path: Path) -> None:
+    """The lifetime lock can be taken once; a competing open-file-description
+    is refused while it is held and succeeds only after the holder's
+    descriptor closes -- the same release the kernel performs on SIGKILL."""
+    lock_path = tmp_path / "held.lock"
+    descriptor = runtime._acquire_courier_lock(lock_path)
+    try:
+        assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+        with pytest.raises(ChatError, match="already running"):
+            runtime._acquire_courier_lock(lock_path)
+    finally:
+        os.close(descriptor)
+    released = runtime._acquire_courier_lock(lock_path)
+    os.close(released)
+
+
+def test_courier_lock_records_the_bound_socket_identity(tmp_path: Path) -> None:
+    """The courier records the exact inode it bound into its held lock, so a
+    later reclaim can attribute the stale socket to the lock's holder."""
+    root = tmp_path / "state"
+    root.mkdir()
+    item = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+    )
+    socket_file = runtime.socket_path(root, item)
+    _dead_courier_socket(socket_file)
+    lock_path = runtime.courier_lock_path(root, item)
+    descriptor = runtime._acquire_courier_lock(lock_path)
+    try:
+        runtime._record_courier_socket(descriptor, socket_file)
+    finally:
+        os.close(descriptor)
+    try:
+        metadata = socket_file.lstat()
+        reader = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            assert runtime._recorded_socket_identity(reader) == (
+                metadata.st_dev,
+                metadata.st_ino,
+            )
+        finally:
+            os.close(reader)
+        assert lock_path.read_text(encoding="ascii") == (f"{metadata.st_dev} {metadata.st_ino}\n")
+    finally:
+        socket_file.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("occupant", ["regular-file", "symlink", "loose-socket"])
+def test_reclaim_refuses_an_unsafe_socket_under_a_released_lock(
+    tmp_path: Path, occupant: str
+) -> None:
+    """With the lock provably free, a generation path that is not this uid's
+    own 0600 socket is evidence of tampering, not of death: reclaim fails
+    closed and unlinks nothing."""
+    root = tmp_path / "state"
+    root.mkdir()
+    item = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+    )
+    path = runtime.socket_path(root, item)
+    lock_path = runtime.courier_lock_path(root, item)
+    _dead_courier_lock(lock_path)
+    target: Path | None = None
+    if occupant == "regular-file":
+        path.touch()
+        path.chmod(0o600)
+    elif occupant == "symlink":
+        target = path.with_name("fixture-target.sock")
+        _dead_courier_socket(target)
+        path.symlink_to(target)
+    else:
+        _dead_courier_socket(path)
+        path.chmod(0o644)
+
+    try:
+        with pytest.raises(ChatError, match="unsafe"):
+            runtime._reclaim_dead_courier_socket(root, item)
+        assert path.is_symlink() or path.exists()
+        if target is not None:
+            assert target.exists()
+    finally:
+        path.unlink(missing_ok=True)
+        if target is not None:
+            target.unlink(missing_ok=True)
+
+
+def test_reclaim_releases_the_lock_so_the_replacement_can_take_it(
+    tmp_path: Path,
+) -> None:
+    """A successful reclaim removes the stale socket and frees the lock, so
+    the respawned courier's own acquisition cannot refuse it."""
+    root = tmp_path / "state"
+    root.mkdir()
+    item = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+    )
+    path = runtime.socket_path(root, item)
+    lock_path = runtime.courier_lock_path(root, item)
+    _dead_courier_socket(path)
+    _dead_courier_lock(lock_path, path)
+
+    try:
+        assert runtime._reclaim_dead_courier_socket(root, item)
+        assert not path.exists()
+        replacement = runtime._acquire_courier_lock(lock_path)
+        os.close(replacement)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_reclaim_leaves_a_socket_whose_lock_records_another_inode(
+    tmp_path: Path,
+) -> None:
+    """The lock names the exact inode its holder bound: a socket at the same
+    path with a different inode belongs to a courier the lock never held,
+    so it is left untouched."""
+    root = tmp_path / "state"
+    root.mkdir()
+    item = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+    )
+    path = runtime.socket_path(root, item)
+    decoy = path.with_name("decoy.sock")
+    _dead_courier_socket(path)
+    _dead_courier_socket(decoy)
+    _dead_courier_lock(runtime.courier_lock_path(root, item), decoy)
+    decoy.unlink()
+    try:
+        assert not runtime._reclaim_dead_courier_socket(root, item)
+        assert path.exists()
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_reclaim_leaves_a_socket_whose_lock_record_is_empty(
+    tmp_path: Path,
+) -> None:
+    """An empty or unrecorded lock cannot attribute the socket to any dead
+    holder, so nothing is unlinked."""
+    root = tmp_path / "state"
+    root.mkdir()
+    item = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+    )
+    path = runtime.socket_path(root, item)
+    _dead_courier_socket(path)
+    _dead_courier_lock(runtime.courier_lock_path(root, item))
+    try:
+        assert not runtime._reclaim_dead_courier_socket(root, item)
+        assert path.exists()
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_locked_courier_inode_must_still_be_the_lock_path_entry(tmp_path: Path) -> None:
+    """Once the directory entry no longer names the inode a descriptor
+    locked, the lock proves nothing: a live courier could still hold the
+    orphaned old inode after an unlink-and-recreate swap."""
+    lock_path = tmp_path / "swapped.lock"
+    _dead_courier_lock(lock_path)
+    descriptor = runtime._open_courier_lock(lock_path, os.O_RDWR)
+    assert descriptor is not None
+    try:
+        assert runtime._try_courier_lock(descriptor)
+        assert runtime._lock_path_is_current(descriptor, lock_path)
+        # Swap the path for a fresh inode while the old one is locked.
+        lock_path.unlink()
+        _dead_courier_lock(lock_path)
+        assert not runtime._lock_path_is_current(descriptor, lock_path)
+    finally:
+        os.close(descriptor)
+
+
+def test_reclaim_refuses_a_lock_inode_the_path_no_longer_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even a lock recording this exact socket must not reclaim it once the
+    locked inode was orphaned by a path swap: the flock was taken on an
+    inode no directory entry names."""
+    root = tmp_path / "state"
+    root.mkdir()
+    item = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+    )
+    path = runtime.socket_path(root, item)
+    lock_path = runtime.courier_lock_path(root, item)
+    _dead_courier_socket(path)
+    _dead_courier_lock(lock_path, path)
+
+    real_open = runtime._open_courier_lock
+
+    def swapped_open(lock: Path, flags: int) -> int | None:
+        descriptor = real_open(lock, flags)
+        # The path is recreated between open and flock: the descriptor locks
+        # the orphaned inode even though it still records this socket.
+        lock.unlink()
+        _dead_courier_lock(lock)
+        return descriptor
+
+    monkeypatch.setattr(runtime, "_open_courier_lock", swapped_open)
+    try:
+        assert not runtime._reclaim_dead_courier_socket(root, item)
+        assert path.exists()
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_reclaim_never_touches_a_socket_while_the_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    """A held lifetime lock means a live courier: reclaim returns False and
+    the refused socket stays exactly where the courier left it."""
+    root = tmp_path / "state"
+    root.mkdir()
+    item = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+    )
+    path = runtime.socket_path(root, item)
+    _dead_courier_socket(path)
+    descriptor = _held_courier_lock(runtime.courier_lock_path(root, item))
+    try:
+        assert not runtime._reclaim_dead_courier_socket(root, item)
+        assert path.exists()
+    finally:
+        os.close(descriptor)
+        path.unlink(missing_ok=True)
+
+
+def test_reclaim_returns_false_without_a_lock_file(tmp_path: Path) -> None:
+    """A pre-version courier holds no lock: its stale socket is unprovable
+    and left in place, never unlinked and never spawned over."""
+    root = tmp_path / "state"
+    root.mkdir()
+    item = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+    )
+    path = runtime.socket_path(root, item)
+    _dead_courier_socket(path)
+    try:
+        assert not runtime._reclaim_dead_courier_socket(root, item)
+        assert path.exists()
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_reclaim_tolerates_a_socket_vanished_under_the_taken_lock(
+    tmp_path: Path,
+) -> None:
+    """If the stale socket disappears between the refused connect and the
+    reclaim, the freed path is still safe to spawn on."""
+    root = tmp_path / "state"
+    root.mkdir()
+    item = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+    )
+    _dead_courier_lock(runtime.courier_lock_path(root, item))
+    assert runtime._reclaim_dead_courier_socket(root, item)
+
+
+def test_anchored_reregistration_without_a_current_owner_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    """The stale-socket removal never weakens ownership: when the anchor no
+    longer proves the route the registration still refuses, and the leftover
+    socket is nobody's to delete."""
+    package = tmp_path / "pkg"
+    binary = _install(compiled["sleeper"], package)
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    process = _spawn(binary)
+    stale: Path | None = None
+    try:
+        route = _register(root, "claude", process.pid, cwd, monkeypatch, session_id)
+        aside = _npm_update_aside(package)
+        shutil.rmtree(aside)
+        stale = runtime.socket_path(root, route)
+        _dead_courier_socket(stale)
+        owner_anchor_path(root, route.generation).unlink()
+
+        monkeypatch.setattr(runtime, "_spawn_courier", lambda *_args: pytest.fail("respawn"))
+        with pytest.raises(ChatError):
+            runtime.register("claude", "studio", process.pid, str(root))
+        assert stale.exists()
+    finally:
+        if stale is not None:
+            stale.unlink(missing_ok=True)
+        process.kill()
+        process.wait()
+
+
+def _codex_route(root: Path, session_id: str, cwd: Path) -> Route:
+    identity, _ = runtime.recipient_owner_identity("codex", os.getpid())
+    route = Route.create(
+        provider="codex",
+        session_id=session_id,
+        device="studio",
+        cwd=str(cwd),
+        pid=os.getpid(),
+        owner_identity=identity,
+    )
+    Registry(root).upsert(route)
+    return route
+
+
+def test_second_reuse_keeps_the_route_while_the_courier_lock_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unanchored reuse path must not mint a new generation over a live
+    courier: a full-backlog ECONNREFUSED while the courier's lifetime lock
+    is held keeps the registered route exactly as published."""
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    first = _codex_route(root, session_id, cwd)
+    occupied = runtime.socket_path(root, first)
+    listener, backlog = _backlogged_listener(occupied)
+    lock_descriptor = _held_courier_lock(runtime.courier_lock_path(root, first))
+    try:
+        monkeypatch.setattr(
+            runtime,
+            "hook_input",
+            lambda _event: {"session_id": session_id, "cwd": str(cwd)},
+        )
+        monkeypatch.setattr(runtime, "_spawn_courier", lambda *_args: pytest.fail("respawn"))
+        reused = runtime.register("codex", "studio", os.getpid(), str(root))
+        assert reused == first
+        assert occupied.exists()
+        assert Registry(root).routes() == [first]
+    finally:
+        os.close(lock_descriptor)
+        backlog.close()
+        listener.close()
+        occupied.unlink(missing_ok=True)
+
+
+def test_second_reuse_mints_again_when_the_registered_courier_has_no_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registered route whose courier predates the lifetime lock keeps the
+    existing recovery: a refused connect mints a replacement generation and
+    spawns a courier for it."""
+    root = tmp_path / "state"
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = str(uuid4())
+    first = _codex_route(root, session_id, cwd)
+    occupied = runtime.socket_path(root, first)
+    _dead_courier_socket(occupied)
+    spawned: list[Route] = []
+    try:
+        monkeypatch.setattr(
+            runtime,
+            "hook_input",
+            lambda _event: {"session_id": session_id, "cwd": str(cwd)},
+        )
+        monkeypatch.setattr(runtime, "_spawn_courier", lambda _root, item: spawned.append(item))
+        reused = runtime.register("codex", "studio", os.getpid(), str(root))
+        assert reused is not None
+        assert reused.generation != first.generation
+        assert spawned == [reused]
+        assert Registry(root).routes() == [reused]
+        assert occupied.exists()
+    finally:
+        occupied.unlink(missing_ok=True)
