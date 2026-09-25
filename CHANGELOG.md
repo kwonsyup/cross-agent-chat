@@ -12,6 +12,8 @@
   lock is held.
 - Couriers started before this version hold no lifetime lock, so their
   leftover sockets are not reclaimed automatically; restart the session.
+  The same applies to a courier killed during its own startup, before it
+  could record the socket it bound.
 
 ## 0.4.4 - 2026-09-24
 

@@ -904,8 +904,10 @@ def _record_courier_socket(descriptor: int, path: Path) -> None:
     own open file, already held under LOCK_EX for the courier's life.
     """
     metadata = path.lstat()
+    payload = f"{metadata.st_dev} {metadata.st_ino}\n".encode()
     os.ftruncate(descriptor, 0)
-    os.write(descriptor, f"{metadata.st_dev} {metadata.st_ino}\n".encode())
+    if os.write(descriptor, payload) != len(payload):
+        raise OSError("courier lock record was truncated")
 
 
 def _open_courier_lock(path: Path, flags: int) -> int | None:
@@ -982,12 +984,23 @@ def _courier_lock_is_held(root: Path, route: Route) -> bool:
 
 
 def _recorded_socket_identity(descriptor: int) -> tuple[int, int] | None:
-    """Parse the (dev, ino) a courier recorded in its lock; None if absent."""
+    """Parse the (dev, ino) a courier recorded in its lock; None if absent.
+
+    Only the exact canonical form ``"<dev> <ino>\\n"`` is a record: a padded,
+    truncated-at-the-read-limit, or otherwise reserialized-different file is
+    not attributable to a courier and proves nothing.
+    """
     try:
-        content = os.pread(descriptor, 128, 0).decode("ascii")
-    except (OSError, UnicodeDecodeError):
+        content = os.pread(descriptor, 129, 0)
+    except OSError:
         return None
-    parts = content.strip().split(" ")
+    if len(content) == 129:
+        return None
+    try:
+        text = content.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    parts = text.strip().split(" ")
     if len(parts) != 2:
         return None
     try:
@@ -995,6 +1008,8 @@ def _recorded_socket_identity(descriptor: int) -> tuple[int, int] | None:
     except ValueError:
         return None
     if device < 0 or inode <= 0:
+        return None
+    if content != f"{device} {inode}\n".encode():
         return None
     return device, inode
 
@@ -1942,7 +1957,9 @@ def courier_server(
     path = socket_path(root, route)
     lock_descriptor = _acquire_courier_lock(courier_lock_path(root, route))
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    old_umask = os.umask(0o077)
+    # The socket must be born 0600: a courier killed before a post-bind
+    # chmod would strand a 0700 socket no reclaim could ever clear.
+    old_umask = os.umask(0o177)
     try:
         server.bind(str(path))
     except BaseException:
@@ -1998,7 +2015,6 @@ def courier_server(
         else None
     )
     bound = path.lstat()
-    path.chmod(0o600)
     server.listen(4)
     server.settimeout(1.0)
     stopping = False
