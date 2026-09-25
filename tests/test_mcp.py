@@ -263,4 +263,4 @@ def test_instructions_stop_senders_waiting_and_explain_both_return_paths() -> No
     assert "do not sleep, wait, or poll" in cli.MCP_INSTRUCTIONS
     assert "while_idle" in cli.MCP_INSTRUCTIONS
     assert "next_turn" in cli.MCP_INSTRUCTIONS
-    assert "after their next message" in cli.MCP_INSTRUCTIONS
+    assert "when your current turn ends or your next prompt starts" in cli.MCP_INSTRUCTIONS
