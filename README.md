@@ -202,11 +202,27 @@ current Codex profile receive while idle, and
 
 - **A session is missing from `chat_peers`.** A session that just started, or
   one whose courier did not answer its health probe in time, can be absent
-  from one listing — list again (the call is read-only) before concluding it
-  is gone. If it stays missing, start a fresh session. If `doctor` prints a
-  `terminal` note it is process-local: the marker is expected inside Claude
-  tool and hook subprocesses, and a normally opened terminal app showing it
-  was launched from inside a Claude session — relaunch that one instance.
+  from one listing — list once more before concluding it is gone. That relist
+  is read-only and sends nothing; whether the task itself may be sent again
+  is decided by the send's delivery result, never by the peer list. If
+  `doctor` prints a `terminal` note it is process-local: the marker is
+  expected inside Claude tool and hook subprocesses, and a normally opened
+  terminal app showing it was launched from inside a Claude session —
+  relaunch that one instance.
+- **A session stays missing from `chat_peers`.** Nothing re-registers while
+  sessions sit idle: a session rejoins the peer list only when its provider's
+  registration hook runs again. Recover the original session through the
+  action that re-runs it — resume the conversation (Claude Code), give the
+  original Devin conversation another prompt from its original workspace,
+  or, on Codex, resume the conversation and list again; if it still does not
+  appear, a fresh session is the fallback. Resuming keeps the original
+  conversation; a fresh start is a different peer. Then list again and use
+  the session's current handle, which may or may not have changed. A session
+  already open when Cross Agent Chat was installed has no hooks loaded, so
+  only relaunching its provider process adds them — starting fresh or
+  resuming the conversation. A courier holds undelivered requests only in
+  memory, so one that died with a turn-bound message still queued lost that
+  copy — check the session directly rather than re-sending.
 - **A send says the handle no longer resolves.** The recipient restarted. Run
   `chat_peers` to get the new handle.
 - **A send was refused before delivery.** That attempt delivered nothing; once
