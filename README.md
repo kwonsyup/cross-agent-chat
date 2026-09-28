@@ -1,278 +1,196 @@
 # Cross Agent Chat
 
-Cross Agent Chat lets your AI coding sessions work together. A Claude Code,
-Codex, or Devin session can find the other sessions running on your Macs, hand
-one of them a task, and get the answer back in its own conversation. The
-sessions don't need the same provider or account, and they don't need to be on
-the same Mac.
-
-- **Ask another session for work.** "Ask the Claude session on my Mac mini to
-  review this diff and send me its findings." Your agent finds that session,
-  sends the request, and gets the answer back.
-- **Work across Macs.** Sessions on any of your Macs reach each other over your
-  Tailscale network. Sessions on the same Mac need nothing extra.
-- **Keep your setup.** It uses the provider logins, terminal apps, and projects
-  you already have. There are no new accounts, peer lists, or terminal plugins.
-- **Reach one exact session.** Every message goes to the one session you
-  picked, and Cross Agent Chat never re-sends a message on its own. Replies
-  return to the session that asked.
-
-## How you use it
-
-A fresh session in an integrated provider loads three tools automatically:
-
-| Tool | What it does |
-|---|---|
-| `chat_peers` | Lists the live sessions you can reach, on this Mac and your other Macs. |
-| `chat_send` | Sends one message to one exact session. |
-| `chat_status` | Shows the delivery record of a message you sent. |
-
-You don't call these yourself. Ask your agent in plain language, and it uses
-them. Collaboration stays within each owner's given task and permissions;
-sessions do not automatically run arbitrary instructions from peers.
-
-## Supported sessions
-
-| Session | When a message arrives |
-|---|---|
-| Claude Code | Straight into the conversation, even while it is idle. Works in Terminal.app, iTerm2, Ghostty, and background sessions. |
-| Codex Native App | Straight into the original conversation, even while it is idle, through a managed helper. |
-| Codex CLI | At its next turn boundary (turn end or your next prompt). A queued message waits only in courier memory until then; the experimental queue (see *Commands*) delivers while idle. |
-| Devin (CLI or App) | At the conversation's next prompt or turn end. A Devin session joins the peer list after its first prompt. Receiving into an already-idle conversation is still open ([#38](https://github.com/kwonsyup/cross-agent-chat/issues/38)). |
-
-Start sessions from your logged-in Mac desktop (any terminal app or background
-session). A Claude Code session launched inside a remote SSH shell registered
-and listed in testing, but the courier could not deliver to it — SSH-hosted
-execution differs from launching a desktop terminal remotely.
-
-Sessions can mix providers and accounts freely. Remote sessions connect over
-Tailscale: the broker listens on your Mac's Tailnet address, TCP port `47071`,
-and your Tailscale ACL decides which Macs can reach it. The local broker health
-port is `127.0.0.1:47072`.
+Let your existing Claude Code, Codex, and local Devin sessions work together
+across your Macs — different accounts, providers, and terminals can work
+together. Ask another session for a review or an investigation, and get the
+answer back where you asked. No new account, no manual peer lists; keep your
+current projects and provider logins.
 
 ## Install
 
-You need:
+Use a Mac where a supported coding tool is already installed and working —
+its existing account is reused, and signing in again is not a normal
+installation step. Git is required; an existing Python 3.11+ or `uv` is
+reused, otherwise the installer bootstraps a runtime. Cross-Mac use needs
+Tailscale already connecting the Macs and permitting the traffic — discovery
+reads its existing status and never brings it up. Same-Mac use needs none.
 
-- A Mac with Claude Code, Codex, or Devin already installed and signed in.
-- Git, plus either `uv` or Python 3.11 or newer. The installer bootstraps a
-  runtime if you have neither.
-- Tailscale on each Mac, if you want sessions on different Macs to talk.
+The command below approves integration edits to the supported profiles
+already configured on this Mac, a local background broker, and private
+configuration backups. It does not migrate or copy credentials. See
+[setup and data handling](SECURITY.md).
 
 Install v0.4.5 with:
 
-```bash
+```sh
 curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.5/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
-This builds the released `v0.4.5` tag, sets up the providers already on the
-Mac, installs the command at `~/.local/bin/cross-agent-chat`, and starts the
-broker. Run it once on each Mac that should take part; re-running the installer
-upgrades or repairs the setup.
+This builds the released `v0.4.5` tag and installs the command at
+`~/.local/bin/cross-agent-chat`. Run it on each participating Mac.
 
-`CROSS_AGENT_CHAT_APPROVE=1` consents to the setup effects listed under
-[*What setup changes*](#what-setup-changes) — provider file edits, the launch
-agent, and the runtime — with a full backup of each managed file written under
-`~/.cache/cross-agent-chat/backups/` first (see [SECURITY.md](SECURITY.md)).
-Without it the script only prints what it would do.
+**Then open a new conversation, or relaunch the provider and resume an
+existing one when convenient** — sessions load Cross Agent Chat when they
+start and already-running ones keep what they loaded, so don't interrupt
+ongoing work just to activate it.
 
-Then **start new sessions**. Sessions load Cross Agent Chat when they start, so
-sessions already open before the first install have no tools. A session kept
-open across an upgrade keeps running the tool version it loaded at start until
-it is restarted.
+**Codex:** newly installed hooks may need a one-time review in the selected
+profile through its normal hook-review flow (the CLI documents `/hooks`).
+That review permits the hooks to run — not a login, and separate from
+MCP-tool approval. Hooks changed by an upgrade may need review again; Desktop
+builds vary, so use each build's supported path rather than bypassing trust.
 
-**Non-default profiles.** If you use custom profile locations, point setup at
-them:
+An agent can do the installation after your approval:
 
-```bash
-CODEX_HOME=~/.codex-work CLAUDE_CONFIG_DIR=~/.claude-work cross-agent-chat setup --yes
+> Install Cross Agent Chat from this repository for the coding tools I
+> already use on this Mac. Keep my current accounts and settings. Tell me
+> only any remaining provider approval and which next session will load it;
+> do not restart my active work.
+
+## Use it normally
+
+Tell the session that will answer requests once, in its own conversation:
+
+> Work on this repository and answer review requests from my Claude Code
+> session on my MacBook through Cross Agent Chat, within your existing
+> permissions.
+
+Then ask your agent:
+
+> Ask the Claude Code session on my Mac mini to review this change, send it
+> the relevant diff or an accessible revision, and bring its findings back
+> here.
+
+The requester finds the recipient, sends the request, and ends its turn; the
+recipient works with its own tools and account, then replies to the original
+conversation — no manual relaying. Messages carry peer requests, never owner
+instructions, and nothing synchronizes files or widens permissions. Start a
+short-lived session with `CROSS_AGENT_CHAT_PRESENCE=off` to keep it off the
+peer list.
+
+## Supported today
+
+| Coding surface on macOS | Receiving behavior |
+|---|---|
+| Claude Code | Receives while idle in supported desktop-launched contexts. |
+| Codex Native App | Receives in the original conversation through its managed helper, when the required provider capabilities and hooks are available. |
+| Codex CLI | By default, receives at a turn boundary: the current turn's end or the next prompt. An explicitly enabled experimental queue has different behavior. |
+| Local Devin CLI/App | Receives at the next prompt or turn end. A conversation joins the peer list after its first prompt; receiving into an already-idle conversation is open in [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38). |
+
+It follows the coding session, not a terminal tab; Terminal.app, iTerm2, and
+Ghostty have recorded supported cases on Intel and Apple silicon. No claim
+for every OS/provider combination, other agents or IDE chat surfaces, web
+chats, Windows, or Linux. A Claude session launched inside a remote SSH shell
+registered but could not receive — remotely opening a desktop terminal is
+different.
+
+<details>
+<summary>Custom profiles and installing with an agent</summary>
+
+Setup uses the current `CLAUDE_CONFIG_DIR` and `CODEX_HOME` when set,
+otherwise their normal defaults; local Devin uses its own local root:
+
+```sh
+CODEX_HOME="$HOME/.codex-work" CLAUDE_CONFIG_DIR="$HOME/.claude-work" \
+  "$HOME/.local/bin/cross-agent-chat" setup --yes
 ```
 
-**Installing with an agent.** An agent can run setup after you approve the
-plan. The agent's own current session must be restarted to load the tools.
+Use the actual command path printed by installation if it differs. To select
+providers explicitly, name the complete intended set — including providers
+this installation already recorded, which cannot be dropped:
 
-## First use
+```sh
+"$HOME/.local/bin/cross-agent-chat" setup --provider claude --provider codex
+```
 
-Give each session its job in its own first message. Then the two sessions
-handle the conversation between them.
+`CROSS_AGENT_CHAT_PROVIDERS=claude,codex` on the install command selects the
+same set.
 
-**1. Start the helper session** — an idle-capable one, such as Claude Code or
-the Codex Native App on your Mac mini — and tell it:
+An installation agent should reuse your existing provider contexts, describe
+the owned changes, use the canonical installer, inspect the resulting
+diagnostic output, and report only the remaining approval or activation step
+— never copying credentials, creating an account, writing hook-trust hashes,
+disabling approvals, scanning unrelated profiles, or enabling experimental
+modes to make a check green. A missing peer or timeout alone is not evidence
+that a login is required.
 
-> Work on this repository. When my Claude Code session on my MacBook asks you
-> for a code review through Cross Agent Chat, do the review and send the
-> result back to it.
+</details>
 
-**2. Start the requesting session** (Claude Code on your MacBook) and tell it:
+<details>
+<summary>Tools, delivery results, and recovery</summary>
 
-> Use Cross Agent Chat to ask the Claude Code session on my Mac mini to review
-> the changes in `src/parser.py`, then summarize its findings for me.
+Sessions load three tools: `chat_peers` finds recipients, `chat_send` sends
+one message, `chat_status` reads sender-local custody. Plain language works
+instead of invoking them.
 
-The requester finds the helper with `chat_peers`, sends the request, and ends
-its turn. The helper receives the request while idle, does the review, and
-replies. The answer arrives in the requester's conversation without manual
-relaying — Claude's own reply mode returns while idle; a turn-bound requester
-would see the answer at its next turn instead.
+`chat_send` reports `TRANSPORT_ACCEPTED` (custody, not a read receipt — do
+not re-send), a pre-delivery refusal (nothing was handed over; correcting
+that refused attempt is safe only if no earlier attempt of the same work was
+accepted or uncertain), or `UNKNOWN_DELIVERY` (check the recipient directly;
+do not re-send). Its `reply_delivery` — `while_idle`, `next_turn`, or
+`unknown` — says how an answer can return.
 
-*(A default Codex CLI or local Devin helper is turn-bound: it handles an
-incoming request at its next turn or prompt, so it needs that interaction
-first.)*
+```sh
+"$HOME/.local/bin/cross-agent-chat" doctor --json
+"$HOME/.local/bin/cross-agent-chat" peers --json
+"$HOME/.local/bin/cross-agent-chat" resolve EVENT_ID
+```
 
-Each session works strictly within the task you gave it and keeps its own
-permissions. Messages from peers arrive as peer requests, never as owner
-instructions. A peer cannot approve prompts, change settings, or widen a task.
+`doctor` reports what it can check about setup and the broker — not whether a
+model read a task. A missing peer warrants one read-only relist, not a
+replay; persistent absence may need the provider's normal registration event
+(resume the Claude conversation, or prompt the original Devin workspace), not
+idle supervision. `resolve` records an owner's disposition of an undecided
+event — it does not cancel work or make replay safe. Turn-bound queues live
+in courier memory; a crash can lose a pending copy. See
+[SECURITY.md](SECURITY.md).
 
-To keep a short-lived worker session off the peer list, start it with
-`CROSS_AGENT_CHAT_PRESENCE=off`.
+</details>
 
-## Delivery results
-
-`chat_send` reports the handover result:
-
-| Result | Meaning | What to do |
-|---|---|---|
-| `TRANSPORT_ACCEPTED` | Accepted for delivery into the recipient's courier or inbox. Not a read receipt — it does not confirm the model saw the message or did the work. | Wait for the reply. Do not send again. |
-| Refused before delivery | Nothing was handed over. The refusal applies only to that one attempted send. | Fix the reported cause (e.g. a discovery timeout), then send again — safe only for that refused attempt, and only if no earlier attempt of the same task was `TRANSPORT_ACCEPTED` or `UNKNOWN_DELIVERY`. |
-| `UNKNOWN_DELIVERY` | The send's outcome could not be confirmed; the message may or may not have been delivered. | Check the recipient session directly. Do not re-send. |
-
-`chat_send` also reports `reply_delivery`, how an answer can return to your
-session:
-
-- `while_idle`: an answer can arrive as a new message after your turn ends.
-- `next_turn`: an answer appears at your next turn boundary — when your current turn ends or your next prompt starts.
-- `unknown`: the return path cannot be confirmed.
-
-`chat_status EVENT_ID` shows the stored custody record for a message you sent.
-`cross-agent-chat resolve EVENT_ID` marks an undecided or unknown delivery as
-reviewed in your local history. It does not cancel, deliver, or contact the
-recipient, and never makes re-sending that task safe.
-
-## What setup changes
+<details>
+<summary>What setup changes</summary>
 
 Setup writes a full backup of each managed file under
 `~/.cache/cross-agent-chat/backups/` before changing:
 
-- **Claude** (`~/.claude` or `$CLAUDE_CONFIG_DIR`):
-  - sets `crossSessionInbound` to `accept` in `settings.json`
-  - adds session start and end hooks
-  - registers the Cross Agent Chat MCP server in `.claude.json`
-- **Codex** (`~/.codex` or `$CODEX_HOME`):
-  - turns on hooks
-  - adds the MCP server and its approval setting in `config.toml`
-  - adds session and native-helper hooks in `hooks.json`
-- **Devin** (`~/.config/devin`, when present):
-  - registers the MCP server
-  - adds lifecycle hooks
-- **Broker:** `~/Library/LaunchAgents/io.github.kwonsyup.cross-agent-chat.plist`
-- **Records, state, and runtimes:**
-  - install records in `~/.config/cross-agent-chat`
-  - state in `~/.local/state/cross-agent-chat`
-  - runtimes in `~/.local/share/cross-agent-chat-runtime`
+- **Claude** (`~/.claude` or `$CLAUDE_CONFIG_DIR`), **Codex** (`~/.codex` or
+  `$CODEX_HOME`), **Devin** (`~/.config/devin` when present): owned
+  session/lifecycle hooks and the Cross Agent Chat MCP server in each;
+  Claude also accepts inbound cross-session messages, Codex enables its
+  hooks feature and the server's approval setting.
+- An owner-local launchd broker under `~/Library/LaunchAgents/`.
 
-A default install integrates the provider roots already on the Mac. To select
-providers yourself, name every provider in one command with repeated
-`--provider` flags, or set `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` on the
-install command:
+Cross-Mac sessions connect over Tailscale: the broker listens on the Mac's
+Tailnet address, TCP port `47071`, and your Tailscale ACL decides which Macs
+may reach it; local broker health is `127.0.0.1:47072`.
+`setup --enable-experimental-codex-native-queue` and
+`--disable-experimental-codex-native-queue` toggle idle reception for new
+sessions in the current Codex profile.
 
-```bash
-cross-agent-chat setup --provider claude --provider codex
-```
+</details>
 
-The set must include every provider an existing install already recorded —
-recorded providers cannot be dropped — and each named provider's configuration
-root must exist. If setup hits a conflict or fails verification, it performs a
-guarded rollback toward your prior state; if rollback itself is obstructed, the
-backup paths and failure report stay in place for manual recovery.
+<details>
+<summary>Updating or removing Cross Agent Chat</summary>
 
-## Commands
+Use the installer for a new release, then activate in new or relaunched
+sessions when convenient. Releases before v0.4.0 minted a different
+reply-handle format — crossing that boundary needs fresh sessions on every
+Mac (not a claim every patch breaks compatibility), and moving to a
+pre-v0.4.0 release means uninstalling with the current version first.
 
-```bash
-cross-agent-chat setup          # show the plan, then install or repair (--yes to approve)
-cross-agent-chat doctor --json  # check the installed setup and the local broker
-cross-agent-chat peers --json   # list reachable sessions
-cross-agent-chat resolve EVENT_ID
-cross-agent-chat uninstall
-```
+`cross-agent-chat uninstall` removes owned integrations and restores recorded
+prior settings; delivery records remain for owner inspection, and
+`~/.config/cross-agent-chat` must stay intact because uninstall relies on its
+records.
 
-`setup --enable-experimental-codex-native-queue` lets new sessions in the
-current Codex profile receive while idle, and
-`--disable-experimental-codex-native-queue` turns that off again.
-
-## Troubleshooting
-
-- **A session is missing from `chat_peers`.** A session that just started, or
-  one whose courier did not answer its health probe in time, can be absent
-  from one listing — list once more before concluding it is gone. That relist
-  is read-only and sends nothing; whether the task itself may be sent again
-  is decided by the send's delivery result, never by the peer list. If
-  `doctor` prints a `terminal` note it is process-local: the marker is
-  expected inside Claude tool and hook subprocesses, and a normally opened
-  terminal app showing it was launched from inside a Claude session —
-  relaunch that one instance.
-- **A session stays missing from `chat_peers`.** Nothing re-registers while
-  sessions sit idle: a session rejoins the peer list only when its provider's
-  registration hook runs again. Recover the original session through the
-  action that re-runs it — resume the conversation (Claude Code), give the
-  original Devin conversation another prompt from its original workspace,
-  or, on Codex, resume the conversation and list again; if it still does not
-  appear, a fresh session is the fallback. Resuming keeps the original
-  conversation; a fresh start is a different peer. Then list again and use
-  the session's current handle, which may or may not have changed. A session
-  already open when Cross Agent Chat was installed has no hooks loaded, so
-  only relaunching its provider process adds them — starting fresh or
-  resuming the conversation. A courier holds undelivered requests only in
-  memory, so one that died with a turn-bound message still queued lost that
-  copy — check the session directly rather than re-sending.
-- **A send says the handle no longer resolves.** The recipient restarted. Run
-  `chat_peers` to get the new handle.
-- **A send was refused before delivery.** That attempt delivered nothing; once
-  the reported cause is fixed, sending again is safe only for that refused
-  attempt — a later refusal never authorizes replaying an earlier attempt of
-  the same task that was `TRANSPORT_ACCEPTED` or `UNKNOWN_DELIVERY`.
-- **`TRANSPORT_ACCEPTED` but no answer yet.** The recipient's courier accepted
-  the request. Check the recipient session directly rather than re-sending.
-
-## Upgrade and uninstall
-
-Re-run the install command for a newer version, then start fresh sessions. The
-upgrade restarts the broker and keeps routes and runtimes still used by live
-sessions. Handles minted before v0.4.0 cannot be answered, so crossing that
-boundary needs fresh sessions on every Mac.
-
-`cross-agent-chat uninstall` removes the integrations it owns, restores the
-earlier provider settings it recorded, and leaves delivery intent records and
-unrelated settings in place.
-
-Moving to a release older than v0.4.0 crosses the pre-v0.4.0 configuration
-format break: run `uninstall` with the current version first, then install the
-older one. Keep `~/.config/cross-agent-chat` intact until then, because
-uninstall relies on the records it holds.
-
-**Provider updates.** Sessions started before CAC 0.4.4 can lose Cross Agent
-Chat when an npm-installed Claude Code updates in place while running; the fix
-applies to sessions started after 0.4.4 is installed. For an affected older
-session, recovery is restarting it (resuming the conversation). See
+Sessions started before 0.4.4 can lose Cross Agent Chat when an npm-installed
+Claude Code updates in place while running; recovery is resuming the
+restarted conversation, and continuity applies only where the required owner
+anchor was recorded. See
 [issue #39](https://github.com/kwonsyup/cross-agent-chat/issues/39).
 
-## How it works
+</details>
 
-1. Each new session registers a route when it starts, bound to its process,
-   profile, Mac, and generation.
-2. `chat_peers` issues an opaque handle pinning that exact session instance.
-3. The recipient's Mac confirms the handle still names the same live session
-   and checks the request with the sender's broker before accepting delivery.
-4. Messages pass into the recipient provider's native inbox.
-
-Stored records retain event IDs and cryptographic digests, never raw message
-bodies. See [docs/source-map.md](docs/source-map.md).
-
-## Security
-
-Your Tailscale network and ACLs form the authorization boundary. Any node
-permitted to reach port `47071` can exchange messages with your sessions. See
-[SECURITY.md](SECURITY.md).
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
-Licensed under Apache-2.0.
+For code and contribution details: [source map](docs/source-map.md),
+[contributing](CONTRIBUTING.md), [release history](CHANGELOG.md). Licensed
+under Apache-2.0.

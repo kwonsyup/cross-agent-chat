@@ -1,6 +1,6 @@
 # Contributing
 
-Cross Agent Chat is a macOS prerelease under active correctness work. The
+Cross Agent Chat is a macOS beta under active correctness work. The
 fastest useful contributions are contained bug reports, regression tests that
 reproduce a real failure, and focused fixes that preserve the effect and
 identity boundaries described below.
@@ -81,7 +81,8 @@ Reviews reject changes that weaken these, even to make a test pass:
 
 When a provider update lands, record the installed provider version and the
 native surfaces relied on, run the affected contained adapter contracts, then
-update the tested-version notes in `README.md`.
+note the verified versions in the release notes (see
+[CHANGELOG.md](CHANGELOG.md)).
 
 ## Reporting issues
 
