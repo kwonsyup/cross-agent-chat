@@ -257,6 +257,15 @@ def test_chat_send_result_says_how_the_answer_returns(
     assert result["status"] == "TRANSPORT_ACCEPTED"
 
 
+def test_instructions_separate_first_install_from_upgrade() -> None:
+    # A session that predates CAC's first install has no CAC tools at all;
+    # only an upgrade leaves older tools loaded. Collapsing the two told a
+    # fresh session it was "running older tools" that do not exist.
+    assert "before a CAC install has no CAC tools" in cli.MCP_INSTRUCTIONS
+    assert "before a CAC upgrade keeps its older loaded tools" in cli.MCP_INSTRUCTIONS
+    assert "install or upgrade runs its older tools" not in cli.MCP_INSTRUCTIONS
+
+
 def test_instructions_stop_senders_waiting_and_explain_both_return_paths() -> None:
     # A Codex CLI requester slept and polled chat_status for eleven minutes; an
     # unconditional "finish your turn" would instead strand Stop-bound answers.

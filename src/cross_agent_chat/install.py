@@ -76,6 +76,11 @@ _PROVIDER_PATH_NAMES: Final[dict[str, tuple[str, ...]]] = {
     "codex": ("codex_config", "codex_hooks"),
     "devin": ("devin_mcp", "devin_hooks"),
 }
+_MISSING_ROOT_REMEDY: Final = (
+    "open the intended installed coding tool normally with its existing account so "
+    "it creates its configuration root (for a non-default profile, set CODEX_HOME "
+    "or CLAUDE_CONFIG_DIR to that profile), then re-run setup"
+)
 
 
 class SettingsError(RuntimeError):
@@ -357,8 +362,7 @@ def resolve_providers(
         )
         if not selected:
             raise NoProviderRootsError(
-                "no supported provider configuration roots exist; "
-                "install a provider or pass --provider"
+                f"no supported provider configuration roots exist; {_MISSING_ROOT_REMEDY}"
             )
         return selected
     names = tuple(requested)
@@ -378,7 +382,11 @@ def resolve_providers(
         if not present[provider] and (recorded is None or provider not in recorded)
     ]
     if absent:
-        raise SettingsError("provider configuration roots are absent: " + ", ".join(absent))
+        raise SettingsError(
+            "provider configuration roots are absent: "
+            + ", ".join(absent)
+            + f"; {_MISSING_ROOT_REMEDY}"
+        )
     return selected
 
 
@@ -1145,6 +1153,67 @@ def _retain_matching_owned_command_hook_trust(
     return tomlkit.dumps(document)
 
 
+CodexHookTrust = Literal["trusted", "pending_review", "not_applicable", "unknown"]
+
+
+def codex_command_hook_trust(
+    *,
+    config_text: str | None,
+    hooks_config: dict[str, object] | None,
+    hooks_path: Path,
+    executable: Path,
+    device: str,
+    codex_native_queue: bool,
+) -> CodexHookTrust:
+    """Classify provider-recorded trust for the owned Codex command hooks.
+
+    Pure and read-only: it inspects the already-loaded ``config.toml`` text
+    and parsed ``hooks.json`` content, reusing the exact command, timeout,
+    and trust-hash builders so a value written by the provider compares
+    equal. It never writes and never returns hash values or file contents.
+    Only the SessionStart/SessionEnd/Stop command hooks are assessed;
+    native helper hooks are out of scope.
+    """
+    if hooks_config is None:
+        return "unknown"
+    raw_hooks = hooks_config.get("hooks")
+    hook_map = cast(dict[str, object], raw_hooks) if isinstance(raw_hooks, dict) else {}
+    owned: list[tuple[str, int]] = []
+    for event in ("SessionStart", "SessionEnd", "Stop"):
+        groups = hook_map.get(event)
+        if not isinstance(groups, list):
+            continue
+        for index, group in enumerate(groups):
+            if _owned_hook(group):
+                owned.append((event, index))
+    if not owned:
+        return "not_applicable"
+    if config_text is None:
+        return "unknown"
+    try:
+        document = tomllib.loads(config_text)
+    except tomllib.TOMLDecodeError:
+        return "unknown"
+    features = document.get("features")
+    if not isinstance(features, dict) or features.get("hooks") is not True:
+        return "unknown"
+    hooks_table = document.get("hooks")
+    state = hooks_table.get("state") if isinstance(hooks_table, dict) else None
+    if not isinstance(state, dict):
+        return "unknown"
+    pending = False
+    for event, index in owned:
+        command = _hook_command(
+            executable, "codex", device, event, codex_native_queue=codex_native_queue
+        )
+        expected = _hook_trust_hash(command, event, _hook_timeout("codex", event))
+        key = f"{hooks_path}:{_hook_event_name(event)}:{index}:0"
+        value = state.get(key)
+        if not isinstance(value, dict) or value.get("trusted_hash") != expected:
+            pending = True
+    return "pending_review" if pending else "trusted"
+
+
 def _remove_owned_codex_server(text: str) -> str:
     try:
         document = tomlkit.parse(text)
@@ -1346,6 +1415,32 @@ class Installer:
             return False
         owned = [item for item in session_start if _owned_hook(item)]
         return len(owned) == 1 and _owned_hook_native_queue(owned[0])
+
+    def codex_hook_trust(self) -> CodexHookTrust:
+        """Read-only trust state of the selected profile's owned Codex hooks."""
+        if "codex" not in self.providers:
+            return "not_applicable"
+        hooks_config: dict[str, object] | None
+        try:
+            hooks_config = _json_object(self.codex_hooks)
+        except (OSError, SettingsError):
+            hooks_config = None
+        try:
+            config_text = self._codex_config_text()
+        except (OSError, SettingsError):
+            config_text = None
+        try:
+            native_queue = self._codex_native_queue_enabled()
+        except OSError:
+            native_queue = False
+        return codex_command_hook_trust(
+            config_text=config_text,
+            hooks_config=hooks_config,
+            hooks_path=self.codex_hooks,
+            executable=self.executable,
+            device=self.device,
+            codex_native_queue=native_queue,
+        )
 
     def _ensure_durable_parent(self, parent: Path) -> None:
         resolved = parent.resolve(strict=False)

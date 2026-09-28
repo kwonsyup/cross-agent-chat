@@ -70,9 +70,15 @@ def test_resolve_providers_refuses_before_mutation_without_roots(tmp_path: Path)
     home = tmp_path / "home"
     home.mkdir()
 
-    with pytest.raises(SettingsError, match="no supported provider"):
+    with pytest.raises(SettingsError, match="no supported provider") as error:
         resolve_providers(home=home)
 
+    # The remedy is to initialize the tool's own root or select its real
+    # profile -- never --provider, which refuses absent roots just the same.
+    message = str(error.value)
+    assert "--provider" not in message
+    assert "CODEX_HOME" in message and "CLAUDE_CONFIG_DIR" in message
+    assert "re-run setup" in message
     assert not list(home.iterdir())
 
 
@@ -153,6 +159,7 @@ def test_real_cli_setup_preserves_strict_explicit_provider_selection(tmp_path: P
     assert result.returncode == 2
     assert result.stdout == ""
     assert "provider configuration roots are absent: codex" in result.stderr
+    assert "re-run setup" in result.stderr
     assert tuple(home.iterdir()) == ()
 
 
@@ -170,11 +177,14 @@ def test_resolve_providers_refuses_absent_explicit_root(tmp_path: Path) -> None:
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
 
-    with pytest.raises(SettingsError, match="roots are absent: codex"):
+    with pytest.raises(SettingsError, match="roots are absent: codex") as codex_error:
         resolve_providers(home=home, requested=("claude", "codex"))
-    with pytest.raises(SettingsError, match="roots are absent: devin"):
+    with pytest.raises(SettingsError, match="roots are absent: devin") as devin_error:
         resolve_providers(home=home, requested=("devin",), devin_global=True)
 
+    for message in (str(codex_error.value), str(devin_error.value)):
+        assert "CODEX_HOME" in message and "CLAUDE_CONFIG_DIR" in message
+        assert "re-run setup" in message
     assert not (home / ".codex").exists()
 
 
@@ -560,6 +570,13 @@ def test_install_script_forwards_providers_and_yes(tmp_path: Path) -> None:
     providers = [forwarded[index + 1] for index, arg in enumerate(forwarded) if arg == "--provider"]
     assert providers == ["claude", "devin"]
 
+    # The fixture PATH never resolves the fresh entrypoint, so the warning
+    # must hand the user a runnable diagnostic, not just a PATH scolding.
+    stable = home.resolve() / ".local/bin/cross-agent-chat"
+    assert "your shell resolves no cross-agent-chat command" in completed.stderr
+    assert f'Run "{stable}" doctor --json' in completed.stderr
+    assert f"put {stable.parent} before older Cross Agent Chat locations" in completed.stderr
+
 
 def _cli_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *providers: str) -> Path:
     home = tmp_path / "home"
@@ -583,11 +600,13 @@ def test_setup_cli_prints_plan_then_threads_provider_selection(
     assert cli.run(parser().parse_args(["setup", "--provider", "claude", "--yes"])) == 0
 
     output = capsys.readouterr().out
-    plan, _, ready = output.partition("Cross Agent Chat is ready")
+    plan, _, completion = output.partition("Cross Agent Chat installed for")
     assert "Cross Agent Chat setup plan:" in plan
     assert f"claude at {(home / '.claude').resolve()}" in plan
     assert "codex at" not in plan
-    assert ready
+    assert completion.startswith(" Claude Code on")
+    assert "Codex" not in completion
+    assert "Diagnostics: /opt/cross-agent-chat doctor --json" in completion
     assert installed == [("claude",)]
 
 
