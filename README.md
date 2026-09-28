@@ -17,10 +17,12 @@ reads its existing status and never brings it up. Same-Mac use needs none.
 
 The command below approves integration edits to the Claude Code, Codex, and
 local Devin configuration roots that already exist on this Mac, a local
-background broker, and private configuration backups. It does not migrate or
-copy credentials. Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the
-install command limits the set. See
-[setup and data handling](SECURITY.md).
+background broker, and private configuration backups. It does not migrate
+credentials or touch your provider logins; its private local backups are
+whole-file copies of the edited configuration files and can contain any
+secrets those files hold (see [setup and data handling](SECURITY.md)).
+Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
+limits the set.
 
 Install v0.4.5 with:
 
@@ -32,9 +34,10 @@ Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
 This builds the released `v0.4.5` tag and installs the command at
-`~/.local/bin/cross-agent-chat` — if a bare `cross-agent-chat` is not found
-in your shell, use that full path; the installer prints the exact one. Run it
-on each participating Mac.
+`~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
+Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
+not found in your shell, use the full path the installer reports. Run it on
+each participating Mac.
 
 **Then open a new conversation, or relaunch the provider and resume an
 existing one when convenient** — sessions load Cross Agent Chat when they
@@ -52,7 +55,8 @@ An agent can do the installation after your approval:
 
 > Install Cross Agent Chat (github.com/kwonsyup/cross-agent-chat) with its
 > documented installer for the coding tools I already use on this Mac. Keep
-> my current accounts and settings. Tell me only any remaining provider
+> my current accounts and preserve my unrelated settings. Tell me only any
+> remaining provider
 > approval and which next session will load it; do not restart my active
 > work.
 
@@ -113,9 +117,9 @@ this installation already recorded, which cannot be dropped:
 ```
 
 An installation agent should reuse your existing provider contexts, describe
-the owned changes, use the canonical installer, verify with the printed
-diagnostics command (`... doctor --json`), and report only the remaining
-approval or activation step
+the owned changes, use the canonical installer, verify with `doctor --json`
+at the installed command path, and report only the remaining approval or
+activation step
 — never copying credentials, creating an account, writing hook-trust hashes,
 disabling approvals, scanning unrelated profiles, or enabling experimental
 modes to make a check green. A missing peer or timeout alone is not evidence
