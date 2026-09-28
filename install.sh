@@ -181,7 +181,8 @@ published_executable=$(command -v cross-agent-chat 2>/dev/null || true)
 if [ "$published_executable" != "$stable_entrypoint" ]; then
     printf '%s\n' \
         "Cross Agent Chat installed at $stable_entrypoint, but your shell resolves ${published_executable:-no cross-agent-chat command}." \
-        "Put $(dirname "$stable_entrypoint") before older Cross Agent Chat locations on PATH." >&2
+        "Run \"$stable_entrypoint\" doctor --json to check this installation." \
+        "If you want a bare cross-agent-chat command to resolve, put $(dirname "$stable_entrypoint") before older Cross Agent Chat locations on PATH." >&2
 fi
 
 staged_runtime=
