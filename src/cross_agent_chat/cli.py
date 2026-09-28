@@ -52,7 +52,7 @@ from cross_agent_chat.tailnet import known_tailnet_address
 from cross_agent_chat.tailnet_broker import broker_server
 
 if TYPE_CHECKING:
-    from cross_agent_chat.install import CodexHookTrust, Installer
+    from cross_agent_chat.install import Installer
 
 _INSTALL_LAZY_NAMES: Final = frozenset(
     {
@@ -219,30 +219,23 @@ def _print_setup_completion(installer: Installer) -> None:
     if "devin" in installer.providers:
         steps.append("submit a prompt in Devin")
     lines.append("Next: " + "; ".join(steps) + ".")
-    if installer.codex_hook_trust() in {"pending_review", "unknown"}:
+    if "codex" in installer.providers:
         lines.append(
-            "Codex: review the new CAC hooks in the selected profile "
-            f"({installer.codex_home}) if prompted (Codex CLI: /hooks); "
+            "Codex: if Codex asks you to review the new Cross Agent Chat hooks "
+            f"in the selected profile ({installer.codex_home}), approve them "
+            "through its own hook-review flow (Codex CLI: /hooks); "
             "do not edit hook trust entries by hand."
         )
     lines.append(f"Diagnostics: {shlex.quote(str(installer.executable))} doctor --json")
     print("\n".join(lines))
 
 
-def _doctor_next(
-    installer: Installer | None,
-    healthy: bool,
-    codex_hooks: CodexHookTrust | None,
-) -> str:
+def _doctor_next(installer: Installer | None, healthy: bool) -> str:
     if installer is None:
         return "cross-agent-chat setup"
     if not healthy:
         return f"{shlex.quote(str(installer.executable))} setup"
     clauses: list[str] = []
-    if "codex" in installer.providers and codex_hooks == "pending_review":
-        clauses.append(
-            "approve the pending CAC hooks in the selected Codex profile (Codex CLI: /hooks)"
-        )
     fresh = [
         _PROVIDER_NAMES[provider]
         for provider in installer.providers
@@ -250,9 +243,10 @@ def _doctor_next(
     ]
     if fresh:
         clause = f"start a fresh {' or '.join(fresh)} session"
-        if "codex" in installer.providers and codex_hooks == "unknown":
+        if "codex" in installer.providers:
+            joiner = " and " if fresh == ["Codex"] else "; "
             clause += (
-                "; review the new CAC hooks if Codex prompts to approve them (Codex CLI: /hooks)"
+                f"{joiner}approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks)"
             )
         clauses.append(clause)
     if "devin" in installer.providers:
@@ -726,7 +720,6 @@ def run(arguments: argparse.Namespace) -> int:
         )
         broker_healthy = doctor_installer is not None and doctor_installer.broker_is_healthy()
         healthy = integration_healthy and broker_healthy
-        codex_hooks = doctor_installer.codex_hook_trust() if doctor_installer is not None else None
         doctor_result: dict[str, object] = {
             "version": __version__,
             "integration": "healthy" if integration_healthy else "needs setup",
@@ -737,10 +730,8 @@ def run(arguments: argparse.Namespace) -> int:
             ),
             "local_broker": "healthy" if broker_healthy else "unavailable",
             "remote_trust": "tailscale_acl",
+            "next": _doctor_next(doctor_installer, healthy),
         }
-        if codex_hooks is not None:
-            doctor_result["codex_hooks"] = codex_hooks
-        doctor_result["next"] = _doctor_next(doctor_installer, healthy, codex_hooks)
         if os.environ.get(CLAUDE_CHILD_SESSION_ENV):
             doctor_result["terminal"] = CLAUDE_CHILD_SESSION_DIAGNOSTIC
         print(
