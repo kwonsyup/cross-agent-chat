@@ -62,9 +62,9 @@ inspection and are never resolved or replayed.
 Setup configures only the owned Cross Agent Chat Codex MCP server to run
 without recurring per-call approval prompts. That covers the three ordinary
 tools — `chat_peers`, read-only `chat_status`, `chat_send` — and, on eligible
-Codex Desktop hosts, the internal native lifecycle tools the same server
-exposes. It does not change global Codex approvals or unrelated MCP servers.
-Setup clears conflicting
+Codex Desktop hosts, the internal `native_bootstrap`, `native_register`, and
+`native_dispatch` lifecycle tools the same server exposes. It does not change
+global Codex approvals or unrelated MCP servers. Setup clears conflicting
 approval overrides for the owned tools while preserving their other
 properties.
 

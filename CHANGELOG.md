@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Setup completion output is scoped to the selected providers and points
+  `doctor` at the exact installed command path. When the provider has not
+  recorded trust for the new Codex hooks, it names the selected Codex root
+  and the pending review instead of claiming readiness, and reminds the
+  owner not to edit hook-trust entries by hand.
+- `doctor --json` gains an additive `codex_hooks` field (`trusted`,
+  `pending_review`, `not_applicable`, or `unknown`) and scopes its `next`
+  hint to the selected providers, including the pending-hook review step.
+- Remedies cover profiles with no provider roots and provider roots absent
+  from an upgrade's recorded set, and the shell installer warns when the
+  published `cross-agent-chat` command does not resolve on PATH.
+- The MCP server instructions now separate first-install from upgrade
+  behavior for loaded tools and reply handles.
+- The README is rewritten as a short front door with installation-agent
+  guidance; SECURITY and CONTRIBUTING corrections included.
+
 ## 0.4.5 - 2026-09-25
 
 - A session whose courier died and left its socket behind now recovers at

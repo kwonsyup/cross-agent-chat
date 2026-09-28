@@ -15,9 +15,11 @@ reused, otherwise the installer bootstraps a runtime. Cross-Mac use needs
 Tailscale already connecting the Macs and permitting the traffic — discovery
 reads its existing status and never brings it up. Same-Mac use needs none.
 
-The command below approves integration edits to the supported profiles
-already configured on this Mac, a local background broker, and private
-configuration backups. It does not migrate or copy credentials. See
+The command below approves integration edits to the Claude Code, Codex, and
+local Devin configuration roots that already exist on this Mac, a local
+background broker, and private configuration backups. It does not migrate or
+copy credentials. Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the
+install command limits the set. See
 [setup and data handling](SECURITY.md).
 
 Install v0.4.5 with:
@@ -26,13 +28,19 @@ Install v0.4.5 with:
 curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.5/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
+Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
+planned effects and exits, so you can preview it first.
+
 This builds the released `v0.4.5` tag and installs the command at
-`~/.local/bin/cross-agent-chat`. Run it on each participating Mac.
+`~/.local/bin/cross-agent-chat` — if a bare `cross-agent-chat` is not found
+in your shell, use that full path; the installer prints the exact one. Run it
+on each participating Mac.
 
 **Then open a new conversation, or relaunch the provider and resume an
 existing one when convenient** — sessions load Cross Agent Chat when they
 start and already-running ones keep what they loaded, so don't interrupt
-ongoing work just to activate it.
+ongoing work just to activate it. A local Devin conversation joins the peer
+list after its first prompt.
 
 **Codex:** newly installed hooks may need a one-time review in the selected
 profile through its normal hook-review flow (the CLI documents `/hooks`).
@@ -42,10 +50,11 @@ builds vary, so use each build's supported path rather than bypassing trust.
 
 An agent can do the installation after your approval:
 
-> Install Cross Agent Chat from this repository for the coding tools I
-> already use on this Mac. Keep my current accounts and settings. Tell me
-> only any remaining provider approval and which next session will load it;
-> do not restart my active work.
+> Install Cross Agent Chat (github.com/kwonsyup/cross-agent-chat) with its
+> documented installer for the coding tools I already use on this Mac. Keep
+> my current accounts and settings. Tell me only any remaining provider
+> approval and which next session will load it; do not restart my active
+> work.
 
 ## Use it normally
 
@@ -73,7 +82,7 @@ peer list.
 | Coding surface on macOS | Receiving behavior |
 |---|---|
 | Claude Code | Receives while idle in supported desktop-launched contexts. |
-| Codex Native App | Receives in the original conversation through its managed helper, when the required provider capabilities and hooks are available. |
+| Codex Native App | Receives while idle in the original conversation through its managed helper, when the required provider capabilities and hooks are available. |
 | Codex CLI | By default, receives at a turn boundary: the current turn's end or the next prompt. An explicitly enabled experimental queue has different behavior. |
 | Local Devin CLI/App | Receives at the next prompt or turn end. A conversation joins the peer list after its first prompt; receiving into an already-idle conversation is open in [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38). |
 
@@ -103,12 +112,10 @@ this installation already recorded, which cannot be dropped:
 "$HOME/.local/bin/cross-agent-chat" setup --provider claude --provider codex
 ```
 
-`CROSS_AGENT_CHAT_PROVIDERS=claude,codex` on the install command selects the
-same set.
-
 An installation agent should reuse your existing provider contexts, describe
-the owned changes, use the canonical installer, inspect the resulting
-diagnostic output, and report only the remaining approval or activation step
+the owned changes, use the canonical installer, verify with the printed
+diagnostics command (`... doctor --json`), and report only the remaining
+approval or activation step
 — never copying credentials, creating an account, writing hook-trust hashes,
 disabling approvals, scanning unrelated profiles, or enabling experimental
 modes to make a check green. A missing peer or timeout alone is not evidence
@@ -185,8 +192,8 @@ records.
 
 Sessions started before 0.4.4 can lose Cross Agent Chat when an npm-installed
 Claude Code updates in place while running; recovery is resuming the
-restarted conversation, and continuity applies only where the required owner
-anchor was recorded. See
+restarted conversation, and continuity applies only to sessions started
+after 0.4.4 was installed. See
 [issue #39](https://github.com/kwonsyup/cross-agent-chat/issues/39).
 
 </details>
