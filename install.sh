@@ -62,7 +62,7 @@ Cross Agent Chat setup will:
 - write full local configuration backups under
   ~/.cache/cross-agent-chat/backups (backup files may contain secrets)
 - install a runtime under ~/.local/share/cross-agent-chat-runtime, repoint the
-  cross-agent-chat entrypoint, and restart the launchd broker (starts at login)
+  cross-agent-chat entrypoint, and restart the launchd broker (runs now and at login)
 Approve and re-run, for example:
   curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.5/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 or from a local copy:
@@ -181,7 +181,8 @@ published_executable=$(command -v cross-agent-chat 2>/dev/null || true)
 if [ "$published_executable" != "$stable_entrypoint" ]; then
     printf '%s\n' \
         "Cross Agent Chat installed at $stable_entrypoint, but your shell resolves ${published_executable:-no cross-agent-chat command}." \
-        "Put $(dirname "$stable_entrypoint") before older Cross Agent Chat locations on PATH." >&2
+        "Run \"$stable_entrypoint\" doctor --json to check this installation." \
+        "If you want a bare cross-agent-chat command to resolve, put $(dirname "$stable_entrypoint") before older Cross Agent Chat locations on PATH." >&2
 fi
 
 staged_runtime=

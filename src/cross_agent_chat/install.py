@@ -76,6 +76,11 @@ _PROVIDER_PATH_NAMES: Final[dict[str, tuple[str, ...]]] = {
     "codex": ("codex_config", "codex_hooks"),
     "devin": ("devin_mcp", "devin_hooks"),
 }
+_MISSING_ROOT_REMEDY: Final = (
+    "open the intended installed coding tool normally with its existing account so "
+    "it creates its configuration root (for a non-default profile, set CODEX_HOME "
+    "or CLAUDE_CONFIG_DIR to that profile), then re-run setup"
+)
 
 
 class SettingsError(RuntimeError):
@@ -357,8 +362,7 @@ def resolve_providers(
         )
         if not selected:
             raise NoProviderRootsError(
-                "no supported provider configuration roots exist; "
-                "install a provider or pass --provider"
+                f"no supported provider configuration roots exist; {_MISSING_ROOT_REMEDY}"
             )
         return selected
     names = tuple(requested)
@@ -378,7 +382,11 @@ def resolve_providers(
         if not present[provider] and (recorded is None or provider not in recorded)
     ]
     if absent:
-        raise SettingsError("provider configuration roots are absent: " + ", ".join(absent))
+        raise SettingsError(
+            "provider configuration roots are absent: "
+            + ", ".join(absent)
+            + f"; {_MISSING_ROOT_REMEDY}"
+        )
     return selected
 
 

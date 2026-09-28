@@ -40,6 +40,7 @@ from cross_agent_chat.install import (
     SettingsError,
     SetupRollbackError,
     _hook_command,
+    _hook_event_name,
     _hook_group,
     _hook_timeout,
     _hook_trust_hash,
@@ -633,6 +634,9 @@ def test_doctor_reports_the_selected_profile_queue_mode(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     class ObservedInstaller:
+        providers = ("claude", "codex", "devin")
+        executable = Path("/opt/cross-agent-chat")
+
         def verify_configuration(self) -> bool:
             return True
 
@@ -650,7 +654,9 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "codex_native_queue": "experimental",
         "integration": "healthy",
         "local_broker": "healthy",
-        "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
+        "next": "start a fresh Claude Code or Codex session; "
+        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
+        "submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
         "version": "0.4.5",
     }
@@ -660,6 +666,9 @@ def test_doctor_reports_an_inherited_claude_child_session_marker(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     class ObservedInstaller:
+        providers = ("claude", "codex", "devin")
+        executable = Path("/opt/cross-agent-chat")
+
         def verify_configuration(self) -> bool:
             return True
 
@@ -683,7 +692,11 @@ def test_doctor_reports_an_inherited_claude_child_session_marker(
         "terminal app instance was launched from inside a Claude session and "
         "should be relaunched normally (not from inside a Claude session)."
     )
-    assert result["next"] == "start a fresh Claude or Codex session, or submit a prompt in Devin"
+    assert result["next"] == (
+        "start a fresh Claude Code or Codex session; "
+        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
+        "submit a prompt in Devin"
+    )
 
     assert cli.run(parser().parse_args(["doctor"])) == 0
 
@@ -696,13 +709,20 @@ def test_doctor_reports_an_inherited_claude_child_session_marker(
         "terminal app instance was launched from inside a Claude session and "
         "should be relaunched normally (not from inside a Claude session)." in lines
     )
-    assert "next: start a fresh Claude or Codex session, or submit a prompt in Devin" in lines
+    assert (
+        "next: start a fresh Claude Code or Codex session; "
+        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
+        "submit a prompt in Devin" in lines
+    )
 
 
 def test_doctor_scopes_the_marker_to_the_process_under_tool_child_indicators(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     class ObservedInstaller:
+        providers = ("claude", "codex", "devin")
+        executable = Path("/opt/cross-agent-chat")
+
         def verify_configuration(self) -> bool:
             return True
 
@@ -729,6 +749,9 @@ def test_doctor_omits_the_terminal_diagnostic_without_the_marker(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     class ObservedInstaller:
+        providers = ("claude", "codex", "devin")
+        executable = Path("/opt/cross-agent-chat")
+
         def verify_configuration(self) -> bool:
             return True
 
@@ -747,7 +770,9 @@ def test_doctor_omits_the_terminal_diagnostic_without_the_marker(
         "codex_native_queue": "stop-bound",
         "integration": "healthy",
         "local_broker": "healthy",
-        "next": "start a fresh Claude or Codex session, or submit a prompt in Devin",
+        "next": "start a fresh Claude Code or Codex session; "
+        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
+        "submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
         "version": "0.4.5",
     }
@@ -761,6 +786,9 @@ def test_doctor_explicit_device_overrides_automatic_identity(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     class ObservedInstaller:
+        providers = ("claude", "codex", "devin")
+        executable = Path("/opt/cross-agent-chat")
+
         def verify_configuration(self) -> bool:
             return True
 
@@ -2173,6 +2201,197 @@ def test_setup_preserves_owned_hook_position_when_unrelated_hook_follows(
     assert repaired_hooks[1]["hooks"][0]["command"] == "/opt/unrelated-hook"
     repaired_trust = tomllib.loads(config.read_text())["hooks"]["state"]
     assert repaired_trust[unrelated_key] == {"trusted_hash": unrelated_hash}
+
+
+def test_doctor_json_reports_no_codex_hook_trust_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: Path("/opt/cross-agent-chat"))
+    monkeypatch.setattr(Installer, "broker_is_healthy", lambda self, **_: True)
+
+    config_before = installer.codex_config.read_bytes()
+    hooks_before = installer.codex_hooks.read_bytes()
+    assert cli.run(parser().parse_args(["doctor", "--json"])) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    # Hook trust is the provider's own state; doctor reports exactly the
+    # released key set and cannot claim the hooks are trusted. (The optional
+    # "terminal" key is asserted separately.)
+    assert "codex_hooks" not in report
+    assert set(report) == {
+        "codex_native_queue",
+        "integration",
+        "local_broker",
+        "next",
+        "remote_trust",
+        "version",
+    }
+    assert report["integration"] == "healthy"
+    assert report["next"] == (
+        "start a fresh Claude Code or Codex session; "
+        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks)"
+    )
+    # doctor is read-only against the provider files it inspects.
+    assert installer.codex_config.read_bytes() == config_before
+    assert installer.codex_hooks.read_bytes() == hooks_before
+
+
+def test_doctor_next_is_scoped_to_selected_providers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        providers=("claude",),
+    )
+    installer.setup()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: Path("/opt/cross-agent-chat"))
+    monkeypatch.setattr(Installer, "broker_is_healthy", lambda self, **_: True)
+
+    assert cli.run(parser().parse_args(["doctor", "--json"])) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["integration"] == "healthy"
+    assert "codex_hooks" not in report
+    assert report["next"] == "start a fresh Claude Code session"
+
+    # An unhealthy profile points setup at the actual executable, not a bare
+    # command the PATH may not resolve.
+    (home / ".claude" / "settings.json").write_text("{}")
+    assert cli.run(parser().parse_args(["doctor", "--json"])) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert "codex_hooks" not in report
+    assert report["next"] == "/opt/cross-agent-chat setup"
+
+
+def test_setup_completion_reports_installed_not_ready_and_scopes_advice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".codex").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: Path("/opt/cross-agent-chat"))
+    monkeypatch.setattr(Installer, "install", lambda self: self.setup())
+
+    assert cli.run(parser().parse_args(["setup", "--device", "studio", "--yes"])) == 0
+
+    output = capsys.readouterr().out
+    assert "is ready" not in output
+    assert "Cross Agent Chat installed for Claude Code and Codex on studio." in output
+    assert "Existing provider logins were left unchanged." in output
+    assert "open new Claude Code or Codex sessions" in output
+    # The advice is conditional on a Codex prompt, not on observed trust
+    # state, and names the exact selected Codex root and the no-hand-edit
+    # rule.
+    codex_root = (home / ".codex").resolve()
+    assert (
+        "Codex: if Codex asks you to review the new Cross Agent Chat hooks "
+        f"in the selected profile ({codex_root}), approve them through its "
+        "own hook-review flow (Codex CLI: /hooks); "
+        "do not edit hook trust entries by hand."
+    ) in output
+    assert "Diagnostics: /opt/cross-agent-chat doctor --json" in output
+    assert "sha256:" not in output
+    assert "trusted_hash" not in output
+
+
+def _seed_codex_hook_trust(installer: Installer) -> None:
+    """Record provider-side trust entries for the owned command hooks.
+
+    Mirrors what Codex records in ``[hooks.state]`` after a user approves a
+    hook, so tests can prove the printed advice never depends on that state.
+    """
+    text = installer.codex_config.read_text()
+    cut = text.find("\n[hooks.state")
+    if cut != -1:
+        text = text[:cut] + "\n"
+    hooks = json.loads(installer.codex_hooks.read_text())["hooks"]
+    rows: list[str] = []
+    for event in ("SessionStart", "SessionEnd", "Stop"):
+        for index, group in enumerate(hooks.get(event, [])):
+            if not _owned_hook(group):
+                continue
+            digest = _hook_trust_hash(
+                _hook_command(installer.executable, "codex", installer.device, event),
+                event,
+                _hook_timeout("codex", event),
+            )
+            key = f"{installer.codex_hooks}:{_hook_event_name(event)}:{index}:0"
+            rows.append(f"{json.dumps(key)} = {{ trusted_hash = {json.dumps(digest)} }}")
+    installer.codex_config.write_text(text + "\n[hooks.state]\n" + "\n".join(rows) + "\n")
+
+
+def test_setup_completion_offers_the_codex_hook_review_unconditionally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".codex").mkdir()
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    _seed_codex_hook_trust(installer)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: Path("/opt/cross-agent-chat"))
+    monkeypatch.setattr(Installer, "install", lambda self: self.setup())
+
+    assert cli.run(parser().parse_args(["setup", "--device", "studio", "--yes"])) == 0
+
+    # Recorded provider trust must not suppress the reminder: the installer
+    # cannot observe every layer that decides whether Codex will ask.
+    output = capsys.readouterr().out
+    assert "Codex: if Codex asks you to review the new Cross Agent Chat hooks" in output
+
+
+def test_setup_completion_names_only_the_selected_providers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    (home / ".config" / "devin").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: Path("/opt/cross-agent-chat"))
+    monkeypatch.setattr(Installer, "install", lambda self: self.setup())
+
+    assert cli.run(parser().parse_args(["setup", "--device", "studio", "--yes"])) == 0
+
+    output = capsys.readouterr().out
+    assert "Cross Agent Chat installed for Devin on studio." in output
+    assert "Claude" not in output.split("installed for", maxsplit=1)[1]
+    assert "Codex" not in output.split("installed for", maxsplit=1)[1]
+    assert "submit a prompt in Devin" in output
+    assert "Diagnostics: /opt/cross-agent-chat doctor --json" in output
+
+    # A Claude-only selection emits no Codex review line at all.
+    claude_home = tmp_path / "claude-home"
+    (claude_home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(claude_home))
+    assert (
+        cli.run(
+            parser().parse_args(["setup", "--device", "studio", "--provider", "claude", "--yes"])
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "Cross Agent Chat installed for Claude Code on studio." in output
+    assert "Codex" not in output.split("installed for", maxsplit=1)[1]
+    assert "Devin" not in output.split("installed for", maxsplit=1)[1]
 
 
 def test_setup_fails_closed_on_duplicate_owned_hooks_without_reindexing_trust(

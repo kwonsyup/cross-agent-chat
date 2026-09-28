@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -86,8 +87,9 @@ MCP_INSTRUCTIONS: Final = (
     "opaque handle: the Reply handle on a received envelope, or a handle from chat_peers. An "
     "exact handle is bound to that peer session's route and protocol generation, so call "
     "chat_peers to discover or when an exact handle stops resolving, not before every send. "
-    "Sessions load CAC when they start, so a session opened before a CAC install or upgrade "
-    "runs its older tools; a Reply handle minted before v0.4.0 cannot be answered, and a "
+    "Sessions load CAC when they start, so a session opened before a CAC install has no "
+    "CAC tools at all and one opened before a CAC upgrade keeps its older loaded tools; "
+    "a Reply handle minted before v0.4.0 cannot be answered, and a "
     "request carrying one must not be replayed. When your local user has assigned you to "
     "answer a named peer's requests, do that work within your task and permissions and reply "
     "through CAC. When requesting work whose result must return, explicitly ask "
@@ -183,6 +185,73 @@ def _doctor_installer(device: str | None) -> Installer | None:
         # Do not construct an empty installer: its verification paths could
         # inspect provider files that are absent or intentionally unselected.
         return None
+
+
+_PROVIDER_NAMES: Final = {"claude": "Claude Code", "codex": "Codex", "devin": "Devin"}
+_SESSION_PROVIDERS: Final = frozenset({"claude", "codex"})
+
+
+def _provider_names(providers: Iterable[str]) -> str:
+    names = [_PROVIDER_NAMES[provider] for provider in providers]
+    if len(names) <= 2:
+        return " and ".join(names)
+    return ", ".join(names[:-1]) + ", and " + names[-1]
+
+
+def _print_setup_completion(installer: Installer) -> None:
+    """Report what setup configured; never claim session or hook readiness."""
+    lines = [
+        f"Cross Agent Chat installed for {_provider_names(installer.providers)} "
+        f"on {installer.device}.",
+        "Existing provider logins were left unchanged.",
+    ]
+    sessions = [
+        _PROVIDER_NAMES[provider]
+        for provider in installer.providers
+        if provider in _SESSION_PROVIDERS
+    ]
+    steps: list[str] = []
+    if sessions:
+        steps.append(
+            f"open new {' or '.join(sessions)} sessions when convenient; "
+            "sessions already running keep what they loaded"
+        )
+    if "devin" in installer.providers:
+        steps.append("submit a prompt in Devin")
+    lines.append("Next: " + "; ".join(steps) + ".")
+    if "codex" in installer.providers:
+        lines.append(
+            "Codex: if Codex asks you to review the new Cross Agent Chat hooks "
+            f"in the selected profile ({installer.codex_home}), approve them "
+            "through its own hook-review flow (Codex CLI: /hooks); "
+            "do not edit hook trust entries by hand."
+        )
+    lines.append(f"Diagnostics: {shlex.quote(str(installer.executable))} doctor --json")
+    print("\n".join(lines))
+
+
+def _doctor_next(installer: Installer | None, healthy: bool) -> str:
+    if installer is None:
+        return "cross-agent-chat setup"
+    if not healthy:
+        return f"{shlex.quote(str(installer.executable))} setup"
+    clauses: list[str] = []
+    fresh = [
+        _PROVIDER_NAMES[provider]
+        for provider in installer.providers
+        if provider in _SESSION_PROVIDERS
+    ]
+    if fresh:
+        clause = f"start a fresh {' or '.join(fresh)} session"
+        if "codex" in installer.providers:
+            joiner = " and " if fresh == ["Codex"] else "; "
+            clause += (
+                f"{joiner}approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks)"
+            )
+        clauses.append(clause)
+    if "devin" in installer.providers:
+        clauses.append("submit a prompt in Devin")
+    return "; ".join(clauses)
 
 
 MCP_INTERNAL_TOOLS: Final = frozenset({"native_bootstrap", "native_register", "native_dispatch"})
@@ -643,8 +712,7 @@ def run(arguments: argparse.Namespace) -> int:
             if input("Apply this setup plan? [y/N] ").strip().lower() not in {"y", "yes"}:
                 _fail("setup was not approved")
         installer.install()
-        next_step = "Start a fresh Claude or Codex session, or submit a prompt in Devin."
-        print(f"Cross Agent Chat is ready on {installer.device}. {next_step}")
+        _print_setup_completion(installer)
     elif command == "doctor":
         doctor_installer = _doctor_installer(arguments.device)
         integration_healthy = (
@@ -652,7 +720,7 @@ def run(arguments: argparse.Namespace) -> int:
         )
         broker_healthy = doctor_installer is not None and doctor_installer.broker_is_healthy()
         healthy = integration_healthy and broker_healthy
-        doctor_result = {
+        doctor_result: dict[str, object] = {
             "version": __version__,
             "integration": "healthy" if integration_healthy else "needs setup",
             "codex_native_queue": (
@@ -662,9 +730,7 @@ def run(arguments: argparse.Namespace) -> int:
             ),
             "local_broker": "healthy" if broker_healthy else "unavailable",
             "remote_trust": "tailscale_acl",
-            "next": "start a fresh Claude or Codex session, or submit a prompt in Devin"
-            if healthy
-            else "cross-agent-chat setup",
+            "next": _doctor_next(doctor_installer, healthy),
         }
         if os.environ.get(CLAUDE_CHILD_SESSION_ENV):
             doctor_result["terminal"] = CLAUDE_CHILD_SESSION_DIAGNOSTIC
@@ -818,9 +884,7 @@ def run(arguments: argparse.Namespace) -> int:
         )
         print(installer.plan(staged=True).describe())
         installer.install_staged(arguments.staged_runtime, arguments.stable_entrypoint)
-        ready_message = f"Cross Agent Chat is ready on {device}."
-        next_step = "Start a fresh Claude or Codex session, or submit a prompt in Devin."
-        print(f"{ready_message} {next_step}")
+        _print_setup_completion(installer)
     else:
         _fail("unsupported command")
     return 0

@@ -25,10 +25,13 @@ prompt, or authorize a retry or bypass.
 
 ## What setup changes
 
-Nothing changes without
+The shell installer writes nothing without
 `CROSS_AGENT_CHAT_APPROVE=1`: run without it and the script prints these
-effects and exits before any staging or write. A fresh install integrates
-only the provider roots that already exist, or the subset named by
+effects and exits before any staging or write. Running `cross-agent-chat
+setup` directly grants the same approval through a different surface: it
+prints a read-only plan of the exact roots and effects first, then applies it
+only after interactive confirmation or an explicit `--yes`. A fresh install
+integrates only the provider roots that already exist, or the subset named by
 `CROSS_AGENT_CHAT_PROVIDERS`; an upgrade retains the provider set recorded by
 the previous install and never silently drops one.
 
@@ -69,6 +72,13 @@ Auto-approval means a Codex agent can send agent-authored text without another
 confirmation. A compromised or prompt-injected peer can try to induce an
 outbound send, including attempted data disclosure, so do not admit untrusted
 nodes to the Tailnet perimeter.
+
+Separately, Codex hook trust is provider-owned: setup never writes hook-trust
+hashes, and an existing trust entry for an owned hook is retained only while
+the exact recorded hook still matches. Newly installed or changed hooks can
+therefore require a one-time review in the provider's own hook-review flow.
+That review permits the hooks to run — it is not an account login, and it is
+distinct from MCP tool approval.
 
 Sender identity is bound, not self-declared: Codex sends require the host's
 thread metadata, Claude sends are tied to the provider process/profile, and
