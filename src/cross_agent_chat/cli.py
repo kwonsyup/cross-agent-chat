@@ -221,8 +221,9 @@ def _print_setup_completion(installer: Installer) -> None:
     lines.append("Next: " + "; ".join(steps) + ".")
     if installer.codex_hook_trust() in {"pending_review", "unknown"}:
         lines.append(
-            "Codex: review the new CAC hooks in the selected profile if prompted "
-            "(Codex CLI: /hooks)."
+            "Codex: review the new CAC hooks in the selected profile "
+            f"({installer.codex_home}) if prompted (Codex CLI: /hooks); "
+            "do not edit hook trust entries by hand."
         )
     lines.append(f"Diagnostics: {shlex.quote(str(installer.executable))} doctor --json")
     print("\n".join(lines))

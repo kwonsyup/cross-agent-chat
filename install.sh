@@ -62,7 +62,7 @@ Cross Agent Chat setup will:
 - write full local configuration backups under
   ~/.cache/cross-agent-chat/backups (backup files may contain secrets)
 - install a runtime under ~/.local/share/cross-agent-chat-runtime, repoint the
-  cross-agent-chat entrypoint, and restart the launchd broker (starts at login)
+  cross-agent-chat entrypoint, and restart the launchd broker (runs now and at login)
 Approve and re-run, for example:
   curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.5/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 or from a local copy:

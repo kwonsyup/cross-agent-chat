@@ -2344,28 +2344,47 @@ def test_codex_hook_trust_pending_review_drives_doctor_next_without_writes(
     monkeypatch.setattr(Installer, "broker_is_healthy", lambda self, **_: True)
 
     # Fresh install: the provider has recorded no trust state at all.
+    config_before = installer.codex_config.read_bytes()
+    hooks_before = installer.codex_hooks.read_bytes()
     assert cli.run(parser().parse_args(["doctor", "--json"])) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["codex_hooks"] == "unknown"
     assert "review the new CAC hooks" in report["next"]
+    # doctor is read-only against the provider files it assesses.
+    assert installer.codex_config.read_bytes() == config_before
+    assert installer.codex_hooks.read_bytes() == hooks_before
 
     # Provider state exists but an owned hook has no matching entry.
     _seed_codex_hook_trust(installer, skip=frozenset({"Stop"}))
+    config_before = installer.codex_config.read_bytes()
+    hooks_before = installer.codex_hooks.read_bytes()
     assert cli.run(parser().parse_args(["doctor", "--json"])) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["integration"] == "healthy"
     assert report["codex_hooks"] == "pending_review"
     assert "approve the pending CAC hooks" in report["next"]
     assert "/hooks" in report["next"]
+    assert installer.codex_config.read_bytes() == config_before
+    assert installer.codex_hooks.read_bytes() == hooks_before
 
     # Matching entries are retained through a re-setup and clear the advice.
-    _seed_codex_hook_trust(installer)
+    # Retention by the real setup path proves the seeded keys are the ones
+    # the installer itself recognizes, so a trusted verdict is not an
+    # artifact of the seed helper sharing the reader's key format.
+    seeded = _seed_codex_hook_trust(installer)
     installer.setup()
+    retained = tomllib.loads(installer.codex_config.read_text())["hooks"]["state"]
+    for key, digest in seeded.items():
+        assert retained[key] == {"trusted_hash": digest}
+    config_before = installer.codex_config.read_bytes()
+    hooks_before = installer.codex_hooks.read_bytes()
     assert cli.run(parser().parse_args(["doctor", "--json"])) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["codex_hooks"] == "trusted"
     assert "/hooks" not in report["next"]
     assert "Codex" in report["next"]
+    assert installer.codex_config.read_bytes() == config_before
+    assert installer.codex_hooks.read_bytes() == hooks_before
 
 
 def test_doctor_next_is_scoped_to_selected_providers(
@@ -2419,8 +2438,14 @@ def test_setup_completion_reports_installed_not_ready_and_scopes_advice(
     assert "Existing provider logins were left unchanged." in output
     assert "open new Claude Code or Codex sessions" in output
     # The provider has not recorded trust for the new hooks yet, so the
-    # completion must not claim readiness and must name the pending review.
-    assert "Codex: review the new CAC hooks" in output
+    # completion must not claim readiness and must name the pending review,
+    # the exact selected Codex root, and the no-hand-edit rule.
+    codex_root = (home / ".codex").resolve()
+    assert (
+        "Codex: review the new CAC hooks in the selected profile "
+        f"({codex_root}) if prompted (Codex CLI: /hooks); "
+        "do not edit hook trust entries by hand."
+    ) in output
     assert "Diagnostics: /opt/cross-agent-chat doctor --json" in output
     assert "sha256:" not in output
     assert "trusted_hash" not in output
@@ -2469,6 +2494,21 @@ def test_setup_completion_names_only_the_selected_providers(
     assert "Codex" not in output.split("installed for", maxsplit=1)[1]
     assert "submit a prompt in Devin" in output
     assert "Diagnostics: /opt/cross-agent-chat doctor --json" in output
+
+    # A Claude-only selection emits no Codex review line at all.
+    claude_home = tmp_path / "claude-home"
+    (claude_home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(claude_home))
+    assert (
+        cli.run(
+            parser().parse_args(["setup", "--device", "studio", "--provider", "claude", "--yes"])
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "Cross Agent Chat installed for Claude Code on studio." in output
+    assert "Codex" not in output.split("installed for", maxsplit=1)[1]
+    assert "Devin" not in output.split("installed for", maxsplit=1)[1]
 
 
 def test_setup_fails_closed_on_duplicate_owned_hooks_without_reindexing_trust(
