@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.6 - 2026-09-28
 
 - Setup completion output is scoped to the selected providers and points
   `doctor` at the exact installed command path. When Codex is selected it
@@ -16,6 +16,11 @@
   behavior for loaded tools and reply handles.
 - The README is rewritten as a short front door with installation-agent
   guidance; SECURITY and CONTRIBUTING corrections included.
+- Verification for this release is contained: the test suite, static
+  checks, and a packaging smoke on a fresh empty HOME. No clean-machine
+  installation or live provider journey was run for 0.4.6. Installed
+  0.4.5 sessions keep running and are not required to upgrade for this
+  release.
 
 ## 0.4.5 - 2026-09-25
 
