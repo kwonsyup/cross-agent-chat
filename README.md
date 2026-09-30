@@ -90,6 +90,14 @@ peer list.
 | Codex CLI | By default, receives at a turn boundary: the current turn's end or the next prompt. An explicitly enabled experimental queue has different behavior. |
 | Local Devin CLI/App | Receives at the next prompt or turn end. A conversation joins the peer list after its first prompt; receiving into an already-idle conversation is open in [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38). |
 
+Idle reception and input during an active turn are separate capabilities.
+The direct experimental Codex route uses `thread/queue/add`: a message can
+wait behind the current turn. The managed Native helper forwards through
+the app's `send_message_to_thread`; active-turn handling depends on that
+installed host operation. Default Codex CLI delivery remains turn-bound.
+`reply_delivery` describes the sender's return path, and
+`TRANSPORT_ACCEPTED` proves custody, not model consumption.
+
 It follows the coding session, not a terminal tab; Terminal.app, iTerm2, and
 Ghostty have recorded supported cases on Intel and Apple silicon. No claim
 for every OS/provider combination, other agents or IDE chat surfaces, web

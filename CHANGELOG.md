@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Recognize the exact nested `Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`
+  client used by the current Native app, alongside the original flat layout.
+  This restores eligibility for the existing managed helper while retaining
+  the supported install location, bundle identity, same-bundle Desktop
+  ancestor, and process-owner checks.
+- Probe the account using the exact validated client that owns the route;
+  do not select a different bundled sibling or a client from PATH.
+- Clarify active versus idle receiving behavior. The direct experimental
+  queue and default CLI turn-bound delivery are unchanged. This source
+  repair alone does not qualify active-turn delivery through the full
+  managed helper path.
+
 ## 0.4.6 - 2026-09-28
 
 - Setup completion output is scoped to the selected providers and points
