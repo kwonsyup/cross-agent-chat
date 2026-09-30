@@ -149,6 +149,13 @@ LOCAL_DISCOVERY_TIMEOUT_SECONDS: Final = HEALTH_TIMEOUT_SECONDS
 NATIVE_TITLE_TIMEOUT_SECONDS: Final = 2.0
 NATIVE_DESKTOP_APPLICATIONS: Final = Path("/Applications")
 NATIVE_DESKTOP_BUNDLE_IDS: Final = ("com.openai.chat", "com.openai.codex")
+# Contents-relative paths of the exact bundled Codex client images a Desktop
+# process may own: the original flat resource and the codex-cli layout's
+# signed CodexCLI.app server binary observed since ChatGPT 26.928.21956.
+NATIVE_DESKTOP_CLIENT_LAYOUTS: Final = (
+    ("Resources", "codex"),
+    ("Resources", "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex"),
+)
 PRESENCE_ENV_VAR: Final = "CROSS_AGENT_CHAT_PRESENCE"
 PROC_PIDTBSDINFO: Final = 3
 PROC_BSDINFO_SIZE: Final = 136
@@ -3611,18 +3618,21 @@ def _native_desktop_route(root: Path, route: Route) -> bool:
     )
 
 
-def _native_bundle_root(executable: Path, inner: tuple[str, str]) -> Path | None:
-    """Return the ChatGPT.app root containing one bundled executable path."""
+def _native_bundle_root(executable: Path, inner: tuple[str, ...]) -> Path | None:
+    """Return the ChatGPT.app root containing one bundled executable path.
 
-    parents = executable.parents
-    if (
-        len(parents) >= 3
-        and parents[2].name == "ChatGPT.app"
-        and parents[1].name == "Contents"
-        and parents[0].name == inner[0]
-        and executable.name == inner[1]
-    ):
-        return parents[2]
+    ``inner`` is the exact Contents-relative path of the executable, so each
+    recognized layout is one tuple of literal component names and nothing
+    else inside the bundle can satisfy it.
+    """
+
+    parts = executable.parts
+    depth = len(inner)
+    if len(parts) < depth + 2:
+        return None
+    bundle = Path(*parts[: len(parts) - depth - 1])
+    if bundle.name == "ChatGPT.app" and parts[-depth - 1] == "Contents" and parts[-depth:] == inner:
+        return bundle
     return None
 
 
@@ -3652,8 +3662,13 @@ def _supported_native_bundle(bundle: Path) -> Path | None:
     return resolved
 
 
-def native_desktop_bundle(pid: int) -> Path | None:
-    """Resolve the supported ChatGPT.app bundle owning one exact Codex child."""
+def _native_desktop_client(pid: int) -> tuple[Path, Path] | None:
+    """Resolve the supported ChatGPT.app bundle and exact client owning one child.
+
+    The returned executable is the process's own image path: it only reaches
+    the caller when it matched one recognized bundled layout and the bounded
+    ancestor chain proved the same supported bundle owns the process.
+    """
 
     if pid <= 0:
         return None
@@ -3661,11 +3676,22 @@ def native_desktop_bundle(pid: int) -> Path | None:
         _, executable = recipient_owner_identity("codex", pid)
     except (ChatError, OSError):
         return None
-    bundle = _native_bundle_root(executable, ("Resources", "codex"))
+    bundle: Path | None = None
+    for layout in NATIVE_DESKTOP_CLIENT_LAYOUTS:
+        bundle = _native_bundle_root(executable, layout)
+        if bundle is not None:
+            break
     resolved = _supported_native_bundle(bundle) if bundle is not None else None
     if resolved is None or not native_desktop_process(pid, resolved):
         return None
-    return resolved
+    return resolved, executable
+
+
+def native_desktop_bundle(pid: int) -> Path | None:
+    """Resolve the supported ChatGPT.app bundle owning one exact Codex child."""
+
+    client = _native_desktop_client(pid)
+    return client[0] if client is not None else None
 
 
 def native_desktop_process(pid: int, bundle: Path | None = None) -> bool:
@@ -3707,11 +3733,11 @@ def _native_account_binary(root: Path, route: Route) -> Path:
 
     if route.profile_root is None:
         raise ChatError("Codex account identity is unavailable")
-    bundle = native_desktop_bundle(route.pid)
-    if not _route_owner_current(root, route) or bundle is None:
+    client = _native_desktop_client(route.pid)
+    if not _route_owner_current(root, route) or client is None:
         raise ChatError("Codex account identity is unavailable")
     try:
-        return (bundle / "Contents" / "Resources" / "codex").resolve(strict=True)
+        return client[1].resolve(strict=True)
     except OSError as error:
         raise ChatError("Codex account identity is unavailable") from error
 
