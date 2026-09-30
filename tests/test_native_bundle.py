@@ -13,7 +13,9 @@ from cross_agent_chat.core import ChatError, Route
 OWNER = "a" * 64
 
 
-def fake_desktop_bundle(parent: Path, identifier: str = "com.openai.codex") -> Path:
+def fake_desktop_bundle(
+    parent: Path, identifier: str = "com.openai.codex", nested: bool = False
+) -> Path:
     """Build a minimal fixture ChatGPT.app tree under one install parent."""
 
     bundle = parent / "ChatGPT.app"
@@ -21,10 +23,29 @@ def fake_desktop_bundle(parent: Path, identifier: str = "com.openai.codex") -> P
     (bundle / "Contents" / "Resources").mkdir(parents=True, exist_ok=True)
     (bundle / "Contents" / "MacOS" / "ChatGPT").write_text("desktop", encoding="utf-8")
     (bundle / "Contents" / "Resources" / "codex").write_text("child", encoding="utf-8")
+    if nested:
+        client = nested_client(bundle)
+        client.parent.mkdir(parents=True, exist_ok=True)
+        client.write_text("child", encoding="utf-8")
     (bundle / "Contents" / "Info.plist").write_bytes(
         plistlib.dumps({"CFBundleIdentifier": identifier})
     )
     return bundle
+
+
+def nested_client(bundle: Path) -> Path:
+    """Return the observed codex-cli bundled app-server path inside one fixture bundle."""
+
+    return (
+        bundle
+        / "Contents"
+        / "Resources"
+        / "codex-cli"
+        / "CodexCLI.app"
+        / "Contents"
+        / "MacOS"
+        / "codex"
+    )
 
 
 def patch_process_chain(
@@ -66,6 +87,17 @@ def standard_chain(bundle: Path) -> tuple[dict[int, Path], dict[int, int]]:
     return (
         {
             300: bundle / "Contents" / "Resources" / "codex",
+            200: bundle / "Contents" / "MacOS" / "ChatGPT",
+            100: Path("/sbin/launchd"),
+        },
+        {300: 200, 200: 100},
+    )
+
+
+def nested_chain(bundle: Path) -> tuple[dict[int, Path], dict[int, int]]:
+    return (
+        {
+            300: nested_client(bundle),
             200: bundle / "Contents" / "MacOS" / "ChatGPT",
             100: Path("/sbin/launchd"),
         },
@@ -251,6 +283,151 @@ def test_account_binary_rejects_route_bound_to_another_owner(
     monkeypatch.setattr(runtime, "NATIVE_DESKTOP_APPLICATIONS", applications)
     bundle = fake_desktop_bundle(applications)
     executables, parents = standard_chain(bundle)
+    patch_process_chain(monkeypatch, executables, parents)
+    route = codex_route(tmp_path, 300)
+    monkeypatch.setattr(
+        runtime, "recipient_owner_identity", lambda *_args: ("b" * 64, executables[300])
+    )
+
+    with pytest.raises(ChatError, match="account identity is unavailable"):
+        runtime._native_account_binary(tmp_path, route)
+
+
+def test_nested_codex_cli_layout_is_recognized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    applications = tmp_path / "Applications"
+    bundle = fake_desktop_bundle(applications, nested=True)
+    monkeypatch.setattr(runtime, "NATIVE_DESKTOP_APPLICATIONS", applications)
+    executables, parents = nested_chain(bundle)
+    patch_process_chain(monkeypatch, executables, parents)
+
+    resolved = bundle.resolve(strict=True)
+    assert runtime.native_desktop_bundle(300) == resolved
+    assert runtime.native_desktop_process(300)
+    assert runtime._native_desktop_route(tmp_path, codex_route(tmp_path, 300))
+
+
+def test_account_binary_returns_the_nested_bundle_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    applications = tmp_path / "Applications"
+    monkeypatch.setattr(runtime, "NATIVE_DESKTOP_APPLICATIONS", applications)
+    bundle = fake_desktop_bundle(applications / "Utilities", nested=True)
+    executables, parents = nested_chain(bundle)
+    patch_process_chain(monkeypatch, executables, parents)
+    route = codex_route(tmp_path, 300)
+
+    assert runtime._native_account_binary(tmp_path, route) == nested_client(bundle).resolve(
+        strict=True
+    )
+
+
+def test_account_binary_selects_the_bound_client_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    applications = tmp_path / "Applications"
+    monkeypatch.setattr(runtime, "NATIVE_DESKTOP_APPLICATIONS", applications)
+    bundle = fake_desktop_bundle(applications, nested=True)
+    executables, parents = standard_chain(bundle)
+    patch_process_chain(monkeypatch, executables, parents)
+    route = codex_route(tmp_path, 300)
+
+    assert runtime._native_account_binary(tmp_path, route) == (
+        bundle / "Contents" / "Resources" / "codex"
+    ).resolve(strict=True)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        ("Resources", "codex-cli", "bin", "codex"),
+        ("Resources", "codex-cli", "bin", "codex-code-mode-host"),
+        ("Resources", "codex-cli", "Other.app", "Contents", "MacOS", "codex"),
+        ("Resources", "codex-cli", "CodexCLI.app", "Contents", "MacOS", "ChatGPT"),
+        ("Resources", "codex-cli", "CodexCLI.app", "Contents", "Resources", "codex"),
+        ("MacOS", "codex"),
+    ],
+)
+def test_unrelated_bundled_descendants_are_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: tuple[str, ...]
+) -> None:
+    applications = tmp_path / "Applications"
+    monkeypatch.setattr(runtime, "NATIVE_DESKTOP_APPLICATIONS", applications)
+    bundle = fake_desktop_bundle(applications, nested=True)
+    patch_process_chain(
+        monkeypatch,
+        {
+            300: bundle.joinpath("Contents", *relative),
+            200: bundle / "Contents" / "MacOS" / "ChatGPT",
+            100: Path("/sbin/launchd"),
+        },
+        {300: 200, 200: 100},
+    )
+
+    assert runtime.native_desktop_bundle(300) is None
+    assert runtime.native_desktop_process(300)
+
+
+def test_nested_client_under_foreign_app_root_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    applications = tmp_path / "Applications"
+    monkeypatch.setattr(runtime, "NATIVE_DESKTOP_APPLICATIONS", applications)
+    bundle = fake_desktop_bundle(applications)
+    patch_process_chain(
+        monkeypatch,
+        {
+            300: (
+                applications
+                / "Impostor.app"
+                / "Contents"
+                / "Resources"
+                / "codex-cli"
+                / "CodexCLI.app"
+                / "Contents"
+                / "MacOS"
+                / "codex"
+            ),
+            200: bundle / "Contents" / "MacOS" / "ChatGPT",
+            100: Path("/sbin/launchd"),
+        },
+        {300: 200, 200: 100},
+    )
+
+    assert runtime.native_desktop_bundle(300) is None
+    assert runtime.native_desktop_process(300)
+
+
+def test_nested_child_and_desktop_ancestor_must_share_one_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    applications = tmp_path / "Applications"
+    monkeypatch.setattr(runtime, "NATIVE_DESKTOP_APPLICATIONS", applications)
+    child_bundle = fake_desktop_bundle(applications, nested=True)
+    ancestor_bundle = fake_desktop_bundle(tmp_path / "home" / "Applications")
+    patch_process_chain(
+        monkeypatch,
+        {
+            300: nested_client(child_bundle),
+            200: ancestor_bundle / "Contents" / "MacOS" / "ChatGPT",
+            100: Path("/sbin/launchd"),
+        },
+        {300: 200, 200: 100},
+    )
+
+    assert runtime.native_desktop_process(300)
+    assert runtime.native_desktop_bundle(300) is None
+    assert not runtime._native_desktop_route(tmp_path, codex_route(tmp_path, 300))
+
+
+def test_nested_account_binary_rejects_route_bound_to_another_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    applications = tmp_path / "Applications"
+    monkeypatch.setattr(runtime, "NATIVE_DESKTOP_APPLICATIONS", applications)
+    bundle = fake_desktop_bundle(applications, nested=True)
+    executables, parents = nested_chain(bundle)
     patch_process_chain(monkeypatch, executables, parents)
     route = codex_route(tmp_path, 300)
     monkeypatch.setattr(
