@@ -74,9 +74,10 @@ Then ask your agent:
 > the relevant diff or an accessible revision, and bring its findings back
 > here.
 
-The requester finds the recipient, sends the request, and ends its turn; the
-recipient works with its own tools and account, then replies to the original
-conversation — no manual relaying. Messages carry peer requests, never owner
+The requester finds the recipient, sends the request, and continues any
+independent work. The recipient works with its own tools and account, then
+replies to the original conversation according to the requester's receiving
+mode — no manual relaying. Messages carry peer requests, never owner
 instructions, and nothing synchronizes files or widens permissions. Start a
 short-lived session with `CROSS_AGENT_CHAT_PRESENCE=off` to keep it off the
 peer list.
