@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.7 - 2026-09-30
+
+- Recognize the exact nested `Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`
+  client used by the current Native app, alongside the original flat layout.
+  This restores eligibility for the existing managed helper while retaining
+  the supported install location, bundle identity, same-bundle Desktop
+  ancestor, and process-owner checks.
+- Probe the account using the exact validated client that owns the route;
+  do not select a different bundled sibling or a client from PATH.
+- Verify active and idle delivery through the existing managed helper on
+  Native app 26.928.21956 / Codex 0.159.2, using disposable recipients.
+  Codex and Claude senders reached the same original during its active
+  turn; a cross-Mac request/result returned during that original turn.
+  Peer envelopes remained tool results with matching payload digests.
+  The direct experimental queue and default CLI turn-bound delivery are
+  unchanged, and existing accepted queue items are not migrated.
+- Sender guidance permits independent useful work after a request while
+  retaining the prohibition on holding a turn open just to wait or poll.
+
 ## 0.4.6 - 2026-09-28
 
 - Setup completion output is scoped to the selected providers and points

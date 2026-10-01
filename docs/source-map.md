@@ -43,6 +43,13 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 | `devin.py` | Devin lifecycle-hook parsing and the filesystem-backed single-use capability store (`atomic_json` + `state_lock`). |
 | `install.py` | Provider selection (`resolve_providers`), selected-root resolution, read-only `SetupPlan`, config payload preparation, whole-file backups, guarded transactions/rollback, LaunchAgent lifecycle, schema-5 install metadata, uninstall/restore. Largest file; most of its size is the ownership/rollback matrix. |
 
+Native eligibility is checked in `runtime.py`: `_native_desktop_client`
+recognizes only the two known bundled Codex executable layouts and verifies
+the matching Desktop ancestor. `_native_account_binary` selects that exact
+owner's client. Queue admission is in `codex.py`; managed helper forwarding
+uses the trusted hook recipe in `native_helper.py`. None of these labels
+alone proves that an active recipient consumed an envelope.
+
 ## Where the boundaries live
 
 - **Sender identity:** `runtime.py` (`authenticate_mcp_sender`), Codex host

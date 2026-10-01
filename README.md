@@ -24,16 +24,16 @@ secrets those files hold (see [setup and data handling](SECURITY.md)).
 Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
 limits the set.
 
-Install v0.4.6 with:
+Install v0.4.7 with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.6/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.7/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
-This builds the released `v0.4.6` tag and installs the command at
+This builds the released `v0.4.7` tag and installs the command at
 `~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
 Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
 not found in your shell, use the full path the installer reports. Run it on
@@ -86,9 +86,21 @@ peer list.
 | Coding surface on macOS | Receiving behavior |
 |---|---|
 | Claude Code | Receives while idle in supported desktop-launched contexts. |
-| Codex Native App | Receives while idle in the original conversation through its managed helper, when the required provider capabilities and hooks are available. |
+| Codex Native App | Managed helper delivery reaches the original conversation while idle or during active work on the qualified host described below. Required provider capabilities and trusted hooks must be available. |
 | Codex CLI | By default, receives at a turn boundary: the current turn's end or the next prompt. An explicitly enabled experimental queue has different behavior. |
 | Local Devin CLI/App | Receives at the next prompt or turn end. A conversation joins the peer list after its first prompt; receiving into an already-idle conversation is open in [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38). |
+
+Idle reception and input during an active turn are separate capabilities.
+The direct experimental Codex route uses `thread/queue/add`: a message can
+wait behind the current turn. The managed Native helper forwards through
+the app's `send_message_to_thread`. Active and idle delivery were verified
+on Intel macOS with Codex 0.159.2 in Native app 26.928.21956, including a cross-Mac return
+to the same active original turn. This does not qualify every host version.
+Default Codex CLI delivery remains turn-bound.
+`reply_delivery` describes the sender's return path, and
+`TRANSPORT_ACCEPTED` proves custody, not model consumption.
+After requesting peer work, continue independent work within your task;
+finish when none remains instead of holding a turn open to wait.
 
 It follows the coding session, not a terminal tab; Terminal.app, iTerm2, and
 Ghostty have recorded supported cases on Intel and Apple silicon. No claim
