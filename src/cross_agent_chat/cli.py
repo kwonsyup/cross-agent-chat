@@ -117,14 +117,17 @@ MCP_INSTRUCTIONS: Final = (
     "delivery helper that appears as the visible sender; never reply to that helper's "
     "address. Never replay accepted or unknown "
     "events. chat_status is sender-local custody, not recipient consumption. "
-    "Read a chat_send outcome by its class: a refusal — an error result or "
-    "PRE_EFFECT_REJECTED — and an error that states nothing was delivered had no "
-    "effect; TRANSPORT_ACCEPTED is custody, not consumption; UNKNOWN_DELIVERY may "
-    "already have effected delivery and is quarantined. Only the recipient "
-    "session's own answer shows a message was used; another peer's report about "
-    "your event is second-hand, not a receipt. A chat_peers entry answered a "
-    "live-route check at listing time; a listed peer can still refuse a send "
-    "before any effect."
+    "Only an explicit decided no-effect refusal — a PRE_EFFECT_REJECTED result "
+    "or an error that states nothing was delivered — proves this newly refused "
+    "call sent nothing; any other error can carry an uncertain effect, so the "
+    "no-replay rule still holds, and a new event id, recipient, or provider "
+    "does not make equivalent uncertain work independent. Consumption is "
+    "evidenced only by the original recipient session's own use or action: a "
+    "missing reply does not prove a message was not consumed, provider input "
+    "or a helper acknowledgement does not prove correctness, and another "
+    "peer's report about your event stays second-hand. A chat_peers entry "
+    "answered a live-route check at listing time; a listed peer can still "
+    "refuse a send."
 )
 
 
@@ -383,9 +386,14 @@ def _mcp_call_tool(
     # CallToolResult isError results so a client can tell a refused call apart
     # from an operation whose effect is uncertain.
     if name == "chat_peers":
-        query = typed_arguments.get("query")
-        if set(typed_arguments) - {"query"} or (query is not None and not isinstance(query, str)):
+        raw_query = typed_arguments.get("query")
+        # The schema permits a string only: an explicit null is as malformed as
+        # a number, while an omitted query stays the unfiltered listing.
+        if set(typed_arguments) - {"query"} or (
+            "query" in typed_arguments and not isinstance(raw_query, str)
+        ):
             _fail("MCP tool call is invalid")
+        query = raw_query if isinstance(raw_query, str) else None
         assert root is not None
         try:
             if query is not None:
@@ -514,6 +522,9 @@ def _mcp_tools(provider: str, presence_enabled: bool) -> list[dict[str, object]]
                 "The optional query narrows the same "
                 "listing; a filtered response states "
                 "its query, matched count, and total. "
+                "Titles and short display hints are "
+                "descriptive and never authoritative: "
+                "only the exact handle selects. "
                 "Sender readiness is separate from "
                 "recipient availability."
             ),

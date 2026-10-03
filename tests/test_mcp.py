@@ -386,8 +386,10 @@ def test_chat_peers_rejects_malformed_query_arguments(
         *_handshake(),
         _chat_peers_call(1, {"bogus": "x"}),
         _chat_peers_call(2, {"query": 5}),
-        _chat_peers_call(3, {"query": "bad\x00query"}),
-        _chat_peers_call(4, {"query": "x" * 200}),
+        # The schema permits a string only: explicit null is not "omitted".
+        _chat_peers_call(3, {"query": None}),
+        _chat_peers_call(4, {"query": "bad\x00query"}),
+        _chat_peers_call(5, {"query": "x" * 200}),
     ]
     monkeypatch.setattr("sys.stdin", _feed(requests))
 
@@ -398,9 +400,10 @@ def test_chat_peers_rejects_malformed_query_arguments(
     # the shape check are operation refusals (isError), like event_status.
     assert responses[1]["error"]["code"] == -32602
     assert responses[2]["error"]["code"] == -32602
-    assert responses[3]["result"]["isError"] is True
-    assert responses[3]["result"]["content"][0]["text"] == "peer query is invalid"
+    assert responses[3]["error"]["code"] == -32602
     assert responses[4]["result"]["isError"] is True
+    assert responses[4]["result"]["content"][0]["text"] == "peer query is invalid"
+    assert responses[5]["result"]["isError"] is True
 
 
 def test_chat_peers_rejects_a_malformed_query_before_any_discovery(
@@ -426,14 +429,23 @@ def test_chat_peers_rejects_a_malformed_query_before_any_discovery(
     monkeypatch.setattr("cross_agent_chat.runtime.local_targets", recorded_local)
     monkeypatch.setattr("cross_agent_chat.runtime.tailnet_identity", recorded_identity)
     monkeypatch.setattr(
-        "sys.stdin", _feed([*_handshake(), _chat_peers_call(1, {"query": "bad\x00query"})])
+        "sys.stdin",
+        _feed(
+            [
+                *_handshake(),
+                _chat_peers_call(1, {"query": "bad\x00query"}),
+                # Explicit null violates the string-only schema the same way.
+                _chat_peers_call(2, {"query": None}),
+            ]
+        ),
     )
 
     mcp("claude", "studio", str(root))
 
-    response = json.loads(capsys.readouterr().out.splitlines()[-1])
-    assert response["result"]["isError"] is True
-    assert response["result"]["content"][0]["text"] == "peer query is invalid"
+    responses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert responses[1]["result"]["isError"] is True
+    assert responses[1]["result"]["content"][0]["text"] == "peer query is invalid"
+    assert responses[2]["error"]["code"] == -32602
     assert probed == []
 
     # A well-formed query still reaches discovery and reports its filter scope.
