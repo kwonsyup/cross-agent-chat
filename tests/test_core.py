@@ -23,6 +23,7 @@ import pytest
 
 from cross_agent_chat.codex import CodexCourier
 from cross_agent_chat.core import (
+    ABANDONED_INTENT_SECONDS,
     ChatError,
     Intent,
     IntentStatus,
@@ -441,7 +442,11 @@ def test_local_delivery_wraps_reply_with_authenticated_sender_handle(
         pid=target.pid,
     )
     captured: dict[str, object] = {}
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [resolved])
+    monkeypatch.setattr(
+        runtime,
+        "local_targets",
+        lambda _root, *, handle=None: [resolved] if handle == resolved.session_key else [],
+    )
 
     def accept(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
         captured.update(payload)
@@ -867,6 +872,311 @@ def test_pre_effect_rejection_does_not_block_fresh_intent(tmp_path: Path) -> Non
     assert store.begin(source, target, source_alias=source.alias, payload_digest="b" * 64)
 
 
+def test_another_sessions_in_flight_send_does_not_block_a_distinct_event(
+    tmp_path: Path,
+) -> None:
+    """2 Oct 2026 dogfood: one lane's PENDING send blocked every other session.
+
+    The unresolved gate is per (source, target): a different session's event is
+    a different task, and the recipient courier already serializes effects, so
+    admitting it cannot produce a duplicate delivery of either event.
+    """
+    first_source = route(tmp_path, project="lane-c")
+    second_source = route(tmp_path, project="lane-w")
+    target = route(tmp_path)
+    store = IntentStore(tmp_path / "state")
+    first_event = store.begin(
+        first_source, target, source_alias=first_source.alias, payload_digest="a" * 64
+    )
+
+    second_event = store.begin(
+        second_source, target, source_alias=second_source.alias, payload_digest="b" * 64
+    )
+
+    assert second_event != first_event
+    assert {item.event_id: item.status for item in store.intents()} == {
+        first_event: "PENDING",
+        second_event: "PENDING",
+    }
+    # Admitting the second event neither replays nor rewrites the first: a
+    # result recorded for one leaves the other's row untouched.
+    store.mark(first_event, "TRANSPORT_ACCEPTED")
+    second = store.intent_for_source(
+        event_id=second_event,
+        source_key=session_key(second_source.provider, second_source.session_id),
+        source_generation=second_source.generation,
+    )
+    assert second is not None and second.status == "PENDING"
+
+
+@pytest.mark.parametrize("status", ["PENDING", "REMOTE_AUTHORIZED"])
+def test_same_sender_second_send_to_same_target_is_refused_with_event_guidance(
+    tmp_path: Path, status: IntentStatus
+) -> None:
+    """The gate that remains: one sender must not double-send while undecided."""
+    source = route(tmp_path, project="source")
+    target = route(tmp_path)
+    store = IntentStore(tmp_path / "state")
+    event_id = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    if status != "PENDING":
+        store.mark(event_id, status)
+
+    with pytest.raises(ChatError, match="unresolved delivery intent") as caught:
+        store.begin(source, target, source_alias=source.alias, payload_digest="b" * 64)
+
+    message = str(caught.value)
+    assert event_id in message
+    assert status in message
+    assert "created no intent" in message
+    assert "sent nothing" in message
+    assert "do not resend" in message
+    assert [item.event_id for item in store.intents()] == [event_id]
+
+
+def test_restarted_generation_of_one_session_is_still_the_same_sender(
+    tmp_path: Path,
+) -> None:
+    """The gate binds the session identity, not one route generation.
+
+    A session that re-registered (new generation, same session id) must still
+    not open a second send toward a recipient its earlier generation left
+    undecided; resolve is the escape for the orphaned row.
+    """
+    previous = route(tmp_path, project="source")
+    restarted = route(tmp_path, project="source", session_id=previous.session_id)
+    assert restarted.generation != previous.generation
+    target = route(tmp_path)
+    store = IntentStore(tmp_path / "state")
+    event_id = store.begin(previous, target, source_alias=previous.alias, payload_digest="a" * 64)
+
+    with pytest.raises(ChatError, match="unresolved delivery intent") as caught:
+        store.begin(restarted, target, source_alias=restarted.alias, payload_digest="b" * 64)
+
+    assert event_id in str(caught.value)
+    assert [item.event_id for item in store.intents()] == [event_id]
+
+
+def test_aged_unresolved_intent_refusal_points_at_owner_resolve(tmp_path: Path) -> None:
+    """An aged row is probably orphaned: identify it, then name the disposition.
+
+    Plausible failure: the refusal treats elapsed time as proof the earlier
+    send is gone, or presents `resolve` as cancellation or as a safe-replay
+    instruction. Age is a heuristic; resolve only records the owner's
+    disposition of an outcome that stays uncertain.
+    """
+    source = route(tmp_path, project="source")
+    target = route(tmp_path)
+    store = IntentStore(tmp_path / "state")
+    event_id = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    _backdate_intent(store, event_id, ABANDONED_INTENT_SECONDS + 60)
+
+    with pytest.raises(ChatError, match="unresolved delivery intent") as caught:
+        store.begin(source, target, source_alias=source.alias, payload_digest="b" * 64)
+
+    message = str(caught.value)
+    assert event_id in message
+    assert "PENDING" in message
+    assert "created no intent" in message
+    assert "sent nothing" in message
+    assert "does not prove" in message
+    assert "bound a live send" not in message
+    assert f"cross-agent-chat resolve {event_id}" in message
+    assert "cancels nothing" in message
+    assert "does not make that work safe to send again" in message
+    # The refused attempt leaves the prior event exactly as recorded.
+    [intent] = store.intents()
+    assert (intent.event_id, intent.status) == (event_id, "PENDING")
+
+
+def test_remote_authorization_claims_exactly_one_row_among_same_target_sends(
+    tmp_path: Path,
+) -> None:
+    """Two admitted events to one target must not confuse the claim callback."""
+    first_source = route(tmp_path, project="lane-c")
+    second_source = route(tmp_path, project="lane-w")
+    target = route(tmp_path)
+    store = IntentStore(tmp_path / "state")
+    target_key = session_key(target.provider, target.session_id)
+    first_event = store.begin(
+        first_source, target, source_alias=first_source.alias, payload_digest="a" * 64
+    )
+    second_event = store.begin(
+        second_source, target, source_alias=second_source.alias, payload_digest="b" * 64
+    )
+    first_claim = {
+        "event_id": first_event,
+        "source_generation": first_source.generation,
+        "source_alias": first_source.alias,
+        "target_key": target_key,
+        "target_generation": target.generation,
+        "payload_digest": "a" * 64,
+    }
+
+    assert store.claim_remote_authorization(**first_claim)
+
+    assert {item.event_id: item.status for item in store.intents()} == {
+        first_event: "REMOTE_AUTHORIZED",
+        second_event: "PENDING",
+    }
+    # A claimed row is decided for the callback: a replayed claim is refused.
+    assert not store.claim_remote_authorization(**first_claim)
+    # The first sender's credentials cannot reach the second event's row.
+    assert not store.claim_remote_authorization(**{**first_claim, "event_id": second_event})
+    # The second event still authorizes normally on its own exact fields.
+    assert store.claim_remote_authorization(
+        event_id=second_event,
+        source_generation=second_source.generation,
+        source_alias=second_source.alias,
+        target_key=target_key,
+        target_generation=target.generation,
+        payload_digest="b" * 64,
+    )
+
+
+def test_an_exact_frame_replay_dedupes_but_a_new_send_is_a_new_attempt(
+    tmp_path: Path,
+) -> None:
+    """Internal busy retries replay the identical frame; chat_send does not.
+
+    Plausible failure: the store folds a second chat_send into the prior
+    event as if it were a retry (hiding a distinct attempt), or a replayed
+    exact frame mints a second intent or re-claims an already claimed row.
+    The two paths must stay separate: an exact-frame replay dedupes on the
+    recorded event, while a fresh send is a new attempt the pair gate
+    adjudicates on its own. That is wire/event dedup only -- minting a new
+    event id never makes equivalent work independent, so semantic no-replay
+    stays the caller's duty, not something the store confers.
+    """
+    source = route(tmp_path, project="source")
+    target = route(tmp_path)
+    store = IntentStore(tmp_path / "state")
+    event_id = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    claim = {
+        "event_id": event_id,
+        "source_generation": source.generation,
+        "source_alias": source.alias,
+        "target_key": session_key(target.provider, target.session_id),
+        "target_generation": target.generation,
+        "payload_digest": "a" * 64,
+    }
+
+    # The courier's internal retry of one exact authorize frame claims the
+    # recorded event once; the identical replay cannot claim it again, and a
+    # retry arriving at admission with the same event id mints no new intent.
+    assert store.claim_remote_authorization(**claim)
+    assert not store.claim_remote_authorization(**claim)
+    with pytest.raises(ChatError, match="event id is unavailable"):
+        store.begin(
+            source,
+            target,
+            source_alias=source.alias,
+            payload_digest="a" * 64,
+            event_id=event_id,
+        )
+    assert [item.event_id for item in store.intents()] == [event_id]
+
+    # A model issuing chat_send again gets no such dedup: even the identical
+    # body is a new attempt, refused by the pair gate while the first is
+    # undecided -- never folded into the first event.
+    with pytest.raises(ChatError, match="unresolved delivery intent"):
+        store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+
+    # Once the first event's outcome is recorded uncertain, the primitive can
+    # mint a second event for the identical body. That is wire/event dedup
+    # only: a fresh event id does not make equivalent work independent, and
+    # this admission is exactly why the caller must not re-send an uncertain
+    # task -- the store records a new attempt, it does not authorize one.
+    store.mark(event_id, "UNKNOWN_DELIVERY")
+    second = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    assert second != event_id
+    assert {item.event_id: item.status for item in store.intents()} == {
+        event_id: "UNKNOWN_DELIVERY",
+        second: "PENDING",
+    }
+
+
+def test_concurrent_begins_hold_one_pending_row_per_source_target_pair(
+    tmp_path: Path,
+) -> None:
+    """Racing begins for one pair yield one PENDING row; distinct pairs race free."""
+    source = route(tmp_path, project="source")
+    other = route(tmp_path, project="other")
+    third = route(tmp_path, project="third")
+    target = route(tmp_path)
+    store = IntentStore(tmp_path / "state")
+
+    def begin_once(sender: Route, digest: str) -> str:
+        return store.begin(sender, target, source_alias=sender.alias, payload_digest=digest)
+
+    admitted: list[str] = []
+    refusals: list[ChatError] = []
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [
+            workers.submit(begin_once, source, "a" * 64),
+            workers.submit(begin_once, source, "b" * 64),
+        ]
+        for future in futures:
+            try:
+                admitted.append(future.result())
+            except ChatError as error:
+                refusals.append(error)
+    assert len(admitted) == 1
+    assert len(refusals) == 1
+    assert "unresolved delivery intent" in str(refusals[0])
+    source_key = session_key(source.provider, source.session_id)
+    assert [
+        item.event_id
+        for item in store.intents()
+        if item.source_key == source_key and item.status == "PENDING"
+    ] == admitted
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [
+            workers.submit(begin_once, other, "c" * 64),
+            workers.submit(begin_once, third, "d" * 64),
+        ]
+        assert len({future.result() for future in futures}) == 2
+    assert len(store.intents()) == 3
+
+
+def test_pre_change_intents_file_still_loads(tmp_path: Path) -> None:
+    """An intents.json written by v0.4.7 must parse unchanged; the schema is fixed."""
+    store = IntentStore(tmp_path / "state")
+    recorded = "2026-10-02T12:00:00+00:00"
+    fixture = [
+        {
+            "schema_version": 1,
+            "event_id": event,
+            "source_key": source_key,
+            "source_generation": str(uuid4()),
+            "source_alias": f"claude@studio:{alias}",
+            "target_key": "f" * 64,
+            "target_generation": str(uuid4()),
+            "payload_digest": "e" * 64,
+            "status": status,
+            "timestamp": recorded,
+        }
+        for event, source_key, alias, status in (
+            ("11111111-1111-4111-8111-111111111111", "a" * 64, "lane-c", "PENDING"),
+            ("22222222-2222-4222-8222-222222222222", "b" * 64, "lane-n", "REMOTE_AUTHORIZED"),
+            ("33333333-3333-4333-8333-333333333333", "a" * 64, "lane-c", "PRE_EFFECT_REJECTED"),
+            ("44444444-4444-4444-8444-444444444444", "b" * 64, "lane-n", "TRANSPORT_ACCEPTED"),
+            ("55555555-5555-4555-8555-555555555555", "c" * 64, "lane-w", "UNKNOWN_DELIVERY"),
+            ("66666666-6666-4666-8666-666666666666", "c" * 64, "lane-w", "RESOLVED_BY_OWNER"),
+        )
+    ]
+    atomic_json(store.path, fixture)
+
+    assert {item.status for item in store.intents()} == {
+        "PENDING",
+        "REMOTE_AUTHORIZED",
+        "PRE_EFFECT_REJECTED",
+        "TRANSPORT_ACCEPTED",
+        "UNKNOWN_DELIVERY",
+        "RESOLVED_BY_OWNER",
+    }
+
+
 def test_configured_tool_deadline_covers_one_remote_discovery_and_delivery() -> None:
     assert OPERATION_TIMEOUT_SECONDS >= (
         LOCAL_DISCOVERY_TIMEOUT_SECONDS
@@ -950,7 +1260,10 @@ def test_local_send_by_exact_token_skips_remote_discovery_and_title_metadata(
         cwd=target.cwd,
         pid=target.pid,
     )
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [local])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.local_targets",
+        lambda _root, *, handle=None: [local] if handle == local.session_key else [],
+    )
     monkeypatch.setattr(
         "cross_agent_chat.runtime.remote_targets",
         lambda _: pytest.fail("local delivery must not wait for Tailnet discovery"),
@@ -1004,7 +1317,10 @@ def test_new_local_send_after_unknown_keeps_old_event_quarantined(
         cwd=target.cwd,
         pid=target.pid,
     )
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [resolved])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.local_targets",
+        lambda _root, *, handle=None: [resolved] if handle == resolved.session_key else [],
+    )
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_socket",
         lambda _path, payload, **_: {
@@ -1052,7 +1368,10 @@ def test_local_claude_receipt_uses_fresh_discovery_alias_after_rename(
         cwd=target.cwd,
         pid=target.pid,
     )
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [resolved])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.local_targets",
+        lambda _root, *, handle=None: [resolved] if handle == resolved.session_key else [],
+    )
     monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_socket",
@@ -2971,7 +3290,11 @@ def test_disappeared_courier_closes_intent_as_pre_effect(
         cwd=destination.cwd,
         pid=destination.pid,
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [target])
+    monkeypatch.setattr(
+        runtime,
+        "local_targets",
+        lambda _root, *, handle=None: [target] if handle == target.session_key else [],
+    )
     with pytest.raises(ChatError) as error:
         runtime.send(
             root,
@@ -3215,17 +3538,29 @@ def test_a_late_result_replaces_the_owner_disposition(
 
     Elapsed age does not prove a send is dead -- a suspended host can resume and
     record its outcome after the owner resolved it. That late evidence is kept
-    rather than discarded to preserve a final-looking label.
+    rather than discarded to preserve a final-looking label, and it still lands
+    on the original event even after the disposition reopened the pair gate.
     """
     home = tmp_path / "home"
     home.mkdir()
-    event_id = _seeded_intent(home, tmp_path, "PENDING", age_seconds=1200)
-    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
     store = IntentStore(home / ".local/state/cross-agent-chat")
+    source = route(tmp_path, project="source")
+    target = route(tmp_path)
+    event_id = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    _backdate_intent(store, event_id, 1200)
+    assert _resolve_cli(home, monkeypatch, event_id)[0] == 0
 
+    # The disposition reopens the pair gate for a genuinely new attempt...
+    new_event = store.begin(source, target, source_alias=source.alias, payload_digest="b" * 64)
+    assert new_event != event_id
+
+    # ...but the delayed original completion is still attributed to its own
+    # event, never folded into the new attempt or dropped as a duplicate.
     store.mark(event_id, decided)
 
-    assert [item.status for item in store.intents() if item.event_id == event_id] == [decided]
+    states = {item.event_id: item.status for item in store.intents()}
+    assert states[event_id] == decided
+    assert states[new_event] == "PENDING"
 
 
 @pytest.mark.parametrize(

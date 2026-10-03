@@ -24,16 +24,16 @@ secrets those files hold (see [setup and data handling](SECURITY.md)).
 Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
 limits the set.
 
-Install v0.4.7 with:
+Install v0.4.8 with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.7/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.8/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
-This builds the released `v0.4.7` tag and installs the command at
+This builds the released `v0.4.8` tag and installs the command at
 `~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
 Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
 not found in your shell, use the full path the installer reports. Run it on
@@ -89,7 +89,7 @@ peer list.
 | Claude Code | Receives while idle in supported desktop-launched contexts. |
 | Codex Native App | Managed helper delivery reaches the original conversation while idle or during active work on the qualified host described below. Required provider capabilities and trusted hooks must be available. |
 | Codex CLI | By default, receives at a turn boundary: the current turn's end or the next prompt. An explicitly enabled experimental queue has different behavior. |
-| Local Devin CLI/App | Receives at the next prompt or turn end. A conversation joins the peer list after its first prompt; receiving into an already-idle conversation is open in [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38). |
+| Local Devin CLI/App | Receives at the next prompt or turn end. A conversation joins the peer list after its first prompt; receiving into an already-idle conversation stays open in [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38), waiting on a supported provider interface for delivering into an existing running conversation. |
 
 Idle reception and input during an active turn are separate capabilities.
 The direct experimental Codex route uses `thread/queue/add`: a message can
@@ -145,13 +145,22 @@ that a login is required.
 
 Sessions load three tools: `chat_peers` finds recipients, `chat_send` sends
 one message, `chat_status` reads sender-local custody. Plain language works
-instead of invoking them.
+instead of invoking them. `chat_peers` accepts an optional `query` that
+narrows the same listing by case-insensitive substring on alias and title —
+a malformed value is refused before any probing — and `chat_send` also
+resolves one peer's exact alias, refusing when it matches zero or several.
+Peer rows may show a descriptive title; a Devin row's is a stable opaque
+session label, not a provider title. Titles are display hints only — an
+exact handle or one uniquely matching full alias still selects.
 
 `chat_send` reports `TRANSPORT_ACCEPTED` (custody, not a read receipt — do
 not re-send), a pre-delivery refusal (nothing was handed over; correcting
 that refused attempt is safe only if no earlier attempt of the same work was
 accepted or uncertain), or `UNKNOWN_DELIVERY` (check the recipient directly;
-do not re-send). Its `reply_delivery` — `while_idle`, `next_turn`, or
+do not re-send). Only an explicit decided no-effect refusal proves a refused
+send delivered nothing — any other error can carry an uncertain effect, and
+a new event id, recipient, or provider does not make equivalent uncertain
+work safe to resend. Its `reply_delivery` — `while_idle`, `next_turn`, or
 `unknown` — says how an answer can return.
 
 ```sh
@@ -165,7 +174,8 @@ model read a task. A missing peer warrants one read-only relist, not a
 replay; persistent absence may need the provider's normal registration event
 (resume the Claude conversation, or prompt the original Devin workspace), not
 idle supervision. `resolve` records an owner's disposition of an undecided
-event — it does not cancel work or make replay safe. Turn-bound queues live
+event — it does not cancel work or make resending equivalent uncertain work
+safe. Turn-bound queues live
 in courier memory; a crash can lose a pending copy. See
 [SECURITY.md](SECURITY.md).
 

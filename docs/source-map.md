@@ -29,11 +29,11 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 | Module | Responsibility |
 |---|---|
 | `__init__.py` | Runtime `__version__`, kept consistent with package and release metadata. |
-| `cli.py` | Argument parsing, public commands (`setup`, `doctor`, `peers`, `resolve`, `uninstall`), hidden provider hook/service entrypoints (`_`-prefixed), and per-tool MCP dispatch including tool schemas. |
+| `cli.py` | Argument parsing, public commands (`setup`, `doctor`, `peers`, `resolve`, `uninstall`), hidden provider hook/service entrypoints (`_`-prefixed), and per-tool MCP dispatch including tool schemas and public argument validation that runs before any discovery. |
 | `mcp_server.py` | The stdio MCP surface itself: bounded frame reading, JSON-RPC batch handling, strict initialize lifecycle, request-ID validation, ping, and `chat_send` argument normalization. |
 | `recipient.py` | Versioned opaque recipient endpoint tokens (`cac2.`): minting and strict parsing. A remote token pins session key + route generation to a stable Tailnet node; a local token pins them to the issuing state root. |
 | `core.py` | Route identity, content-free intent records, validation, private atomic persistence, state locks, and the private per-generation owner image anchor sidecar (`owner-<generation>.json`). This is where durable product state is defined. |
-| `runtime.py` | Hook registration, sender authentication, peer discovery, token minting during listing and re-attestation during send, local couriers, socket framing/transport, Codex native queue plumbing, owner image anchors (built at registration; read by the anchored owner checks), reply-readiness reporting. Largest module; several responsibilities share it. |
+| `runtime.py` | Hook registration, sender authentication, peer discovery, token minting during listing and re-attestation during send, local couriers (bounded per-connection worker seats; one serialized effect at a time, with admission fenced against shutdown acknowledgement and route rotation), socket framing/transport, Codex native queue plumbing, owner image anchors (built at registration; read by the anchored owner checks), reply-readiness reporting. Largest module; several responsibilities share it. |
 | `tailnet.py` | Tailscale IPv4 discovery/validation and port constants (`47071` product, `47072` local health). |
 | `tailnet_broker.py` | Owner-local broker: listener, admission, per-request authorization dispatch, refusal lane. |
 | `remote.py` / `transport.py` | Strict parsing and serialization of the trusted Tailnet envelope (`remote` parses inbound, `transport` builds outbound). |
@@ -76,7 +76,8 @@ alone proves that an active recipient consumed an envelope.
   token needs only its own endpoint to answer. There is no binding store —
   tokens are self-contained.
 - **Durable effects:** `core.py` intent store — event IDs, digests, statuses;
-  `resolve_by_owner` is the only owner disposition and never proves delivery.
+  `resolve_by_owner` is the only owner disposition and never proves delivery
+  or makes resending equivalent uncertain work safe.
 - **Owned configuration writes:** `install.py:_payloads` and the transaction
   layer around it; backups in `_backup` under `~/.cache/cross-agent-chat/`.
 - **Message bodies:** transient gate file (`claude_runtime.py`), courier
@@ -90,7 +91,7 @@ alone proves that an active recipient consumed an envelope.
 | State/identity/recipient tokens | `test_core.py`, `test_recipient_binding.py`, `test_recipient_selection.py`, `test_issue9_regressions.py` |
 | Owner anchor / update continuity | `test_owner_anchor.py` |
 | MCP protocol/tools | `test_mcp.py`, `test_mcp_protocol.py`, `test_native_helper_mcp.py` |
-| Broker/transport | `test_broker_admission.py`, `test_broker_peek.py`, `test_tailnet.py`, `test_transport.py`, `test_transport_deadlines.py` |
+| Broker/transport/courier seats | `test_broker_admission.py`, `test_broker_peek.py`, `test_courier_liveness.py`, `test_tailnet.py`, `test_transport.py`, `test_transport_deadlines.py` |
 | Providers | `test_claude_remote.py`, `test_claude_runtime.py`, `test_claude_registration_cwd.py`, `test_codex.py`, `test_devin.py`, `test_native_*.py`, `test_sender_preflight_retry.py` |
 | Installer | `test_install.py`, `test_install_selection.py` |
 | Misc | `conftest.py` (containment boundary), `bench_intent_history.py` |
