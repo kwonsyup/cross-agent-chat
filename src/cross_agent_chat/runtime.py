@@ -57,6 +57,7 @@ from cross_agent_chat.codex import (
     native_thread_titles,
 )
 from cross_agent_chat.core import (
+    CODEX_ALIAS_DIGEST_LENGTH,
     MAX_MESSAGE_BYTES,
     SCHEMA_VERSION,
     ChatError,
@@ -3672,6 +3673,15 @@ def _target_handle_token(root: Path, target: Target) -> str | None:
     return local_token(root, target.session_key, target.generation)
 
 
+def _devin_display_title(key: str) -> str:
+    """Stand in for the provider title Devin does not expose: the exact
+    session key's short digest, in the same display length the Codex alias
+    uses. Stable for one session and self-evidently synthetic, so it can
+    never be mistaken for a provider title or used as authority."""
+
+    return f"session {key[:CODEX_ALIAS_DIGEST_LENGTH]}"
+
+
 def peers(
     root: Path,
     *,
@@ -3685,6 +3695,14 @@ def peers(
     query: str | None = None,
 ) -> dict[str, object]:
     display_titles = not internal or include_title
+    wanted = (
+        None
+        if query is None
+        # A malformed query is refused before any probe or remote discovery
+        # can run; the MCP boundary validates the same argument earlier for
+        # its own callers.
+        else valid_name(query, "peer query").casefold()
+    )
     deadline = time.monotonic() + (
         REMOTE_DISCOVERY_TIMEOUT_SECONDS if include_remote else LOCAL_DISCOVERY_TIMEOUT_SECONDS
     )
@@ -3731,12 +3749,20 @@ def peers(
         if internal:
             item["generation"] = target.generation
             item["session_key"] = target.session_key
+        if target.provider == "devin" and target.title is None and (not internal or include_title):
+            # Devin carries no provider title, so same-cwd Devin rows would be
+            # indistinguishable. The label is derived from the exact session
+            # key like the Codex alias digest: a display hint only, never a
+            # selector -- a truncated-digest collision stays ambiguous because
+            # nothing selects by it, and exact handles plus generation checks
+            # remain authoritative. Emitting inside the title gate keeps the
+            # strict broker reader shape for title-disabled listings.
+            item["title"] = _devin_display_title(target.session_key)
         items.append(item)
     total = len(items)
-    if query is not None:
+    if wanted is not None:
         # The full listing is produced first and only then narrowed, so a
         # query never changes what discovery probed.
-        wanted = valid_name(query, "peer query").casefold()
         items = [
             item
             for item in items
@@ -3767,8 +3793,20 @@ def sender_readiness(
 def sender_readiness_for_route(root: Path, source: Route) -> dict[str, str]:
     """Check one already-authenticated source route without PID re-resolution."""
 
+    # A Devin sender gets the same session label its roster row carries, so
+    # it can tell itself apart among same-alias peers; other provider shapes
+    # stay exactly as they were.
+    label = (
+        {"title": _devin_display_title(session_key(source.provider, source.session_id))}
+        if source.provider == "devin"
+        else {}
+    )
     if not _route_current(root, source):
-        return {"status": "unavailable", "reason": "registered sender route is not current"}
+        return {
+            "status": "unavailable",
+            "reason": "registered sender route is not current",
+            **label,
+        }
     try:
         response = request_socket(
             socket_path(root, source),
@@ -3780,10 +3818,10 @@ def sender_readiness_for_route(root: Path, source: Route) -> dict[str, str]:
             timeout=HEALTH_TIMEOUT_SECONDS,
         )
     except ChatError:
-        return {"status": "unavailable", "reason": "sender courier is unavailable"}
+        return {"status": "unavailable", "reason": "sender courier is unavailable", **label}
     if response.get("status") != "READY" or response.get("generation") != source.generation:
-        return {"status": "unavailable", "reason": "sender courier is not ready"}
-    return {"status": "ready"}
+        return {"status": "unavailable", "reason": "sender courier is not ready", **label}
+    return {"status": "ready", **label}
 
 
 ReplyDelivery = Literal["while_idle", "next_turn", "unknown"]
