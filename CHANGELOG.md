@@ -14,9 +14,10 @@
   outlived a shutdown acknowledgement or a route generation change is refused
   with a decided pre-effect rejection ("session courier stopped before
   admitting a delivery") and can never start a delivery. An effect admitted
-  just before the stop may still drain; shutdown acknowledges promptly and the
-  drain is bounded by the in-flight provider work's own timeouts, not a
-  separate hard deadline.
+  just before the stop may still drain; shutdown acknowledgement does not
+  wait on non-admitted work, and the drain waits only on already-serving
+  seats under their own request/provider timeouts — there is no separate
+  shutdown deadline promising when every seat finishes.
 - Still one delivery effect at a time per courier. A second `accept` while one
   is in flight gets a decided typed pre-effect refusal ("session courier is
   busy with another delivery"), and a local sender or the remote receive side
