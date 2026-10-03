@@ -325,7 +325,9 @@ def _chat_peers_call(identifier: int, arguments: dict[str, object]) -> dict[str,
 def _tool_result_payload(response: dict[str, object]) -> dict[str, object]:
     result = response["result"]
     assert isinstance(result, dict)
-    return json.loads(result["content"][0]["text"])
+    payload: object = json.loads(result["content"][0]["text"])
+    assert isinstance(payload, dict)
+    return payload
 
 
 def test_chat_peers_query_filters_alias_and_title_and_reports_scope(
@@ -353,20 +355,26 @@ def test_chat_peers_query_filters_alias_and_title_and_reports_scope(
     unfiltered = _tool_result_payload(responses[1])
     # The no-argument response keeps its exact prior shape: no filter key.
     assert set(unfiltered) == {"schema_version", "peers", "remote_discovery", "sender"}
-    assert len(unfiltered["peers"]) == 3
+    unfiltered_peers = unfiltered["peers"]
+    assert isinstance(unfiltered_peers, list)
+    assert len(unfiltered_peers) == 3
 
     by_alias = _tool_result_payload(responses[2])
     assert by_alias["filter"] == {"query": "kluro", "matched": 2, "of": 3}
-    assert {peer["alias"] for peer in by_alias["peers"]} == {
+    by_alias_peers = by_alias["peers"]
+    assert isinstance(by_alias_peers, list)
+    assert {peer["alias"] for peer in by_alias_peers} == {
         "claude@imac:Projects:W_Kluro_2Oct1PM",
         "codex@imac:kwonsyup:662c7d4d031e",
     }
     # Filtering never drops the opaque handle needed to address the peer.
-    assert all(isinstance(peer["handle"], str) for peer in by_alias["peers"])
+    assert all(isinstance(peer["handle"], str) for peer in by_alias_peers)
 
     by_title = _tool_result_payload(responses[3])
     assert by_title["filter"] == {"query": "e_kluro", "matched": 1, "of": 3}
-    assert [peer["alias"] for peer in by_title["peers"]] == ["codex@imac:kwonsyup:662c7d4d031e"]
+    by_title_peers = by_title["peers"]
+    assert isinstance(by_title_peers, list)
+    assert [peer["alias"] for peer in by_title_peers] == ["codex@imac:kwonsyup:662c7d4d031e"]
 
 
 def test_chat_peers_rejects_malformed_query_arguments(

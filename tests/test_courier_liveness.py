@@ -22,6 +22,11 @@ import pytest
 
 from cross_agent_chat import runtime
 from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, session_key
+from cross_agent_chat.native_helper import (
+    NATIVE_QUEUE_BINARY_ENV_VAR,
+    NATIVE_QUEUE_ENV_VALUE,
+    NATIVE_QUEUE_ENV_VAR,
+)
 from cross_agent_chat.recipient import local_token
 from cross_agent_chat.runtime import courier_server, request_socket
 from cross_agent_chat.transport import remote_envelope
@@ -167,10 +172,15 @@ def _counted_accept_frames(monkeypatch: pytest.MonkeyPatch, attempts: list[str])
     """Record every accept frame sent, whether admitted or busy-rejected."""
     real_request = runtime.request_socket
 
-    def counted(path: Path, payload: dict[str, object], **kwargs: object) -> dict[str, object]:
+    def counted(
+        path: Path,
+        payload: dict[str, object],
+        *,
+        timeout: float = runtime.SOCKET_TIMEOUT_SECONDS,
+    ) -> dict[str, object]:
         if payload.get("operation") == "accept":
             attempts.append(str(payload["event_id"]))
-        return real_request(path, payload, **kwargs)
+        return real_request(path, payload, timeout=timeout)
 
     monkeypatch.setattr(runtime, "request_socket", counted)
 
@@ -521,7 +531,7 @@ def test_remote_receive_retries_busy_courier_with_one_authorization(
     _counted_accept_frames(monkeypatch, attempts)
     authorize_calls: list[dict[str, object]] = []
 
-    def authorize(_address: str, payload: dict[str, object], **_: object) -> dict:
+    def authorize(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         authorize_calls.append(payload)
         return {k: v for k, v in payload.items() if k != "operation"} | {"status": "AUTHORIZED"}
 
@@ -742,8 +752,8 @@ def test_codex_native_accept_does_not_block_queue_controls(
     )
     root = tmp_path / "state"
     Registry(root).upsert(item)
-    monkeypatch.setenv(runtime.NATIVE_QUEUE_ENV_VAR, runtime.NATIVE_QUEUE_ENV_VALUE)
-    monkeypatch.setenv(runtime.NATIVE_QUEUE_BINARY_ENV_VAR, sys.executable)
+    monkeypatch.setenv(NATIVE_QUEUE_ENV_VAR, NATIVE_QUEUE_ENV_VALUE)
+    monkeypatch.setenv(NATIVE_QUEUE_BINARY_ENV_VAR, sys.executable)
     rpc_entered = threading.Event()
     release_rpc = threading.Event()
     rpc_calls: list[str] = []
