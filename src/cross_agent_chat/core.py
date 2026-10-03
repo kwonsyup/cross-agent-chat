@@ -169,7 +169,10 @@ def bounded_message(message: str) -> str:
 # REMOTE_AUTHORIZED row older than this is probably an orphan: a live operation
 # would normally have marked it. Elapsed time is a heuristic, not proof -- a
 # suspended host can resume and record its result later, and that result then
-# replaces any owner disposition. The margin covers clock skew and a slow write.
+# replaces any owner disposition. Deadline room only ever permits an attempt to
+# begin; it cannot promise a definitive answer, so a receipt lost after possible
+# acceptance stays legitimately UNKNOWN_DELIVERY rather than a guessed outcome.
+# The margin covers clock skew and a slow write.
 ABANDONED_INTENT_SECONDS: Final = 600.0
 
 
@@ -757,11 +760,15 @@ class IntentStore:
                     fail(
                         "target has an unresolved delivery intent from this sender: "
                         f"event {blocker.event_id} is still {blocker.status} "
-                        f"({int(age)}s old, past the {int(ABANDONED_INTENT_SECONDS)}s "
-                        "bound a live send can hold it for); this attempt created no "
-                        "intent and sent nothing; if that send is gone, run "
-                        f"`cross-agent-chat resolve {blocker.event_id}` to record "
-                        "your acceptance of its uncertain outcome before sending again"
+                        f"({int(age)}s old -- probably orphaned, though age alone "
+                        "does not prove its send finished or failed); this attempt "
+                        "created no intent and sent nothing; it refuses only "
+                        "another send from this session to this target, so "
+                        "unrelated work still proceeds; if you accept that "
+                        "event's uncertain outcome, record your disposition with "
+                        f"`cross-agent-chat resolve {blocker.event_id}` -- a "
+                        "disposition cancels nothing and does not make that "
+                        "work safe to send again"
                     )
                 fail(
                     "target has an unresolved delivery intent from this sender: "
@@ -887,7 +894,9 @@ class IntentStore:
                     fail(
                         f"event {event_id} is {current.status} and only "
                         f"{int(age)}s old, so it may still be in flight; wait until it "
-                        f"is at least {int(ABANDONED_INTENT_SECONDS)}s old, then resolve"
+                        f"is at least {int(ABANDONED_INTENT_SECONDS)}s old -- a "
+                        "heuristic orphan test, not proof the send is gone -- then "
+                        "resolve"
                     )
             self._write_status(existing, event_id, "RESOLVED_BY_OWNER")
             return current.status
