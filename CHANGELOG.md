@@ -1,19 +1,22 @@
 # Changelog
 
-## 0.4.8 - 2026-10-02
+## 0.4.8 - 2026-10-03
 
-- A courier's control plane stays responsive while one provider delivery is in
-  flight. The accept loop previously served each connection to completion, so a
-  slow `SendMessage` held health probes, shutdown, and every other request in
-  the socket backlog until their own deadlines died, and listers reported the
-  live peer as "unavailable or changed". The single in-flight delivery now runs
-  on one bounded worker while health, bootstrap, peek, ack, native dispatch,
-  and shutdown acknowledgement keep answering; courier queue state is
-  serialized inside the courier itself. Stopping acknowledges first and then
-  waits for the in-flight delivery to finish; that wait is bounded by the
-  delivery's own provider timeouts and cleanup, not by a separate shutdown
-  deadline. The listener backlog rises from 4 to 16, matching the broker; a
-  burst larger than the backlog can still be refused.
+- Every courier connection's whole service — frame read, provider inventory,
+  queue control, or delivery — now runs on one bounded worker seat, so a slow
+  provider call, a held native-queue RPC, or a trickled partial frame occupies
+  one seat and never the listener. Seat count matches the 16-connection
+  backlog; overflow accepts get a bounded read and the same decided no-effect
+  busy answer, and beyond a small bounded refusal pool a connection closes
+  before a request byte is read, so no effect is possible. Delivery effects
+  stay serialized on one non-blocking lock.
+- New effect admission is fenced at a short recheck: a frame whose read
+  outlived a shutdown acknowledgement or a route generation change is refused
+  with a decided pre-effect rejection ("session courier stopped before
+  admitting a delivery") and can never start a delivery. An effect admitted
+  just before the stop may still drain; shutdown acknowledges promptly and the
+  drain is bounded by the in-flight provider work's own timeouts, not a
+  separate hard deadline.
 - Still one delivery effect at a time per courier. A second `accept` while one
   is in flight gets a decided typed pre-effect refusal ("session courier is
   busy with another delivery"), and a local sender or the remote receive side
@@ -47,8 +50,33 @@
 - A send whose bounded pre-effect retry pause spends the last deadline room
   now marks its intent `PRE_EFFECT_REJECTED` and raises the decided
   busy/capacity error instead of leaving the row pending.
+- A Codex native-queue body already handed to the managed helper before a
+  late notification refusal stays uncertain rather than being recorded as no
+  effect — the event keeps its UNKNOWN custody instead of inviting a replay.
+- `resolve` stays an owner's disposition of an undecided event only: it
+  neither cancels the work nor makes resending equivalent uncertain work
+  safe.
+- Devin peer rows now carry a descriptive title built from a stable opaque
+  session label (Devin exposes no per-session provider title to hooks), and
+  the caller's own session gets the same label so a Devin session can
+  identify its own row among peers sharing a directory alias. Titles are
+  display hints only — the exact handle still selects, persisted aliases are
+  unchanged, and the remote listing carries no new field.
+- Malformed `chat_peers` arguments — unknown fields or a non-string `query`
+  including explicit null — are refused before any local probe or remote
+  discovery; an omitted `query` still lists the complete roster, and a
+  well-formed `query` narrows that complete listing as before.
+- Caller guidance corrected: only an explicit decided no-effect refusal
+  proves a refused send delivered nothing; any other error can carry an
+  uncertain effect, so the no-replay rule holds across a new event id,
+  recipient, or provider. Consumption is evidenced by the original session's
+  own use or action — a missing reply proves nothing and another peer's
+  report stays second-hand.
 - Verification for this release is contained: the test suite, static checks,
-  and a packaging smoke. No live fleet journey was run for 0.4.8.
+  and a packaging smoke. These corrections are source-qualified only; no new
+  live fleet journey was run for 0.4.8, and the Codex Native active/idle
+  result stays scoped to the 0.4.7 verification (app 26.928.21956, Codex
+  0.159.2).
 
 ## 0.4.7 - 2026-09-30
 
