@@ -524,7 +524,8 @@ def _mcp_tools(provider: str, presence_enabled: bool) -> list[dict[str, object]]
                 "its query, matched count, and total. "
                 "Titles and short display hints are "
                 "descriptive and never authoritative: "
-                "only the exact handle selects. "
+                "selection needs an exact handle or "
+                "one uniquely matching full alias. "
                 "Sender readiness is separate from "
                 "recipient availability."
             ),

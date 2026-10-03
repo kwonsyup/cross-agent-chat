@@ -61,8 +61,9 @@
   session label (Devin exposes no per-session provider title to hooks), and
   the caller's own session gets the same label so a Devin session can
   identify its own row among peers sharing a directory alias. Titles are
-  display hints only — the exact handle still selects, persisted aliases are
-  unchanged, and the remote listing carries no new field.
+  display hints only — an exact handle or one uniquely matching full alias
+  still selects, persisted aliases are unchanged, and the remote listing
+  carries no new field.
 - Malformed `chat_peers` arguments — unknown fields or a non-string `query`
   including explicit null — are refused before any local probe or remote
   discovery; an omitted `query` still lists the complete roster, and a

@@ -150,8 +150,8 @@ narrows the same listing by case-insensitive substring on alias and title —
 a malformed value is refused before any probing — and `chat_send` also
 resolves one peer's exact alias, refusing when it matches zero or several.
 Peer rows may show a descriptive title; a Devin row's is a stable opaque
-session label, not a provider title. Titles are display hints only — the
-exact handle still selects.
+session label, not a provider title. Titles are display hints only — an
+exact handle or one uniquely matching full alias still selects.
 
 `chat_send` reports `TRANSPORT_ACCEPTED` (custody, not a read receipt — do
 not re-send), a pre-delivery refusal (nothing was handed over; correcting
