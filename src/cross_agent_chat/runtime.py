@@ -2103,6 +2103,13 @@ def courier_server(
                         )
                     except OSError:
                         return
+                    # Readiness publishes only after its acknowledgement was
+                    # delivered: a failed emit must never leave the courier
+                    # admitting effects no caller could have asked for, and an
+                    # accept landing in the narrow emit-to-publish window earns
+                    # only a decided retryable refusal, never a wrong effect.
+                    # The denying transition (shutdown) publishes in the
+                    # opposite order for the same reason.
                     bootstrapped.set()
                 elif operation == "health":
                     if not bootstrapped.is_set():
@@ -2136,8 +2143,16 @@ def courier_server(
                             ),
                         )
                 elif operation == "shutdown":
-                    emit_frame_safely(connection, {"schema_version": 1, "status": "STOPPED"})
+                    # Publish the stop BEFORE its acknowledgement: the accept
+                    # admission recheck reads this flag, so any caller that has
+                    # observed STOPPED can never race a worker that still sees
+                    # a running courier into starting a new effect. Emitting
+                    # first would leave an observable window -- acknowledged
+                    # yet still admitting -- which is not already-admitted
+                    # drain. If the emit fails the stop still stands, which is
+                    # the safe direction.
                     stopping.set()
+                    emit_frame_safely(connection, {"schema_version": 1, "status": "STOPPED"})
                 elif operation == "accept":
                     event_id = request.get("event_id")
                     message = request.get("message")
@@ -2160,13 +2175,17 @@ def courier_server(
                         )
                     elif accept_lock.acquire(blocking=False):
                         try:
-                            # Admission is the linearization point: a frame
-                            # whose read outlived a shutdown acknowledgement or
-                            # this route's exact generation can no longer start
-                            # an effect, while an effect admitted just before
-                            # the stop may still drain. The recheck reads only
-                            # local registry state, so provider I/O stays
-                            # outside the lock and shutdown stays prompt.
+                            # Admission is the linearization point, and the
+                            # shutdown branch publishes `stopping` before its
+                            # STOPPED acknowledgement, so a frame admitted to a
+                            # worker seat before the stop but never
+                            # effect-admitted can no longer start an effect
+                            # once STOPPED is observable. A generation
+                            # replacement fails the same recheck, while an
+                            # effect admitted just before the stop may still
+                            # drain. The recheck reads only local registry
+                            # state, so provider I/O stays outside the lock
+                            # and shutdown stays prompt.
                             if stopping.is_set() or not _route_current(root, route):
                                 try:
                                     identifier = valid_uuid(event_id, "event id")

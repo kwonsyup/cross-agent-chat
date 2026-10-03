@@ -1196,6 +1196,76 @@ def test_an_incomplete_accept_cannot_start_an_effect_after_shutdown(
     assert not worker.is_alive()
 
 
+def test_a_frame_completed_while_stopped_is_being_emitted_stays_pre_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Observed STOPPED must never coexist with a still-admitting courier.
+
+    The emitter is wrapped so that after the real STOPPED bytes are written
+    it parks on a barrier before returning. On the old ordering the stop
+    flag was published only after that emit returned, so a caller holding a
+    STOPPED response while the emitter was held could race a held accept
+    frame into ``sendmessage`` -- a new effect after acknowledgement, not
+    admitted-before-stop drain. Publishing the flag first makes the decided
+    refusal below unconditional; zero provider calls is the repair evidence.
+    """
+    item = _route(tmp_path)
+    root = tmp_path / "state"
+    Registry(root).upsert(item)
+    monkeypatch.setattr(runtime, "exact_agent", lambda *_a, **_k: _agent_view(item))
+    monkeypatch.setattr(runtime, "discover_target_ref", lambda _name: "API A [ref]")
+    send_calls: list[str] = []
+    monkeypatch.setattr(runtime, "sendmessage", lambda _r, _m, _e: send_calls.append(_r))
+    emitter_held = threading.Event()
+    release_emitter = threading.Event()
+    real_emit_safely = runtime.emit_frame_safely
+
+    def held_emit(connection: socket.socket, payload: dict[str, object]) -> None:
+        if payload.get("status") == "STOPPED":
+            real_emit_safely(connection, payload)
+            emitter_held.set()
+            release_emitter.wait(timeout=30.0)
+        else:
+            real_emit_safely(connection, payload)
+
+    monkeypatch.setattr(runtime, "emit_frame_safely", held_emit)
+    worker = _start_courier(root, item)
+    event_id = str(uuid4())
+    partial, tail = _partial_accept(root, item, event_id, "post-ack delivery")
+    shutdown = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    shutdown.settimeout(30.0)
+    shutdown.connect(str(runtime.socket_path(root, item)))
+    try:
+        _bootstrap(root, item)
+        shutdown.sendall(
+            (
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "operation": "shutdown",
+                        "generation": item.generation,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode()
+        )
+        stopped: dict[str, object] = json.loads(runtime.read_frame(shutdown))
+        assert stopped == {"schema_version": 1, "status": "STOPPED"}
+        # The caller has observed STOPPED while the emitter is provably still
+        # parked; under the old order the stop flag is still unpublished here.
+        assert emitter_held.wait(timeout=5.0)
+        partial.sendall(tail)
+        _read_stopped_refusal(partial, event_id)
+        assert send_calls == []
+    finally:
+        release_emitter.set()
+        partial.close()
+        shutdown.close()
+        worker.join(timeout=30.0)
+    assert not worker.is_alive()
+
+
 def test_an_incomplete_accept_cannot_start_an_effect_after_route_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
