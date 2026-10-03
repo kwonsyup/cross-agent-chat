@@ -7,6 +7,7 @@ import json
 import os
 import selectors
 import subprocess
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -384,6 +385,11 @@ class CodexCourier:
         self.native_helper = native_helper
         self.provider = provider
         self._pending: OrderedDict[str, str] = OrderedDict()
+        # The courier listener and the one delivery worker share this queue, so
+        # every read or mutation takes the short lock; the native-queue RPC in
+        # accept is deliberately outside it so queue controls never wait on a
+        # provider call.
+        self._lock = threading.Lock()
 
     def accept(self, event_id: str, message: str) -> dict[str, object]:
         identifier = valid_uuid(event_id, "event id")
@@ -391,23 +397,24 @@ class CodexCourier:
         if self.native_queue is not None:
             newly_admitted = False
             if self.native_helper:
-                if identifier in self._pending:
-                    if self._pending[identifier] != body:
-                        raise UnknownDeliveryError(
-                            "Codex courier event conflicts with a pending message"
-                        )
-                    return {
-                        "schema_version": 1,
-                        "event_id": identifier,
-                        "status": "TRANSPORT_ACCEPTED",
-                        "to": self.alias,
-                        "provider": "codex",
-                    }
-                elif len(self._pending) >= self.capacity:
-                    raise ChatError("Codex courier queue is full")
-                else:
-                    self._pending[identifier] = body
-                    newly_admitted = True
+                with self._lock:
+                    if identifier in self._pending:
+                        if self._pending[identifier] != body:
+                            raise UnknownDeliveryError(
+                                "Codex courier event conflicts with a pending message"
+                            )
+                        return {
+                            "schema_version": 1,
+                            "event_id": identifier,
+                            "status": "TRANSPORT_ACCEPTED",
+                            "to": self.alias,
+                            "provider": "codex",
+                        }
+                    elif len(self._pending) >= self.capacity:
+                        raise ChatError("Codex courier queue is full")
+                    else:
+                        self._pending[identifier] = body
+                        newly_admitted = True
             binary, environment, thread_id = self.native_queue
             try:
                 queue_native_input(
@@ -428,7 +435,8 @@ class CodexCourier:
                 raise
             except ChatError:
                 if newly_admitted:
-                    del self._pending[identifier]
+                    with self._lock:
+                        self._pending.pop(identifier, None)
                 raise
             return {
                 "schema_version": 1,
@@ -437,13 +445,16 @@ class CodexCourier:
                 "to": self.alias,
                 "provider": self.provider,
             }
-        if identifier in self._pending:
-            if self._pending[identifier] != body:
-                raise UnknownDeliveryError("Codex courier event conflicts with a pending message")
-        elif len(self._pending) >= self.capacity:
-            raise ChatError("Codex courier queue is full")
-        else:
-            self._pending[identifier] = body
+        with self._lock:
+            if identifier in self._pending:
+                if self._pending[identifier] != body:
+                    raise UnknownDeliveryError(
+                        "Codex courier event conflicts with a pending message"
+                    )
+            elif len(self._pending) >= self.capacity:
+                raise ChatError("Codex courier queue is full")
+            else:
+                self._pending[identifier] = body
         return {
             "schema_version": 1,
             "event_id": identifier,
@@ -455,54 +466,59 @@ class CodexCourier:
     def peek(self) -> list[dict[str, str]]:
         """Return the oldest whole messages that fit in one courier response."""
         messages: list[dict[str, str]] = []
-        for event_id, message in self._pending.items():
-            candidate = [*messages, {"event_id": event_id, "message": message}]
-            response = {
-                "schema_version": 1,
-                "status": "PEEKED",
-                "generation": self.generation,
-                "messages": candidate,
-            }
-            encoded = (
-                json.dumps(response, separators=(",", ":"), ensure_ascii=False) + "\n"
-            ).encode()
-            continuation = (
-                json.dumps(
-                    {"decision": "block", "reason": hook_context(candidate)},
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                )
-                + "\n"
-            ).encode()
-            if max(len(encoded), len(continuation)) > MAX_PEEK_FRAME_BYTES:
-                if not messages:
-                    raise ChatError("Codex courier message exceeds the bounded frame")
-                break
-            messages = candidate
+        with self._lock:
+            for event_id, message in self._pending.items():
+                candidate = [*messages, {"event_id": event_id, "message": message}]
+                response = {
+                    "schema_version": 1,
+                    "status": "PEEKED",
+                    "generation": self.generation,
+                    "messages": candidate,
+                }
+                encoded = (
+                    json.dumps(response, separators=(",", ":"), ensure_ascii=False) + "\n"
+                ).encode()
+                continuation = (
+                    json.dumps(
+                        {"decision": "block", "reason": hook_context(candidate)},
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                ).encode()
+                if max(len(encoded), len(continuation)) > MAX_PEEK_FRAME_BYTES:
+                    if not messages:
+                        raise ChatError("Codex courier message exceeds the bounded frame")
+                    break
+                messages = candidate
         return messages
 
     def acknowledge(self, event_ids: list[str]) -> None:
-        if len(set(event_ids)) != len(event_ids):
-            raise ChatError("Codex courier acknowledgement is invalid")
-        if any(event_id not in self._pending for event_id in event_ids):
-            raise ChatError("Codex courier acknowledgement is stale")
-        for event_id in event_ids:
-            del self._pending[event_id]
+        with self._lock:
+            if len(set(event_ids)) != len(event_ids):
+                raise ChatError("Codex courier acknowledgement is invalid")
+            if any(event_id not in self._pending for event_id in event_ids):
+                raise ChatError("Codex courier acknowledgement is stale")
+            for event_id in event_ids:
+                del self._pending[event_id]
 
     def native_dispatch_message(self, event_id: str) -> str:
         """Read one opaque event while its durable native claim is prepared."""
 
         identifier = valid_uuid(event_id, "event id")
-        try:
-            return self._pending[identifier]
-        except KeyError as error:
-            raise ChatError("native helper dispatch is unavailable") from error
+        with self._lock:
+            try:
+                return self._pending[identifier]
+            except KeyError as error:
+                raise ChatError("native helper dispatch is unavailable") from error
 
     def pending_ids(self) -> list[str]:
-        return list(self._pending)
+        with self._lock:
+            return list(self._pending)
 
     def clear(self) -> None:
-        self._pending.clear()
+        with self._lock:
+            self._pending.clear()
 
 
 def hook_context(messages: list[dict[str, str]]) -> str:

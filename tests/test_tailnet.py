@@ -3033,6 +3033,71 @@ def test_remote_node_targets_retries_capacity_then_returns_targets(
     assert all(call == calls[0] for call in calls)
 
 
+def test_remote_send_deadline_dying_in_the_retry_pause_ends_decided(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recompute that finds no room after the pause still marks the row."""
+    source = _remote_send_source(tmp_path)
+    target = _remote_target()
+    calls: list[dict[str, object]] = []
+
+    def broker(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        calls.append(payload)
+        return dict(BROKER_CAPACITY_REFUSAL)
+
+    monkeypatch.setattr(runtime, "request_tailnet", broker)
+
+    def burning_pause(_deadline: float, delay: float) -> float | None:
+        # The sleep itself spends the rest of this send's deadline, so the
+        # next attempt's budget recompute raises after the pause returned.
+        time.sleep(0.6)
+        return delay
+
+    monkeypatch.setattr(runtime, "_pre_effect_retry_pause", burning_pause)
+
+    with pytest.raises(ChatError) as caught:
+        runtime._send_remote_target(
+            tmp_path,
+            source,
+            target,
+            "hello",
+            deadline=time.monotonic() + 0.5,
+            self_node_id="nSelf",
+        )
+
+    assert not isinstance(caught.value, UnknownDeliveryError)
+    assert str(caught.value) == (
+        "recipient broker is at capacity; nothing was delivered; send again"
+    )
+    # The deadlined retry never emitted a second frame, and the intent ends
+    # decided rather than parked PENDING.
+    assert len(calls) == 1
+    assert [row.status for row in IntentStore(tmp_path).intents()] == ["PRE_EFFECT_REJECTED"]
+
+
+def test_remote_node_targets_deadline_dying_in_the_pause_stays_precise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pause that consumes the deadline still reports the proven refusal."""
+    monkeypatch.setattr(runtime, "request_tailnet", lambda *_a, **_k: dict(BROKER_CAPACITY_REFUSAL))
+
+    def burning_pause(_deadline: float, delay: float) -> float | None:
+        # The sleep itself spends the rest of the discovery deadline.
+        time.sleep(0.6)
+        return delay
+
+    monkeypatch.setattr(runtime, "_pre_effect_retry_pause", burning_pause)
+
+    with pytest.raises(ChatError) as caught:
+        runtime._remote_node_targets(
+            "100.64.0.10", deadline=time.monotonic() + 0.5, handle="f" * 64
+        )
+
+    assert str(caught.value) == (
+        "recipient broker is at capacity; nothing was delivered; send again"
+    )
+
+
 def test_wrapped_message_limit_rejects_before_intent_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

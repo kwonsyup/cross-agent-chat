@@ -492,3 +492,42 @@ def test_chat_send_refuses_an_ambiguous_alias_before_effect(
     assert response["result"]["isError"] is True
     assert response["result"]["content"][0]["text"] == "target is ambiguous or unavailable"
     assert resolved == []
+
+
+def test_chat_send_refuses_a_fuzzy_only_alias_before_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The reported hazard: `...:Kluro` must not fuzzy-land on the W_ twin."""
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=1,
+    )
+    target = _discovered_target("claude@imac:Projects:W_Kluro_2Oct1PM", "d")
+    resolved = _stub_alias_send(monkeypatch, [target])
+    monkeypatch.setattr(cli, "authenticate_mcp_sender", lambda *_args: source)
+    monkeypatch.setattr(cli, "reply_delivery", lambda *_args: "unknown")
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "chat_send",
+            # A near alias that only fuzzy-matches the discovered peer.
+            "arguments": {"to": "claude@imac:Projects:Kluro", "message": "hi"},
+        },
+    }
+    monkeypatch.setattr("sys.stdin", _feed([*_handshake(), request]))
+
+    mcp("claude", "studio", str(root))
+
+    response = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert response["result"]["isError"] is True
+    assert response["result"]["content"][0]["text"] == (
+        "recipient is not an exact handle or exact alias of one discovered peer; "
+        "call chat_peers and choose the recipient"
+    )
+    assert resolved == []

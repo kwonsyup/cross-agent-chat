@@ -144,9 +144,9 @@ BOOTSTRAP_FRAME_TIMEOUT_SECONDS: Final = 0.1
 COURIER_BUSY_PRE_EFFECT_REASON: Final = "session courier is busy with another delivery"
 # Shared bounds for retrying a provably pre-effect refusal -- a busy courier or
 # a broker that refused admission before reading a request byte: the identical
-# frame may be re-sent inside the caller's own deadline, and a retry is issued
-# only while enough budget remains for the bounded attempt to answer decisively
-# rather than read-time out into an UNKNOWN outcome.
+# frame may be re-sent inside the caller's own deadline. The retry room only
+# guards whether another attempt may start; a late-admitted attempt whose
+# provider answer outlives the deadline still truthfully ends UNKNOWN.
 PRE_EFFECT_RETRY_SECONDS: Final = 0.25
 PRE_EFFECT_RETRY_MAX_SECONDS: Final = 1.0
 PRE_EFFECT_RETRY_ROOM_SECONDS: Final = 2.0
@@ -2041,16 +2041,16 @@ def courier_server(
     # Provider accepts can run for tens of seconds; they move to one bounded
     # worker so health, shutdown, and the queue controls keep answering. The
     # non-blocking lock keeps effects serialized: a second accept is rejected
-    # outright instead of queueing into an unbounded wait.
+    # outright instead of queueing into an unbounded wait. Shared courier queue
+    # state is protected inside CodexCourier itself, so no lock crosses the
+    # provider call.
     accept_lock = threading.Lock()
-    courier_lock = threading.Lock()
     accept_workers = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cross-agent-chat-accept")
 
     def serve_accept(connection: socket.socket, event_id: str, message: str) -> None:
         try:
             with connection:
-                with courier_lock:
-                    response = courier_accept(route, courier, event_id, message)
+                response = courier_accept(route, courier, event_id, message)
                 emit_frame_safely(connection, response)
         finally:
             accept_lock.release()
@@ -2177,8 +2177,7 @@ def courier_server(
                     ):
                         continue
                     try:
-                        with courier_lock:
-                            message = courier.native_dispatch_message(event_id)
+                        message = courier.native_dispatch_message(event_id)
                     except ChatError as error:
                         emit_frame_safely(
                             connection,
@@ -2209,8 +2208,7 @@ def courier_server(
                     ):
                         continue
                     try:
-                        with courier_lock:
-                            courier.acknowledge([event_id])
+                        courier.acknowledge([event_id])
                     except ChatError:
                         continue
                     emit_frame_safely(
@@ -2225,16 +2223,15 @@ def courier_server(
                 elif operation == "peek":
                     if courier is None:
                         continue
-                    with courier_lock:
-                        emit_frame_safely(
-                            connection,
-                            {
-                                "schema_version": 1,
-                                "status": "PEEKED",
-                                "generation": route.generation,
-                                "messages": courier.peek(),
-                            },
-                        )
+                    emit_frame_safely(
+                        connection,
+                        {
+                            "schema_version": 1,
+                            "status": "PEEKED",
+                            "generation": route.generation,
+                            "messages": courier.peek(),
+                        },
+                    )
                 elif operation == "ack":
                     if courier is None:
                         continue
@@ -2245,8 +2242,7 @@ def courier_server(
                         continue
                     try:
                         typed_ids = [cast(str, item) for item in identifiers]
-                        with courier_lock:
-                            courier.acknowledge(typed_ids)
+                        courier.acknowledge(typed_ids)
                         emit_frame_safely(
                             connection,
                             {"schema_version": 1, "status": "ACKNOWLEDGED", "event_ids": typed_ids},
@@ -2589,6 +2585,10 @@ def _remote_node_targets(
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                # A pause can consume the deadline after a proven refusal; the
+                # last decided answer still governs instead of a generic miss.
+                if capacity_refused:
+                    break
                 return [], False
             try:
                 raw = request_tailnet(
@@ -2598,15 +2598,17 @@ def _remote_node_targets(
                 )
             except (ChatError, UnknownDeliveryError):
                 raw = None
+                capacity_refused = False
                 break
             if raw != BROKER_CAPACITY_REFUSAL:
+                capacity_refused = False
                 break
             # Admission is refused before the broker reads a request byte, so
             # the identical read-only probe is safe to retry inside the
             # deadline; no payload variant could change the capacity answer.
+            capacity_refused = True
             paused = _pre_effect_retry_pause(deadline, retry_delay)
             if paused is None:
-                capacity_refused = True
                 break
             retry_delay = paused
         if capacity_refused:
@@ -2957,7 +2959,8 @@ def _pre_effect_retry_pause(deadline: float, delay: float) -> float | None:
     """Pause before resending a provably pre-effect-refused frame.
 
     Returns the next backoff delay, or None when the deadline no longer leaves
-    enough room for the retried attempt to answer decisively.
+    room for another attempt to start. An attempt admitted near the deadline
+    can still read out UNKNOWN; the room narrows that window, not closes it.
     """
     remaining = deadline - time.monotonic() - PRE_EFFECT_RETRY_ROOM_SECONDS
     if remaining <= 0:
@@ -3051,7 +3054,16 @@ def _send_local_target(
                 "deadline; nothing was delivered; send again"
             )
         retry_delay = paused
-        timeout = _remaining_operation_timeout(deadline, ACCEPT_TIMEOUT_SECONDS)
+        try:
+            timeout = _remaining_operation_timeout(deadline, ACCEPT_TIMEOUT_SECONDS)
+        except ChatError:
+            # The pause itself can spend the last retry room; the row must end
+            # decided, not PENDING, when no further attempt can start.
+            store.mark(event_id, "PRE_EFFECT_REJECTED")
+            raise ChatError(
+                "recipient stayed busy with another delivery until the send "
+                "deadline; nothing was delivered; send again"
+            ) from None
     delivery_expected = {
         "schema_version": 1,
         "event_id": event_id,
@@ -3196,7 +3208,13 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
     elif len(exact_aliases) > 1:
         raise ChatError("target is ambiguous or unavailable")
     else:
-        target = resolve_target([*local, *remote], target_query)
+        # MCP dispatch never fuzzy-matches a recipient: a near alias like
+        # "...:Kluro" could silently resolve to "...:W_Kluro_2Oct1PM". Zero
+        # exact matches refuse before any intent or provider effect.
+        raise ChatError(
+            "recipient is not an exact handle or exact alias of one discovered peer; "
+            "call chat_peers and choose the recipient"
+        )
     if not target.remote:
         return _send_local_target(root, source, target, message, deadline=deadline)
     if target.tailnet_node_id is None:
@@ -3297,7 +3315,15 @@ def _send_remote_target(
             store.mark(event_id, "PRE_EFFECT_REJECTED")
             raise ChatError("recipient broker is at capacity; nothing was delivered; send again")
         retry_delay = paused
-        timeout = _remaining_operation_timeout(deadline, REMOTE_TIMEOUT_SECONDS)
+        try:
+            timeout = _remaining_operation_timeout(deadline, REMOTE_TIMEOUT_SECONDS)
+        except ChatError:
+            # The pause itself can spend the last retry room; the row must end
+            # decided, not PENDING, when no further attempt can start.
+            store.mark(event_id, "PRE_EFFECT_REJECTED")
+            raise ChatError(
+                "recipient broker is at capacity; nothing was delivered; send again"
+            ) from None
     rejection = pre_effect_error(response, event_id, target.provider)
     if rejection is not None:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
@@ -3480,6 +3506,10 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
                 # still the decided pre-effect outcome for this event.
                 break
             retry_delay = paused
+            if deadline - time.monotonic() <= 0:
+                # The pause spent the last retry room; forward the proven busy
+                # rejection rather than a generic connect failure.
+                break
         delivery_expected: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "event_id": event_id,

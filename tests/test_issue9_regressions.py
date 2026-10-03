@@ -25,9 +25,10 @@ def _safe_uninstall(installer: Installer, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(installer, "_stop_couriers", lambda: None)
 
 
-def test_fuzzy_target_is_ambiguous_across_local_and_remote_peers(
+def test_non_exact_recipient_refuses_before_any_send(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A fuzzy-only query refuses pre-effect, even with candidate peers."""
     local = runtime.Target(
         alias="claude@m1:parser:alpha",
         provider="claude",
@@ -58,11 +59,76 @@ def test_fuzzy_target_is_ambiguous_across_local_and_remote_peers(
     monkeypatch.setattr(
         runtime,
         "_send_local_target",
-        lambda *args, **kwargs: pytest.fail("ambiguous query reached local delivery"),
+        lambda *args, **kwargs: pytest.fail("fuzzy query reached local delivery"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_send_remote_token_target",
+        lambda *args, **kwargs: pytest.fail("fuzzy query reached remote delivery"),
     )
 
-    with pytest.raises(ChatError, match="ambiguous"):
+    with pytest.raises(ChatError) as caught:
         runtime.send(tmp_path / "state", source, "claude parser", "synthetic probe")
+
+    assert str(caught.value) == (
+        "recipient is not an exact handle or exact alias of one discovered peer; "
+        "call chat_peers and choose the recipient"
+    )
+    # No intent row and no provider effect were created for the refused send.
+    assert not (tmp_path / "state").exists()
+
+
+def test_exact_alias_selects_the_shorter_twin_while_a_fuzzy_form_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`...:Kluro` binds its own peer; a fuzzy form must not land on the twin."""
+    plain = runtime.Target(
+        alias="claude@imac:Projects:Kluro",
+        provider="claude",
+        device="imac",
+        project="Projects",
+        generation=str(uuid4()),
+        session_key="a" * 64,
+        remote=False,
+    )
+    twin = runtime.Target(
+        alias="claude@imac:Projects:W_Kluro_2Oct1PM",
+        provider="claude",
+        device="imac",
+        project="Projects",
+        generation=str(uuid4()),
+        session_key="b" * 64,
+        remote=False,
+    )
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="m1",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    root = tmp_path / "state"
+    monkeypatch.setattr(runtime, "local_targets", lambda _: [plain, twin])
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
+    chosen: list[runtime.Target] = []
+
+    def deliver(
+        _root: Path, _source: Route, picked: runtime.Target, _message: str, **_kwargs: object
+    ) -> dict[str, object]:
+        chosen.append(picked)
+        return {"status": "TRANSPORT_ACCEPTED", "to": picked.alias}
+
+    monkeypatch.setattr(runtime, "_send_local_target", deliver)
+
+    # The exact alias -- even in a different case -- resolves its own peer,
+    # never the longer twin a fuzzy match could pick.
+    result = runtime.send(root, source, "CLAUDE@IMAC:PROJECTS:KLURO", "synthetic probe")
+    assert result["to"] == plain.alias
+    assert chosen == [plain]
+
+    with pytest.raises(ChatError, match="exact handle or exact alias"):
+        runtime.send(root, source, "kluro", "synthetic probe")
+    assert chosen == [plain]
 
 
 @pytest.mark.parametrize("alternate_only", ["claude", "codex"])
@@ -198,7 +264,7 @@ def test_exact_local_token_does_not_wait_for_remote_discovery(
     assert runtime.send(state_root, source, token, "synthetic probe") == expected
 
 
-def test_fuzzy_target_refuses_incomplete_remote_discovery_before_intent(
+def test_recipient_refuses_incomplete_remote_discovery_before_intent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = runtime.Target(
@@ -283,7 +349,7 @@ def test_remote_token_send_probes_only_the_pinned_node(
     assert len(responses) == 1
 
 
-def test_fuzzy_local_target_sends_after_complete_global_resolution(
+def test_exact_alias_local_target_sends_after_complete_global_resolution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = runtime.Target(
@@ -310,7 +376,7 @@ def test_fuzzy_local_target_sends_after_complete_global_resolution(
     monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
     monkeypatch.setattr(runtime, "_send_local_target", lambda *args, **kwargs: expected)
 
-    assert runtime.send(tmp_path / "state", source, "claude parser", "synthetic probe") == expected
+    assert runtime.send(tmp_path / "state", source, target.alias, "synthetic probe") == expected
 
 
 def test_shared_codex_config_with_distinct_hooks_fails_before_second_setup(

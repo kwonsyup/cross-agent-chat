@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import socket
 import stat
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -724,3 +725,149 @@ def test_two_senders_to_one_busy_target_each_complete_once(
     finally:
         release_accept.set()
         _stop_courier(root, item, worker)
+
+
+def test_codex_native_accept_does_not_block_queue_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held native-queue RPC must not freeze peek, health, or shutdown."""
+    project = tmp_path / "codex-project"
+    project.mkdir()
+    item = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(project),
+        pid=os.getpid(),
+    )
+    root = tmp_path / "state"
+    Registry(root).upsert(item)
+    monkeypatch.setenv(runtime.NATIVE_QUEUE_ENV_VAR, runtime.NATIVE_QUEUE_ENV_VALUE)
+    monkeypatch.setenv(runtime.NATIVE_QUEUE_BINARY_ENV_VAR, sys.executable)
+    rpc_entered = threading.Event()
+    release_rpc = threading.Event()
+    rpc_calls: list[str] = []
+
+    def held_queue_native_input(**kwargs: object) -> None:
+        rpc_calls.append(str(kwargs["event_id"]))
+        rpc_entered.set()
+        release_rpc.wait(timeout=30.0)
+
+    monkeypatch.setattr("cross_agent_chat.codex.queue_native_input", held_queue_native_input)
+    worker = _start_courier(root, item)
+    path = runtime.socket_path(root, item)
+    event_id = str(uuid4())
+    responses: list[dict[str, object]] = []
+    sender = threading.Thread(
+        target=lambda: responses.append(
+            _accept(root, item, event_id, "held native delivery", 30.0)
+        ),
+        daemon=True,
+    )
+    try:
+        _bootstrap(root, item)
+        sender.start()
+        assert rpc_entered.wait(10.0)
+        started = time.monotonic()
+        peeked = request_socket(
+            path,
+            {"schema_version": 1, "operation": "peek", "generation": item.generation},
+            timeout=5.0,
+        )
+        assert peeked["status"] == "PEEKED"
+        # A plain native delivery rides the provider queue, not the courier's
+        # pending list: the held event must never appear here, even once.
+        assert peeked["messages"] == []
+        health = request_socket(
+            path,
+            {"schema_version": 1, "operation": "health", "generation": item.generation},
+            timeout=5.0,
+        )
+        assert health["status"] == "READY"
+        stopped = request_socket(
+            path,
+            {"schema_version": 1, "operation": "shutdown", "generation": item.generation},
+            timeout=5.0,
+        )
+        assert stopped == {"schema_version": 1, "status": "STOPPED"}
+        # All three control-plane answers arrive while the RPC is still held.
+        assert time.monotonic() - started < 1.0
+        assert not release_rpc.is_set()
+    finally:
+        release_rpc.set()
+        sender.join(timeout=15.0)
+        worker.join(timeout=30.0)
+    assert not worker.is_alive()
+    # Exactly one native effect ran, for exactly the held event.
+    assert rpc_calls == [event_id]
+    assert responses == [
+        {
+            "schema_version": 1,
+            "event_id": event_id,
+            "status": "TRANSPORT_ACCEPTED",
+            "to": item.alias,
+            "provider": "codex",
+        }
+    ]
+
+
+def test_local_send_deadline_dying_in_the_retry_pause_ends_decided(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recompute that finds no room after the pause still marks the row."""
+    item = _route(tmp_path)
+    root = tmp_path / "state"
+    Registry(root).upsert(item)
+    source = _source_route(tmp_path)
+    Registry(root).upsert(source)
+    target = runtime.Target(
+        alias="claude@studio:project:API A",
+        provider="claude",
+        device="studio",
+        project="project",
+        generation=item.generation,
+        session_key=session_key(item.provider, item.session_id),
+        remote=False,
+        session_id=item.session_id,
+        cwd=item.cwd,
+        pid=item.pid,
+    )
+    calls: list[dict[str, object]] = []
+
+    def busy(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        calls.append(payload)
+        return {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "PRE_EFFECT_REJECTED",
+            "provider": "claude",
+            "error": runtime.COURIER_BUSY_PRE_EFFECT_REASON,
+        }
+
+    monkeypatch.setattr(runtime, "request_socket", busy)
+
+    def burning_pause(_deadline: float, delay: float) -> float | None:
+        # The sleep itself spends the rest of this send's deadline, so the
+        # next attempt's budget recompute raises after the pause returned.
+        time.sleep(0.6)
+        return delay
+
+    monkeypatch.setattr(runtime, "_pre_effect_retry_pause", burning_pause)
+
+    with pytest.raises(ChatError) as caught:
+        runtime._send_local_target(
+            root,
+            source,
+            target,
+            "retry with a dying deadline",
+            deadline=time.monotonic() + 0.5,
+        )
+
+    assert str(caught.value) == (
+        "recipient stayed busy with another delivery until the send "
+        "deadline; nothing was delivered; send again"
+    )
+    # The deadlined retry never emitted a second frame, and the intent ends
+    # decided rather than parked PENDING.
+    assert len(calls) == 1
+    assert [row.status for row in IntentStore(root).intents()] == ["PRE_EFFECT_REJECTED"]
