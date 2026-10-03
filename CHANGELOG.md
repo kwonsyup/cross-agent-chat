@@ -9,9 +9,11 @@
   live peer as "unavailable or changed". The single in-flight delivery now runs
   on one bounded worker while health, bootstrap, peek, ack, native dispatch,
   and shutdown acknowledgement keep answering; courier queue state is
-  serialized inside the courier itself, and stopping still drains the
-  in-flight delivery only within its provider deadline. The listener backlog
-  rises from 4 to 16, matching the broker.
+  serialized inside the courier itself. Stopping acknowledges first and then
+  waits for the in-flight delivery to finish; that wait is bounded by the
+  delivery's own provider timeouts and cleanup, not by a separate shutdown
+  deadline. The listener backlog rises from 4 to 16, matching the broker; a
+  burst larger than the backlog can still be refused.
 - Still one delivery effect at a time per courier. A second `accept` while one
   is in flight gets a decided typed pre-effect refusal ("session courier is
   busy with another delivery"), and a local sender or the remote receive side

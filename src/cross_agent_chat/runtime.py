@@ -2033,7 +2033,8 @@ def courier_server(
     )
     bound = path.lstat()
     # Many listers probe health at once while a delivery occupies the accept
-    # worker; the backlog matches the broker listener so none are refused.
+    # worker; the backlog matches the broker listener so an ordinary burst
+    # is queued rather than refused.
     server.listen(16)
     server.settimeout(1.0)
     stopping = False
