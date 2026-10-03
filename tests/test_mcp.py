@@ -403,6 +403,50 @@ def test_chat_peers_rejects_malformed_query_arguments(
     assert responses[4]["result"]["isError"] is True
 
 
+def test_chat_peers_rejects_a_malformed_query_before_any_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed public argument must be refused before local or remote work.
+
+    The query only narrows an already-collected listing, so a bad value used to
+    still pay the full local probe and remote discovery. The refusal has to run
+    first: any recorded probe here means the malformed call reached discovery.
+    """
+    root = tmp_path / "state"
+    probed: list[str] = []
+
+    def recorded_local(*_args: object, **_kwargs: object) -> list[Target]:
+        probed.append("local")
+        return []
+
+    def recorded_identity() -> None:
+        probed.append("tailnet")
+        return None
+
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", recorded_local)
+    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_identity", recorded_identity)
+    monkeypatch.setattr(
+        "sys.stdin", _feed([*_handshake(), _chat_peers_call(1, {"query": "bad\x00query"})])
+    )
+
+    mcp("claude", "studio", str(root))
+
+    response = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert response["result"]["isError"] is True
+    assert response["result"]["content"][0]["text"] == "peer query is invalid"
+    assert probed == []
+
+    # A well-formed query still reaches discovery and reports its filter scope.
+    monkeypatch.setattr(
+        "sys.stdin", _feed([*_handshake(), _chat_peers_call(2, {"query": "kluro"})])
+    )
+    mcp("claude", "studio", str(root))
+
+    filtered = _tool_result_payload(json.loads(capsys.readouterr().out.splitlines()[-1]))
+    assert filtered["filter"] == {"query": "kluro", "matched": 0, "of": 0}
+    assert probed.count("local") == 1
+
+
 def _stub_alias_send(monkeypatch: pytest.MonkeyPatch, targets: list[Target]) -> list[Target]:
     resolved: list[Target] = []
     monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda *_args, **_kwargs: targets)
