@@ -142,6 +142,13 @@ COURIER_STARTUP_SECONDS: Final = 15.0
 MAX_COURIER_DIAGNOSTIC_BYTES: Final = 1024
 BOOTSTRAP_FRAME_TIMEOUT_SECONDS: Final = 0.1
 COURIER_BUSY_PRE_EFFECT_REASON: Final = "session courier is busy with another delivery"
+# Each accepted courier connection gets one bounded worker seat for its whole
+# service -- frame read, provider inventory, queue control, or delivery -- so a
+# slow provider call or a trickled frame can never serialize the listener. The
+# seat count matches the listen backlog; beyond it a connection is refused.
+COURIER_CONNECTION_LIMIT: Final = 16
+COURIER_REFUSAL_WORKERS: Final = 4
+COURIER_REFUSAL_FRAME_SECONDS: Final = 1.0
 # Shared bounds for retrying a provably pre-effect refusal -- a busy courier or
 # a broker that refused admission before reading a request byte: the identical
 # frame may be re-sent inside the caller's own deadline. The retry room only
@@ -2032,53 +2039,52 @@ def courier_server(
         else None
     )
     bound = path.lstat()
-    # Many listers probe health at once while a delivery occupies the accept
-    # worker; the backlog matches the broker listener so an ordinary burst
-    # is queued rather than refused.
-    server.listen(16)
+    # Many listers probe health at once while a delivery occupies the effect
+    # lock; the backlog matches the broker listener so an ordinary burst is
+    # queued rather than refused.
+    server.listen(COURIER_CONNECTION_LIMIT)
     server.settimeout(1.0)
-    stopping = False
-    bootstrapped = False
-    # Provider accepts can run for tens of seconds; they move to one bounded
-    # worker so health, shutdown, and the queue controls keep answering. The
-    # non-blocking lock keeps effects serialized: a second accept is rejected
-    # outright instead of queueing into an unbounded wait. Shared courier queue
-    # state is protected inside CodexCourier itself, so no lock crosses the
-    # provider call.
+    stopping = threading.Event()
+    bootstrapped = threading.Event()
+    # Every connection's whole service -- its frame read, provider inventory,
+    # queue control, or delivery -- runs on one bounded worker seat, so a slow
+    # Claude agents call, a held native-queue RPC, or a trickled partial frame
+    # occupies one seat and never the listener. The non-blocking lock keeps
+    # effects serialized: a second accept is rejected outright instead of
+    # queueing into an unbounded wait. Shared courier queue state is protected
+    # inside CodexCourier itself, so no lock crosses the provider call.
     accept_lock = threading.Lock()
-    accept_workers = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cross-agent-chat-accept")
+    admission = threading.BoundedSemaphore(COURIER_CONNECTION_LIMIT)
+    workers = ThreadPoolExecutor(
+        max_workers=COURIER_CONNECTION_LIMIT,
+        thread_name_prefix="cross-agent-chat-conn",
+    )
+    refusal_budget = threading.BoundedSemaphore(COURIER_REFUSAL_WORKERS)
+    refusals = ThreadPoolExecutor(
+        max_workers=COURIER_REFUSAL_WORKERS,
+        thread_name_prefix="cross-agent-chat-refusal",
+    )
 
-    def serve_accept(connection: socket.socket, event_id: str, message: str) -> None:
+    def serve_connection(connection: socket.socket) -> None:
         try:
             with connection:
-                response = courier_accept(route, courier, event_id, message)
-                emit_frame_safely(connection, response)
-        finally:
-            accept_lock.release()
-
-    try:
-        while not stopping and _route_current(root, route):
-            try:
-                connection, _ = server.accept()
-            except TimeoutError:
-                continue
-            owned = True
-            try:
                 connection.settimeout(
-                    SOCKET_TIMEOUT_SECONDS if bootstrapped else BOOTSTRAP_FRAME_TIMEOUT_SECONDS
+                    SOCKET_TIMEOUT_SECONDS
+                    if bootstrapped.is_set()
+                    else BOOTSTRAP_FRAME_TIMEOUT_SECONDS
                 )
                 try:
                     raw = json.loads(read_frame(connection))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError):
-                    continue
+                    return
                 if not isinstance(raw, dict):
-                    continue
+                    return
                 request = cast(dict[str, object], raw)
                 if (
                     request.get("schema_version") != SCHEMA_VERSION
                     or request.get("generation") != route.generation
                 ):
-                    continue
+                    return
                 operation = request.get("operation")
                 if operation == "bootstrap":
                     try:
@@ -2091,10 +2097,10 @@ def courier_server(
                             },
                         )
                     except OSError:
-                        continue
-                    bootstrapped = True
+                        return
+                    bootstrapped.set()
                 elif operation == "health":
-                    if not bootstrapped:
+                    if not bootstrapped.is_set():
                         emit_frame_safely(
                             connection,
                             {
@@ -2126,17 +2132,17 @@ def courier_server(
                         )
                 elif operation == "shutdown":
                     emit_frame_safely(connection, {"schema_version": 1, "status": "STOPPED"})
-                    stopping = True
+                    stopping.set()
                 elif operation == "accept":
                     event_id = request.get("event_id")
                     message = request.get("message")
                     if not isinstance(event_id, str) or not isinstance(message, str):
-                        continue
-                    if not bootstrapped:
+                        return
+                    if not bootstrapped.is_set():
                         try:
                             identifier = valid_uuid(event_id, "event id")
                         except ChatError:
-                            continue
+                            return
                         emit_frame_safely(
                             connection,
                             {
@@ -2149,16 +2155,17 @@ def courier_server(
                         )
                     elif accept_lock.acquire(blocking=False):
                         try:
-                            accept_workers.submit(serve_accept, connection, event_id, message)
-                        except BaseException:
+                            emit_frame_safely(
+                                connection,
+                                courier_accept(route, courier, event_id, message),
+                            )
+                        finally:
                             accept_lock.release()
-                            raise
-                        owned = False
                     else:
                         try:
                             identifier = valid_uuid(event_id, "event id")
                         except ChatError:
-                            continue
+                            return
                         emit_frame_safely(
                             connection,
                             {
@@ -2176,7 +2183,7 @@ def courier_server(
                         or courier is None
                         or not isinstance(event_id, str)
                     ):
-                        continue
+                        return
                     try:
                         message = courier.native_dispatch_message(event_id)
                     except ChatError as error:
@@ -2207,11 +2214,11 @@ def courier_server(
                         or courier is None
                         or not isinstance(event_id, str)
                     ):
-                        continue
+                        return
                     try:
                         courier.acknowledge([event_id])
                     except ChatError:
-                        continue
+                        return
                     emit_frame_safely(
                         connection,
                         {
@@ -2223,7 +2230,7 @@ def courier_server(
                     )
                 elif operation == "peek":
                     if courier is None:
-                        continue
+                        return
                     emit_frame_safely(
                         connection,
                         {
@@ -2235,12 +2242,12 @@ def courier_server(
                     )
                 elif operation == "ack":
                     if courier is None:
-                        continue
+                        return
                     identifiers = request.get("event_ids")
                     if not isinstance(identifiers, list) or not all(
                         isinstance(item, str) for item in identifiers
                     ):
-                        continue
+                        return
                     try:
                         typed_ids = [cast(str, item) for item in identifiers]
                         courier.acknowledge(typed_ids)
@@ -2249,12 +2256,82 @@ def courier_server(
                             {"schema_version": 1, "status": "ACKNOWLEDGED", "event_ids": typed_ids},
                         )
                     except ChatError:
-                        continue
-            finally:
-                if owned:
-                    connection.close()
+                        return
+        finally:
+            admission.release()
+
+    def refuse_connection(connection: socket.socket) -> None:
+        """Give one overflowed accept the decided busy answer, then close.
+
+        The connection seats are full, so this request can never be admitted.
+        A complete in-bound accept frame is read and refused with the same
+        no-effect busy answer an occupied effect worker gives: nothing was
+        dispatched, so the identical frame stays safe to retry. Every other
+        request closes without a response, exactly like a gated request on a
+        live seat; the bounded read keeps a trickled frame from holding this
+        refusal seat open.
+        """
+        try:
+            with connection:
+                connection.settimeout(COURIER_REFUSAL_FRAME_SECONDS)
+                try:
+                    raw = json.loads(read_frame(connection))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError):
+                    return
+                if not isinstance(raw, dict):
+                    return
+                request = cast(dict[str, object], raw)
+                event_id = request.get("event_id")
+                if (
+                    request.get("schema_version") != SCHEMA_VERSION
+                    or request.get("generation") != route.generation
+                    or request.get("operation") != "accept"
+                    or not isinstance(event_id, str)
+                    or not isinstance(request.get("message"), str)
+                ):
+                    return
+                try:
+                    identifier = valid_uuid(event_id, "event id")
+                except ChatError:
+                    return
+                emit_frame_safely(
+                    connection,
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "event_id": identifier,
+                        "status": "PRE_EFFECT_REJECTED",
+                        "provider": route.provider,
+                        "error": COURIER_BUSY_PRE_EFFECT_REASON,
+                    },
+                )
+        finally:
+            refusal_budget.release()
+
+    try:
+        while not stopping.is_set() and _route_current(root, route):
+            try:
+                connection, _ = server.accept()
+            except TimeoutError:
+                continue
+            if admission.acquire(blocking=False):
+                try:
+                    workers.submit(serve_connection, connection)
+                except BaseException:
+                    admission.release()
+                    raise
+            elif refusal_budget.acquire(blocking=False):
+                try:
+                    refusals.submit(refuse_connection, connection)
+                except BaseException:
+                    refusal_budget.release()
+                    raise
+            else:
+                # No serving or refusal seat: the connection closes before a
+                # request byte is read, so no effect is possible.
+                connection.close()
     finally:
-        accept_workers.shutdown(wait=True)
+        workers.shutdown(wait=True)
+        refusals.shutdown(wait=True)
         if courier is not None:
             courier.clear()
         server.close()

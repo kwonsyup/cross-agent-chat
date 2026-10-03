@@ -8,9 +8,11 @@ to exact-token senders as "unavailable or changed".
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -21,11 +23,19 @@ from uuid import uuid4
 import pytest
 
 from cross_agent_chat import runtime
-from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, session_key
+from cross_agent_chat.core import (
+    ChatError,
+    IntentStore,
+    Registry,
+    Route,
+    UnknownDeliveryError,
+    session_key,
+)
 from cross_agent_chat.native_helper import (
     NATIVE_QUEUE_BINARY_ENV_VAR,
     NATIVE_QUEUE_ENV_VALUE,
     NATIVE_QUEUE_ENV_VAR,
+    NativeHelperStore,
 )
 from cross_agent_chat.recipient import local_token
 from cross_agent_chat.runtime import courier_server, request_socket
@@ -881,3 +891,441 @@ def test_local_send_deadline_dying_in_the_retry_pause_ends_decided(
     # decided rather than parked PENDING.
     assert len(calls) == 1
     assert [row.status for row in IntentStore(root).intents()] == ["PRE_EFFECT_REJECTED"]
+
+
+def _health(root: Path, item: Route, timeout: float) -> dict[str, object]:
+    return request_socket(
+        runtime.socket_path(root, item),
+        {"schema_version": 1, "operation": "health", "generation": item.generation},
+        timeout=timeout,
+    )
+
+
+def _held_claude_inventory(
+    monkeypatch: pytest.MonkeyPatch, item: Route
+) -> tuple[threading.Event, threading.Event, list[str]]:
+    """Hold the first Claude inventory call open; every later call answers."""
+    inventory_entered = threading.Event()
+    release_inventory = threading.Event()
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+
+    def held_exact_agent(*_a: object, **_k: object) -> dict[str, object]:
+        with calls_lock:
+            calls.append(item.session_id)
+            first = len(calls) == 1
+        if first:
+            inventory_entered.set()
+            release_inventory.wait(timeout=30.0)
+        return _agent_view(item)
+
+    monkeypatch.setattr(runtime, "exact_agent", held_exact_agent)
+    return inventory_entered, release_inventory, calls
+
+
+def _codex_helper_route(tmp_path: Path, root: Path) -> Route:
+    """One helper-lineage Codex route inside the fixture state root.
+
+    ``is_helper_lineage`` binds the reserved directory name to the route's
+    cwd, so a reserved binding is enough to place this courier on the helper
+    dispatch path without faking an owner identity.
+    """
+    original_cwd = tmp_path / "helper-original"
+    original_cwd.mkdir()
+    profile = tmp_path / "helper-codex-home"
+    profile.mkdir()
+    original = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(original_cwd),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+        profile_root=str(profile),
+    )
+    account = hashlib.sha256(b"fixture-account").hexdigest()
+    binding, _nonce = NativeHelperStore(root).reserve(original, account)
+    helper_cwd = tmp_path / binding.helper_directory
+    helper_cwd.mkdir()
+    helper = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(helper_cwd),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(helper)
+    return helper
+
+
+def test_fixture_boundary_blocks_real_provider_subprocesses() -> None:
+    """The suite's own guard: no test may reach a real provider binary."""
+    with pytest.raises(AssertionError):
+        subprocess.run(["claude", "agents", "--json"], capture_output=True, timeout=5.0)
+    with pytest.raises(AssertionError):
+        subprocess.Popen(["codex", "app-server", "--listen", "stdio://"])
+
+
+def test_held_claude_inventory_does_not_serialize_controls_or_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow provider inventory holds one worker seat, never the listener.
+
+    While the first ``claude agents`` read is deterministically held, a second
+    health request must spend its own real inventory call, a real accept must
+    still reach the provider exactly once, and shutdown must still answer. A
+    serialized listener would leave all three inside the provider timeout; a
+    guessed READY would never spend the second inventory call.
+    """
+    item = _route(tmp_path)
+    root = tmp_path / "state"
+    Registry(root).upsert(item)
+    inventory_entered, release_inventory, inventory_calls = _held_claude_inventory(
+        monkeypatch, item
+    )
+    monkeypatch.setattr(runtime, "discover_target_ref", lambda _name: "API A [ref]")
+    send_calls: list[str] = []
+    monkeypatch.setattr(runtime, "sendmessage", lambda _r, _m, _e: send_calls.append(_r))
+    worker = _start_courier(root, item)
+    first_health: list[dict[str, object]] = []
+    held_probe = threading.Thread(
+        target=lambda: first_health.append(_health(root, item, 30.0)),
+        daemon=True,
+    )
+    try:
+        _bootstrap(root, item)
+        held_probe.start()
+        assert inventory_entered.wait(10.0)
+        # The inventory read is provably in flight, so no response can have
+        # been answered from a cache or a guess.
+        assert first_health == []
+        second = _health(root, item, 5.0)
+        assert second["status"] == "READY"
+        # Health spent its own real inventory call while the first was held.
+        assert len(inventory_calls) == 2
+        accepted = _accept(root, item, str(uuid4()), "delivery beside held health", 10.0)
+        assert accepted["status"] == "TRANSPORT_ACCEPTED"
+        assert send_calls == ["API A [ref]"]
+        # The accept re-read the exact agent twice at the effect boundary; a
+        # cached identity would leave this count at 2.
+        assert len(inventory_calls) == 4
+        stopped = request_socket(
+            runtime.socket_path(root, item),
+            {"schema_version": 1, "operation": "shutdown", "generation": item.generation},
+            timeout=5.0,
+        )
+        assert stopped == {"schema_version": 1, "status": "STOPPED"}
+        assert not release_inventory.is_set()
+    finally:
+        release_inventory.set()
+        if held_probe.ident is not None:
+            held_probe.join(timeout=15.0)
+        worker.join(timeout=30.0)
+    # Draining let the held read finish honestly: the first probe's READY
+    # arrived only after its inventory call returned.
+    assert first_health[0]["status"] == "READY"
+    assert not worker.is_alive()
+
+
+def test_a_partial_frame_does_not_serialize_the_listener(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A trickled request body occupies one seat, not the accept loop."""
+    item = _route(tmp_path)
+    root = tmp_path / "state"
+    Registry(root).upsert(item)
+    monkeypatch.setattr(runtime, "exact_agent", lambda *_a, **_k: _agent_view(item))
+    worker = _start_courier(root, item)
+    partial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        _bootstrap(root, item)
+        partial.connect(str(runtime.socket_path(root, item)))
+        partial.sendall(b'{"schema_version": 1, "operation": "heal')
+        started = time.monotonic()
+        health = _health(root, item, 5.0)
+        assert health["status"] == "READY"
+        stopped = request_socket(
+            runtime.socket_path(root, item),
+            {"schema_version": 1, "operation": "shutdown", "generation": item.generation},
+            timeout=5.0,
+        )
+        assert stopped == {"schema_version": 1, "status": "STOPPED"}
+        # Both controls answered while the incomplete frame was still open,
+        # well inside the per-connection frame deadline that reclaims its seat.
+        assert time.monotonic() - started < 4.0
+    finally:
+        partial.close()
+        worker.join(timeout=30.0)
+    assert not worker.is_alive()
+
+
+def test_helper_dispatch_and_ack_survive_a_held_native_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Helper dispatch/ack answer while the queue notification RPC is held.
+
+    A rollback of a failed notification must not resurrect a body the native
+    dispatch already acknowledged: the failed accept ends pre-effect and the
+    queue stays empty.
+    """
+    root = tmp_path / "state"
+    item = _codex_helper_route(tmp_path, root)
+    monkeypatch.setenv(NATIVE_QUEUE_ENV_VAR, NATIVE_QUEUE_ENV_VALUE)
+    monkeypatch.setenv(NATIVE_QUEUE_BINARY_ENV_VAR, sys.executable)
+    rpc_entered = threading.Event()
+    release_rpc = threading.Event()
+    rpc_calls: list[str] = []
+
+    def held_queue_native_input(**kwargs: object) -> None:
+        rpc_calls.append(str(kwargs["event_id"]))
+        rpc_entered.set()
+        release_rpc.wait(timeout=30.0)
+        raise ChatError("Codex native queue rejected the message before acceptance")
+
+    monkeypatch.setattr("cross_agent_chat.codex.queue_native_input", held_queue_native_input)
+    worker = _start_courier(root, item)
+    path = runtime.socket_path(root, item)
+    event_id = str(uuid4())
+    responses: list[dict[str, object]] = []
+    sender = threading.Thread(
+        target=lambda: responses.append(
+            _accept(root, item, event_id, "held helper delivery", 30.0)
+        ),
+        daemon=True,
+    )
+    try:
+        _bootstrap(root, item)
+        sender.start()
+        assert rpc_entered.wait(10.0)
+        dispatched = request_socket(
+            path,
+            {
+                "schema_version": 1,
+                "operation": "native_dispatch",
+                "generation": item.generation,
+                "event_id": event_id,
+            },
+            timeout=5.0,
+        )
+        assert dispatched == {
+            "schema_version": 1,
+            "status": "NATIVE_DISPATCH",
+            "generation": item.generation,
+            "event_id": event_id,
+            "message": "held helper delivery",
+        }
+        acked = request_socket(
+            path,
+            {
+                "schema_version": 1,
+                "operation": "native_dispatch_ack",
+                "generation": item.generation,
+                "event_id": event_id,
+            },
+            timeout=5.0,
+        )
+        assert acked == {
+            "schema_version": 1,
+            "status": "NATIVE_DISPATCH_ACKED",
+            "generation": item.generation,
+            "event_id": event_id,
+        }
+        peeked = request_socket(
+            path,
+            {"schema_version": 1, "operation": "peek", "generation": item.generation},
+            timeout=5.0,
+        )
+        assert peeked["messages"] == []
+        # Every queue control answered while the provider RPC was still held.
+        assert not release_rpc.is_set()
+        release_rpc.set()
+        sender.join(timeout=15.0)
+        assert responses == [
+            {
+                "schema_version": 1,
+                "event_id": event_id,
+                "status": "PRE_EFFECT_REJECTED",
+                "provider": "codex",
+                "error": "Codex native queue rejected the message before acceptance",
+            }
+        ]
+        # The failed-notification rollback cannot resurrect the acknowledged body.
+        assert (
+            request_socket(
+                path,
+                {"schema_version": 1, "operation": "peek", "generation": item.generation},
+                timeout=5.0,
+            )["messages"]
+            == []
+        )
+        assert (
+            request_socket(
+                path,
+                {
+                    "schema_version": 1,
+                    "operation": "native_dispatch",
+                    "generation": item.generation,
+                    "event_id": event_id,
+                },
+                timeout=5.0,
+            )["status"]
+            == "UNAVAILABLE"
+        )
+        assert rpc_calls == [event_id]
+    finally:
+        release_rpc.set()
+        if sender.ident is not None:
+            sender.join(timeout=15.0)
+        _stop_courier(root, item, worker)
+
+
+def test_unknown_native_notification_keeps_the_unclaimed_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An uncertain notification outcome preserves the pending body.
+
+    The provider may have queued the notification, so the unacknowledged body
+    stays claimable rather than being rolled back into disappearance.
+    """
+    root = tmp_path / "state"
+    item = _codex_helper_route(tmp_path, root)
+    monkeypatch.setenv(NATIVE_QUEUE_ENV_VAR, NATIVE_QUEUE_ENV_VALUE)
+    monkeypatch.setenv(NATIVE_QUEUE_BINARY_ENV_VAR, sys.executable)
+    rpc_entered = threading.Event()
+    release_rpc = threading.Event()
+    rpc_calls: list[str] = []
+
+    def held_queue_native_input(**kwargs: object) -> None:
+        rpc_calls.append(str(kwargs["event_id"]))
+        rpc_entered.set()
+        release_rpc.wait(timeout=30.0)
+        raise UnknownDeliveryError("Codex native queue outcome is unknown")
+
+    monkeypatch.setattr("cross_agent_chat.codex.queue_native_input", held_queue_native_input)
+    worker = _start_courier(root, item)
+    path = runtime.socket_path(root, item)
+    event_id = str(uuid4())
+    responses: list[dict[str, object]] = []
+    sender = threading.Thread(
+        target=lambda: responses.append(
+            _accept(root, item, event_id, "uncertain helper delivery", 30.0)
+        ),
+        daemon=True,
+    )
+    try:
+        _bootstrap(root, item)
+        sender.start()
+        assert rpc_entered.wait(10.0)
+        release_rpc.set()
+        sender.join(timeout=15.0)
+        assert responses == [
+            {
+                "schema_version": 1,
+                "event_id": event_id,
+                "status": "UNKNOWN_DELIVERY",
+                "provider": "codex",
+            }
+        ]
+        peeked = request_socket(
+            path,
+            {"schema_version": 1, "operation": "peek", "generation": item.generation},
+            timeout=5.0,
+        )
+        assert peeked["messages"] == [
+            {"event_id": event_id, "message": "uncertain helper delivery"}
+        ]
+        # The retained body remains claimable through the normal dispatch path.
+        dispatched = request_socket(
+            path,
+            {
+                "schema_version": 1,
+                "operation": "native_dispatch",
+                "generation": item.generation,
+                "event_id": event_id,
+            },
+            timeout=5.0,
+        )
+        assert dispatched["status"] == "NATIVE_DISPATCH"
+        assert dispatched["message"] == "uncertain helper delivery"
+        assert rpc_calls == [event_id]
+    finally:
+        release_rpc.set()
+        if sender.ident is not None:
+            sender.join(timeout=15.0)
+        _stop_courier(root, item, worker)
+
+
+def test_a_saturated_courier_refuses_an_overflow_accept_with_decided_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrency is bounded; an overflowed accept gets a no-effect busy.
+
+    Every connection seat is provably held inside the provider inventory, so
+    one more health probe is refused rather than serialized, and a well-formed
+    accept is read and answered with the decided busy rejection its sender can
+    safely retry -- never dropped into an unknown outcome and never given an
+    effect.
+    """
+    item = _route(tmp_path)
+    root = tmp_path / "state"
+    Registry(root).upsert(item)
+    gate = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def held_inventory(*_a: object, **_k: object) -> dict[str, object]:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        gate.wait(timeout=30.0)
+        return _agent_view(item)
+
+    monkeypatch.setattr(runtime, "exact_agent", held_inventory)
+    send_calls: list[str] = []
+    monkeypatch.setattr(runtime, "sendmessage", lambda _r, _m, _e: send_calls.append(_r))
+    worker = _start_courier(root, item)
+    probes = 20
+    probe_results: list[dict[str, object]] = []
+    probe_errors: list[ChatError] = []
+    start = threading.Barrier(probes)
+
+    def probe() -> None:
+        start.wait(timeout=10.0)
+        try:
+            probe_results.append(_health(root, item, 30.0))
+        except ChatError as error:
+            probe_errors.append(error)
+
+    probe_threads = [threading.Thread(target=probe, daemon=True) for _ in range(probes)]
+    try:
+        _bootstrap(root, item)
+        for probe_thread in probe_threads:
+            probe_thread.start()
+        # Every worker seat is provably occupied inside the provider read;
+        # the refused remainder never reaches the inventory at all, so the
+        # count staying at the limit is the bound itself.
+        _wait_until(lambda: calls >= runtime.COURIER_CONNECTION_LIMIT)
+        assert calls == runtime.COURIER_CONNECTION_LIMIT
+        event_id = str(uuid4())
+        rejected = _accept(root, item, event_id, "overflow delivery", 10.0)
+        assert rejected == {
+            "schema_version": 1,
+            "event_id": event_id,
+            "status": "PRE_EFFECT_REJECTED",
+            "provider": "claude",
+            "error": runtime.COURIER_BUSY_PRE_EFFECT_REASON,
+        }
+        # No provider effect ran for the refused event.
+        assert send_calls == []
+    finally:
+        gate.set()
+        for probe_thread in probe_threads:
+            if probe_thread.ident is not None:
+                probe_thread.join(timeout=15.0)
+        _stop_courier(root, item, worker)
+    # The seated probes all answered READY; the overflow was refused, not
+    # silently admitted beyond the bound.
+    assert [probe.get("status") for probe in probe_results] == ["READY"] * (
+        runtime.COURIER_CONNECTION_LIMIT
+    )
+    assert len(probe_errors) == probes - runtime.COURIER_CONNECTION_LIMIT
