@@ -26,6 +26,7 @@ import pytest
 from cross_agent_chat import runtime
 from cross_agent_chat.core import (
     ChatError,
+    Intent,
     IntentStore,
     Registry,
     Route,
@@ -203,6 +204,47 @@ def _wait_until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
     while not predicate() and time.monotonic() < deadline:
         time.sleep(0.02)
     assert predicate()
+
+
+def _assert_each_caller_body_delivered_once(
+    routed: list[str], intents: list[Intent], caller_texts: dict[str, str]
+) -> None:
+    """Each caller's own text reaches the provider exactly once, digest-bound.
+
+    ``routed`` is the list of bodies actually observed at the sendmessage
+    boundary and ``caller_texts`` maps each source's session key to the exact
+    message its caller passed in. The wrapped envelope puts the caller text
+    last, so an exact suffix match identifies authorship; the stored intent's
+    payload digest then binds that source's event to the bytes that were
+    really delivered, and the event id appearing inside the same body rules
+    out a body delivered under a different event's identity. A producer that
+    duplicated one caller's body, dropped the other's, or wrapped content
+    under the wrong event fails one of these three observations.
+    """
+    for source_key, text in caller_texts.items():
+        rows = [row for row in intents if row.source_key == source_key]
+        assert len(rows) == 1
+        (row,) = rows
+        matched = [body for body in routed if body.endswith(text)]
+        assert len(matched) == 1
+        (body,) = matched
+        assert hashlib.sha256(body.encode()).hexdigest() == row.payload_digest
+        assert row.event_id in body
+
+
+def _probe_intent_row(source_key: str, event_id: str, payload_digest: str) -> Intent:
+    return Intent(
+        schema_version=1,
+        event_id=event_id,
+        source_key=source_key,
+        source_generation=str(uuid4()),
+        source_alias="codex@studio:probe:probe-a1",
+        target_key="c" * 64,
+        target_generation=str(uuid4()),
+        payload_digest=payload_digest,
+        status="TRANSPORT_ACCEPTED",
+        timestamp="2026-10-03T00:00:00+00:00",
+    )
 
 
 def test_idle_courier_health_returns_the_live_target(
@@ -665,7 +707,12 @@ def test_two_senders_to_one_busy_target_each_complete_once(
 
     The per-(source, target) intent gate admits both sends as distinct events;
     the busy retries -- not the admission gate -- absorb the contention while
-    the held delivery finishes.
+    the held delivery finishes. The failure a ref-only ledger could not name:
+    a producer that delivered source A's wrapped body twice while losing B's,
+    or that wrapped B's content under A's event, still satisfies three
+    ref-equal sends and two stored rows. The provider-boundary bodies
+    themselves -- each ending in exactly one caller's own text and
+    digest-bound to that source's stored event -- are the evidence.
     """
     item = _route(tmp_path)
     root = tmp_path / "state"
@@ -688,7 +735,21 @@ def test_two_senders_to_one_busy_target_each_complete_once(
         cwd=item.cwd,
         pid=item.pid,
     )
-    accept_entered, release_accept, send_calls = _held_claude_provider(monkeypatch, item)
+    # The real provider boundary, held like _held_claude_provider but
+    # recording the exact body handed to sendmessage -- not the body the
+    # sender intended or the event the stored row describes.
+    monkeypatch.setattr(runtime, "exact_agent", lambda *_a, **_k: _agent_view(item))
+    monkeypatch.setattr(runtime, "discover_target_ref", lambda _name: "API A [ref]")
+    accept_entered = threading.Event()
+    release_accept = threading.Event()
+    deliveries: list[tuple[str, str]] = []
+
+    def held_sendmessage(ref: str, body: str, _executable: Path) -> None:
+        deliveries.append((ref, body))
+        accept_entered.set()
+        release_accept.wait(timeout=30.0)
+
+    monkeypatch.setattr(runtime, "sendmessage", held_sendmessage)
     attempts: list[str] = []
     _counted_accept_frames(monkeypatch, attempts)
     worker = _start_courier(root, item)
@@ -737,7 +798,13 @@ def test_two_senders_to_one_busy_target_each_complete_once(
             "TRANSPORT_ACCEPTED",
         ]
         assert held_responses[0]["status"] == "TRANSPORT_ACCEPTED"
-        assert send_calls == ["API A [ref]"] * 3
+        # Three provider calls exactly: the held occupier's raw body first
+        # (accept admission is serialized, so it can only be first), then one
+        # wrapped body per caller -- no duplicate and no extra replay.
+        assert len(deliveries) == 3
+        assert [ref for ref, _body in deliveries] == ["API A [ref]"] * 3
+        assert sum(body == "held delivery" for _ref, body in deliveries) == 1
+        assert deliveries[0][1] == "held delivery"
         intents = IntentStore(root).intents()
         assert [row.status for row in intents] == [
             "TRANSPORT_ACCEPTED",
@@ -745,9 +812,41 @@ def test_two_senders_to_one_busy_target_each_complete_once(
         ]
         assert len({row.event_id for row in intents}) == 2
         assert len({row.source_key for row in intents}) == 2
+        _assert_each_caller_body_delivered_once(
+            [body for _ref, body in deliveries[1:]],
+            intents,
+            {
+                session_key(source.provider, source.session_id): (f"concurrent delivery {index}")
+                for index, source in enumerate(sources)
+            },
+        )
     finally:
         release_accept.set()
         _stop_courier(root, item, worker)
+
+
+def test_a_replayed_body_cannot_pass_the_per_caller_delivery_ledger() -> None:
+    """Probe: one caller's body replayed for the other's send is caught.
+
+    The strengthened busy-target assertions only matter if the observation
+    itself discriminates, so the matcher is exercised against a tampered
+    delivery list -- A's wrapped body delivered twice while B's never
+    reached the provider. The old ref-only ledger could not see that; the
+    per-caller text and digest binding must refuse it, while the honest
+    two-body list still passes so the probe is not a tautology.
+    """
+    key_a, key_b = "a" * 64, "b" * 64
+    event_a, event_b = str(uuid4()), str(uuid4())
+    body_a = f"envelope head {event_a}\n\nalpha caller text"
+    body_b = f"envelope head {event_b}\n\nbeta caller text"
+    intents = [
+        _probe_intent_row(key_a, event_a, hashlib.sha256(body_a.encode()).hexdigest()),
+        _probe_intent_row(key_b, event_b, hashlib.sha256(body_b.encode()).hexdigest()),
+    ]
+    callers = {key_a: "alpha caller text", key_b: "beta caller text"}
+    _assert_each_caller_body_delivered_once([body_a, body_b], intents, callers)
+    with pytest.raises(AssertionError):
+        _assert_each_caller_body_delivered_once([body_a, body_a], intents, callers)
 
 
 def test_codex_native_accept_does_not_block_queue_controls(
