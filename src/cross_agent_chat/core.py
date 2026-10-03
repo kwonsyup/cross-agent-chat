@@ -738,13 +738,38 @@ class IntentStore:
             existing = self.intents()
             if any(item.event_id == identifier for item in existing):
                 fail("event id is unavailable")
+            # The in-flight gate is per (source, target) pair: this sender must
+            # not start a second send while its own earlier event to this
+            # recipient is still undecided, but another session's unresolved
+            # intent is a different event and must not block this one -- the
+            # recipient courier already serializes provider effects.
             unresolved = [
                 item
                 for item in existing
-                if item.target_key == target_key and item.status in {"PENDING", "REMOTE_AUTHORIZED"}
+                if item.source_key == source_key
+                and item.target_key == target_key
+                and item.status in {"PENDING", "REMOTE_AUTHORIZED"}
             ]
             if unresolved:
-                fail("target has an unresolved delivery intent")
+                blocker = min(unresolved, key=lambda item: intent_age_seconds(item.timestamp))
+                age = intent_age_seconds(blocker.timestamp)
+                if age >= ABANDONED_INTENT_SECONDS:
+                    fail(
+                        "target has an unresolved delivery intent from this sender: "
+                        f"event {blocker.event_id} is still {blocker.status} "
+                        f"({int(age)}s old, past the {int(ABANDONED_INTENT_SECONDS)}s "
+                        "bound a live send can hold it for); this attempt created no "
+                        "intent and sent nothing; if that send is gone, run "
+                        f"`cross-agent-chat resolve {blocker.event_id}` to record "
+                        "your acceptance of its uncertain outcome before sending again"
+                    )
+                fail(
+                    "target has an unresolved delivery intent from this sender: "
+                    f"event {blocker.event_id} is still {blocker.status} "
+                    f"({int(age)}s old); this attempt created no intent and sent "
+                    "nothing; do not resend that event -- wait for its recorded "
+                    "result before sending again"
+                )
             intent = Intent(
                 schema_version=SCHEMA_VERSION,
                 event_id=identifier,

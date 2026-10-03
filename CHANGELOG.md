@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.4.8 - 2026-10-02
+
+- A courier's control plane stays responsive while one provider delivery is in
+  flight. The accept loop previously served each connection to completion, so a
+  slow `SendMessage` held health probes, shutdown, and every other request in
+  the socket backlog until their own deadlines died, and listers reported the
+  live peer as "unavailable or changed". The single in-flight delivery now runs
+  on one bounded worker while health, bootstrap, peek, ack, native dispatch,
+  and shutdown keep answering; courier queue state is serialized across both
+  threads. The listener backlog rises from 4 to 16, matching the broker.
+- Still one delivery effect at a time per courier. A second `accept` while one
+  is in flight gets a decided typed pre-effect refusal ("session courier is
+  busy with another delivery"), and a local sender or the remote receive side
+  retries that identical frame inside its unchanged deadline instead of
+  reporting a live recipient as changed. The same bounded retry applies to the
+  broker's explicit capacity refusal, which is emitted before any request byte
+  is read. A broker that stays at capacity now reports "recipient broker is at
+  capacity; nothing was delivered; send again" instead of the generic
+  unavailable message, and a courier that stays busy reports "recipient stayed
+  busy with another delivery until the send deadline; nothing was delivered;
+  send again". An older broker that closes silently stays UNKNOWN, as before.
+- Exact-recipient discovery is scoped to the addressed session: local token
+  sends probe only the token's handle, and a remote receive probes only the
+  session pinned by the envelope's target generation instead of the whole
+  roster.
+- The intent admission gate is per sender-recipient pair: one sender may not
+  begin a second send to the same recipient while its own event is undecided,
+  but another session's in-flight event no longer blocks it. The typed refusal
+  names the sender's own in-flight event and its age, and directs genuinely
+  abandoned events to `resolve`.
+- `chat_peers` accepts an optional `query` that narrows the listed peers by
+  alias or title without changing what discovery probed; the response reports
+  `filter.matched`/`filter.of`. `chat_send` alias acceptance and the
+  `reply_delivery` wording are documented, and the stale `to` upgrade sentence
+  is aligned with the README.
+- Verification for this release is contained: the test suite, static checks,
+  and a packaging smoke. No live fleet journey was run for 0.4.8.
+
 ## 0.4.7 - 2026-09-30
 
 - Recognize the exact nested `Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`

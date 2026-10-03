@@ -141,6 +141,15 @@ AUTHORIZE_TIMEOUT_SECONDS: Final = 20.0
 COURIER_STARTUP_SECONDS: Final = 15.0
 MAX_COURIER_DIAGNOSTIC_BYTES: Final = 1024
 BOOTSTRAP_FRAME_TIMEOUT_SECONDS: Final = 0.1
+COURIER_BUSY_PRE_EFFECT_REASON: Final = "session courier is busy with another delivery"
+# Shared bounds for retrying a provably pre-effect refusal -- a busy courier or
+# a broker that refused admission before reading a request byte: the identical
+# frame may be re-sent inside the caller's own deadline, and a retry is issued
+# only while enough budget remains for the bounded attempt to answer decisively
+# rather than read-time out into an UNKNOWN outcome.
+PRE_EFFECT_RETRY_SECONDS: Final = 0.25
+PRE_EFFECT_RETRY_MAX_SECONDS: Final = 1.0
+PRE_EFFECT_RETRY_ROOM_SECONDS: Final = 2.0
 REMOTE_TIMEOUT_SECONDS: Final = (
     HEALTH_TIMEOUT_SECONDS + AUTHORIZE_TIMEOUT_SECONDS + ACCEPT_TIMEOUT_SECONDS + 5.0
 )
@@ -1796,6 +1805,7 @@ FORWARDABLE_PRE_EFFECT_REASONS: Final = frozenset(
         "Claude SendMessage courier setup failed",
         "Claude courier finished without a SendMessage call",
         "session courier is still bootstrapping",
+        COURIER_BUSY_PRE_EFFECT_REASON,
         "Codex courier is unavailable",
         "Codex courier queue is full",
         "Codex native queue is unavailable",
@@ -2022,17 +2032,37 @@ def courier_server(
         else None
     )
     bound = path.lstat()
-    server.listen(4)
+    # Many listers probe health at once while a delivery occupies the accept
+    # worker; the backlog matches the broker listener so none are refused.
+    server.listen(16)
     server.settimeout(1.0)
     stopping = False
     bootstrapped = False
+    # Provider accepts can run for tens of seconds; they move to one bounded
+    # worker so health, shutdown, and the queue controls keep answering. The
+    # non-blocking lock keeps effects serialized: a second accept is rejected
+    # outright instead of queueing into an unbounded wait.
+    accept_lock = threading.Lock()
+    courier_lock = threading.Lock()
+    accept_workers = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cross-agent-chat-accept")
+
+    def serve_accept(connection: socket.socket, event_id: str, message: str) -> None:
+        try:
+            with connection:
+                with courier_lock:
+                    response = courier_accept(route, courier, event_id, message)
+                emit_frame_safely(connection, response)
+        finally:
+            accept_lock.release()
+
     try:
         while not stopping and _route_current(root, route):
             try:
                 connection, _ = server.accept()
             except TimeoutError:
                 continue
-            with connection:
+            owned = True
+            try:
                 connection.settimeout(
                     SOCKET_TIMEOUT_SECONDS if bootstrapped else BOOTSTRAP_FRAME_TIMEOUT_SECONDS
                 )
@@ -2116,9 +2146,27 @@ def courier_server(
                                 "error": "session courier is still bootstrapping",
                             },
                         )
+                    elif accept_lock.acquire(blocking=False):
+                        try:
+                            accept_workers.submit(serve_accept, connection, event_id, message)
+                        except BaseException:
+                            accept_lock.release()
+                            raise
+                        owned = False
                     else:
+                        try:
+                            identifier = valid_uuid(event_id, "event id")
+                        except ChatError:
+                            continue
                         emit_frame_safely(
-                            connection, courier_accept(route, courier, event_id, message)
+                            connection,
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "event_id": identifier,
+                                "status": "PRE_EFFECT_REJECTED",
+                                "provider": route.provider,
+                                "error": COURIER_BUSY_PRE_EFFECT_REASON,
+                            },
                         )
                 elif operation == "native_dispatch":
                     event_id = request.get("event_id")
@@ -2129,7 +2177,8 @@ def courier_server(
                     ):
                         continue
                     try:
-                        message = courier.native_dispatch_message(event_id)
+                        with courier_lock:
+                            message = courier.native_dispatch_message(event_id)
                     except ChatError as error:
                         emit_frame_safely(
                             connection,
@@ -2160,7 +2209,8 @@ def courier_server(
                     ):
                         continue
                     try:
-                        courier.acknowledge([event_id])
+                        with courier_lock:
+                            courier.acknowledge([event_id])
                     except ChatError:
                         continue
                     emit_frame_safely(
@@ -2175,15 +2225,16 @@ def courier_server(
                 elif operation == "peek":
                     if courier is None:
                         continue
-                    emit_frame_safely(
-                        connection,
-                        {
-                            "schema_version": 1,
-                            "status": "PEEKED",
-                            "generation": route.generation,
-                            "messages": courier.peek(),
-                        },
-                    )
+                    with courier_lock:
+                        emit_frame_safely(
+                            connection,
+                            {
+                                "schema_version": 1,
+                                "status": "PEEKED",
+                                "generation": route.generation,
+                                "messages": courier.peek(),
+                            },
+                        )
                 elif operation == "ack":
                     if courier is None:
                         continue
@@ -2194,14 +2245,19 @@ def courier_server(
                         continue
                     try:
                         typed_ids = [cast(str, item) for item in identifiers]
-                        courier.acknowledge(typed_ids)
+                        with courier_lock:
+                            courier.acknowledge(typed_ids)
                         emit_frame_safely(
                             connection,
                             {"schema_version": 1, "status": "ACKNOWLEDGED", "event_ids": typed_ids},
                         )
                     except ChatError:
                         continue
+            finally:
+                if owned:
+                    connection.close()
     finally:
+        accept_workers.shutdown(wait=True)
         if courier is not None:
             courier.clear()
         server.close()
@@ -2526,14 +2582,38 @@ def _remote_node_targets(
         variants.append(({**legacy, "include_devin": True}, False))
     variants.append((legacy, False))
     base: list[Target] | None = None
+    capacity_refused = False
     for payload, mode_requested in variants:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return [], False
+        retry_delay = PRE_EFFECT_RETRY_SECONDS
+        raw: dict[str, object] | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return [], False
+            try:
+                raw = request_tailnet(
+                    address,
+                    payload,
+                    timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining),
+                )
+            except (ChatError, UnknownDeliveryError):
+                raw = None
+                break
+            if raw != BROKER_CAPACITY_REFUSAL:
+                break
+            # Admission is refused before the broker reads a request byte, so
+            # the identical read-only probe is safe to retry inside the
+            # deadline; no payload variant could change the capacity answer.
+            paused = _pre_effect_retry_pause(deadline, retry_delay)
+            if paused is None:
+                capacity_refused = True
+                break
+            retry_delay = paused
+        if capacity_refused:
+            break
+        if raw is None:
+            continue
         try:
-            raw = request_tailnet(
-                address, payload, timeout=min(REMOTE_DISCOVERY_TIMEOUT_SECONDS, remaining)
-            )
             base = _targets_from_tailnet(
                 address,
                 raw,
@@ -2545,6 +2625,8 @@ def _remote_node_targets(
         except (ChatError, UnknownDeliveryError):
             continue
     if base is None:
+        if capacity_refused:
+            raise ChatError("recipient broker is at capacity; nothing was delivered; send again")
         return [], False
     remaining = deadline - time.monotonic()
     # Return validated identities even when optional title work cannot finish.
@@ -2619,7 +2701,13 @@ def _remote_discovery(
     try:
         try:
             for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
-                discovered, node_complete = future.result()
+                try:
+                    discovered, node_complete = future.result()
+                except ChatError:
+                    # A decided per-node refusal (for example a broker at
+                    # capacity) is still an incomplete discovery here; the
+                    # precise reason only matters on the exact-token send path.
+                    discovered, node_complete = [], False
                 targets.extend(discovered)
                 complete = complete and node_complete
         except FuturesTimeoutError:
@@ -2865,6 +2953,19 @@ def _remaining_operation_timeout(deadline: float, maximum: float) -> float:
     return min(maximum, remaining)
 
 
+def _pre_effect_retry_pause(deadline: float, delay: float) -> float | None:
+    """Pause before resending a provably pre-effect-refused frame.
+
+    Returns the next backoff delay, or None when the deadline no longer leaves
+    enough room for the retried attempt to answer decisively.
+    """
+    remaining = deadline - time.monotonic() - PRE_EFFECT_RETRY_ROOM_SECONDS
+    if remaining <= 0:
+        return None
+    time.sleep(min(delay, remaining))
+    return min(PRE_EFFECT_RETRY_MAX_SECONDS, delay * 2)
+
+
 def _send_local_target(
     root: Path,
     source: Route,
@@ -2915,26 +3016,42 @@ def _send_local_target(
         payload_digest=hashlib.sha256(body.encode()).hexdigest(),
         event_id=event_id,
     )
-    try:
-        response = request_socket(
-            socket_path(root, delivery_route),
-            {
-                "schema_version": 1,
-                "operation": "accept",
-                "generation": delivery_route.generation,
-                "event_id": event_id,
-                "message": body,
-            },
-            timeout=timeout,
-        )
-    except UnknownDeliveryError:
-        store.mark(event_id, "UNKNOWN_DELIVERY")
-        raise UnknownDeliveryError(
-            f"delivery state is unknown for event {event_id}; do not retry automatically"
-        ) from None
-    except ChatError:
-        store.mark(event_id, "PRE_EFFECT_REJECTED")
-        raise
+    retry_delay = PRE_EFFECT_RETRY_SECONDS
+    while True:
+        try:
+            response = request_socket(
+                socket_path(root, delivery_route),
+                {
+                    "schema_version": 1,
+                    "operation": "accept",
+                    "generation": delivery_route.generation,
+                    "event_id": event_id,
+                    "message": body,
+                },
+                timeout=timeout,
+            )
+        except UnknownDeliveryError:
+            store.mark(event_id, "UNKNOWN_DELIVERY")
+            raise UnknownDeliveryError(
+                f"delivery state is unknown for event {event_id}; do not retry automatically"
+            ) from None
+        except ChatError:
+            store.mark(event_id, "PRE_EFFECT_REJECTED")
+            raise
+        # A busy courier is a decided pre-effect answer, so the identical
+        # frame -- same event, same body -- can be retried inside this send's
+        # deadline instead of making the caller re-pick a live recipient.
+        if pre_effect_error(response, event_id, target.provider) != COURIER_BUSY_PRE_EFFECT_REASON:
+            break
+        paused = _pre_effect_retry_pause(deadline, retry_delay)
+        if paused is None:
+            store.mark(event_id, "PRE_EFFECT_REJECTED")
+            raise ChatError(
+                "recipient stayed busy with another delivery until the send "
+                "deadline; nothing was delivered; send again"
+            )
+        retry_delay = paused
+        timeout = _remaining_operation_timeout(deadline, ACCEPT_TIMEOUT_SECONDS)
     delivery_expected = {
         "schema_version": 1,
         "event_id": event_id,
@@ -2984,7 +3101,7 @@ def _send_local_token_target(
         )
     matches = [
         target
-        for target in local_targets(root)
+        for target in local_targets(root, handle=token.handle)
         if target.session_key == token.handle and target.generation == token.generation
     ]
     if len(matches) != 1:
@@ -3149,29 +3266,38 @@ def _send_remote_target(
         "to": target.alias,
         "provider": target.provider,
     }
-    try:
-        response = request_tailnet(
-            target.tailnet_address,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "operation": "receive",
-                "envelope": envelope,
-            },
-            timeout=timeout,
-        )
-    except UnknownDeliveryError as error:
-        store.mark(event_id, "UNKNOWN_DELIVERY")
-        raise UnknownDeliveryError(
-            f"remote delivery state is unknown for event {event_id}; do not retry automatically"
-        ) from error
-    except ChatError:
-        store.mark(event_id, "PRE_EFFECT_REJECTED")
-        raise
-    if response == BROKER_CAPACITY_REFUSAL:
-        # The broker refused admission before reading a byte, so nothing could
-        # have happened. Older brokers close instead, which stays unknown.
-        store.mark(event_id, "PRE_EFFECT_REJECTED")
-        raise ChatError("recipient broker is at capacity; nothing was delivered; send again")
+    retry_delay = PRE_EFFECT_RETRY_SECONDS
+    while True:
+        try:
+            response = request_tailnet(
+                target.tailnet_address,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "operation": "receive",
+                    "envelope": envelope,
+                },
+                timeout=timeout,
+            )
+        except UnknownDeliveryError as error:
+            store.mark(event_id, "UNKNOWN_DELIVERY")
+            raise UnknownDeliveryError(
+                f"remote delivery state is unknown for event {event_id}; do not retry automatically"
+            ) from error
+        except ChatError:
+            store.mark(event_id, "PRE_EFFECT_REJECTED")
+            raise
+        if response != BROKER_CAPACITY_REFUSAL:
+            break
+        # The broker refused admission before reading a request byte, so the
+        # identical envelope is provably pre-effect and can be re-sent inside
+        # this send's deadline. Older brokers close instead, which is read as
+        # an exception above and stays UNKNOWN.
+        paused = _pre_effect_retry_pause(deadline, retry_delay)
+        if paused is None:
+            store.mark(event_id, "PRE_EFFECT_REJECTED")
+            raise ChatError("recipient broker is at capacity; nothing was delivered; send again")
+        retry_delay = paused
+        timeout = _remaining_operation_timeout(deadline, REMOTE_TIMEOUT_SECONDS)
     rejection = pre_effect_error(response, event_id, target.provider)
     if rejection is not None:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
@@ -3253,9 +3379,23 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
     if target_provider not in {"claude", "codex", "devin"}:
         raise ChatError("remote target provider is invalid")
     try:
+        # The envelope pins the target generation, and a generation belongs to
+        # exactly one session, so discovery only needs to probe the routes that
+        # generation could resolve to rather than the whole roster.
+        scoped_handles = {
+            session_key(route.provider, route.session_id)
+            for route in Registry(root).routes()
+            if route.generation == generation
+        }
+        if len(scoped_handles) == 1:
+            candidates = local_targets(root, handle=next(iter(scoped_handles)))
+        elif scoped_handles:
+            candidates = local_targets(root)
+        else:
+            candidates = []
         matches = [
             target
-            for target in local_targets(root)
+            for target in candidates
             if target.alias == target_alias and target.generation == generation
         ]
         if len(matches) != 1:
@@ -3316,17 +3456,30 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
                 if not _route_current(root, helper):
                     raise ChatError("native helper is unavailable")
                 delivery_route = helper
-        response = request_socket(
-            socket_path(root, delivery_route),
-            {
-                "schema_version": SCHEMA_VERSION,
-                "operation": "accept",
-                "generation": delivery_route.generation,
-                "event_id": event_id,
-                "message": message,
-            },
-            timeout=min(ACCEPT_TIMEOUT_SECONDS, deadline - time.monotonic()),
-        )
+        retry_delay = PRE_EFFECT_RETRY_SECONDS
+        while True:
+            response = request_socket(
+                socket_path(root, delivery_route),
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "operation": "accept",
+                    "generation": delivery_route.generation,
+                    "event_id": event_id,
+                    "message": message,
+                },
+                timeout=min(ACCEPT_TIMEOUT_SECONDS, deadline - time.monotonic()),
+            )
+            if (
+                pre_effect_error(response, event_id, target.provider)
+                != COURIER_BUSY_PRE_EFFECT_REASON
+            ):
+                break
+            paused = _pre_effect_retry_pause(deadline, retry_delay)
+            if paused is None:
+                # Authorization stays claimed; the forwarded busy rejection is
+                # still the decided pre-effect outcome for this event.
+                break
+            retry_delay = paused
         delivery_expected: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "event_id": event_id,
@@ -3394,6 +3547,7 @@ def peers(
     include_title: bool = False,
     include_devin: bool = True,
     handle: str | None = None,
+    query: str | None = None,
 ) -> dict[str, object]:
     display_titles = not internal or include_title
     deadline = time.monotonic() + (
@@ -3443,10 +3597,22 @@ def peers(
             item["generation"] = target.generation
             item["session_key"] = target.session_key
         items.append(item)
+    total = len(items)
+    if query is not None:
+        # The full listing is produced first and only then narrowed, so a
+        # query never changes what discovery probed.
+        wanted = valid_name(query, "peer query").casefold()
+        items = [
+            item
+            for item in items
+            if wanted in item["alias"].casefold() or wanted in item.get("title", "").casefold()
+        ]
     result: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "peers": items,
     }
+    if query is not None:
+        result["filter"] = {"query": query, "matched": len(items), "of": total}
     if not internal:
         result["remote_discovery"] = remote_discovery
     return result

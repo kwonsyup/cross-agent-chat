@@ -182,7 +182,11 @@ def test_exact_local_token_does_not_wait_for_remote_discovery(
     )
     expected = {"status": "TRANSPORT_ACCEPTED"}
     state_root = tmp_path / "state"
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [target])
+    monkeypatch.setattr(
+        runtime,
+        "local_targets",
+        lambda _root, *, handle=None: [target] if handle == target.session_key else [],
+    )
     monkeypatch.setattr(
         runtime,
         "_remote_discovery",

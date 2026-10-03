@@ -33,6 +33,7 @@ from cross_agent_chat.recipient import remote_token
 from cross_agent_chat.runtime import (
     ACCEPT_TIMEOUT_SECONDS,
     AUTHORIZE_TIMEOUT_SECONDS,
+    BROKER_CAPACITY_REFUSAL,
     MAX_FRAME_BYTES,
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     Target,
@@ -1683,7 +1684,12 @@ def test_remote_receive_routes_registered_codex_original_to_its_helper(
         generation=original.generation,
         message="hello",
     )
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.local_targets",
+        lambda _root, *, handle=None: (
+            [public_target] if handle == public_target.session_key else []
+        ),
+    )
     monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_tailnet",
@@ -1757,7 +1763,12 @@ def test_remote_receive_authorization_spend_shrinks_the_accept_budget(
         generation=route.generation,
         message="hello",
     )
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.local_targets",
+        lambda _root, *, handle=None: (
+            [public_target] if handle == public_target.session_key else []
+        ),
+    )
     now = [1_000.0]
     monkeypatch.setattr(time, "monotonic", lambda: now[0])
     authorize_timeouts: list[float] = []
@@ -1813,7 +1824,12 @@ def test_remote_receive_spent_budget_refuses_before_any_accept(
         generation=route.generation,
         message="hello",
     )
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.local_targets",
+        lambda _root, *, handle=None: (
+            [public_target] if handle == public_target.session_key else []
+        ),
+    )
     now = [1_000.0]
     monkeypatch.setattr(time, "monotonic", lambda: now[0])
     accept_timeouts: list[float] = []
@@ -1873,7 +1889,12 @@ def test_remote_claude_receipt_uses_fresh_discovery_alias_after_rename(
         generation=target.generation,
         message="fresh independent work",
     )
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.local_targets",
+        lambda _root, *, handle=None: (
+            [public_target] if handle == public_target.session_key else []
+        ),
+    )
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_tailnet",
         lambda _address, payload, **_: (
@@ -2407,7 +2428,12 @@ def test_remote_receiver_forwards_only_exact_claude_diagnostic(
         generation=target.generation,
         message="private message body",
     )
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.local_targets",
+        lambda _root, *, handle=None: (
+            [public_target] if handle == public_target.session_key else []
+        ),
+    )
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_tailnet",
         lambda _address, payload, **_: (
@@ -2538,7 +2564,12 @@ def test_remote_receiver_sanitizes_pre_effect_provider_error(
         generation=target.generation,
         message="hello",
     )
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [public_target])
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.local_targets",
+        lambda _root, *, handle=None: (
+            [public_target] if handle == public_target.session_key else []
+        ),
+    )
 
     def authorize(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         return {key: value for key, value in payload.items() if key != "operation"} | {
@@ -2671,6 +2702,335 @@ def test_remote_send_surfaces_allowlisted_courier_reason(
         "session courier is still bootstrapping; nothing was delivered"
     )
     assert IntentStore(sender_root).intents()[0].status == "PRE_EFFECT_REJECTED"
+
+
+def test_remote_receive_probes_only_the_addressed_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unrelated courier's health must not stand between receive and match.
+
+    The full-roster scan a receive used to run could spend the discovery
+    budget on routes the envelope could never select; the pinned target
+    generation scopes the probe to the one session that could carry it.
+    """
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    unrelated = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="other",
+        cwd=str(other_dir),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(target)
+    Registry(tmp_path).upsert(unrelated)
+    public_target = Target(
+        alias=target.alias,
+        provider="codex",
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=session_key(target.provider, target.session_id),
+        remote=False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=str(uuid4()),
+        target_alias=target.alias,
+        generation=target.generation,
+        message="hello",
+    )
+    probed: list[str | None] = []
+
+    def scoped(_root: Path, *, handle: str | None = None) -> list[Target]:
+        probed.append(handle)
+        if handle != session_key(target.provider, target.session_id):
+            return []
+        return [public_target]
+
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", scoped)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_tailnet",
+        lambda _address, payload, **_: (
+            {key: value for key, value in payload.items() if key != "operation"}
+            | {"status": "AUTHORIZED"}
+        ),
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_socket",
+        lambda _path, payload, **_: {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": "codex",
+        },
+    )
+
+    assert receive_remote(tmp_path, envelope, "100.64.0.11")["status"] == "TRANSPORT_ACCEPTED"
+    assert probed == [session_key(target.provider, target.session_id)]
+
+
+def test_remote_receive_with_no_matching_generation_probes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generation no registered route owns can never match; probing is wasted."""
+    envelope = remote_envelope(
+        event_id=str(uuid4()),
+        source_alias="codex@source:api:source-a1",
+        source_generation=str(uuid4()),
+        target_alias="codex@target:api:a1b2c3d4e5f6",
+        generation=str(uuid4()),
+        message="hello",
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.local_targets",
+        lambda *_a, **_k: pytest.fail("discovery ran without a generation match"),
+    )
+
+    response = receive_remote(tmp_path, envelope, "100.64.0.11")
+
+    assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["provider"] == "codex"
+
+
+def test_remote_node_targets_reports_broker_capacity_precisely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A decided capacity refusal is not 'unavailable or changed'."""
+    monkeypatch.setattr(runtime, "request_tailnet", lambda *_a, **_k: dict(BROKER_CAPACITY_REFUSAL))
+
+    with pytest.raises(ChatError) as caught:
+        # The short deadline leaves no room for a retry, so a broker that stays
+        # at capacity raises the precise refusal once the budget is spent.
+        runtime._remote_node_targets(
+            "100.64.0.10", deadline=time.monotonic() + 1.0, handle="f" * 64
+        )
+
+    assert str(caught.value) == (
+        "recipient broker is at capacity; nothing was delivered; send again"
+    )
+
+
+def test_remote_discovery_treats_broker_capacity_as_incomplete_not_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime, "REMOTE_DISCOVERY_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(runtime, "request_tailnet", lambda *_a, **_k: dict(BROKER_CAPACITY_REFUSAL))
+
+    assert runtime._remote_discovery(
+        identity=TailnetIdentity(self_node_id="nSelf", peers={"nA": "100.64.0.10"})
+    ) == ([], False)
+
+
+def test_remote_token_send_names_broker_capacity_instead_of_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal during exact-token attestation keeps its precise reason."""
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="source",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(source)
+    handle = "a" * 64
+    generation = str(uuid4())
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nOwner": "100.64.0.10"}),
+    )
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime.request_tailnet",
+        lambda *_a, **_k: dict(BROKER_CAPACITY_REFUSAL),
+    )
+    # Keep the retry budget short: a broker that stays at capacity must surface
+    # the precise refusal once the send's discovery budget is exhausted.
+    monkeypatch.setattr(runtime, "REMOTE_DISCOVERY_TIMEOUT_SECONDS", 1.0)
+
+    with pytest.raises(ChatError) as caught:
+        send(tmp_path, source, remote_token("nOwner", handle, generation), "hello")
+
+    assert str(caught.value) == (
+        "recipient broker is at capacity; nothing was delivered; send again"
+    )
+
+
+def _remote_target() -> Target:
+    return Target(
+        alias="claude@peer:api:a1",
+        provider="claude",
+        device="peer",
+        project="api",
+        generation=str(uuid4()),
+        session_key="a" * 64,
+        remote=True,
+        tailnet_address="100.64.0.10",
+        tailnet_node_id="nOwner",
+    )
+
+
+def _remote_send_source(root: Path) -> Route:
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="source",
+        cwd=str(root),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(source)
+    return source
+
+
+def test_remote_send_retries_broker_capacity_then_delivers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A capacity refusal retries the identical envelope inside the deadline."""
+    source = _remote_send_source(tmp_path)
+    target = _remote_target()
+    calls: list[dict[str, object]] = []
+
+    def broker(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        calls.append(payload)
+        if len(calls) < 3:
+            return dict(BROKER_CAPACITY_REFUSAL)
+        event_id = str(json.loads(str(payload["envelope"]))["event_id"])
+        return {
+            "schema_version": 1,
+            "event_id": event_id,
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": "claude",
+        }
+
+    monkeypatch.setattr(runtime, "request_tailnet", broker)
+
+    response = runtime._send_remote_target(
+        tmp_path,
+        source,
+        target,
+        "hello",
+        deadline=time.monotonic() + 30.0,
+        self_node_id="nSelf",
+    )
+
+    assert response["status"] == "TRANSPORT_ACCEPTED"
+    # Two refusals, then the admitted attempt -- every call carries the
+    # identical request, event id and envelope bytes included.
+    assert len(calls) == 3
+    assert len({call["envelope"] for call in calls}) == 1
+    assert [row.status for row in IntentStore(tmp_path).intents()] == ["TRANSPORT_ACCEPTED"]
+
+
+def test_remote_send_still_refused_at_deadline_fails_pre_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broker that stays at capacity fails decided, never UNKNOWN."""
+    source = _remote_send_source(tmp_path)
+    target = _remote_target()
+    calls: list[dict[str, object]] = []
+
+    def broker(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        calls.append(payload)
+        return dict(BROKER_CAPACITY_REFUSAL)
+
+    monkeypatch.setattr(runtime, "request_tailnet", broker)
+
+    with pytest.raises(ChatError) as caught:
+        runtime._send_remote_target(
+            tmp_path,
+            source,
+            target,
+            "hello",
+            deadline=time.monotonic() + 3.5,
+            self_node_id="nSelf",
+        )
+
+    assert not isinstance(caught.value, UnknownDeliveryError)
+    assert str(caught.value) == (
+        "recipient broker is at capacity; nothing was delivered; send again"
+    )
+    assert len(calls) >= 2
+    assert [row.status for row in IntentStore(tmp_path).intents()] == ["PRE_EFFECT_REJECTED"]
+
+
+def test_remote_send_treats_silent_broker_close_as_unknown_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older broker that closes without a frame stays UNKNOWN, one shot."""
+    source = _remote_send_source(tmp_path)
+    target = _remote_target()
+    calls: list[dict[str, object]] = []
+
+    def closing(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        calls.append(payload)
+        raise UnknownDeliveryError("peer closed connection without a response")
+
+    monkeypatch.setattr(runtime, "request_tailnet", closing)
+
+    with pytest.raises(UnknownDeliveryError):
+        runtime._send_remote_target(
+            tmp_path,
+            source,
+            target,
+            "hello",
+            deadline=time.monotonic() + 30.0,
+            self_node_id="nSelf",
+        )
+
+    assert len(calls) == 1
+    assert [row.status for row in IntentStore(tmp_path).intents()] == ["UNKNOWN_DELIVERY"]
+
+
+def test_remote_node_targets_retries_capacity_then_returns_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery retries the identical read-only probe while refused."""
+    generation = str(uuid4())
+    calls: list[dict[str, object]] = []
+
+    def broker(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        calls.append(payload)
+        if len(calls) < 3:
+            return dict(BROKER_CAPACITY_REFUSAL)
+        return {
+            "schema_version": 1,
+            "peers": [
+                {
+                    "alias": "claude@peer:api:a1",
+                    "provider": "claude",
+                    "device": "peer",
+                    "project": "api",
+                    "status": "available",
+                    "generation": generation,
+                    "session_key": "a" * 64,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(runtime, "request_tailnet", broker)
+
+    targets, complete = runtime._remote_node_targets("100.64.0.10", node_id="nOwner")
+
+    assert complete
+    assert [t.alias for t in targets] == ["claude@peer:api:a1"]
+    assert [t.tailnet_node_id for t in targets] == ["nOwner"]
+    # Each retry re-issues the identical probe payload.
+    assert len(calls) == 3
+    assert all(call == calls[0] for call in calls)
 
 
 def test_wrapped_message_limit_rejects_before_intent_creation(

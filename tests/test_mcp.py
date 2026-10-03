@@ -12,6 +12,7 @@ from cross_agent_chat import cli
 from cross_agent_chat.cli import mcp
 from cross_agent_chat.core import ChatError, IntentStore, Registry, Route
 from cross_agent_chat.mcp_server import normalize_send_arguments
+from cross_agent_chat.runtime import Target
 
 
 def _handshake(*, identifier: int = 0) -> list[dict[str, object]]:
@@ -212,8 +213,14 @@ def test_chat_send_target_description_does_not_demand_a_fresh_discovery_call(
     assert "Fresh" not in target
     assert "Reply handle" in target
     assert "route and protocol generation" in target
-    assert "fresh sessions" in target
-    assert "mixed-generation request cannot be answered" in target
+    # The stale claim that every upgrade strands a mixed-generation request was
+    # narrowed to the pre-v0.4.0 reply-handle boundary, matching the README.
+    assert "minted before v0.4.0 cannot be answered" in target
+    assert "fresh sessions on every Mac" in target
+    assert "mixed-generation request cannot be answered" not in target
+    # The alias form `send()` already resolves must be stated truthfully.
+    assert "exact full alias" in target
+    assert "remote discovery is complete" in target
     # It must also steer away from the visible sender, which is the helper.
     assert "delivery helper" in target
 
@@ -273,3 +280,215 @@ def test_instructions_stop_senders_waiting_and_explain_both_return_paths() -> No
     assert "while_idle" in cli.MCP_INSTRUCTIONS
     assert "next_turn" in cli.MCP_INSTRUCTIONS
     assert "when your current turn ends or your next prompt starts" in cli.MCP_INSTRUCTIONS
+
+
+def test_instructions_describe_reply_delivery_as_the_sender_return_path() -> None:
+    # A dogfood agent read reply_delivery as the destination's delivery state;
+    # it only ever describes how an answer comes back to this sender.
+    assert (
+        "this sending session's own return path, not the recipient's state or activity"
+        in cli.MCP_INSTRUCTIONS
+    )
+
+
+def _discovered_target(alias: str, handle_char: str, title: str | None = None) -> Target:
+    return Target(
+        alias=alias,
+        provider="claude",
+        device="imac",
+        project="proj",
+        generation=str(uuid4()),
+        session_key=handle_char * 64,
+        remote=False,
+        title=title,
+    )
+
+
+def _stub_peer_discovery(monkeypatch: pytest.MonkeyPatch, targets: list[Target]) -> None:
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda *_args, **_kwargs: targets)
+    monkeypatch.setattr("cross_agent_chat.runtime.tailnet_identity", lambda: None)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime._with_codex_titles",
+        lambda _root, found, _deadline: found,
+    )
+
+
+def _chat_peers_call(identifier: int, arguments: dict[str, object]) -> dict[str, object]:
+    return {
+        "jsonrpc": "2.0",
+        "id": identifier,
+        "method": "tools/call",
+        "params": {"name": "chat_peers", "arguments": arguments},
+    }
+
+
+def _tool_result_payload(response: dict[str, object]) -> dict[str, object]:
+    result = response["result"]
+    assert isinstance(result, dict)
+    return json.loads(result["content"][0]["text"])
+
+
+def test_chat_peers_query_filters_alias_and_title_and_reports_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A filtered listing must narrow the same discovery result, not probe less."""
+    root = tmp_path / "state"
+    targets = [
+        _discovered_target("claude@imac:Projects:W_Kluro_2Oct1PM", "a"),
+        _discovered_target("codex@imac:kwonsyup:662c7d4d031e", "b", title="E_Kluro_2Oct1PM"),
+        _discovered_target("claude@imac:Projects:W_Other", "c"),
+    ]
+    _stub_peer_discovery(monkeypatch, targets)
+    requests = [
+        *_handshake(),
+        _chat_peers_call(1, {}),
+        _chat_peers_call(2, {"query": "kluro"}),
+        _chat_peers_call(3, {"query": "e_kluro"}),
+    ]
+    monkeypatch.setattr("sys.stdin", _feed(requests))
+
+    mcp("claude", "studio", str(root))
+
+    responses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    unfiltered = _tool_result_payload(responses[1])
+    # The no-argument response keeps its exact prior shape: no filter key.
+    assert set(unfiltered) == {"schema_version", "peers", "remote_discovery", "sender"}
+    assert len(unfiltered["peers"]) == 3
+
+    by_alias = _tool_result_payload(responses[2])
+    assert by_alias["filter"] == {"query": "kluro", "matched": 2, "of": 3}
+    assert {peer["alias"] for peer in by_alias["peers"]} == {
+        "claude@imac:Projects:W_Kluro_2Oct1PM",
+        "codex@imac:kwonsyup:662c7d4d031e",
+    }
+    # Filtering never drops the opaque handle needed to address the peer.
+    assert all(isinstance(peer["handle"], str) for peer in by_alias["peers"])
+
+    by_title = _tool_result_payload(responses[3])
+    assert by_title["filter"] == {"query": "e_kluro", "matched": 1, "of": 3}
+    assert [peer["alias"] for peer in by_title["peers"]] == ["codex@imac:kwonsyup:662c7d4d031e"]
+
+
+def test_chat_peers_rejects_malformed_query_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    _stub_peer_discovery(monkeypatch, [])
+    requests = [
+        *_handshake(),
+        _chat_peers_call(1, {"bogus": "x"}),
+        _chat_peers_call(2, {"query": 5}),
+        _chat_peers_call(3, {"query": "bad\x00query"}),
+        _chat_peers_call(4, {"query": "x" * 200}),
+    ]
+    monkeypatch.setattr("sys.stdin", _feed(requests))
+
+    mcp("claude", "studio", str(root))
+
+    responses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    # Argument-shape failures stay JSON-RPC errors; content failures that pass
+    # the shape check are operation refusals (isError), like event_status.
+    assert responses[1]["error"]["code"] == -32602
+    assert responses[2]["error"]["code"] == -32602
+    assert responses[3]["result"]["isError"] is True
+    assert responses[3]["result"]["content"][0]["text"] == "peer query is invalid"
+    assert responses[4]["result"]["isError"] is True
+
+
+def _stub_alias_send(monkeypatch: pytest.MonkeyPatch, targets: list[Target]) -> list[Target]:
+    resolved: list[Target] = []
+    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda *_args, **_kwargs: targets)
+    monkeypatch.setattr("cross_agent_chat.runtime._remote_discovery", lambda **_kwargs: ([], True))
+
+    def fake_local_send(
+        _root: Path, _source: Route, target: Target, _message: str, *, deadline: float
+    ) -> dict[str, object]:
+        resolved.append(target)
+        return {
+            "schema_version": 1,
+            "event_id": "e",
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": target.provider,
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime._send_local_target", fake_local_send)
+    return resolved
+
+
+def test_chat_send_resolves_a_unique_exact_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """send() already resolves a unique alias; the MCP path must expose it."""
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=1,
+    )
+    target = _discovered_target("claude@imac:Projects:W_Kluro_2Oct1PM", "d")
+    resolved = _stub_alias_send(monkeypatch, [target])
+    monkeypatch.setattr(cli, "authenticate_mcp_sender", lambda *_args: source)
+    monkeypatch.setattr(cli, "reply_delivery", lambda *_args: "unknown")
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "chat_send",
+            # Case-insensitive: the stored alias differs in case from the query.
+            "arguments": {
+                "to": "CLAUDE@IMAC:PROJECTS:W_KLURO_2OCT1PM",
+                "message": "hi",
+            },
+        },
+    }
+    monkeypatch.setattr("sys.stdin", _feed([*_handshake(), request]))
+
+    mcp("claude", "studio", str(root))
+
+    response = json.loads(capsys.readouterr().out.splitlines()[-1])
+    result = _tool_result_payload(response)
+    assert resolved == [target]
+    # The human-readable recipient is surfaced alongside the effect result.
+    assert result["to"] == "claude@imac:Projects:W_Kluro_2Oct1PM"
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+
+
+def test_chat_send_refuses_an_ambiguous_alias_before_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=1,
+    )
+    same_alias = "claude@imac:Projects:W_Kluro_2Oct1PM"
+    resolved = _stub_alias_send(
+        monkeypatch,
+        [_discovered_target(same_alias, "d"), _discovered_target(same_alias, "e")],
+    )
+    monkeypatch.setattr(cli, "authenticate_mcp_sender", lambda *_args: source)
+    monkeypatch.setattr(cli, "reply_delivery", lambda *_args: "unknown")
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "chat_send",
+            "arguments": {"to": same_alias, "message": "hi"},
+        },
+    }
+    monkeypatch.setattr("sys.stdin", _feed([*_handshake(), request]))
+
+    mcp("claude", "studio", str(root))
+
+    response = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert response["result"]["isError"] is True
+    assert response["result"]["content"][0]["text"] == "target is ambiguous or unavailable"
+    assert resolved == []

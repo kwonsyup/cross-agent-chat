@@ -24,16 +24,16 @@ secrets those files hold (see [setup and data handling](SECURITY.md)).
 Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
 limits the set.
 
-Install v0.4.7 with:
+Install v0.4.8 with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.7/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.8/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
-This builds the released `v0.4.7` tag and installs the command at
+This builds the released `v0.4.8` tag and installs the command at
 `~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
 Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
 not found in your shell, use the full path the installer reports. Run it on
@@ -145,7 +145,10 @@ that a login is required.
 
 Sessions load three tools: `chat_peers` finds recipients, `chat_send` sends
 one message, `chat_status` reads sender-local custody. Plain language works
-instead of invoking them.
+instead of invoking them. `chat_peers` accepts an optional `query` that
+narrows the same listing by case-insensitive substring on alias and title,
+and `chat_send` also resolves one peer's exact alias, refusing when it
+matches zero or several.
 
 `chat_send` reports `TRANSPORT_ACCEPTED` (custody, not a read receipt — do
 not re-send), a pre-delivery refusal (nothing was handed over; correcting
