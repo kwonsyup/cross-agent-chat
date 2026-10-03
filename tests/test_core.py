@@ -978,7 +978,6 @@ def test_aged_unresolved_intent_refusal_points_at_owner_resolve(tmp_path: Path) 
     assert "PENDING" in message
     assert "created no intent" in message
     assert "sent nothing" in message
-    assert "probably orphaned" in message
     assert "does not prove" in message
     assert "bound a live send" not in message
     assert f"cross-agent-chat resolve {event_id}" in message
@@ -1044,7 +1043,9 @@ def test_an_exact_frame_replay_dedupes_but_a_new_send_is_a_new_attempt(
     exact frame mints a second intent or re-claims an already claimed row.
     The two paths must stay separate: an exact-frame replay dedupes on the
     recorded event, while a fresh send is a new attempt the pair gate
-    adjudicates on its own.
+    adjudicates on its own. That is wire/event dedup only -- minting a new
+    event id never makes equivalent work independent, so semantic no-replay
+    stays the caller's duty, not something the store confers.
     """
     source = route(tmp_path, project="source")
     target = route(tmp_path)
@@ -1080,8 +1081,11 @@ def test_an_exact_frame_replay_dedupes_but_a_new_send_is_a_new_attempt(
     with pytest.raises(ChatError, match="unresolved delivery intent"):
         store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
 
-    # Once the first event's outcome is recorded uncertain, the same body is
-    # admitted only as a new event id: a distinct attempt, not a replay.
+    # Once the first event's outcome is recorded uncertain, the primitive can
+    # mint a second event for the identical body. That is wire/event dedup
+    # only: a fresh event id does not make equivalent work independent, and
+    # this admission is exactly why the caller must not re-send an uncertain
+    # task -- the store records a new attempt, it does not authorize one.
     store.mark(event_id, "UNKNOWN_DELIVERY")
     second = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
     assert second != event_id

@@ -760,8 +760,8 @@ class IntentStore:
                     fail(
                         "target has an unresolved delivery intent from this sender: "
                         f"event {blocker.event_id} is still {blocker.status} "
-                        f"({int(age)}s old -- probably orphaned, though age alone "
-                        "does not prove its send finished or failed); this attempt "
+                        f"({int(age)}s old -- age alone does not prove its send "
+                        "finished or failed); this attempt "
                         "created no intent and sent nothing; it refuses only "
                         "another send from this session to this target, so "
                         "unrelated work still proceeds; if you accept that "
