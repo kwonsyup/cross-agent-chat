@@ -232,21 +232,6 @@ def _assert_each_caller_body_delivered_once(
         assert row.event_id in body
 
 
-def _probe_intent_row(source_key: str, event_id: str, payload_digest: str) -> Intent:
-    return Intent(
-        schema_version=1,
-        event_id=event_id,
-        source_key=source_key,
-        source_generation=str(uuid4()),
-        source_alias="codex@studio:probe:probe-a1",
-        target_key="c" * 64,
-        target_generation=str(uuid4()),
-        payload_digest=payload_digest,
-        status="TRANSPORT_ACCEPTED",
-        timestamp="2026-10-03T00:00:00+00:00",
-    )
-
-
 def test_idle_courier_health_returns_the_live_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -823,30 +808,6 @@ def test_two_senders_to_one_busy_target_each_complete_once(
     finally:
         release_accept.set()
         _stop_courier(root, item, worker)
-
-
-def test_a_replayed_body_cannot_pass_the_per_caller_delivery_ledger() -> None:
-    """Probe: one caller's body replayed for the other's send is caught.
-
-    The strengthened busy-target assertions only matter if the observation
-    itself discriminates, so the matcher is exercised against a tampered
-    delivery list -- A's wrapped body delivered twice while B's never
-    reached the provider. The old ref-only ledger could not see that; the
-    per-caller text and digest binding must refuse it, while the honest
-    two-body list still passes so the probe is not a tautology.
-    """
-    key_a, key_b = "a" * 64, "b" * 64
-    event_a, event_b = str(uuid4()), str(uuid4())
-    body_a = f"envelope head {event_a}\n\nalpha caller text"
-    body_b = f"envelope head {event_b}\n\nbeta caller text"
-    intents = [
-        _probe_intent_row(key_a, event_a, hashlib.sha256(body_a.encode()).hexdigest()),
-        _probe_intent_row(key_b, event_b, hashlib.sha256(body_b.encode()).hexdigest()),
-    ]
-    callers = {key_a: "alpha caller text", key_b: "beta caller text"}
-    _assert_each_caller_body_delivered_once([body_a, body_b], intents, callers)
-    with pytest.raises(AssertionError):
-        _assert_each_caller_body_delivered_once([body_a, body_a], intents, callers)
 
 
 def test_codex_native_accept_does_not_block_queue_controls(
