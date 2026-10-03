@@ -9,6 +9,7 @@ to exact-token senders as "unavailable or changed".
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import socket
 import stat
@@ -35,7 +36,9 @@ from cross_agent_chat.native_helper import (
     NATIVE_QUEUE_BINARY_ENV_VAR,
     NATIVE_QUEUE_ENV_VALUE,
     NATIVE_QUEUE_ENV_VAR,
+    NativeDispatchStore,
     NativeHelperStore,
+    native_helper_dispatch_hook_group,
 )
 from cross_agent_chat.recipient import local_token
 from cross_agent_chat.runtime import courier_server, request_socket
@@ -958,6 +961,64 @@ def _codex_helper_route(tmp_path: Path, root: Path) -> Route:
     return helper
 
 
+def _registered_helper_courier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Route, Route]:
+    """An original route with a registered helper on real guarded state.
+
+    Everything ``runtime.native_dispatch`` checks is exercised for real: the
+    binding comes from ``reserve``/``register``, the owner identity from the
+    real kernel read of this process, the hook readiness from real
+    trusted-hash profile files, and the dispatch claim from the durable
+    store. Only the account-digest subprocess boundary is stubbed.
+    """
+    root = tmp_path / "state"
+    profile = tmp_path / "dispatch-codex-home"
+    profile.mkdir()
+    owner, _binary = runtime.recipient_owner_identity("codex", os.getpid(), str(profile))
+    original_cwd = tmp_path / "dispatch-original"
+    original_cwd.mkdir()
+    original = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(original_cwd),
+        pid=os.getpid(),
+        owner_identity=owner,
+        profile_root=str(profile),
+    )
+    Registry(root).upsert(original)
+    store = NativeHelperStore(root)
+    account = hashlib.sha256(b"fixture-account").hexdigest()
+    binding, nonce = store.reserve(original, account)
+    helper_cwd = tmp_path / binding.helper_directory
+    helper_cwd.mkdir()
+    helper = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(helper_cwd),
+        pid=os.getpid(),
+        owner_identity=owner,
+        profile_root=str(profile),
+    )
+    Registry(root).upsert(helper)
+    store.register(helper, nonce, original, account)
+    group = native_helper_dispatch_hook_group()
+    hooks_path = profile / "hooks.json"
+    hooks_path.write_text(json.dumps({"hooks": {"PostToolUse": [group]}}), encoding="utf-8")
+    trusted = runtime._native_hook_hash("post_tool_use", group)
+    (profile / "config.toml").write_text(
+        "[features]\n"
+        "hooks = true\n\n"
+        "[hooks.state]\n"
+        f'"{hooks_path.resolve()}:post_tool_use:0:0" = {{ trusted_hash = "{trusted}" }}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime, "_native_account_digest", lambda *_args: account)
+    return root, original, helper
+
+
 def test_fixture_boundary_blocks_real_provider_subprocesses() -> None:
     """The suite's own guard: no test may reach a real provider binary."""
     with pytest.raises(AssertionError):
@@ -1059,14 +1120,215 @@ def test_a_partial_frame_does_not_serialize_the_listener(
     assert not worker.is_alive()
 
 
-def test_helper_dispatch_and_ack_survive_a_held_native_notification(
+def _partial_accept(
+    root: Path, item: Route, event_id: str, message: str
+) -> tuple[socket.socket, bytes]:
+    """Open a courier connection holding all but the tail of an accept frame."""
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(30.0)
+    connection.connect(str(runtime.socket_path(root, item)))
+    frame = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "operation": "accept",
+                "generation": item.generation,
+                "event_id": event_id,
+                "message": message,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    connection.sendall(frame[:-4])
+    return connection, frame[-4:]
+
+
+def _read_stopped_refusal(connection: socket.socket, event_id: str) -> dict[str, object]:
+    raw: dict[str, object] = json.loads(runtime.read_frame(connection))
+    assert raw == {
+        "schema_version": 1,
+        "event_id": event_id,
+        "status": "PRE_EFFECT_REJECTED",
+        "provider": "claude",
+        "error": runtime.COURIER_STOPPED_PRE_EFFECT_REASON,
+    }
+    return raw
+
+
+def test_an_incomplete_accept_cannot_start_an_effect_after_shutdown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Helper dispatch/ack answer while the queue notification RPC is held.
+    """A frame completed after STOPPED stays pre-effect, never an old effect.
 
-    A rollback of a failed notification must not resurrect a body the native
-    dispatch already acknowledged: the failed accept ends pre-effect and the
-    queue stays empty.
+    The worker holding the unfinished frame drains during shutdown, but
+    effect admission rechecks the stop first, so the finished accept is
+    answered with a decided pre-effect refusal and the provider is never
+    reached. Before the recheck this sequence ran ``sendmessage`` after the
+    courier had already acknowledged its stop.
+    """
+    item = _route(tmp_path)
+    root = tmp_path / "state"
+    Registry(root).upsert(item)
+    monkeypatch.setattr(runtime, "exact_agent", lambda *_a, **_k: _agent_view(item))
+    monkeypatch.setattr(runtime, "discover_target_ref", lambda _name: "API A [ref]")
+    send_calls: list[str] = []
+    monkeypatch.setattr(runtime, "sendmessage", lambda _r, _m, _e: send_calls.append(_r))
+    worker = _start_courier(root, item)
+    event_id = str(uuid4())
+    partial, tail = _partial_accept(root, item, event_id, "stale frame delivery")
+    try:
+        _bootstrap(root, item)
+        stopped = request_socket(
+            runtime.socket_path(root, item),
+            {"schema_version": 1, "operation": "shutdown", "generation": item.generation},
+            timeout=5.0,
+        )
+        assert stopped == {"schema_version": 1, "status": "STOPPED"}
+        # The frame read only now finishes, already after the acknowledged
+        # stop; the decided refusal is honest because nothing was admitted.
+        partial.sendall(tail)
+        _read_stopped_refusal(partial, event_id)
+        assert send_calls == []
+    finally:
+        partial.close()
+        worker.join(timeout=30.0)
+    assert not worker.is_alive()
+
+
+def test_an_incomplete_accept_cannot_start_an_effect_after_route_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frame completed after generation replacement stays pre-effect too.
+
+    The request still names the old generation, so only the admission-time
+    route recheck stands between it and a delivery into a rotated session;
+    the refused response and the zero provider effects are the repair.
+    """
+    item = _route(tmp_path)
+    root = tmp_path / "state"
+    Registry(root).upsert(item)
+    monkeypatch.setattr(runtime, "exact_agent", lambda *_a, **_k: _agent_view(item))
+    monkeypatch.setattr(runtime, "discover_target_ref", lambda _name: "API A [ref]")
+    send_calls: list[str] = []
+    monkeypatch.setattr(runtime, "sendmessage", lambda _r, _m, _e: send_calls.append(_r))
+    worker = _start_courier(root, item)
+    event_id = str(uuid4())
+    partial, tail = _partial_accept(root, item, event_id, "stale frame delivery")
+    try:
+        _bootstrap(root, item)
+        replacement = Route.create(
+            provider="claude",
+            session_id=item.session_id,
+            device="studio",
+            cwd=item.cwd,
+            pid=item.pid,
+        )
+        Registry(root).upsert(replacement)
+        partial.sendall(tail)
+        _read_stopped_refusal(partial, event_id)
+        assert send_calls == []
+    finally:
+        partial.close()
+        worker.join(timeout=30.0)
+    assert not worker.is_alive()
+
+
+def test_a_guarded_dispatch_handoff_makes_a_late_notice_refusal_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claimed body makes a definitive notice failure UNKNOWN, never replayable.
+
+    The real ``runtime.native_dispatch`` producer -- hook, binding, owner,
+    account, and durable-claim guards all live -- hands the staged body to the
+    trusted helper path while the queue notice RPC is still held. When that
+    notice then fails definitively, the body may already have reached the
+    bound original thread, so the accept cannot claim no effect: a reported
+    PRE_EFFECT_REJECTED here is the misclassification this test names.
+    """
+    root, original, item = _registered_helper_courier(tmp_path, monkeypatch)
+    monkeypatch.setenv(NATIVE_QUEUE_ENV_VAR, NATIVE_QUEUE_ENV_VALUE)
+    monkeypatch.setenv(NATIVE_QUEUE_BINARY_ENV_VAR, sys.executable)
+    rpc_entered = threading.Event()
+    release_rpc = threading.Event()
+    rpc_calls: list[str] = []
+
+    def held_queue_native_input(**kwargs: object) -> None:
+        rpc_calls.append(str(kwargs["event_id"]))
+        rpc_entered.set()
+        release_rpc.wait(timeout=30.0)
+        raise ChatError("Codex native queue rejected the message before acceptance")
+
+    monkeypatch.setattr("cross_agent_chat.codex.queue_native_input", held_queue_native_input)
+    worker = _start_courier(root, item)
+    event_id = str(uuid4())
+    responses: list[dict[str, object]] = []
+    sender = threading.Thread(
+        target=lambda: responses.append(
+            _accept(root, item, event_id, "held helper delivery", 30.0)
+        ),
+        daemon=True,
+    )
+    try:
+        _bootstrap(root, item)
+        sender.start()
+        assert rpc_entered.wait(10.0)
+        # The whole guarded path runs while the notice is still in flight:
+        # real socket dispatch, durable UNKNOWN claim, real socket ack.
+        dispatched = runtime.native_dispatch(root, item, event_id)
+        assert dispatched["_meta"] == {
+            "native_args": {
+                "threadId": original.session_id,
+                "prompt": "held helper delivery",
+            }
+        }
+        claims = NativeDispatchStore(root).dispatches()
+        assert len(claims) == 1
+        assert claims[0].event_id == event_id
+        assert claims[0].state == "UNKNOWN"
+        assert claims[0].payload_sha256 == hashlib.sha256(b"held helper delivery").hexdigest()
+        assert "held helper delivery" not in (root / "native-dispatches.json").read_text(
+            encoding="utf-8"
+        )
+        peeked = request_socket(
+            runtime.socket_path(root, item),
+            {"schema_version": 1, "operation": "peek", "generation": item.generation},
+            timeout=5.0,
+        )
+        assert peeked["messages"] == []
+        # The claim and ack completed while the provider notice was still held.
+        assert not release_rpc.is_set()
+        release_rpc.set()
+        sender.join(timeout=15.0)
+        # The body may already have effected through the bound native path, so
+        # the notice's definitive refusal is uncertain -- never a retryable
+        # no-effect answer, and no automatic second dispatch exists.
+        assert responses == [
+            {
+                "schema_version": 1,
+                "event_id": event_id,
+                "status": "UNKNOWN_DELIVERY",
+                "provider": "codex",
+            }
+        ]
+        assert rpc_calls == [event_id]
+        with pytest.raises(ChatError, match="native helper dispatch is unavailable"):
+            runtime.native_dispatch(root, item, event_id)
+    finally:
+        release_rpc.set()
+        if sender.ident is not None:
+            sender.join(timeout=15.0)
+        _stop_courier(root, item, worker)
+
+
+def test_a_definitive_notice_refusal_without_handoff_stays_pre_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A body that never left is the only safely retracted rollback.
+
+    With no dispatch while the notice is held, the definitive refusal proves
+    no effect: the accept stays PRE_EFFECT_REJECTED, the rollback removes the
+    staged body atomically, and no later dispatch can claim it.
     """
     root = tmp_path / "state"
     item = _codex_helper_route(tmp_path, root)
@@ -1084,12 +1346,11 @@ def test_helper_dispatch_and_ack_survive_a_held_native_notification(
 
     monkeypatch.setattr("cross_agent_chat.codex.queue_native_input", held_queue_native_input)
     worker = _start_courier(root, item)
-    path = runtime.socket_path(root, item)
     event_id = str(uuid4())
     responses: list[dict[str, object]] = []
     sender = threading.Thread(
         target=lambda: responses.append(
-            _accept(root, item, event_id, "held helper delivery", 30.0)
+            _accept(root, item, event_id, "refused helper delivery", 30.0)
         ),
         daemon=True,
     )
@@ -1097,47 +1358,6 @@ def test_helper_dispatch_and_ack_survive_a_held_native_notification(
         _bootstrap(root, item)
         sender.start()
         assert rpc_entered.wait(10.0)
-        dispatched = request_socket(
-            path,
-            {
-                "schema_version": 1,
-                "operation": "native_dispatch",
-                "generation": item.generation,
-                "event_id": event_id,
-            },
-            timeout=5.0,
-        )
-        assert dispatched == {
-            "schema_version": 1,
-            "status": "NATIVE_DISPATCH",
-            "generation": item.generation,
-            "event_id": event_id,
-            "message": "held helper delivery",
-        }
-        acked = request_socket(
-            path,
-            {
-                "schema_version": 1,
-                "operation": "native_dispatch_ack",
-                "generation": item.generation,
-                "event_id": event_id,
-            },
-            timeout=5.0,
-        )
-        assert acked == {
-            "schema_version": 1,
-            "status": "NATIVE_DISPATCH_ACKED",
-            "generation": item.generation,
-            "event_id": event_id,
-        }
-        peeked = request_socket(
-            path,
-            {"schema_version": 1, "operation": "peek", "generation": item.generation},
-            timeout=5.0,
-        )
-        assert peeked["messages"] == []
-        # Every queue control answered while the provider RPC was still held.
-        assert not release_rpc.is_set()
         release_rpc.set()
         sender.join(timeout=15.0)
         assert responses == [
@@ -1149,10 +1369,10 @@ def test_helper_dispatch_and_ack_survive_a_held_native_notification(
                 "error": "Codex native queue rejected the message before acceptance",
             }
         ]
-        # The failed-notification rollback cannot resurrect the acknowledged body.
+        # The never-handed-off body was retracted: no peek, no later dispatch.
         assert (
             request_socket(
-                path,
+                runtime.socket_path(root, item),
                 {"schema_version": 1, "operation": "peek", "generation": item.generation},
                 timeout=5.0,
             )["messages"]
@@ -1160,7 +1380,7 @@ def test_helper_dispatch_and_ack_survive_a_held_native_notification(
         )
         assert (
             request_socket(
-                path,
+                runtime.socket_path(root, item),
                 {
                     "schema_version": 1,
                     "operation": "native_dispatch",
@@ -1172,6 +1392,92 @@ def test_helper_dispatch_and_ack_survive_a_held_native_notification(
             == "UNAVAILABLE"
         )
         assert rpc_calls == [event_id]
+    finally:
+        release_rpc.set()
+        if sender.ident is not None:
+            sender.join(timeout=15.0)
+        _stop_courier(root, item, worker)
+
+
+def test_a_dispatch_racing_rollback_lands_on_one_coherent_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The handoff check and retraction share one lock: no half-admitted end.
+
+    If the guarded dispatch takes the queue lock first, the durable claim is
+    possible-effect custody and the accept must end UNKNOWN; if the rollback
+    runs first, the dispatch finds no body and the accept stays
+    PRE_EFFECT_REJECTED. A non-atomic check could land a third, wrong state:
+    a rejected accept beside a completed handoff, or a resurrected body.
+    """
+    root, original, item = _registered_helper_courier(tmp_path, monkeypatch)
+    del original
+    monkeypatch.setenv(NATIVE_QUEUE_ENV_VAR, NATIVE_QUEUE_ENV_VALUE)
+    monkeypatch.setenv(NATIVE_QUEUE_BINARY_ENV_VAR, sys.executable)
+    rpc_entered = threading.Event()
+    release_rpc = threading.Event()
+
+    def held_queue_native_input(**_kwargs: object) -> None:
+        rpc_entered.set()
+        release_rpc.wait(timeout=30.0)
+        raise ChatError("Codex native queue rejected the message before acceptance")
+
+    monkeypatch.setattr("cross_agent_chat.codex.queue_native_input", held_queue_native_input)
+    worker = _start_courier(root, item)
+    event_id = str(uuid4())
+    responses: list[dict[str, object]] = []
+    sender = threading.Thread(
+        target=lambda: responses.append(
+            _accept(root, item, event_id, "raced helper delivery", 30.0)
+        ),
+        daemon=True,
+    )
+    dispatch_result: list[dict[str, object]] = []
+    dispatch_errors: list[BaseException] = []
+    try:
+        _bootstrap(root, item)
+        sender.start()
+        assert rpc_entered.wait(10.0)
+
+        def dispatch() -> None:
+            try:
+                dispatch_result.append(runtime.native_dispatch(root, item, event_id))
+            except BaseException as error:
+                dispatch_errors.append(error)
+
+        dispatcher = threading.Thread(target=dispatch, daemon=True)
+        dispatcher.start()
+        # Releasing the notice and starting the claim concurrently puts the
+        # dispatch's lock acquisition and the rollback's lock acquisition in
+        # real contention; whichever wins decides the whole outcome.
+        release_rpc.set()
+        dispatcher.join(timeout=15.0)
+        sender.join(timeout=15.0)
+        claims = NativeDispatchStore(root).dispatches()
+        if dispatch_result:
+            # The dispatch's handoff won: the claimed body may have effected,
+            # so a PRE_EFFECT_REJECTED answer would have been a lie.
+            assert responses[0]["status"] == "UNKNOWN_DELIVERY"
+            assert len(claims) == 1
+            assert claims[0].state == "UNKNOWN"
+        else:
+            # The rollback won: nothing ever left, so the decided refusal and
+            # the empty queue are the honest, coherent end state.
+            assert dispatch_errors
+            assert responses[0]["status"] == "PRE_EFFECT_REJECTED"
+            assert claims == []
+            assert (
+                request_socket(
+                    runtime.socket_path(root, item),
+                    {
+                        "schema_version": 1,
+                        "operation": "peek",
+                        "generation": item.generation,
+                    },
+                    timeout=5.0,
+                )["messages"]
+                == []
+            )
     finally:
         release_rpc.set()
         if sender.ident is not None:

@@ -142,6 +142,9 @@ COURIER_STARTUP_SECONDS: Final = 15.0
 MAX_COURIER_DIAGNOSTIC_BYTES: Final = 1024
 BOOTSTRAP_FRAME_TIMEOUT_SECONDS: Final = 0.1
 COURIER_BUSY_PRE_EFFECT_REASON: Final = "session courier is busy with another delivery"
+# A frame whose read finished after shutdown or a route generation change was
+# never effect-admitted; the decided pre-effect rejection tells its sender so.
+COURIER_STOPPED_PRE_EFFECT_REASON: Final = "session courier stopped before admitting a delivery"
 # Each accepted courier connection gets one bounded worker seat for its whole
 # service -- frame read, provider inventory, queue control, or delivery -- so a
 # slow provider call or a trickled frame can never serialize the listener. The
@@ -1813,6 +1816,7 @@ FORWARDABLE_PRE_EFFECT_REASONS: Final = frozenset(
         "Claude courier finished without a SendMessage call",
         "session courier is still bootstrapping",
         COURIER_BUSY_PRE_EFFECT_REASON,
+        COURIER_STOPPED_PRE_EFFECT_REASON,
         "Codex courier is unavailable",
         "Codex courier queue is full",
         "Codex native queue is unavailable",
@@ -2155,10 +2159,33 @@ def courier_server(
                         )
                     elif accept_lock.acquire(blocking=False):
                         try:
-                            emit_frame_safely(
-                                connection,
-                                courier_accept(route, courier, event_id, message),
-                            )
+                            # Admission is the linearization point: a frame
+                            # whose read outlived a shutdown acknowledgement or
+                            # this route's exact generation can no longer start
+                            # an effect, while an effect admitted just before
+                            # the stop may still drain. The recheck reads only
+                            # local registry state, so provider I/O stays
+                            # outside the lock and shutdown stays prompt.
+                            if stopping.is_set() or not _route_current(root, route):
+                                try:
+                                    identifier = valid_uuid(event_id, "event id")
+                                except ChatError:
+                                    return
+                                emit_frame_safely(
+                                    connection,
+                                    {
+                                        "schema_version": SCHEMA_VERSION,
+                                        "event_id": identifier,
+                                        "status": "PRE_EFFECT_REJECTED",
+                                        "provider": route.provider,
+                                        "error": COURIER_STOPPED_PRE_EFFECT_REASON,
+                                    },
+                                )
+                            else:
+                                emit_frame_safely(
+                                    connection,
+                                    courier_accept(route, courier, event_id, message),
+                                )
                         finally:
                             accept_lock.release()
                     else:

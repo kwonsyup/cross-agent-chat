@@ -385,6 +385,14 @@ class CodexCourier:
         self.native_helper = native_helper
         self.provider = provider
         self._pending: OrderedDict[str, str] = OrderedDict()
+        # _unresolved holds the staged event ids whose helper notice RPC is
+        # still in flight, and _handed_off the subset whose body already left
+        # through a guarded native dispatch. A handoff observation must outlive
+        # the body's acknowledgement so a late definitive notice failure can
+        # never masquerade as a no-effect rejection; both sets live only while
+        # that one effect is unresolved and stay bounded by the queue capacity.
+        self._unresolved: set[str] = set()
+        self._handed_off: set[str] = set()
         # The courier listener and the one delivery worker share this queue, so
         # every read or mutation takes the short lock; the native-queue RPC in
         # accept is deliberately outside it so queue controls never wait on a
@@ -414,6 +422,7 @@ class CodexCourier:
                         raise ChatError("Codex courier queue is full")
                     else:
                         self._pending[identifier] = body
+                        self._unresolved.add(identifier)
                         newly_admitted = True
             binary, environment, thread_id = self.native_queue
             try:
@@ -431,13 +440,27 @@ class CodexCourier:
                         else body
                     ),
                 )
-            except UnknownDeliveryError:
-                raise
-            except ChatError:
+            except ChatError as error:
+                handed_off = False
                 if newly_admitted:
+                    # Only a body that never left is safely retracted. If a
+                    # guarded dispatch claimed the body while this notice was
+                    # in flight, the message may already have been submitted to
+                    # the bound original thread, so a late definitive notice
+                    # failure is uncertain, not a no-effect rejection.
                     with self._lock:
-                        self._pending.pop(identifier, None)
+                        handed_off = identifier in self._handed_off
+                        self._handed_off.discard(identifier)
+                        self._unresolved.discard(identifier)
+                        if not handed_off and not isinstance(error, UnknownDeliveryError):
+                            self._pending.pop(identifier, None)
+                if handed_off:
+                    raise UnknownDeliveryError("Codex native queue outcome is unknown") from error
                 raise
+            if newly_admitted:
+                with self._lock:
+                    self._handed_off.discard(identifier)
+                    self._unresolved.discard(identifier)
             return {
                 "schema_version": 1,
                 "event_id": identifier,
@@ -508,9 +531,12 @@ class CodexCourier:
         identifier = valid_uuid(event_id, "event id")
         with self._lock:
             try:
-                return self._pending[identifier]
+                body = self._pending[identifier]
             except KeyError as error:
                 raise ChatError("native helper dispatch is unavailable") from error
+            if identifier in self._unresolved:
+                self._handed_off.add(identifier)
+            return body
 
     def pending_ids(self) -> list[str]:
         with self._lock:
@@ -519,6 +545,8 @@ class CodexCourier:
     def clear(self) -> None:
         with self._lock:
             self._pending.clear()
+            self._unresolved.clear()
+            self._handed_off.clear()
 
 
 def hook_context(messages: list[dict[str, str]]) -> str:
