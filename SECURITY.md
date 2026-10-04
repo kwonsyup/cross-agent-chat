@@ -108,6 +108,16 @@ peer handles. Without those flags, the endpoint can address the owner's
 available peers. Recipient tokens select exact generations and are not
 credentials themselves.
 
+`external configure-scope ENDPOINT_ID --expected-generation UUID` replaces
+that endpoint's allowlist and requires at least one exact recipient token.
+It acquires the endpoint-effect lock before the endpoint-state lock and
+refuses a stale generation or inactive endpoint without writing. An identical
+set is a no-op; a changed set rotates the endpoint generation, fencing old
+handles. Scope changes preserve the endpoint ID, credential verifier,
+callback configuration, and delivery intents. The endpoint can no longer
+inspect earlier events, and peers need fresh handles for it. There is no
+owner-wide empty-scope or `allow all` operation.
+
 The owner may configure a callback using a private JSON file containing its
 exact HTTPS `url` and bearer value. Keep that source file private; CAC copies
 the configuration into the owner-only state root. The callback POST includes

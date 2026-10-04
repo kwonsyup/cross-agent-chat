@@ -35,11 +35,11 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 | Module | Responsibility |
 |---|---|
 | `__init__.py` | Runtime `__version__`, kept consistent with package and release metadata. |
-| `cli.py` | Argument parsing, public commands (`setup`, `doctor`, `peers`, `resolve`, `uninstall`), owner-managed `external enroll/revoke/rotate/configure-callback`, one-shot `external-call`, stdio `external-mcp`, hidden provider hook/service entrypoints (`_`-prefixed), and MCP tool dispatch. |
+| `cli.py` | Argument parsing, public commands (`setup`, `doctor`, `peers`, `resolve`, `uninstall`), owner-managed `external enroll/configure-scope/configure-callback/rotate/revoke`, one-shot `external-call`, stdio `external-mcp`, hidden provider hook/service entrypoints (`_`-prefixed), and MCP tool dispatch. |
 | `mcp_server.py` | The stdio MCP surface itself: bounded frame reading, JSON-RPC batch handling, strict initialize lifecycle, request-ID validation, ping, and `chat_send` argument normalization. |
 | `recipient.py` | Versioned opaque recipient endpoint tokens (`cac2.`): minting and strict parsing. A remote token pins session key + route generation to a stable Tailnet node; a local token pins them to the issuing state root. |
 | `core.py` | Route identity, content-free intent records, validation, private atomic persistence, state locks, and the private per-generation owner image anchor sidecar (`owner-<generation>.json`). This is where durable product state is defined. |
-| `external.py` | Owner-enrolled endpoint IDs, credential verifiers, generation, exact recipient scope, revocation/rotation, and private callback references. Revocation removes CAC's callback copy, not the owner's credential/config source files. The context label is not provider attestation; these records live outside the native route registry. |
+| `external.py` | Owner-enrolled endpoint IDs, credential verifiers, generation, exact recipient scope, generation-fenced scope replacement, revocation/rotation, and private callback references. Revocation removes CAC's callback copy, not the owner's credential/config source files. The context label is not provider attestation; these records live outside the native route registry. |
 | `external_callback.py` | Owner-configured bounded HTTPS POST with hostname/TLS checks, no redirects, and content-free outcome. A busy endpoint is an explicit pre-effect refusal; a 2xx is transport custody only, not model receipt, wake, or completion. |
 | `runtime.py` | Hook registration, native and owner-enrolled sender authentication, peer discovery, token minting during listing and re-attestation during send, local/external recipients, local couriers (bounded per-connection worker seats; one serialized effect at a time, with admission fenced against shutdown acknowledgement and route rotation), socket framing/transport, Codex native queue plumbing, owner image anchors (built at registration; read by the anchored owner checks), reply-readiness reporting. Largest module; several responsibilities share it. |
 | `tailnet.py` | Tailscale IPv4 discovery/validation and port constants (`47071` product, `47072` local health). |
@@ -68,6 +68,8 @@ alone proves that an active recipient consumed an envelope.
 - **External access and scope:** `cli.py` (`external-call`, `external-mcp`,
   and `external` management commands), `external.py` (credential verification,
   exact allowed `cac2.` recipient set, generation changes, revocation). The
+  owner changes a scope only with an expected current endpoint generation; a
+  changed scope preserves credentials and intents while fencing old handles.
   request-id guard returns prior custody only after the exact target/content
   tuple is verified; if the target is unavailable, it refuses without a new
   effect and directs the caller to `chat_status`, never a new recipient. The

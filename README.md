@@ -144,6 +144,23 @@ never send equivalent accepted or uncertain work under a new request ID.
 `reply_delivery` remains `unknown` until original external conversation
 receiving is established.
 
+To replace an endpoint's recipient set, use its latest generation and pass
+one or more exact current peer handles. There is no empty or owner-wide scope
+option:
+
+```sh
+cross-agent-chat external configure-scope "$CAC_ENDPOINT_ID" \
+  --expected-generation "$CAC_ENDPOINT_GENERATION" \
+  --allow-recipient "$CAC_ALLOWED_RECIPIENT"
+```
+
+Repeat `--allow-recipient` for each permitted peer. A stale expected generation
+refuses without changing state. Repeating the same set is a no-op; an actual
+change rotates the endpoint generation, so older handles to that endpoint
+stop working. Peers need fresh handles, and the endpoint can no longer inspect
+earlier events with `chat_status` or request IDs. The credential, callback
+configuration, and stored delivery intents remain unchanged.
+
 The current source also has an owner-configured HTTPS callback option, but no
 external Bot or original-context callback has been qualified. A 2xx response
 means only that the HTTP receiver accepted custody; it does not prove the Bot

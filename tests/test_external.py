@@ -17,7 +17,15 @@ from uuid import uuid4
 import pytest
 
 from cross_agent_chat import cli, external_callback, runtime
-from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, atomic_json, session_key
+from cross_agent_chat.core import (
+    ChatError,
+    IntentStatus,
+    IntentStore,
+    Registry,
+    Route,
+    atomic_json,
+    session_key,
+)
 from cross_agent_chat.external import ExternalEndpoint, ExternalEndpointStore, endpoint_effect_lock
 from cross_agent_chat.recipient import local_token, parse_recipient_token, remote_token
 from cross_agent_chat.tailnet import TailnetIdentity
@@ -223,6 +231,332 @@ def test_selected_scope_pins_origin_and_generation(tmp_path: Path) -> None:
         with pytest.raises(ChatError, match="outside"):
             cli._external_call_tool(root, credential, _send(disallowed, str(uuid4())))
     assert IntentStore(root).intents() == []
+
+
+def test_configure_scope_cli_rotates_and_preserves_endpoint_owned_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    endpoint, credential = _enroll(root)
+    endpoint = _callback(root, endpoint)
+    callback_path = root / cast(str, endpoint.callback_ref)
+    callback_bytes = callback_path.read_bytes()
+    intents = IntentStore(root)
+    intent_statuses: tuple[tuple[IntentStatus, str], ...] = (
+        ("TRANSPORT_ACCEPTED", "a" * 64),
+        ("UNKNOWN_DELIVERY", "b" * 64),
+    )
+    for status, target_key in intent_statuses:
+        event = str(uuid4())
+        event_id = intents.begin_identity(
+            source_key=endpoint.key,
+            source_generation=endpoint.generation,
+            source_alias=endpoint.alias,
+            target_key=target_key,
+            target_generation=str(uuid4()),
+            payload_digest="c" * 64,
+            event_id=event,
+        )
+        intents.mark(event_id, status)
+    prior_intents = intents.intents()
+    prior_generation = endpoint.generation
+    prior_credential_hash = endpoint.credential_hash
+    first = local_token(root, "d" * 64, str(uuid4()))
+    second = remote_token("nSelected", "e" * 64, str(uuid4()))
+
+    arguments = cli.parser().parse_args(
+        [
+            "external",
+            "--state-root",
+            str(root),
+            "configure-scope",
+            endpoint.endpoint_id,
+            "--expected-generation",
+            prior_generation,
+            "--allow-recipient",
+            second,
+            "--allow-recipient",
+            first,
+        ]
+    )
+    assert cli.run(arguments) == 0
+    output = capsys.readouterr().out
+    report = json.loads(output)
+    configured = ExternalEndpointStore(root).endpoints()[0]
+    assert report == {
+        "endpoint_id": endpoint.endpoint_id,
+        "generation": configured.generation,
+        "alias": endpoint.alias,
+        "scope_changed": True,
+        "allowed_recipient_count": 2,
+        "identity_assurance": "owner_enrolled_endpoint",
+    }
+    assert first not in output and second not in output and credential not in output
+    assert configured.generation != prior_generation
+    assert configured.endpoint_id == endpoint.endpoint_id
+    assert configured.credential_hash == prior_credential_hash
+    assert configured.callback_ref == endpoint.callback_ref
+    assert configured.allowed_recipients == tuple(sorted({first, second}))
+    assert callback_path.read_bytes() == callback_bytes
+    assert ExternalEndpointStore(root).authenticate(credential) == configured
+    assert intents.intents() == prior_intents
+
+    state_bytes = ExternalEndpointStore(root).path.read_bytes()
+    unchanged, changed = ExternalEndpointStore(root).configure_scope(
+        endpoint.endpoint_id,
+        expected_generation=configured.generation,
+        allowed_recipients=(first, second, first),
+    )
+    assert not changed and unchanged == configured
+    assert ExternalEndpointStore(root).path.read_bytes() == state_bytes
+    assert callback_path.read_bytes() == callback_bytes
+    assert intents.intents() == prior_intents
+
+
+def test_configure_scope_stale_or_invalid_request_refuses_without_mutation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    endpoint, _credential = _enroll(root)
+    endpoint = _callback(root, endpoint)
+    store = ExternalEndpointStore(root)
+    callback_path = root / cast(str, endpoint.callback_ref)
+    state_bytes = store.path.read_bytes()
+    callback_bytes = callback_path.read_bytes()
+    token = local_token(root, "f" * 64, str(uuid4()))
+
+    with pytest.raises(ChatError, match="generation changed"):
+        store.configure_scope(
+            endpoint.endpoint_id,
+            expected_generation=str(uuid4()),
+            allowed_recipients=(token,),
+        )
+    with pytest.raises(ChatError, match="at least one token"):
+        store.configure_scope(
+            endpoint.endpoint_id,
+            expected_generation=endpoint.generation,
+            allowed_recipients=(),
+        )
+    with pytest.raises(ChatError, match="scope is invalid"):
+        store.configure_scope(
+            endpoint.endpoint_id,
+            expected_generation=endpoint.generation,
+            allowed_recipients=("not-a-cac2-token",),
+        )
+    foreign_token = local_token(tmp_path / "other-state", "0" * 64, str(uuid4()))
+    with pytest.raises(ChatError, match="scope is invalid"):
+        store.configure_scope(
+            endpoint.endpoint_id,
+            expected_generation=endpoint.generation,
+            allowed_recipients=(foreign_token,),
+        )
+    assert store.path.read_bytes() == state_bytes
+    assert callback_path.read_bytes() == callback_bytes
+    assert IntentStore(root).intents() == []
+
+    expired, _credential = store.enroll(
+        device="fixture",
+        name="expired-scope",
+        context="fixture",
+        expires_at="2000-01-01T00:00:00+00:00",
+    )
+    expired_bytes = store.path.read_bytes()
+    with pytest.raises(ChatError, match="unavailable or generation changed"):
+        store.configure_scope(
+            expired.endpoint_id,
+            expected_generation=expired.generation,
+            allowed_recipients=(token,),
+        )
+    assert store.path.read_bytes() == expired_bytes
+
+
+def test_configure_scope_waits_for_endpoint_effect_lock(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    endpoint, _credential = _enroll(root)
+    store = ExternalEndpointStore(root)
+    recipient = local_token(root, "9" * 64, str(uuid4()))
+    started = threading.Event()
+    finished = threading.Event()
+    results: list[tuple[ExternalEndpoint, bool]] = []
+    errors: list[BaseException] = []
+
+    def configure() -> None:
+        started.set()
+        try:
+            results.append(
+                store.configure_scope(
+                    endpoint.endpoint_id,
+                    expected_generation=endpoint.generation,
+                    allowed_recipients=(recipient,),
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=configure)
+    with endpoint_effect_lock(root, endpoint.endpoint_id):
+        thread.start()
+        assert started.wait(timeout=1)
+        assert not finished.wait(timeout=0.1)
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert errors == []
+    assert len(results) == 1 and results[0][1]
+
+
+def test_external_send_rechecks_scope_after_waiting_for_effect_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    endpoint, credential = _enroll(root)
+    selected = local_token(root, "a" * 64, str(uuid4()))
+    remaining = local_token(root, "b" * 64, str(uuid4()))
+    configured, changed = ExternalEndpointStore(root).configure_scope(
+        endpoint.endpoint_id,
+        expected_generation=endpoint.generation,
+        allowed_recipients=(selected, remaining),
+    )
+    assert changed
+    original_lock = endpoint_effect_lock
+    narrowed = False
+
+    @contextmanager
+    def narrow_before_lock(
+        lock_root: Path, endpoint_id: str, *, wait: bool = False
+    ) -> Iterator[int]:
+        nonlocal narrowed
+        if not narrowed:
+            narrowed = True
+            ExternalEndpointStore(root).configure_scope(
+                endpoint.endpoint_id,
+                expected_generation=configured.generation,
+                allowed_recipients=(remaining,),
+            )
+        with original_lock(lock_root, endpoint_id, wait=wait) as descriptor:
+            yield descriptor
+
+    monkeypatch.setattr("cross_agent_chat.cli.endpoint_effect_lock", narrow_before_lock)
+    monkeypatch.setattr(
+        cli,
+        "send",
+        lambda *_args, **_kwargs: pytest.fail("send bypassed narrowed scope"),
+    )
+
+    response = cli._external_call_tool(root, credential, _send(selected, str(uuid4())))
+    assert response["isError"] is True
+    assert (
+        "outside this external endpoint's enrolled scope"
+        in cast(list[dict[str, str]], response["content"])[0]["text"]
+    )
+    assert narrowed
+    assert IntentStore(root).intents() == []
+
+
+def test_configured_scope_filters_and_dispatches_only_exact_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    endpoint, credential = _enroll(root)
+    endpoint = _callback(root, endpoint)
+    first = local_token(root, "1" * 64, str(uuid4()))
+    second = remote_token("nSelected", "2" * 64, str(uuid4()))
+    outside = local_token(root, "3" * 64, str(uuid4()))
+    updated, changed = ExternalEndpointStore(root).configure_scope(
+        endpoint.endpoint_id,
+        expected_generation=endpoint.generation,
+        allowed_recipients=(first, second),
+    )
+    assert changed and updated.generation != endpoint.generation
+
+    monkeypatch.setattr(
+        cli,
+        "peers",
+        lambda *_args, **_kwargs: {
+            "schema_version": 1,
+            "peers": [
+                {"alias": "peer:first", "handle": first},
+                {"alias": "peer:second", "handle": second},
+                {"alias": "peer:outside", "handle": outside},
+            ],
+            "remote_discovery": "complete",
+        },
+    )
+    listing = _result(
+        cli._external_call_tool(root, credential, {"name": "chat_peers", "arguments": {}})
+    )
+    assert [item["handle"] for item in cast(list[dict[str, str]], listing["peers"])] == [
+        first,
+        second,
+    ]
+
+    calls: list[tuple[str, str, str]] = []
+
+    def fake_send(
+        _root: Path,
+        source: object,
+        target: str,
+        message: str,
+        *,
+        event_id: str | None = None,
+        source_lock_fd: int | None = None,
+        include_external: bool = False,
+    ) -> dict[str, object]:
+        assert isinstance(source, ExternalEndpoint)
+        assert source.endpoint_id == endpoint.endpoint_id
+        assert source_lock_fd is not None and include_external
+        calls.append((target, message, event_id or ""))
+        return {
+            "schema_version": 1,
+            "event_id": event_id or "",
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target,
+            "provider": "codex",
+        }
+
+    monkeypatch.setattr(cli, "send", fake_send)
+    request_id = str(uuid4())
+    sent = _result(
+        cli._external_call_tool(
+            root,
+            credential,
+            _send(first, request_id, "selected target only"),
+        )
+    )
+    assert sent["status"] == "TRANSPORT_ACCEPTED"
+    assert calls == [(first, "selected target only", request_id)]
+
+    with pytest.raises(ChatError, match="outside this external endpoint's enrolled scope"):
+        cli._external_call_tool(root, credential, _send(outside, str(uuid4())))
+    assert calls == [(first, "selected target only", request_id)]
+
+    old_target_handle = local_token(root, updated.key, endpoint.generation)
+    native_source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="fixture",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    monkeypatch.setattr(
+        external_callback,
+        "post_callback",
+        lambda *_args, **_kwargs: pytest.fail("stale generation reached callback"),
+    )
+    prior_intents = IntentStore(root).intents()
+    with pytest.raises(ChatError, match="recipient is unavailable or changed"):
+        runtime.send(
+            root,
+            native_source,
+            old_target_handle,
+            "stale handle must refuse",
+            include_external=True,
+        )
+    targets = runtime.external_targets(root, handle=updated.key)
+    assert len(targets) == 1 and targets[0].generation == updated.generation
+    assert all(target.generation != endpoint.generation for target in targets)
+    assert IntentStore(root).intents() == prior_intents
 
 
 def test_native_roster_remains_usable_until_external_opt_in(tmp_path: Path) -> None:

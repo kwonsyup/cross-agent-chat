@@ -27,7 +27,7 @@ from cross_agent_chat.core import (
     valid_name,
     valid_uuid,
 )
-from cross_agent_chat.recipient import parse_recipient_token
+from cross_agent_chat.recipient import local_origin, parse_recipient_token
 
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _CREDENTIAL = re.compile(
@@ -228,6 +228,57 @@ class ExternalEndpointStore:
         if len(matches) != 1:
             raise ChatError("external credential is unavailable; enroll this endpoint")
         return matches[0]
+
+    def configure_scope(
+        self,
+        endpoint_id: str,
+        *,
+        expected_generation: str,
+        allowed_recipients: tuple[str, ...],
+    ) -> tuple[ExternalEndpoint, bool]:
+        identifier = valid_uuid(endpoint_id, "external endpoint id")
+        generation = valid_uuid(expected_generation, "external endpoint generation")
+        if not allowed_recipients:
+            raise ChatError("external recipient scope must contain at least one token")
+        recipients = tuple(sorted(set(allowed_recipients)))
+        for recipient in recipients:
+            parsed = parse_recipient_token(recipient)
+            if parsed is None or (
+                parsed.scope == "local" and parsed.origin != local_origin(self.root)
+            ):
+                raise ChatError("external recipient scope is invalid")
+        with (
+            endpoint_effect_lock(self.root, identifier, wait=True),
+            state_lock(self.root, "external-endpoints"),
+        ):
+            existing = self.endpoints()
+            matches = [
+                item
+                for item in existing
+                if item.endpoint_id == identifier
+                and item.generation == generation
+                and item.available()
+            ]
+            if len(matches) != 1:
+                raise ChatError("external endpoint is unavailable or generation changed")
+            current = matches[0]
+            if current.allowed_recipients is not None and set(current.allowed_recipients) == set(
+                recipients
+            ):
+                return current, False
+            updated = replace(
+                current,
+                generation=str(uuid4()),
+                allowed_recipients=recipients,
+            )
+            atomic_json(
+                self.path,
+                [
+                    asdict(updated) if item.endpoint_id == identifier else asdict(item)
+                    for item in existing
+                ],
+            )
+            return updated, True
 
     def current(self, endpoint: ExternalEndpoint) -> bool:
         return endpoint.available() and any(item == endpoint for item in self.endpoints())

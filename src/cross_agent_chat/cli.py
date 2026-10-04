@@ -722,6 +722,11 @@ def _external_call_tool(
             # previously initialized MCP session or a duplicate request.
             with endpoint_effect_lock(root, source.endpoint_id) as source_fd:
                 source = ExternalEndpointStore(root).authenticate(credential)
+                if (
+                    source.allowed_recipients is not None
+                    and target not in source.allowed_recipients
+                ):
+                    _fail("recipient is outside this external endpoint's enrolled scope")
                 previous = IntentStore(root).intent_for_source(
                     event_id=identifier, source_key=source.key, source_generation=source.generation
                 )
@@ -806,6 +811,12 @@ def parser() -> argparse.ArgumentParser:
     enroll.add_argument("--expires-at")
     enroll.add_argument("--allow-recipient", action="append")
     enroll.add_argument("--credential-file", type=Path, required=True)
+    configure_scope = external_commands.add_parser(
+        "configure-scope", help="replace an endpoint's exact recipient scope"
+    )
+    configure_scope.add_argument("endpoint_id")
+    configure_scope.add_argument("--expected-generation", required=True)
+    configure_scope.add_argument("--allow-recipient", action="append", required=True)
     callback = external_commands.add_parser("configure-callback")
     callback.add_argument("endpoint_id")
     callback.add_argument("--config-file", type=Path, required=True)
@@ -945,6 +956,27 @@ def run(arguments: argparse.Namespace) -> int:
         if arguments.external_command == "revoke":
             store.revoke(arguments.endpoint_id)
             print("External endpoint revoked; accepted and uncertain work is preserved.")
+        elif arguments.external_command == "configure-scope":
+            recipient_tokens = cast(list[str] | None, arguments.allow_recipient)
+            if not recipient_tokens:
+                _fail("external recipient scope must contain at least one token")
+            endpoint, changed = store.configure_scope(
+                arguments.endpoint_id,
+                expected_generation=arguments.expected_generation,
+                allowed_recipients=tuple(recipient_tokens),
+            )
+            print(
+                json.dumps(
+                    {
+                        "endpoint_id": endpoint.endpoint_id,
+                        "generation": endpoint.generation,
+                        "alias": endpoint.alias,
+                        "scope_changed": changed,
+                        "allowed_recipient_count": len(endpoint.allowed_recipients or ()),
+                        "identity_assurance": "owner_enrolled_endpoint",
+                    }
+                )
+            )
         elif arguments.external_command == "configure-callback":
             endpoint = store.configure_callback(arguments.endpoint_id, arguments.config_file)
             print(
