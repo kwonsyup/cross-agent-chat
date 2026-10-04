@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0 - 2026-10-04
+
+- Release the owner-enrolled external CLI/MCP endpoint for optional Grokbot
+  use, including exact recipient scoping, secure credential-file handling,
+  configurable HTTPS callback delivery, and revoke/rotation controls.
+- Grokbot 0.66.0 completed one owner-enrolled webhook/local-shell round trip
+  to an iMac/M1 Claude Opus 5.5 original in bypass-permission mode and used
+  the automatic idle return in the same Grok conversation. This does not
+  qualify active-turn Grok receiving, other Bots, fresh-user setup, M2, or
+  provider-attested Bot identity. Existing Native and owner CLI Stop-bound
+  behaviors retain their prior scoped evidence.
+
 ## 0.4.8 - 2026-10-03
 
 - Every courier connection's whole service — frame read, provider inventory,

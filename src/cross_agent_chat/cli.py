@@ -16,6 +16,13 @@ from cross_agent_chat.core import (
     ChatError,
     IntentStore,
     valid_name,
+    valid_uuid,
+)
+from cross_agent_chat.external import (
+    ExternalEndpointStore,
+    endpoint_effect_lock,
+    read_credential,
+    write_credential,
 )
 from cross_agent_chat.mcp_server import (
     MethodNotFound,
@@ -404,6 +411,7 @@ def _mcp_call_tool(
                 root,
                 include_delivery_mode=True,
                 include_delivery_mechanism=True,
+                include_external=True,
                 query=query,
             )
             result["sender"] = (
@@ -429,7 +437,7 @@ def _mcp_call_tool(
         try:
             # Asked before the send so it can neither delay nor fail an accepted one.
             delivery = reply_delivery(root, source)
-            result = send(root, source, target, message)
+            result = send(root, source, target, message, include_external=True)
             result["reply_delivery"] = delivery
         except ChatError as error:
             return _mcp_tool_error(error)
@@ -648,10 +656,183 @@ def mcp(provider: str, device: str, state_root_value: str | None) -> None:
     )
 
 
+def _external_call_tool(
+    root: Path, credential: str, params: dict[str, object]
+) -> dict[str, object]:
+    # This entry point has no native-provider or caller-selected sender path.
+    source = ExternalEndpointStore(root).authenticate(credential)
+    if not presence_is_enabled():
+        _fail("Cross Agent Chat presence is disabled")
+    name = params.get("name")
+    raw_arguments = params.get("arguments", {})
+    if (
+        set(params) - {"name", "arguments", "_meta"}
+        or not isinstance(name, str)
+        or not isinstance(params.get("_meta", {}), dict)
+        or not isinstance(raw_arguments, dict)
+    ):
+        _fail("external MCP tool call is invalid")
+    arguments = cast(dict[str, object], raw_arguments)
+    if name == "chat_peers":
+        query = arguments.get("query")
+        if set(arguments) - {"query"} or ("query" in arguments and not isinstance(query, str)):
+            _fail("external MCP tool call is invalid")
+        exact_query = None if query is None else valid_name(cast(str, query), "peer query")
+        result = peers(root, include_delivery_mode=True, include_external=True)
+        if source.allowed_recipients is not None:
+            rows = cast(list[dict[str, str]], result["peers"])
+            result["peers"] = [row for row in rows if row["handle"] in source.allowed_recipients]
+        if exact_query is not None:
+            rows = cast(list[dict[str, str]], result["peers"])
+            filtered = [
+                row
+                for row in rows
+                if exact_query.casefold() in row["alias"].casefold()
+                or exact_query.casefold() in row.get("title", "").casefold()
+            ]
+            result["peers"] = filtered
+            result["filter"] = {"query": exact_query, "matched": len(filtered), "of": len(rows)}
+        result["sender"] = {
+            "status": "ready",
+            "alias": source.alias,
+            "identity_assurance": "owner_enrolled_endpoint",
+            "scope": "owner_peers"
+            if source.allowed_recipients is None
+            else "selected_recipient_tokens",
+            "reply_delivery": "unknown",
+        }
+        return _mcp_tool_result(result)
+    if name == "chat_status":
+        if set(arguments) != {"event_id"} or not isinstance(arguments["event_id"], str):
+            _fail("event id is invalid")
+        return _mcp_tool_result(event_status(root, source, arguments["event_id"]))
+    if name == "chat_send":
+        request_id = arguments.get("request_id")
+        if not isinstance(request_id, str):
+            _fail("external chat_send requires a stable UUID request_id")
+        identifier = valid_uuid(request_id, "request id")
+        target, message = normalize_send_arguments(
+            {key: value for key, value in arguments.items() if key != "request_id"}
+        )
+        if source.allowed_recipients is not None and target not in source.allowed_recipients:
+            _fail("recipient is outside this external endpoint's enrolled scope")
+        try:
+            # Serialize duplicate requests across connectors/processes. Recheck
+            # the capability after waiting; revocation cannot be bypassed by a
+            # previously initialized MCP session or a duplicate request.
+            with endpoint_effect_lock(root, source.endpoint_id) as source_fd:
+                source = ExternalEndpointStore(root).authenticate(credential)
+                if (
+                    source.allowed_recipients is not None
+                    and target not in source.allowed_recipients
+                ):
+                    _fail("recipient is outside this external endpoint's enrolled scope")
+                previous = IntentStore(root).intent_for_source(
+                    event_id=identifier, source_key=source.key, source_generation=source.generation
+                )
+                try:
+                    result = send(
+                        root,
+                        source,
+                        target,
+                        message,
+                        event_id=identifier,
+                        include_external=True,
+                        source_lock_fd=source_fd,
+                    )
+                except ChatError as error:
+                    if previous is not None:
+                        raise ChatError(
+                            f"request {identifier} has recorded custody {previous.status}; "
+                            "this retry was refused without another effect. "
+                            "Do not replay or choose "
+                            "a new recipient; use chat_status for this event"
+                        ) from error
+                    raise
+            result["reply_delivery"] = "unknown"
+        except ChatError as error:
+            return _mcp_tool_error(error)
+        return _mcp_tool_result(result)
+    _fail("external MCP tool is unavailable")
+
+
+def external_mcp(root: Path, credential_path: Path) -> None:
+    credential = read_credential(credential_path)
+    ExternalEndpointStore(root).authenticate(credential)
+
+    def dispatch(method: str, params: dict[str, object]) -> object:
+        ExternalEndpointStore(root).authenticate(credential)
+        if method == "tools/list":
+            if set(params) - {"_meta"} or not isinstance(params.get("_meta", {}), dict):
+                _fail("external tools/list params are invalid")
+            tools = _mcp_tools("external", presence_is_enabled())
+            for tool in tools:
+                if tool["name"] == "chat_send":
+                    schema = cast(dict[str, object], tool["inputSchema"])
+                    properties = cast(dict[str, object], schema["properties"])
+                    properties["request_id"] = {
+                        "type": "string",
+                        "description": "Stable UUID for this one send; retain it on retry. "
+                        "Same key with changed content or recipient refuses. Never use a new "
+                        "key to replay accepted or uncertain work.",
+                    }
+                    schema["required"] = ["to", "message", "request_id"]
+            return {"tools": tools}
+        if method == "tools/call":
+            return _external_call_tool(root, credential, params)
+        raise MethodNotFound(method)
+
+    serve(
+        stream=sys.stdin,
+        emit=lambda payload: print(json.dumps(payload, separators=(",", ":")), flush=True),
+        initialize_result=lambda: {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "cross-agent-chat-external", "version": __version__},
+            "instructions": MCP_INSTRUCTIONS + " This connection represents an owner-enrolled "
+            "external endpoint, not a provider-attested Bot conversation. External chat_send "
+            "requires a stable UUID request_id per new send. Return receiving remains unknown.",
+        },
+        dispatch=dispatch,
+    )
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="cross-agent-chat")
     root.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = root.add_subparsers(dest="command", required=True)
+    external = commands.add_parser("external", help="manage owner-enrolled external endpoints")
+    external.add_argument("--state-root")
+    external_commands = external.add_subparsers(dest="external_command", required=True)
+    enroll = external_commands.add_parser("enroll")
+    enroll.add_argument("--device", required=True)
+    enroll.add_argument("--name", required=True)
+    enroll.add_argument("--context", required=True)
+    enroll.add_argument("--expires-at")
+    enroll.add_argument("--allow-recipient", action="append")
+    enroll.add_argument("--credential-file", type=Path, required=True)
+    configure_scope = external_commands.add_parser(
+        "configure-scope", help="replace an endpoint's exact recipient scope"
+    )
+    configure_scope.add_argument("endpoint_id")
+    configure_scope.add_argument("--expected-generation", required=True)
+    configure_scope.add_argument("--allow-recipient", action="append", required=True)
+    callback = external_commands.add_parser("configure-callback")
+    callback.add_argument("endpoint_id")
+    callback.add_argument("--config-file", type=Path, required=True)
+    rotate = external_commands.add_parser("rotate")
+    rotate.add_argument("endpoint_id")
+    rotate.add_argument("--credential-file", type=Path, required=True)
+    revoke = external_commands.add_parser("revoke")
+    revoke.add_argument("endpoint_id")
+    external_call = commands.add_parser(
+        "external-call", help="one authenticated external tool call"
+    )
+    external_call.add_argument("--state-root")
+    external_call.add_argument("--credential-file", type=Path, required=True)
+    external_client = commands.add_parser("external-mcp", help="authenticated local external MCP")
+    external_client.add_argument("--state-root")
+    external_client.add_argument("--credential-file", type=Path, required=True)
     setup = commands.add_parser("setup", help="install and verify native provider integrations")
     setup.add_argument("--device")
     setup.add_argument(
@@ -752,6 +933,97 @@ def parser() -> argparse.ArgumentParser:
 
 def run(arguments: argparse.Namespace) -> int:
     command = cast(str, arguments.command)
+    if command == "external-call":
+        root = state_root(arguments.state_root)
+        credential = read_credential(arguments.credential_file)
+        ExternalEndpointStore(root).authenticate(credential)
+        raw = sys.stdin.buffer.read(65537)
+        if len(raw) > 65536:
+            _fail("external tool request exceeds the bounded limit")
+        try:
+            request: object = json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as error:
+            raise ChatError("external tool request is invalid") from error
+        if not isinstance(request, dict):
+            _fail("external tool request is invalid")
+        print(json.dumps(_external_call_tool(root, credential, cast(dict[str, object], request))))
+        return 0
+    if command == "external-mcp":
+        external_mcp(state_root(arguments.state_root), arguments.credential_file)
+        return 0
+    if command == "external":
+        store = ExternalEndpointStore(state_root(arguments.state_root))
+        if arguments.external_command == "revoke":
+            store.revoke(arguments.endpoint_id)
+            print("External endpoint revoked; accepted and uncertain work is preserved.")
+        elif arguments.external_command == "configure-scope":
+            recipient_tokens = cast(list[str] | None, arguments.allow_recipient)
+            if not recipient_tokens:
+                _fail("external recipient scope must contain at least one token")
+            endpoint, changed = store.configure_scope(
+                arguments.endpoint_id,
+                expected_generation=arguments.expected_generation,
+                allowed_recipients=tuple(recipient_tokens),
+            )
+            print(
+                json.dumps(
+                    {
+                        "endpoint_id": endpoint.endpoint_id,
+                        "generation": endpoint.generation,
+                        "alias": endpoint.alias,
+                        "scope_changed": changed,
+                        "allowed_recipient_count": len(endpoint.allowed_recipients or ()),
+                        "identity_assurance": "owner_enrolled_endpoint",
+                    }
+                )
+            )
+        elif arguments.external_command == "configure-callback":
+            endpoint = store.configure_callback(arguments.endpoint_id, arguments.config_file)
+            print(
+                json.dumps(
+                    {
+                        "endpoint_id": endpoint.endpoint_id,
+                        "generation": endpoint.generation,
+                        "alias": endpoint.alias,
+                        "reply_delivery": "unknown",
+                    }
+                )
+            )
+        else:
+            destination = cast(Path, arguments.credential_file)
+            if destination.exists() or destination.is_symlink():
+                _fail("external credential file already exists")
+            if arguments.external_command == "rotate":
+                endpoint, credential = store.rotate(arguments.endpoint_id)
+            else:
+                endpoint, credential = store.enroll(
+                    device=arguments.device,
+                    name=arguments.name,
+                    context=arguments.context,
+                    expires_at=arguments.expires_at,
+                    allowed_recipients=None
+                    if arguments.allow_recipient is None
+                    else tuple(arguments.allow_recipient),
+                )
+            try:
+                write_credential(destination, credential)
+            except (OSError, ChatError) as error:
+                store.revoke(endpoint.endpoint_id)
+                raise ChatError(
+                    "external credential file could not be created; enrollment revoked"
+                ) from error
+            print(
+                json.dumps(
+                    {
+                        "endpoint_id": endpoint.endpoint_id,
+                        "generation": endpoint.generation,
+                        "alias": endpoint.alias,
+                        "identity_assurance": "owner_enrolled_endpoint",
+                        "reply_delivery": "unknown",
+                    }
+                )
+            )
+        return 0
     if command == "setup":
         codex_native_queue = (
             True

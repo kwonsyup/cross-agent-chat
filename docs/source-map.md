@@ -20,6 +20,12 @@ chat_peers / chat_send / chat_status    (MCP stdio: mcp_server.py session +
   → recipient-local delivery            (claude_runtime.py, codex.py,
                                          native_helper.py, devin.py)
 
+external-call / external-mcp             (cli.py one-shot/stdio entrypoints)
+  → owner-enrolled credential            (external.py; separate private state)
+  → exact allowed cac2 peer token         (runtime.py shared send path)
+  → local courier or remote broker        (runtime.py → tailnet_broker.py)
+  ← optional owner-configured HTTPS callback (external_callback.py; custody only)
+
 install/setup/uninstall                 (install.sh → cli.py _install-staged
                                          → install.py transactions)
 ```
@@ -29,11 +35,13 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 | Module | Responsibility |
 |---|---|
 | `__init__.py` | Runtime `__version__`, kept consistent with package and release metadata. |
-| `cli.py` | Argument parsing, public commands (`setup`, `doctor`, `peers`, `resolve`, `uninstall`), hidden provider hook/service entrypoints (`_`-prefixed), and per-tool MCP dispatch including tool schemas and public argument validation that runs before any discovery. |
+| `cli.py` | Argument parsing, public commands (`setup`, `doctor`, `peers`, `resolve`, `uninstall`), owner-managed `external enroll/configure-scope/configure-callback/rotate/revoke`, one-shot `external-call`, stdio `external-mcp`, hidden provider hook/service entrypoints (`_`-prefixed), and MCP tool dispatch. |
 | `mcp_server.py` | The stdio MCP surface itself: bounded frame reading, JSON-RPC batch handling, strict initialize lifecycle, request-ID validation, ping, and `chat_send` argument normalization. |
 | `recipient.py` | Versioned opaque recipient endpoint tokens (`cac2.`): minting and strict parsing. A remote token pins session key + route generation to a stable Tailnet node; a local token pins them to the issuing state root. |
 | `core.py` | Route identity, content-free intent records, validation, private atomic persistence, state locks, and the private per-generation owner image anchor sidecar (`owner-<generation>.json`). This is where durable product state is defined. |
-| `runtime.py` | Hook registration, sender authentication, peer discovery, token minting during listing and re-attestation during send, local couriers (bounded per-connection worker seats; one serialized effect at a time, with admission fenced against shutdown acknowledgement and route rotation), socket framing/transport, Codex native queue plumbing, owner image anchors (built at registration; read by the anchored owner checks), reply-readiness reporting. Largest module; several responsibilities share it. |
+| `external.py` | Owner-enrolled endpoint IDs, credential verifiers, generation, exact recipient scope, generation-fenced scope replacement, revocation/rotation, and private callback references. Revocation removes CAC's callback copy, not the owner's credential/config source files. The context label is not provider attestation; these records live outside the native route registry. |
+| `external_callback.py` | Owner-configured bounded HTTPS POST with hostname/TLS checks, no redirects, and content-free outcome. A busy endpoint is an explicit pre-effect refusal; a 2xx is transport custody only, not model receipt, wake, or completion. |
+| `runtime.py` | Hook registration, native and owner-enrolled sender authentication, peer discovery, token minting during listing and re-attestation during send, local/external recipients, local couriers (bounded per-connection worker seats; one serialized effect at a time, with admission fenced against shutdown acknowledgement and route rotation), socket framing/transport, Codex native queue plumbing, owner image anchors (built at registration; read by the anchored owner checks), reply-readiness reporting. Largest module; several responsibilities share it. |
 | `tailnet.py` | Tailscale IPv4 discovery/validation and port constants (`47071` product, `47072` local health). |
 | `tailnet_broker.py` | Owner-local broker: listener, admission, per-request authorization dispatch, refusal lane. |
 | `remote.py` / `transport.py` | Strict parsing and serialization of the trusted Tailnet envelope (`remote` parses inbound, `transport` builds outbound). |
@@ -54,7 +62,24 @@ alone proves that an active recipient consumed an envelope.
 
 - **Sender identity:** `runtime.py` (`authenticate_mcp_sender`), Codex host
   `threadId` `_meta` in `cli.py:mcp`, Devin capability issuance/consumption in
-  `devin.py`.
+  `devin.py`. External identity is authenticated from an owner-created
+  credential in `external.py`; it is not provider- or Bot-attested, and a
+  shared credential is one endpoint identity across every client that holds it.
+- **External access and scope:** `cli.py` (`external-call`, `external-mcp`,
+  and `external` management commands), `external.py` (credential verification,
+  exact allowed `cac2.` recipient set, generation changes, revocation). The
+  owner changes a scope only with an expected current endpoint generation; a
+  changed scope preserves credentials and intents while fencing old handles.
+  request-id guard returns prior custody only after the exact target/content
+  tuple is verified; if the target is unavailable, it refuses without a new
+  effect and directs the caller to `chat_status`, never a new recipient. The
+  endpoint file `external-endpoints-v1.json` is separate from `routes.json`,
+  so old native readers ignore it; older loaded sessions do not gain the new
+  commands. A binary rollback does not itself revoke endpoint credentials.
+- **External callback:** `runtime.py:_accept_external` validates the selected
+  endpoint/generation and uses `external_callback.py` to POST to its private
+  owner-configured HTTPS destination. HTTP 2xx means callback custody only;
+  original-context receiving and model consumption require separate evidence.
 - **Owner image anchor (update continuity):** `runtime.py`
   `_owner_anchor_document` builds the private per-generation sidecar
   `owner-<generation>.json` in the state root at registration, only when the
@@ -84,11 +109,60 @@ alone proves that an active recipient consumed an envelope.
   memory (`codex.py`), provider queue/transcript (experimental path) — never
   durable product state.
 
+## External-client contract
+
+The local command accepts one JSON object on standard input. Its credential
+argument is a file path, not the credential value:
+
+    cross-agent-chat external-call --credential-file "$HOME/.config/cross-agent-chat/external/grok/credential"
+
+For a send, the JSON object is:
+
+    {"name":"chat_send","arguments":{"to":"<exact current peer handle>","message":"Review this change.","request_id":"550e8400-e29b-41d4-a716-446655440000"}}
+
+Use an exact current handle returned by chat_peers or carried as a reply
+handle. Each new event needs one stable UUID request_id. Retrying the identical
+request can return its recorded custody only while target and content match;
+never resend accepted or uncertain work under a new ID. chat_status reads
+sender-local custody and does not prove recipient consumption. A reply is a
+separate send to the exact reply handle.
+
+Enrollment without --allow-recipient uses owner_peers scope: the endpoint can
+address the owner's available peers. Repeating --allow-recipient enrolls an
+exact-token allowlist; chat_peers then shows only those recipients and sends
+outside it refuse. configure-scope replaces that list, requires the current
+endpoint generation and at least one exact handle, and rotates the generation
+when the set changes. Old endpoint handles then stop working; peers need fresh
+handles. There is no empty scope.
+
+For an HTTPS callback, keep a private JSON source file with exactly these
+fields:
+
+    {"url":"<Grok-generated webhook URL>","bearer":"<Grok-generated key>"}
+
+Grok displays the generated webhook key in the owned routine panel; the
+routine update API does not return it to the Bot. During owner-authorized
+setup, capture the URL and key from that panel directly into the private
+file, then pass only its path to external configure-callback. CAC sends the
+bearer field as the HTTP Authorization header. Do not place secret values in
+model chat, command arguments, or logs. Callback setup
+rotates the endpoint generation. The callback POST sends the message, event
+and endpoint metadata, and reply handle off the Mac; HTTP 2xx proves receiver
+custody only, not model consumption.
+
+Credential rotation also changes generation. external revoke stops future
+calls and removes CAC's saved callback copy, but does not recall accepted or
+uncertain events or delete the owner's source files. Remove those private
+files when no longer needed. External identity remains owner-enrolled: the
+same credential shared across Bots is one endpoint identity, not Bot
+attestation or per-Bot isolation.
+
 ## Tests
 
 | Area | Files |
 |---|---|
 | State/identity/recipient tokens | `test_core.py`, `test_recipient_binding.py`, `test_recipient_selection.py`, `test_issue9_regressions.py` |
+| Owner-enrolled external endpoints (including the optional Grok CLI/MCP path) | `test_external.py` |
 | Owner anchor / update continuity | `test_owner_anchor.py` |
 | MCP protocol/tools | `test_mcp.py`, `test_mcp_protocol.py`, `test_native_helper_mcp.py` |
 | Broker/transport/courier seats | `test_broker_admission.py`, `test_broker_peek.py`, `test_courier_liveness.py`, `test_tailnet.py`, `test_transport.py`, `test_transport_deadlines.py` |

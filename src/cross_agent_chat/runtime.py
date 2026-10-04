@@ -32,7 +32,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import FrameType
-from typing import BinaryIO, Final, Literal, cast
+from typing import BinaryIO, Final, Literal, TypedDict, cast
 from uuid import uuid4
 
 from cross_agent_chat import claude_runtime
@@ -61,6 +61,7 @@ from cross_agent_chat.core import (
     MAX_MESSAGE_BYTES,
     SCHEMA_VERSION,
     ChatError,
+    Intent,
     IntentStore,
     Provider,
     Registry,
@@ -93,6 +94,7 @@ from cross_agent_chat.devin import (
     parse_hook_input,
     parse_pretool_input,
 )
+from cross_agent_chat.external import ExternalEndpoint, ExternalEndpointStore, endpoint_effect_lock
 from cross_agent_chat.native_helper import (
     NATIVE_HELPER_MODEL,
     NATIVE_QUEUE_BINARY_ENV_VAR,
@@ -629,7 +631,7 @@ def _courier_owner_binary(root: Path, route: Route) -> Path | None:
 @dataclass(frozen=True, slots=True)
 class Target:
     alias: str
-    provider: Provider
+    provider: Provider | Literal["external"]
     device: str
     project: str
     generation: str
@@ -1834,7 +1836,7 @@ FORWARDABLE_PRE_EFFECT_REASONS: Final = frozenset(
 )
 
 
-def pre_effect_error(response: dict[str, object], event_id: str, provider: Provider) -> str | None:
+def pre_effect_error(response: dict[str, object], event_id: str, provider: str) -> str | None:
     if set(response) != {"schema_version", "event_id", "status", "provider", "error"}:
         return None
     error = response.get("error")
@@ -1857,7 +1859,7 @@ def pre_effect_error(response: dict[str, object], event_id: str, provider: Provi
 
 
 def unknown_delivery_diagnostic(
-    response: dict[str, object], event_id: str, provider: Provider
+    response: dict[str, object], event_id: str, provider: str
 ) -> str | None:
     diagnostic = response.get("diagnostic")
     if (
@@ -2583,6 +2585,14 @@ def _with_codex_titles(root: Path, targets: list[Target], deadline: float) -> li
     ]
 
 
+class _ExternalDiscoveryOption(TypedDict, total=False):
+    include_external: bool
+
+
+def _external_option(enabled: bool) -> _ExternalDiscoveryOption:
+    return {"include_external": True} if enabled else {}
+
+
 def _targets_from_tailnet(
     address: str,
     raw: object,
@@ -2590,6 +2600,7 @@ def _targets_from_tailnet(
     include_delivery_mode: bool = False,
     include_title: bool = False,
     include_devin: bool = False,
+    include_external: bool = False,
     node_id: str | None = None,
 ) -> list[Target]:
     if not isinstance(raw, dict) or set(raw) != {"schema_version", "peers"}:
@@ -2627,7 +2638,8 @@ def _targets_from_tailnet(
         )
         if (
             not isinstance(provider, str)
-            or provider not in {"claude", "codex", "devin"}
+            or provider not in {"claude", "codex", "devin", "external"}
+            or (provider == "external" and not include_external)
             or (provider == "devin" and not include_devin)
             or not all(isinstance(value, str) for value in values)
             or item.get("status") != "available"
@@ -2655,7 +2667,7 @@ def _targets_from_tailnet(
         targets.append(
             Target(
                 alias=valid_name(cast(str, item["alias"]), "remote alias"),
-                provider=cast(Provider, provider),
+                provider=cast(Provider | Literal["external"], provider),
                 device=valid_device(cast(str, item["device"])),
                 project=valid_name(cast(str, item["project"]), "remote project"),
                 generation=valid_uuid(cast(str, item["generation"]), "route generation"),
@@ -2681,6 +2693,7 @@ def _remote_node_targets(
     include_delivery_mode: bool = False,
     include_title: bool = False,
     include_devin: bool = False,
+    include_external: bool = False,
     handle: str | None = None,
     node_id: str | None = None,
 ) -> tuple[list[Target], bool]:
@@ -2688,6 +2701,15 @@ def _remote_node_targets(
         deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
     legacy: dict[str, object] = {"schema_version": SCHEMA_VERSION, "operation": "peers"}
     variants: list[tuple[dict[str, object], bool]] = []
+    if include_external:
+        extended: dict[str, object] = {**legacy, "include_external": True}
+        if include_delivery_mode:
+            extended["include_delivery_mode"] = True
+        if include_devin:
+            extended["include_devin"] = True
+        if handle is not None:
+            extended["handle"] = handle
+        variants.append((extended, include_delivery_mode))
     if handle is not None:
         bound: dict[str, object] = {**legacy, "handle": handle}
         if include_delivery_mode:
@@ -2703,6 +2725,7 @@ def _remote_node_targets(
         variants.append(({**legacy, "include_devin": True}, False))
     variants.append((legacy, False))
     base: list[Target] | None = None
+    external_negotiated = False
     capacity_refused = False
     for payload, mode_requested in variants:
         retry_delay = PRE_EFFECT_RETRY_SECONDS
@@ -2746,8 +2769,10 @@ def _remote_node_targets(
                 raw,
                 include_delivery_mode=mode_requested,
                 include_devin=include_devin,
+                **_external_option(include_external),
                 node_id=node_id,
             )
+            external_negotiated = "include_external" in payload
             break
         except (ChatError, UnknownDeliveryError):
             continue
@@ -2768,6 +2793,8 @@ def _remote_node_targets(
         }
         if include_devin:
             rich_payload["include_devin"] = True
+        if external_negotiated:
+            rich_payload["include_external"] = True
         if handle is not None:
             rich_payload["handle"] = handle
         raw = request_tailnet(
@@ -2781,6 +2808,7 @@ def _remote_node_targets(
             include_delivery_mode=True,
             include_title=True,
             include_devin=include_devin,
+            **_external_option(external_negotiated),
             node_id=node_id,
         )
     except (ChatError, UnknownDeliveryError):
@@ -2803,6 +2831,7 @@ def _remote_discovery(
     include_delivery_mode: bool = False,
     include_title: bool = False,
     include_devin: bool = True,
+    include_external: bool = False,
     identity: TailnetIdentity | None = None,
 ) -> tuple[list[Target], bool]:
     if identity is None:
@@ -2821,6 +2850,7 @@ def _remote_discovery(
             include_delivery_mode=include_delivery_mode,
             include_title=include_title,
             include_devin=include_devin,
+            **_external_option(include_external),
             node_id=node_id,
         )
         for node_id, address in identity.peers.items()
@@ -2852,11 +2882,13 @@ def remote_targets(
     include_delivery_mode: bool = False,
     include_title: bool = False,
     include_devin: bool = False,
+    include_external: bool = False,
 ) -> list[Target]:
     return _remote_discovery(
         include_delivery_mode=include_delivery_mode,
         include_title=include_title,
         include_devin=include_devin,
+        **_external_option(include_external),
     )[0]
 
 
@@ -2924,6 +2956,8 @@ def _delivery_principal(target_provider: str) -> str:
         return "the installed Claude Code Cross Agent Chat helper"
     if target_provider == "codex":
         return "the configured Cross Agent Chat Codex courier"
+    if target_provider == "external":
+        return "the owner-enrolled Cross Agent Chat external callback"
     if target_provider == "devin":
         return "the configured Cross Agent Chat Devin inbox"
     raise ChatError("target provider is invalid")
@@ -3048,10 +3082,99 @@ def wrapped_message(
         ) from error
 
 
-def canonical_source_alias(root: Path, source: Route, *, deadline: float | None = None) -> str:
+class _EventOption(TypedDict, total=False):
+    event_id: str
+
+
+def _event_option(event_id: str | None) -> _EventOption:
+    return {} if event_id is None else {"event_id": event_id}
+
+
+class _SourceLockOption(TypedDict, total=False):
+    source_lock_fd: int
+
+
+def _source_lock_option(descriptor: int | None) -> _SourceLockOption:
+    return {} if descriptor is None else {"source_lock_fd": descriptor}
+
+
+SourceIdentity = Route | ExternalEndpoint
+
+
+def _source_key(source: SourceIdentity) -> str:
+    return (
+        source.key
+        if isinstance(source, ExternalEndpoint)
+        else session_key(source.provider, source.session_id)
+    )
+
+
+def _source_current(root: Path, source: SourceIdentity) -> bool:
+    return (
+        ExternalEndpointStore(root).current(source)
+        if isinstance(source, ExternalEndpoint)
+        else _route_current(root, source)
+    )
+
+
+def _begin_delivery(
+    store: IntentStore,
+    source: SourceIdentity,
+    target_key: str,
+    target_generation: str,
+    *,
+    source_alias: str,
+    body: str,
+    event_id: str,
+) -> Intent | None:
+    digest = hashlib.sha256(body.encode()).hexdigest()
+    # The external entry point holds its source endpoint lock through this send.
+    # Native callers retain the original one-use begin_identity behavior.
+    if isinstance(source, ExternalEndpoint):
+        existing = store.intent_for_source(
+            event_id=event_id, source_key=source.key, source_generation=source.generation
+        )
+        if existing is not None:
+            if (
+                existing.target_key,
+                existing.target_generation,
+                existing.source_alias,
+                existing.payload_digest,
+            ) != (target_key, target_generation, source_alias, digest):
+                raise ChatError("request id was already used with different content or recipient")
+            return existing
+    store.begin_identity(
+        source_key=_source_key(source),
+        source_generation=source.generation,
+        source_alias=source_alias,
+        target_key=target_key,
+        target_generation=target_generation,
+        payload_digest=digest,
+        event_id=event_id,
+    )
+    return None
+
+
+def _existing_delivery(intent: Intent, target: Target) -> dict[str, object]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": intent.event_id,
+        "status": intent.status,
+        "to": target.alias,
+        "provider": target.provider,
+        "delivery_observation": "not_observed",
+        "reused_request": True,
+    }
+
+
+def canonical_source_alias(
+    root: Path, source: SourceIdentity, *, deadline: float | None = None
+) -> str:
     """Return the exact currently live public alias for an authenticated sender."""
-    if not _route_current(root, source):
+    if not _source_current(root, source):
         raise ChatError("sender route changed before transport acceptance")
+    if isinstance(source, ExternalEndpoint):
+        return source.alias
     if source.provider in {"codex", "devin"}:
         return source.alias
     attempt_timeout = (
@@ -3068,7 +3191,7 @@ def canonical_source_alias(root: Path, source: Route, *, deadline: float | None 
         if remaining < SOURCE_INVENTORY_RETRY_MINIMUM_SECONDS:
             raise
         agent = exact_agent(source.session_id, source.cwd, min(AGENTS_TIMEOUT_SECONDS, remaining))
-    if not _route_current(root, source):
+    if not _source_current(root, source):
         raise ChatError("sender route changed before transport acceptance")
     return claude_alias(source.device, source.project, agent)
 
@@ -3096,12 +3219,24 @@ def _pre_effect_retry_pause(deadline: float, delay: float) -> float | None:
 
 def _send_local_target(
     root: Path,
-    source: Route,
+    source: SourceIdentity,
     target: Target,
     message: str,
     *,
     deadline: float,
+    event_id: str | None = None,
+    source_lock_fd: int | None = None,
 ) -> dict[str, object]:
+    if target.provider == "external":
+        return _send_external_target(
+            root,
+            source,
+            target,
+            message,
+            deadline=deadline,
+            event_id=event_id,
+            **_source_lock_option(source_lock_fd),
+        )
     if target.session_id is None or target.pid is None or target.cwd is None:
         raise ChatError("target route is incomplete")
     source_alias = canonical_source_alias(root, source, deadline=deadline)
@@ -3124,10 +3259,8 @@ def _send_local_target(
             if not _route_current(root, helper):
                 raise ChatError("native helper is unavailable")
             delivery_route = helper
-    event_id = str(uuid4())
-    source_token = local_token(
-        root, session_key(source.provider, source.session_id), source.generation
-    )
+    event_id = str(uuid4()) if event_id is None else valid_uuid(event_id, "event id")
+    source_token = local_token(root, _source_key(source), source.generation)
     body = wrapped_message(
         source_alias,
         source_token,
@@ -3137,13 +3270,20 @@ def _send_local_target(
     )
     timeout = _remaining_operation_timeout(deadline, ACCEPT_TIMEOUT_SECONDS)
     store = IntentStore(root)
-    store.begin(
+    previous = _begin_delivery(
+        store,
         source,
-        target_route,
+        target.session_key,
+        target.generation,
         source_alias=source_alias,
-        payload_digest=hashlib.sha256(body.encode()).hexdigest(),
+        body=body,
         event_id=event_id,
     )
+    if previous is not None:
+        return _existing_delivery(previous, target)
+    if isinstance(source, ExternalEndpoint) and not _source_current(root, source):
+        store.mark(event_id, "PRE_EFFECT_REJECTED")
+        raise ChatError("sender changed before transport acceptance")
     retry_delay = PRE_EFFECT_RETRY_SECONDS
     while True:
         try:
@@ -3225,11 +3365,14 @@ def _send_local_target(
 
 def _send_local_token_target(
     root: Path,
-    source: Route,
+    source: SourceIdentity,
     token: RecipientToken,
     message: str,
     *,
     deadline: float,
+    event_id: str | None = None,
+    source_lock_fd: int | None = None,
+    include_external: bool = False,
 ) -> dict[str, object]:
     if token.origin != local_origin(root):
         raise ChatError(
@@ -3238,23 +3381,38 @@ def _send_local_token_target(
         )
     matches = [
         target
-        for target in local_targets(root, handle=token.handle)
+        for target in (
+            _local_endpoint_targets(root, handle=token.handle)
+            if include_external
+            else local_targets(root, handle=token.handle)
+        )
         if target.session_key == token.handle and target.generation == token.generation
     ]
     if len(matches) != 1:
         raise ChatError(
             "recipient is unavailable or changed; call chat_peers and choose the recipient again"
         )
-    return _send_local_target(root, source, matches[0], message, deadline=deadline)
+    return _send_local_target(
+        root,
+        source,
+        matches[0],
+        message,
+        deadline=deadline,
+        **_source_lock_option(source_lock_fd),
+        **_event_option(event_id),
+    )
 
 
 def _send_remote_token_target(
     root: Path,
-    source: Route,
+    source: SourceIdentity,
     token: RecipientToken,
     message: str,
     *,
     deadline: float,
+    event_id: str | None = None,
+    source_lock_fd: int | None = None,
+    include_external: bool = False,
 ) -> dict[str, object]:
     if token.node_id is None:
         raise ChatError("recipient token is invalid")
@@ -3276,6 +3434,7 @@ def _send_remote_token_target(
         address,
         min(time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS, deadline),
         include_devin=True,
+        **_external_option(include_external),
         handle=token.handle,
         node_id=token.node_id,
     )
@@ -3286,41 +3445,101 @@ def _send_remote_token_target(
     ]
     if len(claimants) != 1:
         raise ChatError(
-            "recipient is unavailable or changed; call chat_peers and choose the recipient again"
+            "recipient is unavailable or changed; "
+            + ("external recipients require an external-aware broker; " if include_external else "")
+            + "call chat_peers and choose the recipient again"
         )
     return _send_remote_target(
-        root, source, claimants[0], message, deadline=deadline, self_node_id=self_node_id
+        root,
+        source,
+        claimants[0],
+        message,
+        deadline=deadline,
+        self_node_id=self_node_id,
+        **_source_lock_option(source_lock_fd),
+        **_event_option(event_id),
     )
 
 
-def send_local(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
+def send_local(
+    root: Path,
+    source: SourceIdentity,
+    target_query: str,
+    message: str,
+    *,
+    event_id: str | None = None,
+    source_lock_fd: int | None = None,
+) -> dict[str, object]:
     deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
     token = parse_recipient_token(target_query)
     if token is not None:
         if token.scope != "local":
             raise ChatError("recipient token selects a remote device, not a local session")
-        return _send_local_token_target(root, source, token, message, deadline=deadline)
+        return _send_local_token_target(
+            root,
+            source,
+            token,
+            message,
+            deadline=deadline,
+            **_source_lock_option(source_lock_fd),
+            **_event_option(event_id),
+        )
     if re.fullmatch(r"[0-9a-f]{64}", target_query) is not None:
         raise ChatError(
             "recipient handles are now opaque tokens; call chat_peers and send to the fresh handle"
         )
-    target = resolve_target(local_targets(root), target_query)
-    return _send_local_target(root, source, target, message, deadline=deadline)
+    target = resolve_target(_local_endpoint_targets(root), target_query)
+    return _send_local_target(
+        root,
+        source,
+        target,
+        message,
+        deadline=deadline,
+        **_source_lock_option(source_lock_fd),
+        **_event_option(event_id),
+    )
 
 
-def send(root: Path, source: Route, target_query: str, message: str) -> dict[str, object]:
+def send(
+    root: Path,
+    source: SourceIdentity,
+    target_query: str,
+    message: str,
+    *,
+    event_id: str | None = None,
+    source_lock_fd: int | None = None,
+    include_external: bool = False,
+) -> dict[str, object]:
     deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
     token = parse_recipient_token(target_query)
     if token is not None:
         if token.scope == "local":
-            return _send_local_token_target(root, source, token, message, deadline=deadline)
-        return _send_remote_token_target(root, source, token, message, deadline=deadline)
+            return _send_local_token_target(
+                root,
+                source,
+                token,
+                message,
+                deadline=deadline,
+                include_external=include_external,
+                **_source_lock_option(source_lock_fd),
+                **_event_option(event_id),
+            )
+        return _send_remote_token_target(
+            root,
+            source,
+            token,
+            message,
+            deadline=deadline,
+            include_external=include_external,
+            **_source_lock_option(source_lock_fd),
+            **_event_option(event_id),
+        )
     if re.fullmatch(r"[0-9a-f]{64}", target_query) is not None:
         raise ChatError(
             "recipient handles are now opaque tokens; call chat_peers and send to the fresh handle"
         )
-    local = local_targets(root)
-    remote, remote_complete = _remote_discovery()
+    local = _local_endpoint_targets(root) if include_external else local_targets(root)
+    remote, remote_complete = _remote_discovery(**_external_option(include_external))
     if not remote_complete:
         raise ChatError(
             "remote peer discovery is incomplete; use an exact available recipient handle"
@@ -3341,7 +3560,15 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
             "call chat_peers and choose the recipient"
         )
     if not target.remote:
-        return _send_local_target(root, source, target, message, deadline=deadline)
+        return _send_local_target(
+            root,
+            source,
+            target,
+            message,
+            deadline=deadline,
+            **_source_lock_option(source_lock_fd),
+            **_event_option(event_id),
+        )
     if target.tailnet_node_id is None:
         raise ChatError("remote target route is incomplete")
     # An alias is only a display-time selector: dispatch revalidates the same
@@ -3357,25 +3584,28 @@ def send(root: Path, source: Route, target_query: str, message: str) -> dict[str
         ),
         message,
         deadline=deadline,
+        include_external=include_external,
+        **_source_lock_option(source_lock_fd),
+        **_event_option(event_id),
     )
 
 
 def _send_remote_target(
     root: Path,
-    source: Route,
+    source: SourceIdentity,
     target: Target,
     message: str,
     *,
     deadline: float,
     self_node_id: str,
+    event_id: str | None = None,
+    source_lock_fd: int | None = None,
 ) -> dict[str, object]:
     if target.tailnet_address is None:
         raise ChatError("remote target route is incomplete")
     source_alias = canonical_source_alias(root, source, deadline=deadline)
-    event_id = str(uuid4())
-    source_token = remote_token(
-        self_node_id, session_key(source.provider, source.session_id), source.generation
-    )
+    event_id = str(uuid4()) if event_id is None else valid_uuid(event_id, "event id")
+    source_token = remote_token(self_node_id, _source_key(source), source.generation)
     body = wrapped_message(
         source_alias,
         source_token,
@@ -3385,15 +3615,20 @@ def _send_remote_target(
     )
     timeout = _remaining_operation_timeout(deadline, REMOTE_TIMEOUT_SECONDS)
     store = IntentStore(root)
-    store.begin_identity(
-        source_key=session_key(source.provider, source.session_id),
-        source_generation=source.generation,
+    previous = _begin_delivery(
+        store,
+        source,
+        target.session_key,
+        target.generation,
         source_alias=source_alias,
-        target_key=target.session_key,
-        target_generation=target.generation,
-        payload_digest=hashlib.sha256(body.encode()).hexdigest(),
+        body=body,
         event_id=event_id,
     )
+    if previous is not None:
+        return _existing_delivery(previous, target)
+    if isinstance(source, ExternalEndpoint) and not _source_current(root, source):
+        store.mark(event_id, "PRE_EFFECT_REJECTED")
+        raise ChatError("sender changed before transport acceptance")
     envelope = remote_envelope(
         event_id=event_id,
         source_alias=source_alias,
@@ -3527,7 +3762,7 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         parse_remote_envelope(text)
     )
     target_provider = target_alias.split("@", 1)[0]
-    if target_provider not in {"claude", "codex", "devin"}:
+    if target_provider not in {"claude", "codex", "devin", "external"}:
         raise ChatError("remote target provider is invalid")
     try:
         # The envelope pins the target generation, and a generation belongs to
@@ -3544,6 +3779,8 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
             candidates = local_targets(root)
         else:
             candidates = []
+        if target_provider == "external":
+            candidates = external_targets(root)
         matches = [
             target
             for target in candidates
@@ -3552,9 +3789,11 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         if len(matches) != 1:
             raise ChatError("remote target changed before transport acceptance")
         target = matches[0]
-        if target.session_id is None or target.pid is None or target.cwd is None:
+        if target.provider != "external" and (
+            target.session_id is None or target.pid is None or target.cwd is None
+        ):
             raise ChatError("remote target route is incomplete")
-        target_key = session_key(target.provider, target.session_id)
+        target_key = target.session_key
         payload_digest = hashlib.sha256(message.encode()).hexdigest()
         authorization_request: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
@@ -3588,6 +3827,16 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         source_token = _envelope_reply_token(message, source_alias, event_id, target_provider)
         if source_token is not None:
             _verify_remote_reply_token(source_token, source_generation, source_address)
+        if target.provider == "external":
+            return _accept_external(
+                root,
+                target,
+                message,
+                event_id,
+                source_alias,
+                source_generation,
+                timeout_seconds=_remaining_operation_timeout(deadline, 15.0),
+            )
         routes = [
             route
             for route in Registry(root).routes()
@@ -3678,6 +3927,158 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         }
 
 
+def external_targets(root: Path, *, handle: str | None = None) -> list[Target]:
+    return [
+        Target(
+            alias=item.alias,
+            provider="external",
+            device=item.device,
+            project=item.name,
+            generation=item.generation,
+            session_key=item.key,
+            remote=False,
+            title=item.name,
+        )
+        for item in ExternalEndpointStore(root).endpoints()
+        if item.available()
+        and item.callback_ref is not None
+        and (handle is None or item.key == handle)
+    ]
+
+
+def _local_endpoint_targets(root: Path, *, handle: str | None = None) -> list[Target]:
+    native = local_targets(root) if handle is None else local_targets(root, handle=handle)
+    if handle is not None and native:
+        return native
+    try:
+        return [*native, *external_targets(root, handle=handle)]
+    except ChatError:
+        return native
+
+
+def _accept_external(
+    root: Path,
+    target: Target,
+    body: str,
+    event_id: str,
+    source_alias: str,
+    source_generation: str,
+    *,
+    timeout_seconds: float,
+    source_lock_fd: int | None = None,
+) -> dict[str, object]:
+    from cross_agent_chat.external_callback import post_callback, read_callback
+
+    identifier = valid_uuid(event_id, "event id")
+    matches = [
+        item
+        for item in ExternalEndpointStore(root).endpoints()
+        if item.key == target.session_key
+        and item.generation == target.generation
+        and item.alias == target.alias
+        and item.available()
+        and item.callback_ref is not None
+    ]
+    if len(matches) != 1:
+        raise ChatError("external recipient is unavailable or changed; nothing was delivered")
+    endpoint = matches[0]
+    with endpoint_effect_lock(root, endpoint.endpoint_id) as target_fd:
+        if not ExternalEndpointStore(root).current(endpoint):
+            raise ChatError("external recipient changed before effect; nothing was delivered")
+        config = read_callback(root / cast(str, endpoint.callback_ref))
+        source_token = _envelope_reply_token(body, source_alias, identifier, "external")
+        if source_token is None:
+            raise ChatError("external recipient requires an exact CAC reply token")
+        # This is data for the enrolled receiver, never a system instruction.
+        lines = body.split("\n", 3)
+        reply_handle = lines[2][len("Reply via CAC to handle: ") :]
+        outcome = post_callback(
+            config,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "event_id": identifier,
+                "source_alias": source_alias,
+                "source_generation": source_generation,
+                "target_alias": target.alias,
+                "generation": target.generation,
+                "reply_handle": reply_handle,
+                "message": body,
+            },
+            timeout_seconds=timeout_seconds,
+            lock_fds=(target_fd,) if source_lock_fd is None else (source_lock_fd, target_fd),
+        )
+    if outcome == "PRE_EFFECT_REJECTED":
+        raise ChatError("external callback rejected before submission; nothing was delivered")
+    if outcome != "TRANSPORT_ACCEPTED":
+        raise UnknownDeliveryError("external callback delivery is unknown; do not retry")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": identifier,
+        "status": "TRANSPORT_ACCEPTED",
+        "to": target.alias,
+        "provider": "external",
+    }
+
+
+def _send_external_target(
+    root: Path,
+    source: SourceIdentity,
+    target: Target,
+    message: str,
+    *,
+    deadline: float,
+    event_id: str | None = None,
+    source_lock_fd: int | None = None,
+) -> dict[str, object]:
+    if isinstance(source, ExternalEndpoint) and source_lock_fd is None:
+        raise ChatError("external sender effect custody is unavailable; nothing was delivered")
+    source_alias = canonical_source_alias(root, source, deadline=deadline)
+    identifier = str(uuid4()) if event_id is None else valid_uuid(event_id, "event id")
+    body = wrapped_message(
+        source_alias,
+        local_token(root, _source_key(source), source.generation),
+        bounded_message(message),
+        identifier,
+        "external",
+    )
+    store = IntentStore(root)
+    previous = _begin_delivery(
+        store,
+        source,
+        target.session_key,
+        target.generation,
+        source_alias=source_alias,
+        body=body,
+        event_id=identifier,
+    )
+    if previous is not None:
+        return _existing_delivery(previous, target)
+    try:
+        if not _source_current(root, source):
+            raise ChatError("sender changed before effect; nothing was delivered")
+        remaining = _remaining_operation_timeout(deadline, 15.0)
+        result = _accept_external(
+            root,
+            target,
+            body,
+            identifier,
+            source_alias,
+            source.generation,
+            timeout_seconds=remaining,
+            **_source_lock_option(source_lock_fd),
+        )
+    except UnknownDeliveryError:
+        store.mark(identifier, "UNKNOWN_DELIVERY")
+        raise UnknownDeliveryError(
+            f"external delivery is unknown for event {identifier}; do not retry"
+        ) from None
+    except ChatError:
+        store.mark(identifier, "PRE_EFFECT_REJECTED")
+        raise
+    store.mark(identifier, "TRANSPORT_ACCEPTED")
+    return result
+
+
 def _target_handle_token(root: Path, target: Target) -> str | None:
     """Mint the public endpoint token for one discovered target, or none.
 
@@ -3710,6 +4111,7 @@ def peers(
     include_delivery_mechanism: bool = False,
     include_title: bool = False,
     include_devin: bool = True,
+    include_external: bool = False,
     handle: str | None = None,
     query: str | None = None,
 ) -> dict[str, object]:
@@ -3734,6 +4136,7 @@ def peers(
                 include_delivery_mode=include_delivery_mode,
                 include_title=display_titles,
                 identity=identity,
+                **_external_option(include_external),
             )
             remote_targets, remote_complete = remote.result()
             targets = [*local.result(), *remote_targets]
@@ -3745,6 +4148,15 @@ def peers(
     else:
         targets = local_targets(root, handle=handle)
         remote_discovery = "not_requested"
+    external_discovery = "not_requested"
+    if include_external:
+        try:
+            targets.extend(external_targets(root, handle=handle))
+            external_discovery = "configured"
+        except ChatError:
+            # An optional extension cannot take down native discovery. The
+            # authenticated external sender still refuses the corrupt state.
+            external_discovery = "unavailable"
     if not include_devin:
         targets = [target for target in targets if target.provider != "devin"]
     handles = [target.session_key for target in targets]
@@ -3777,6 +4189,8 @@ def peers(
             # remain authoritative. Emitting inside the title gate keeps the
             # strict broker reader shape for title-disabled listings.
             item["title"] = _devin_display_title(target.session_key)
+        if target.provider == "external" and not internal:
+            item["identity_assurance"] = "owner_enrolled_endpoint"
         items.append(item)
     total = len(items)
     if wanted is not None:
@@ -3795,6 +4209,8 @@ def peers(
         result["filter"] = {"query": query, "matched": len(items), "of": total}
     if not internal:
         result["remote_discovery"] = remote_discovery
+        if include_external and external_discovery == "unavailable":
+            result["external_discovery"] = external_discovery
     return result
 
 
@@ -3848,7 +4264,7 @@ ReplyDelivery = Literal["while_idle", "next_turn", "unknown"]
 REPLY_DELIVERY_TIMEOUT_SECONDS: Final = 1.0
 
 
-def reply_delivery(root: Path, source: Route) -> ReplyDelivery:
+def reply_delivery(root: Path, source: SourceIdentity) -> ReplyDelivery:
     """Say how an answer sent to this authenticated source session reaches it.
 
     Claude and a queued Codex route receive a new message while idle. A Stop-bound
@@ -3858,6 +4274,8 @@ def reply_delivery(root: Path, source: Route) -> ReplyDelivery:
     Callers ask before sending: a slow or failing check must never turn an accepted
     send into an apparent failure that invites a resend.
     """
+    if isinstance(source, ExternalEndpoint):
+        return "unknown"
     if source.provider == "claude":
         mode: str | None = "claude_native_cross_session"
     elif source.provider == "devin":
@@ -4273,13 +4691,13 @@ def native_dispatch(root: Path, helper: Route, event_id: str) -> dict[str, objec
     }
 
 
-def event_status(root: Path, source: Route, event_id: str) -> dict[str, object]:
+def event_status(root: Path, source: SourceIdentity, event_id: str) -> dict[str, object]:
     """Return body-free custody state for one exact authenticated source event."""
-    if not _route_current(root, source):
+    if not _source_current(root, source):
         raise ChatError("event is unavailable")
     intent = IntentStore(root).intent_for_source(
         event_id=event_id,
-        source_key=session_key(source.provider, source.session_id),
+        source_key=_source_key(source),
         source_generation=source.generation,
     )
     if intent is None:

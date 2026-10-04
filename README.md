@@ -24,16 +24,16 @@ secrets those files hold (see [setup and data handling](SECURITY.md)).
 Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
 limits the set.
 
-Install v0.4.8 with:
+Install v0.5.0 with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.8/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.0/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
-This builds the released `v0.4.8` tag and installs the command at
+This builds the released `v0.5.0` tag and installs the command at
 `~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
 Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
 not found in your shell, use the full path the installer reports. Run it on
@@ -90,6 +90,7 @@ peer list.
 | Codex Native App | Managed helper delivery reaches the original conversation while idle or during active work on the qualified host described below. Required provider capabilities and trusted hooks must be available. |
 | Codex CLI | By default, receives at a turn boundary: the current turn's end or the next prompt. An explicitly enabled experimental queue has different behavior. |
 | Local Devin CLI/App | Receives at the next prompt or turn end. A conversation joins the peer list after its first prompt; receiving into an already-idle conversation stays open in [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38), waiting on a supported provider interface for delivering into an existing running conversation. |
+| Grokbot 0.66.0 | One owner-enrolled Bot using a webhook and local shell completed a round trip to the same Grok conversation through an iMac-to-M1 Claude Opus 5.5 original running in bypass-permission mode. Idle webhook return was consumed; active-turn receiving is unverified. This does not certify another Bot, a fresh-user setup, or M2. |
 
 Idle reception and input during an active turn are separate capabilities.
 The direct experimental Codex route uses `thread/queue/add`: a message can
@@ -109,6 +110,32 @@ for every OS/provider combination, other agents or IDE chat surfaces, web
 chats, Windows, or Linux. A Claude session launched inside a remote SSH shell
 registered but could not receive — remotely opening a desktop terminal is
 different.
+
+## Optional Grokbot connection
+
+Cross Agent Chat 0.5.0 adds an owner-enrolled external CLI/MCP connection.
+Grokbot 0.66.0 was qualified with one owner's webhook and local-shell routine:
+the original Bot sent work to an iMac/M1 Claude Opus 5.5 session in the
+bypass-permission class, and the same Grok conversation used the automatic
+webhook return while idle. This is an owner-enrolled endpoint, not provider
+attestation or per-Bot identity. Active-turn Grok receiving, another Bot,
+fresh-user setup, and M2 are not qualified.
+
+Keep the optional setup in ~/.config/cross-agent-chat/external/grok/.
+Store the CAC credential in credential and Grok's callback URL/key in
+callback.json; keep both owner-private. Grok generates the webhook key in the
+owned routine panel. Its routine update API does not return that key to the
+Bot. During authorized setup, capture the key from the panel directly into
+callback.json, then pass only the file path to configure-callback. Do not put
+credential values in model chat, command arguments, or logs.
+
+Enroll the endpoint and configure its callback with the existing CLI.
+Connect the Grok local-shell routine to external-call, or configure a stdio
+MCP client with external-mcp; pass the CAC credential file path, never its
+value. The external MCP exposes chat_peers, chat_send, and chat_status.
+Scope, request, callback, and revocation details are in the
+[external-client contract](docs/source-map.md#external-client-contract).
+The Mac's CAC broker must be reachable when Grok sends work.
 
 <details>
 <summary>Custom profiles and installing with an agent</summary>

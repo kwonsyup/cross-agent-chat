@@ -86,6 +86,69 @@ Devin sends require a short-lived single-use capability issued through the
 trusted hook path and bound to session, generation, prompt, tool, and
 arguments.
 
+## Owner-enrolled external endpoints
+
+An external endpoint is an optional owner-created bearer credential. The
+private state root
+stores endpoint metadata and a credential verifier; the credential itself is
+written only to the explicit `--credential-file` path. The `context` supplied
+at enrollment is an owner label, not a provider attestation. The endpoint
+alias identifies that enrolled credential. If the same credential is copied
+to several Bots or conversations, they all act as the same endpoint. It does
+not prove which Bot or conversation made a call, and it does not provide
+per-Bot isolation.
+
+`external enroll --credential-file PATH` creates a new credential file with
+mode `0600` and refuses to overwrite an existing path. For Grok, keep the
+credential and callback source under
+`~/.config/cross-agent-chat/external/grok/`. Give a client only the
+file path through the approved local command or stdio MCP configuration. Do
+not copy the credential value into a provider prompt, tool argument, shell
+argument, log, or public configuration. The credential is accepted as a
+sender capability; `--allow-recipient` can limit it to exact current `cac2.`
+peer handles. Without those flags, the endpoint can address the owner's
+available peers. Recipient tokens select exact generations and are not
+credentials themselves.
+
+`external configure-scope ENDPOINT_ID --expected-generation UUID` replaces
+that endpoint's allowlist and requires at least one exact recipient token.
+It acquires the endpoint-effect lock before the endpoint-state lock and
+refuses a stale generation or inactive endpoint without writing. An identical
+set is a no-op; a changed set rotates the endpoint generation, fencing old
+handles. Scope changes preserve the endpoint ID, credential verifier,
+callback configuration, and delivery intents. The endpoint can no longer
+inspect earlier events, and peers need fresh handles for it. There is no
+owner-wide empty-scope or `allow all` operation.
+
+The owner may configure a callback using a private JSON file containing its
+exact HTTPS `url` and bearer value. Keep that source file private; CAC copies
+the configuration into the owner-only state root. The callback POST includes
+the message body, event and endpoint metadata, and the exact CAC reply handle;
+those bytes leave the Mac for the configured receiver. This path is not
+cloud-free. The callback must use a public HTTPS hostname on port 443. One
+owner-enrolled Grokbot 0.66.0 webhook/local-shell path completed a round
+trip to the same original Grok conversation; this does not qualify active
+Grok receiving or other Bot identities. CAC
+does not follow redirects or retry a callback after an uncertain write. A
+2xx response proves only that the receiver accepted custody. It does not prove
+a Bot run started, read the message or returned it in the original
+conversation. If either endpoint is busy, CAC refuses before the POST with an
+explicit pre-effect result; it does not retry internally or promise a model
+wake. No external original-context callback has been qualified.
+
+`external revoke ENDPOINT_ID` blocks future calls and changes the endpoint
+generation. Credential rotation and callback configuration also change the
+generation; old endpoint handles then refuse. Revoke does not recall accepted
+or uncertain events or erase intent records. It removes CAC's saved callback
+copy while revoking, but does not remove the separate credential file or the
+owner-supplied callback configuration file. Remove those source files after
+revoking when they are no longer needed. Uninstall removes CAC's endpoint
+records and saved callback copy on the last owner, but leaves owner-supplied
+credential/configuration files and retains delivery intents. Rolling back to
+an older binary does not revoke endpoint credentials; use the supporting
+build to revoke first. Older loaded provider sessions also do not acquire the
+new external commands until they load a build that contains them.
+
 ## Inference and provider-owned data
 
 Provider credentials stay in their existing local provider sessions and are

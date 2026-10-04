@@ -234,7 +234,10 @@ def test_chat_send_result_says_how_the_answer_returns(
     )
     sent: list[tuple[str, str]] = []
 
-    def fake_send(_root: Path, _source: Route, target: str, message: str) -> dict[str, object]:
+    def fake_send(
+        _root: Path, _source: Route, target: str, message: str, *, include_external: bool = False
+    ) -> dict[str, object]:
+        assert include_external is True
         sent.append((target, message))
         return {"schema_version": 1, "status": "TRANSPORT_ACCEPTED", "event_id": "e"}
 
