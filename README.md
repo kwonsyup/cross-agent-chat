@@ -24,16 +24,16 @@ secrets those files hold (see [setup and data handling](SECURITY.md)).
 Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
 limits the set.
 
-Install v0.4.8 with:
+Install v0.5.0 with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.4.8/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.0/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
-This builds the released `v0.4.8` tag and installs the command at
+This builds the released `v0.5.0` tag and installs the command at
 `~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
 Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
 not found in your shell, use the full path the installer reports. Run it on
@@ -90,6 +90,7 @@ peer list.
 | Codex Native App | Managed helper delivery reaches the original conversation while idle or during active work on the qualified host described below. Required provider capabilities and trusted hooks must be available. |
 | Codex CLI | By default, receives at a turn boundary: the current turn's end or the next prompt. An explicitly enabled experimental queue has different behavior. |
 | Local Devin CLI/App | Receives at the next prompt or turn end. A conversation joins the peer list after its first prompt; receiving into an already-idle conversation stays open in [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38), waiting on a supported provider interface for delivering into an existing running conversation. |
+| Grokbot 0.66.0 | One owner-enrolled Bot using a webhook and local shell completed a round trip to the same Grok conversation through an iMac-to-M1 Claude Opus 5.5 original running in bypass-permission mode. Idle webhook return was consumed; active-turn receiving is unverified. This does not certify another Bot, a fresh-user setup, or M2. |
 
 Idle reception and input during an active turn are separate capabilities.
 The direct experimental Codex route uses `thread/queue/add`: a message can
@@ -110,79 +111,31 @@ chats, Windows, or Linux. A Claude session launched inside a remote SSH shell
 registered but could not receive — remotely opening a desktop terminal is
 different.
 
-## Experimental external endpoints — unreleased
+## Optional Grokbot connection
 
-The owner-enrolled external endpoint path is in unreleased source and is not
-part of the v0.4.8 installer above. It adds a generic local CLI/MCP boundary;
-it does not attest which provider or Bot used the credential. Reusing one
-credential across Bots or conversations gives CAC one shared endpoint
-identity, not per-Bot isolation. No external Bot or chat product has qualified
-original-context receiving or a complete round trip.
+Cross Agent Chat 0.5.0 adds an owner-enrolled external CLI/MCP connection.
+Grokbot 0.66.0 was qualified with one owner's webhook and local-shell routine:
+the original Bot sent work to an iMac/M1 Claude Opus 5.5 session in the
+bypass-permission class, and the same Grok conversation used the automatic
+webhook return while idle. This is an owner-enrolled endpoint, not provider
+attestation or per-Bot identity. Active-turn Grok receiving, another Bot,
+fresh-user setup, and M2 are not qualified.
 
-On a reviewed build that includes these commands, an owner can enroll one
-endpoint and save its credential in a new owner-private file:
+Keep the optional setup in ~/.config/cross-agent-chat/external/grok/.
+Store the CAC credential in credential and Grok's callback URL/key in
+callback.json; keep both owner-private. Grok generates the webhook key in the
+owned routine panel. Its routine update API does not return that key to the
+Bot. During authorized setup, capture the key from the panel directly into
+callback.json, then pass only the file path to configure-callback. Do not put
+credential values in model chat, command arguments, or logs.
 
-```sh
-cross-agent-chat external enroll \
-  --device imac --name "External Client" --context owner-enrolled \
-  --allow-recipient "$CAC_ALLOWED_RECIPIENT" \
-  --credential-file "$HOME/.config/cross-agent-chat/external.credential"
-```
-
-Set `CAC_ALLOWED_RECIPIENT` to an exact current `cac2.` peer handle the owner
-chooses; repeat `--allow-recipient` for each permitted peer. Omitting the flag
-allows the endpoint to address the owner's available peers. Enrollment prints
-identity metadata, not the credential. The credential file is created with
-mode `0600`; pass its **path** to `external-mcp` (stdio) or `external-call`
-(one JSON request). Never put the credential value in a prompt, tool argument,
-command argument, or log. Every `chat_send` requires one stable UUID
-`request_id` for that intended event. An identical request returns its recorded
-custody only when the same current target and content can be verified. If the
-target is unavailable or changed, the retry refuses with its recorded custody
-status and says not to replay or choose another recipient. Check `chat_status`;
-never send equivalent accepted or uncertain work under a new request ID.
-`reply_delivery` remains `unknown` until original external conversation
-receiving is established.
-
-To replace an endpoint's recipient set, use its latest generation and pass
-one or more exact current peer handles. There is no empty or owner-wide scope
-option:
-
-```sh
-cross-agent-chat external configure-scope "$CAC_ENDPOINT_ID" \
-  --expected-generation "$CAC_ENDPOINT_GENERATION" \
-  --allow-recipient "$CAC_ALLOWED_RECIPIENT"
-```
-
-Repeat `--allow-recipient` for each permitted peer. A stale expected generation
-refuses without changing state. Repeating the same set is a no-op; an actual
-change rotates the endpoint generation, so older handles to that endpoint
-stop working. Peers need fresh handles, and the endpoint can no longer inspect
-earlier events with `chat_status` or request IDs. The credential, callback
-configuration, and stored delivery intents remain unchanged.
-
-The current source also has an owner-configured HTTPS callback option, but no
-external Bot or original-context callback has been qualified. A 2xx response
-means only that the HTTP receiver accepted custody; it does not prove the Bot
-ran or consumed the task. The callback POST carries the message and reply
-handle off the Mac to the configured receiver. Callback setup and credential
-rotation change the endpoint generation, so old handles stop working. Do not
-configure a callback until its exact destination and credential are authorized
-and reviewed.
-
-If either endpoint is busy, CAC refuses before starting a callback POST; it
-does not retry that callback automatically or promise that a Bot was woken.
-
-Revoke an endpoint with `cross-agent-chat external revoke ENDPOINT_ID`; this
-stops future calls, removes CAC's saved callback copy, and does not cancel
-accepted or uncertain work. The separate credential file and callback
-configuration file supplied by the owner remain; remove them when no longer
-needed. An already-running provider session will not gain the new commands
-until it loads the reviewed build. Rolling back to an older binary does not
-revoke external credentials; revoke first with the supporting build. Uninstall
-removes CAC's endpoint records and callback copy on the last owner, but leaves
-the source credential/configuration files. Delivery intent records remain for
-inspection.
+Enroll the endpoint and configure its callback with the existing CLI.
+Connect the Grok local-shell routine to external-call, or configure a stdio
+MCP client with external-mcp; pass the CAC credential file path, never its
+value. The external MCP exposes chat_peers, chat_send, and chat_status.
+Scope, request, callback, and revocation details are in the
+[external-client contract](docs/source-map.md#external-client-contract).
+The Mac's CAC broker must be reachable when Grok sends work.
 
 <details>
 <summary>Custom profiles and installing with an agent</summary>

@@ -86,10 +86,10 @@ Devin sends require a short-lived single-use capability issued through the
 trusted hook path and bound to session, generation, prompt, tool, and
 arguments.
 
-## Experimental owner-enrolled external endpoints
+## Owner-enrolled external endpoints
 
-The external endpoint path is unreleased source and remains experimental.
-Its authority is an owner-created bearer credential. The private state root
+An external endpoint is an optional owner-created bearer credential. The
+private state root
 stores endpoint metadata and a credential verifier; the credential itself is
 written only to the explicit `--credential-file` path. The `context` supplied
 at enrollment is an owner label, not a provider attestation. The endpoint
@@ -99,7 +99,9 @@ not prove which Bot or conversation made a call, and it does not provide
 per-Bot isolation.
 
 `external enroll --credential-file PATH` creates a new credential file with
-mode `0600` and refuses to overwrite an existing path. Give a client only the
+mode `0600` and refuses to overwrite an existing path. For Grok, keep the
+credential and callback source under
+`~/.config/cross-agent-chat/external/grok/`. Give a client only the
 file path through the approved local command or stdio MCP configuration. Do
 not copy the credential value into a provider prompt, tool argument, shell
 argument, log, or public configuration. The credential is accepted as a
@@ -123,7 +125,10 @@ exact HTTPS `url` and bearer value. Keep that source file private; CAC copies
 the configuration into the owner-only state root. The callback POST includes
 the message body, event and endpoint metadata, and the exact CAC reply handle;
 those bytes leave the Mac for the configured receiver. This path is not
-cloud-free. The callback must use a public HTTPS hostname on port 443. CAC
+cloud-free. The callback must use a public HTTPS hostname on port 443. One
+owner-enrolled Grokbot 0.66.0 webhook/local-shell path completed a round
+trip to the same original Grok conversation; this does not qualify active
+Grok receiving or other Bot identities. CAC
 does not follow redirects or retry a callback after an uncertain write. A
 2xx response proves only that the receiver accepted custody. It does not prove
 a Bot run started, read the message or returned it in the original

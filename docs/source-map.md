@@ -109,12 +109,60 @@ alone proves that an active recipient consumed an envelope.
   memory (`codex.py`), provider queue/transcript (experimental path) — never
   durable product state.
 
+## External-client contract
+
+The local command accepts one JSON object on standard input. Its credential
+argument is a file path, not the credential value:
+
+    cross-agent-chat external-call --credential-file "$HOME/.config/cross-agent-chat/external/grok/credential"
+
+For a send, the JSON object is:
+
+    {"name":"chat_send","arguments":{"to":"<exact current peer handle>","message":"Review this change.","request_id":"550e8400-e29b-41d4-a716-446655440000"}}
+
+Use an exact current handle returned by chat_peers or carried as a reply
+handle. Each new event needs one stable UUID request_id. Retrying the identical
+request can return its recorded custody only while target and content match;
+never resend accepted or uncertain work under a new ID. chat_status reads
+sender-local custody and does not prove recipient consumption. A reply is a
+separate send to the exact reply handle.
+
+Enrollment without --allow-recipient uses owner_peers scope: the endpoint can
+address the owner's available peers. Repeating --allow-recipient enrolls an
+exact-token allowlist; chat_peers then shows only those recipients and sends
+outside it refuse. configure-scope replaces that list, requires the current
+endpoint generation and at least one exact handle, and rotates the generation
+when the set changes. Old endpoint handles then stop working; peers need fresh
+handles. There is no empty scope.
+
+For an HTTPS callback, keep a private JSON source file with exactly these
+fields:
+
+    {"url":"<Grok-generated webhook URL>","bearer":"<Grok-generated key>"}
+
+Grok displays the generated webhook key in the owned routine panel; the
+routine update API does not return it to the Bot. During owner-authorized
+setup, capture the URL and key from that panel directly into the private
+file, then pass only its path to external configure-callback. CAC sends the
+bearer field as the HTTP Authorization header. Do not place secret values in
+model chat, command arguments, or logs. Callback setup
+rotates the endpoint generation. The callback POST sends the message, event
+and endpoint metadata, and reply handle off the Mac; HTTP 2xx proves receiver
+custody only, not model consumption.
+
+Credential rotation also changes generation. external revoke stops future
+calls and removes CAC's saved callback copy, but does not recall accepted or
+uncertain events or delete the owner's source files. Remove those private
+files when no longer needed. External identity remains owner-enrolled: the
+same credential shared across Bots is one endpoint identity, not Bot
+attestation or per-Bot isolation.
+
 ## Tests
 
 | Area | Files |
 |---|---|
 | State/identity/recipient tokens | `test_core.py`, `test_recipient_binding.py`, `test_recipient_selection.py`, `test_issue9_regressions.py` |
-| Experimental external endpoints | `test_external.py` |
+| Owner-enrolled external endpoints (including the optional Grok CLI/MCP path) | `test_external.py` |
 | Owner anchor / update continuity | `test_owner_anchor.py` |
 | MCP protocol/tools | `test_mcp.py`, `test_mcp_protocol.py`, `test_native_helper_mcp.py` |
 | Broker/transport/courier seats | `test_broker_admission.py`, `test_broker_peek.py`, `test_courier_liveness.py`, `test_tailnet.py`, `test_transport.py`, `test_transport_deadlines.py` |
