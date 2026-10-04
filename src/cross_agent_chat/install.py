@@ -3374,7 +3374,12 @@ class Installer:
             return False
         if self.state.is_symlink() or not self.state.is_dir():
             raise SettingsError("runtime state ownership is invalid")
-        for routes in (self.state / "routes.json", self.state / "devin-routes.json"):
+        for routes in (
+            self.state / "routes.json",
+            self.state / "devin-routes.json",
+            self.state / "external-endpoints-v1.json",
+            *self.state.glob("external-callback-*.json"),
+        ):
             if routes.is_symlink() or routes.is_file():
                 routes.unlink()
             elif routes.exists():

@@ -14,7 +14,7 @@ from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, cast
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import SCHEMA_VERSION, ChatError
@@ -105,6 +105,10 @@ def bind_broker_listener(
     return server
 
 
+class _ExternalDiscoveryOption(TypedDict, total=False):
+    include_external: bool
+
+
 def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[str, object]:
     """Handle one validated Tailnet broker request without recursive discovery."""
     if not isinstance(raw, dict):
@@ -122,7 +126,12 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
             "module_path": str(Path(__file__).resolve()),
         }
     if operation == "peers":
-        include_flags = {"include_delivery_mode", "include_title", "include_devin"}
+        include_flags = {
+            "include_delivery_mode",
+            "include_title",
+            "include_devin",
+            "include_external",
+        }
         optional = set(request) - {"schema_version", "operation"}
         handle = request.get("handle")
         if (
@@ -137,6 +146,9 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
         ):
             raise ChatError("Tailnet broker request is invalid")
         valid_tailnet_address(peer_address)
+        extra: _ExternalDiscoveryOption = (
+            {"include_external": True} if "include_external" in optional else {}
+        )
         return peers(
             root,
             include_remote=False,
@@ -145,6 +157,7 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
             include_title="include_title" in optional,
             include_devin="include_devin" in optional,
             handle=cast(str | None, handle if "handle" in optional else None),
+            **extra,
         )
     authorization_fields = {
         "schema_version",

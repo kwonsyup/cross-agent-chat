@@ -110,6 +110,63 @@ chats, Windows, or Linux. A Claude session launched inside a remote SSH shell
 registered but could not receive — remotely opening a desktop terminal is
 different.
 
+## Experimental external endpoints — unreleased
+
+The owner-enrolled external endpoint path is in unreleased source and is not
+part of the v0.4.8 installer above. It adds a generic local CLI/MCP boundary;
+it does not attest which provider or Bot used the credential. Reusing one
+credential across Bots or conversations gives CAC one shared endpoint
+identity, not per-Bot isolation. No external Bot or chat product has qualified
+original-context receiving or a complete round trip.
+
+On a reviewed build that includes these commands, an owner can enroll one
+endpoint and save its credential in a new owner-private file:
+
+```sh
+cross-agent-chat external enroll \
+  --device imac --name "External Client" --context owner-enrolled \
+  --allow-recipient "$CAC_ALLOWED_RECIPIENT" \
+  --credential-file "$HOME/.config/cross-agent-chat/external.credential"
+```
+
+Set `CAC_ALLOWED_RECIPIENT` to an exact current `cac2.` peer handle the owner
+chooses; repeat `--allow-recipient` for each permitted peer. Omitting the flag
+allows the endpoint to address the owner's available peers. Enrollment prints
+identity metadata, not the credential. The credential file is created with
+mode `0600`; pass its **path** to `external-mcp` (stdio) or `external-call`
+(one JSON request). Never put the credential value in a prompt, tool argument,
+command argument, or log. Every `chat_send` requires one stable UUID
+`request_id` for that intended event. An identical request returns its recorded
+custody only when the same current target and content can be verified. If the
+target is unavailable or changed, the retry refuses with its recorded custody
+status and says not to replay or choose another recipient. Check `chat_status`;
+never send equivalent accepted or uncertain work under a new request ID.
+`reply_delivery` remains `unknown` until original external conversation
+receiving is established.
+
+The current source also has an owner-configured HTTPS callback option, but no
+external Bot or original-context callback has been qualified. A 2xx response
+means only that the HTTP receiver accepted custody; it does not prove the Bot
+ran or consumed the task. The callback POST carries the message and reply
+handle off the Mac to the configured receiver. Callback setup and credential
+rotation change the endpoint generation, so old handles stop working. Do not
+configure a callback until its exact destination and credential are authorized
+and reviewed.
+
+If either endpoint is busy, CAC refuses before starting a callback POST; it
+does not retry that callback automatically or promise that a Bot was woken.
+
+Revoke an endpoint with `cross-agent-chat external revoke ENDPOINT_ID`; this
+stops future calls, removes CAC's saved callback copy, and does not cancel
+accepted or uncertain work. The separate credential file and callback
+configuration file supplied by the owner remain; remove them when no longer
+needed. An already-running provider session will not gain the new commands
+until it loads the reviewed build. Rolling back to an older binary does not
+revoke external credentials; revoke first with the supporting build. Uninstall
+removes CAC's endpoint records and callback copy on the last owner, but leaves
+the source credential/configuration files. Delivery intent records remain for
+inspection.
+
 <details>
 <summary>Custom profiles and installing with an agent</summary>
 

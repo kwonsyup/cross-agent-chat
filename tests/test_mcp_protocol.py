@@ -81,7 +81,10 @@ def _patch_send(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[tuple[s
     )
     sent: list[tuple[str, str]] = []
 
-    def record_send(_root: Path, _source: Route, target: str, message: str) -> dict[str, object]:
+    def record_send(
+        _root: Path, _source: Route, target: str, message: str, *, include_external: bool = False
+    ) -> dict[str, object]:
+        assert include_external is True
         sent.append((target, message))
         return {"schema_version": 1, "event_id": "e"}
 
@@ -726,7 +729,8 @@ def test_execution_failure_after_a_possible_effect_is_a_tool_result(
     )
     effects: list[str] = []
 
-    def uncertain_send(*_args: object) -> dict[str, object]:
+    def uncertain_send(*_args: object, include_external: bool = False) -> dict[str, object]:
+        assert include_external is True
         effects.append("maybe-delivered")
         raise ChatError("delivery outcome is uncertain")
 
