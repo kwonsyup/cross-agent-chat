@@ -1810,11 +1810,19 @@ class Installer:
             "RunAtLoad": True,
             "KeepAlive": True,
             "ProcessType": "Standard",
+            "EnvironmentVariables": {
+                # launchd's default PATH omits owner-selected CLI bindings.
+                # Use the same installed command front door as native sessions.
+                "PATH": (
+                    f"{self.home / '.local/bin'}:/usr/local/bin:/opt/homebrew/bin:"
+                    "/usr/bin:/bin:/usr/sbin:/sbin"
+                ),
+            },
         }
         if self.tailnet_address is not None:
-            payload["EnvironmentVariables"] = {
-                "CROSS_AGENT_CHAT_TAILNET_ADDRESS": self.tailnet_address
-            }
+            cast(dict[str, str], payload["EnvironmentVariables"])[
+                "CROSS_AGENT_CHAT_TAILNET_ADDRESS"
+            ] = self.tailnet_address
         return plistlib.dumps(payload, sort_keys=True)
 
     def _codex_config_text(self) -> str | None:
@@ -2862,7 +2870,11 @@ class Installer:
             if launch_agent != expected_launch_agent:
                 # The address is an optional startup hint. An installation made
                 # without it remains valid when discovery later knows the address.
-                expected_launch_agent.pop("EnvironmentVariables", None)
+                # Only the address hint is optional; losing the selected CLI
+                # PATH can silently bind the disconnected macOS GUI backend.
+                cast(dict[str, str], expected_launch_agent["EnvironmentVariables"]).pop(
+                    "CROSS_AGENT_CHAT_TAILNET_ADDRESS", None
+                )
                 if launch_agent != expected_launch_agent:
                     return False
             self._install_metadata(settings)
