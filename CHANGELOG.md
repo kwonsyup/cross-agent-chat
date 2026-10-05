@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 - 2026-10-05
+
+- Preserve the owner-selected Tailscale CLI in the broker startup environment. macOS system-daemon installations now use the same command binding in native sessions and launchd.
+- Configuration verification retains the required CLI path while allowing an optional address hint to be discovered later.
+- Add a producer-to-consumer startup regression and preserve private state, exact-recipient and no-replay boundaries.
+
 ## 0.5.0 - 2026-10-04
 
 - Release the owner-enrolled external CLI/MCP endpoint for optional Grokbot

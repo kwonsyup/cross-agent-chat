@@ -660,7 +660,7 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
         "submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
-        "version": "0.5.0",
+        "version": "0.5.1",
     }
 
 
@@ -776,7 +776,7 @@ def test_doctor_omits_the_terminal_diagnostic_without_the_marker(
         "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
         "submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
-        "version": "0.5.0",
+        "version": "0.5.1",
     }
 
     assert cli.run(parser().parse_args(["doctor"])) == 0
@@ -1206,7 +1206,8 @@ def test_broker_startup_uses_owner_selected_cli_instead_of_disconnected_backend(
     monkeypatch.setattr(tailnet, "TAILSCALE_STANDALONE_BINARIES", (fallback,))
     monkeypatch.setattr(tailnet, "TAILSCALE_APP_BINARY", tmp_path / "absent-gui")
     monkeypatch.setattr(
-        tailnet, "_ifconfig_output",
+        tailnet,
+        "_ifconfig_output",
         lambda: "utun0: flags=8051\n    inet 100.64.0.10 netmask 0xffffffff\n",
     )
     installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
@@ -1218,8 +1219,6 @@ def test_broker_startup_uses_owner_selected_cli_instead_of_disconnected_backend(
     }
     with patch.dict(os.environ, environment, clear=True):
         assert ("100.64.0.10", tailnet.TAILNET_PORT) in tailnet_broker.broker_bindings()
-
-
 
 
 def test_setup_passes_known_tailnet_address_to_broker(tmp_path: Path) -> None:
@@ -3904,7 +3903,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.5.0')\n"
+        "    print('cross-agent-chat 0.5.1')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -3930,7 +3929,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.5.0"
+    assert completed.stdout.strip() == "cross-agent-chat 0.5.1"
     assert stage.exists()
 
 
@@ -5372,7 +5371,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.5.0",
+            "version": "0.5.1",
             "module_path": str(module),
         },
     )
@@ -5550,7 +5549,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.5.0",
+            "version": "0.5.1",
             "module_path": str(module),
         }
 
