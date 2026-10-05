@@ -4,6 +4,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -17,6 +18,7 @@ from collections.abc import MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -1174,7 +1176,50 @@ def test_setup_installs_owned_standard_broker(tmp_path: Path) -> None:
         "RunAtLoad": True,
         "KeepAlive": True,
         "ProcessType": "Standard",
+        "EnvironmentVariables": {
+            "PATH": (
+                f"{home / '.local/bin'}:/usr/local/bin:/opt/homebrew/bin:"
+                "/usr/bin:/bin:/usr/sbin:/sbin"
+            ),
+        },
     }
+
+
+def test_broker_startup_uses_owner_selected_cli_instead_of_disconnected_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A launchd environment must reach the selected system CLI, not an
+    # installed GUI backend which truthfully reports NeedsLogin.
+    from cross_agent_chat import tailnet, tailnet_broker
+
+    home = tmp_path / "home"
+    local_bin = home / ".local/bin"
+    local_bin.mkdir(parents=True)
+    selected = tmp_path / "selected-tailscale-fixture"
+    (local_bin / "tailscale").symlink_to(selected)
+    fallback = tmp_path / "fallback-tailscale"
+    running = {"BackendState": "Running", "Self": {"TailscaleIPs": ["100.64.0.10"]}}
+    for path, status in ((selected, running), (fallback, {"BackendState": "NeedsLogin"})):
+        command = "printf '%s' " + shlex.quote(json.dumps(status))
+        path.write_text(chr(10).join(["#!/bin/sh", command, ""]))
+        path.chmod(0o755)
+    monkeypatch.setattr(tailnet, "TAILSCALE_STANDALONE_BINARIES", (fallback,))
+    monkeypatch.setattr(tailnet, "TAILSCALE_APP_BINARY", tmp_path / "absent-gui")
+    monkeypatch.setattr(
+        tailnet, "_ifconfig_output",
+        lambda: "utun0: flags=8051\n    inet 100.64.0.10 netmask 0xffffffff\n",
+    )
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    payload = plistlib.loads(installer.launch_agent.read_bytes())
+    environment = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        **payload.get("EnvironmentVariables", {}),
+    }
+    with patch.dict(os.environ, environment, clear=True):
+        assert ("100.64.0.10", tailnet.TAILNET_PORT) in tailnet_broker.broker_bindings()
+
+
 
 
 def test_setup_passes_known_tailnet_address_to_broker(tmp_path: Path) -> None:
@@ -1189,7 +1234,8 @@ def test_setup_passes_known_tailnet_address_to_broker(tmp_path: Path) -> None:
     installer.setup()
 
     payload = plistlib.loads(installer.launch_agent.read_bytes())
-    assert payload["EnvironmentVariables"] == {"CROSS_AGENT_CHAT_TAILNET_ADDRESS": "100.64.0.10"}
+    assert payload["EnvironmentVariables"]["CROSS_AGENT_CHAT_TAILNET_ADDRESS"] == "100.64.0.10"
+    assert payload["EnvironmentVariables"]["PATH"].startswith(str(home / ".local/bin") + ":")
     assert installer.verify_configuration()
 
 
@@ -1213,6 +1259,7 @@ def test_verify_accepts_address_discovered_after_installation(tmp_path: Path) ->
 @pytest.mark.parametrize(
     ("key", "value"),
     [
+        ("EnvironmentVariables", {}),
         ("EnvironmentVariables", {"UNEXPECTED": "value"}),
         ("EnvironmentVariables", {"CROSS_AGENT_CHAT_TAILNET_ADDRESS": "100.64.0.11"}),
         ("ProgramArguments", ["/opt/other", "_broker"]),
@@ -5810,7 +5857,14 @@ def test_uninstall_and_reinstall_preserve_foreign_entries_and_durable_intents(
     fresh.setup()
 
     assert installer.launch_agent.read_bytes() == first_plist
-    assert installer.launch_agent.read_bytes() == fresh.launch_agent.read_bytes()
+    actual_agent = plistlib.loads(installer.launch_agent.read_bytes())
+    fresh_agent = plistlib.loads(fresh.launch_agent.read_bytes())
+    # The same installed configuration uses each home-specific CLI front door.
+    fresh_path = fresh_agent["EnvironmentVariables"]["PATH"]
+    fresh_agent["EnvironmentVariables"]["PATH"] = fresh_path.replace(
+        str(fresh.home) + "/", str(installer.home) + "/", 1
+    )
+    assert actual_agent == fresh_agent
     assert (installer.state / "intents.json").read_bytes() == intents_payload
     assert lock.read_bytes() == lock_payload
     lock_stat = lock.stat()
