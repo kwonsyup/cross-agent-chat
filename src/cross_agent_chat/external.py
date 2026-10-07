@@ -80,8 +80,13 @@ class ExternalEndpoint:
                 if parse_recipient_token(recipient) is None:
                     raise ChatError("external recipient scope is invalid")
         if self.callback_ref is not None:
-            ref_suffix = self.callback_ref.removeprefix(f"external-callback-{self.endpoint_id}")
-            if ref_suffix != ".json" and _CALLBACK_VERSION.fullmatch(ref_suffix) is None:
+            prefix = f"external-callback-{self.endpoint_id}"
+            ref_suffix = (
+                self.callback_ref[len(prefix) :] if self.callback_ref.startswith(prefix) else None
+            )
+            if ref_suffix is None or not (
+                ref_suffix == ".json" or _CALLBACK_VERSION.fullmatch(ref_suffix)
+            ):
                 raise ChatError("external callback reference is invalid")
 
     @property
@@ -352,10 +357,19 @@ class ExternalEndpointStore:
                     ],
                 )
             except BaseException:
-                # The uncommitted copy was never selected; removing only that
-                # file can never delete a live binding.
-                with suppress(OSError):
-                    published.unlink()
+                # The record write may already have committed: atomic_json can
+                # os.replace the record and only then fail the directory fsync.
+                # Drop the new file only when the on-disk record provably does
+                # not select it; an unreadable record leaves an unreachable
+                # orphan rather than deleting what could be the live binding.
+                orphan = False
+                with suppress(ChatError, OSError):
+                    orphan = not any(
+                        item.callback_ref == endpoint.callback_ref for item in self.endpoints()
+                    )
+                if orphan:
+                    with suppress(OSError):
+                        published.unlink()
                 raise
             previous = matches[0].callback_ref
             if previous is not None and previous != endpoint.callback_ref:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import threading
 import time
@@ -1359,6 +1360,104 @@ def test_callback_update_failure_before_any_write_leaves_state_untouched(
     assert _delivered_urls(root, tmp_path, monkeypatch, endpoint, endpoint.generation) == [old_url]
 
 
+def test_callback_commit_reported_failure_keeps_a_committed_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """os.replace may commit before a later fsync fails; no cleanup then."""
+    root = tmp_path / "state"
+    endpoint, _credential = _enroll(root)
+    endpoint = _callback(root, endpoint)
+    store = ExternalEndpointStore(root)
+    new_url = "https://replacement.example.com/fsync"
+    incoming = _callback_input(root, new_url)
+
+    state = {"fail_dir_fsync": False}
+    real_fsync = os.fsync
+    real_atomic_json = external.atomic_json
+
+    def fsync_with_post_commit_fault(fd: int) -> None:
+        if state["fail_dir_fsync"] and stat.S_ISDIR(os.fstat(fd).st_mode):
+            state["fail_dir_fsync"] = False
+            raise OSError("injected fsync failure after committed replace")
+        real_fsync(fd)
+
+    def committing(path: Path, value: object) -> None:
+        if path == store.path:
+            state["fail_dir_fsync"] = True
+        real_atomic_json(path, value)
+
+    external.atomic_json = committing
+    os.fsync = fsync_with_post_commit_fault
+    try:
+        with pytest.raises(OSError, match="fsync failure"):
+            store.configure_callback(endpoint.endpoint_id, incoming)
+    finally:
+        external.atomic_json = real_atomic_json
+        os.fsync = real_fsync
+
+    # The rename already committed, so the fresh reader sees the new
+    # generation selecting the new binding -- which must still exist.
+    restarted = ExternalEndpointStore(root)
+    retained = restarted.endpoints()[0]
+    assert retained.generation != endpoint.generation
+    assert retained.callback_ref != endpoint.callback_ref
+    committed = root / cast(str, retained.callback_ref)
+    assert committed.exists()
+    assert external_callback.read_callback(committed).url == new_url
+    assert _delivered_urls(root, tmp_path, monkeypatch, retained, retained.generation) == [new_url]
+    with pytest.raises(ChatError, match="unavailable or changed"):
+        _delivered_urls(root, tmp_path, monkeypatch, endpoint, endpoint.generation)
+
+
+def test_callback_commit_failure_with_unreadable_record_keeps_the_orphan(
+    tmp_path: Path,
+) -> None:
+    """A failed selection readback must never authorize binding cleanup."""
+    root = tmp_path / "state"
+    endpoint, _credential = _enroll(root)
+    endpoint = _callback(root, endpoint)
+    store = ExternalEndpointStore(root)
+    incoming = _callback_input(root, "https://replacement.example.com/orphan")
+
+    state = {"armed": False}
+    real_atomic_json = external.atomic_json
+    real_endpoints = ExternalEndpointStore.endpoints
+
+    def committing(path: Path, value: object) -> None:
+        if path == store.path:
+            state["armed"] = True
+            raise OSError("injected write failure, not a real disk error")
+        real_atomic_json(path, value)
+
+    def unreadable_endpoints(self: ExternalEndpointStore) -> list[ExternalEndpoint]:
+        if state["armed"]:
+            raise ChatError("injected record readback failure")
+        return real_endpoints(self)
+
+    external.atomic_json = committing
+    ExternalEndpointStore.endpoints = unreadable_endpoints  # type: ignore[method-assign]
+    try:
+        with pytest.raises(OSError, match="injected write failure"):
+            store.configure_callback(endpoint.endpoint_id, incoming)
+    finally:
+        external.atomic_json = real_atomic_json
+        ExternalEndpointStore.endpoints = real_endpoints  # type: ignore[method-assign]
+
+    # The old binding stays selected and live; the uncommitted copy is an
+    # unreachable orphan that cleanup may only retire, never confuse with it.
+    assert store.endpoints() == [endpoint] and store.current(endpoint)
+    assert (
+        external_callback.read_callback(root / cast(str, endpoint.callback_ref)).url
+        == "https://receiver.example.com/enrolled"
+    )
+    orphans = [
+        path for path in root.glob("external-callback-*.json") if path.name != endpoint.callback_ref
+    ]
+    assert len(orphans) == 1
+    store.revoke(endpoint.endpoint_id)
+    assert not list(root.glob("external-callback-*.json"))
+
+
 def test_callback_reconfigure_switches_generation_and_destination_together(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1572,6 +1671,7 @@ def test_callback_ref_accepts_only_exact_endpoint_owned_names(tmp_path: Path) ->
     for accepted in (
         f"external-callback-{eid}.json",
         f"external-callback-{eid}-{generation}.json",
+        f"external-callback-{eid}-{uuid4()}.json",
     ):
         assert (
             ExternalEndpoint.from_object({**record, "callback_ref": accepted}).callback_ref
@@ -1579,6 +1679,10 @@ def test_callback_ref_accepts_only_exact_endpoint_owned_names(tmp_path: Path) ->
         )
     for rejected in (
         "../outside.json",
+        ".json",
+        f"-{generation}.json",
+        f"xexternal-callback-{eid}.json",
+        f"external-callback-{uuid4()}.json",
         f"external-callback-{eid}-not-a-uuid.json",
         f"external-callback-{eid}-{generation}.json.bak",
         f"external-callback-{uuid4()}-{generation}.json",
