@@ -3678,26 +3678,46 @@ def send(
         raise ChatError(
             "remote peer discovery is incomplete; use an exact available recipient handle"
         )
-    local = _with_codex_titles(root, local, deadline)
     exact_aliases = [
-        target
-        for target in [*local, *remote]
-        if target.alias.casefold() == target_query.casefold()
-        or (target.title is not None and target.title.casefold() == target_query.casefold())
+        target for target in [*local, *remote] if target.alias.casefold() == target_query.casefold()
     ]
     if len(exact_aliases) == 1:
         target = exact_aliases[0]
     elif len(exact_aliases) > 1:
         raise ChatError("target is ambiguous or unavailable")
     else:
-        # Dispatch never fuzzy-matches a recipient: a near alias like
-        # "...:Kluro" could silently resolve to "...:W_Kluro_2Oct1PM". Zero
-        # exact matches refuse before any intent or provider effect.
-        raise ChatError(
-            "recipient is not an exact handle, exact alias, or exact title "
-            "of one discovered peer; "
-            "call chat_peers and choose the recipient"
-        )
+        local = _with_codex_titles(root, local, deadline)
+        # Identity-complete discovery is not title-complete discovery: optional
+        # enrichment may have timed out while retaining an exact live identity.
+        # Missing Codex/enrolled-endpoint titles therefore cannot establish that
+        # one visible name is unique. Synthetic Devin labels are not selectors;
+        # Claude's provider name remains part of its authenticated full alias.
+        title_candidates = [
+            item for item in [*local, *remote] if item.provider in {"codex", "external"}
+        ]
+        title_metadata_complete = all(item.title is not None for item in title_candidates)
+        if not title_metadata_complete:
+            raise ChatError(
+                "recipient title metadata is incomplete; "
+                "use an exact available recipient handle or full alias"
+            )
+        exact_titles = [
+            item
+            for item in title_candidates
+            if item.title is not None and item.title.casefold() == target_query.casefold()
+        ]
+        if len(exact_titles) == 1:
+            target = exact_titles[0]
+        elif len(exact_titles) > 1:
+            raise ChatError("target is ambiguous or unavailable")
+        else:
+            # Dispatch never fuzzy-matches aliases or titles. Zero exact matches
+            # refuse before any intent or provider effect.
+            raise ChatError(
+                "recipient is not an exact handle, exact alias, or exact title "
+                "of one discovered peer; "
+                "call chat_peers and choose the recipient"
+            )
     if not target.remote:
         return _send_local_target(
             root,

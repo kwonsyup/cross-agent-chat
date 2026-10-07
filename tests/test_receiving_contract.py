@@ -233,3 +233,109 @@ def test_queue_health_alone_does_not_qualify_parked_wake_or_active_input(mechani
     assert receiving["parked_wake"] == "unknown"
     assert receiving["active_turn_input"] == "unknown"
     assert receiving["delivery_observation"] == "not_observed"
+
+
+def test_title_dispatch_refuses_a_hidden_remote_duplicate_when_title_enrichment_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identity discovery can be complete while another actor's matching title is unavailable."""
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    local = runtime.Target(
+        alias="codex@test:local:123456789abc",
+        provider="codex",
+        device="test",
+        project="local",
+        generation=str(uuid4()),
+        session_key="a" * 64,
+        remote=False,
+        title="Review task",
+    )
+    # Its real provider title is also Review task, but the optional title query
+    # times out. The base identity row remains live and identity-complete.
+    remote = runtime.Target(
+        alias="codex@remote:review:987654321abc",
+        provider="codex",
+        device="remote",
+        project="review",
+        generation=str(uuid4()),
+        session_key="b" * 64,
+        remote=True,
+    )
+    row = remote.public(include_handle=False)
+    row.update(generation=remote.generation, session_key=remote.session_key)
+    probes: list[dict[str, object]] = []
+    effects: list[runtime.Target] = []
+
+    def wire(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        probes.append(payload)
+        if payload.get("include_title"):
+            raise runtime.UnknownDeliveryError("optional title response timed out")
+        return {"schema_version": 1, "peers": [row]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", wire)
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nLocal", peers={"nRemote": "100.64.0.2"}),
+    )
+    monkeypatch.setattr(runtime, "local_targets", lambda *_a, **_k: [local])
+    monkeypatch.setattr(runtime, "_with_codex_titles", lambda _r, rows, _d: rows)
+    monkeypatch.setattr(
+        runtime, "_send_local_target", lambda _r, _s, target, _m, **_: effects.append(target) or {}
+    )
+    # This exercises the real optional-negotiation failure, rather than supplying
+    # two already complete duplicate-title rows to the selector.
+    with pytest.raises(ChatError, match="title metadata is incomplete"):
+        runtime.send(root, source, "Review task", "must not pick the visible twin")
+    assert any(probe.get("include_title") for probe in probes)
+    assert effects == []
+
+
+@pytest.mark.parametrize("unknown_is_remote", [False, True])
+def test_title_metadata_failure_preserves_exact_alias_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unknown_is_remote: bool,
+) -> None:
+    """Unknown title metadata cannot prevent a uniquely authenticated full alias send."""
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    selected = runtime.Target(
+        alias="codex@test:local:123456789abc",
+        provider="codex",
+        device="test",
+        project="local",
+        generation=str(uuid4()),
+        session_key="a" * 64,
+        remote=False,
+        title="Review task",
+    )
+    unknown = runtime.Target(
+        alias="codex@remote:review:987654321abc",
+        provider="codex",
+        device="remote",
+        project="review",
+        generation=str(uuid4()),
+        session_key="b" * 64,
+        remote=unknown_is_remote,
+    )
+    effects: list[runtime.Target] = []
+    monkeypatch.setattr(
+        runtime,
+        "local_targets",
+        lambda *_a, **_k: [selected] + ([] if unknown_is_remote else [unknown]),
+    )
+    monkeypatch.setattr(
+        runtime, "_remote_discovery", lambda **_: ([unknown] if unknown_is_remote else [], True)
+    )
+    monkeypatch.setattr(runtime, "_with_codex_titles", lambda _r, rows, _d: rows)
+    monkeypatch.setattr(
+        runtime, "_send_local_target", lambda _r, _s, target, _m, **_: effects.append(target) or {}
+    )
+    runtime.send(root, source, selected.alias, "exact alias task")
+    assert effects == [selected]
+    with pytest.raises(ChatError, match="title metadata is incomplete"):
+        runtime.send(root, source, "Review task", "must not guess")
+    assert effects == [selected]
