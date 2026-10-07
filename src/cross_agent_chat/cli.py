@@ -92,7 +92,11 @@ def discover_executable(invoked_as: Path | None = None) -> Path:
 
 MCP_INSTRUCTIONS: Final = (
     "Use Cross Agent Chat only for requested communication. Address chat_send with an exact "
-    "opaque handle: the Reply handle on a received envelope, or a handle from chat_peers. An "
+    "opaque handle: the Reply handle on a received envelope, or a handle from chat_peers. "
+    "Obtain recipient handles from your own chat_peers or a received Reply line. "
+    "Send and reply to CAC handles using chat_send; "
+    "native SendMessage cannot interpret CAC tokens. "
+    "An "
     "exact handle is bound to that peer session's route and protocol generation, so call "
     "chat_peers to discover or when an exact handle stops resolving, not before every send; "
     "its optional query argument narrows the same listing by case-insensitive substring on "
