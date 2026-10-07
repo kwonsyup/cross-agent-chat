@@ -89,9 +89,9 @@ harness and mode:
 
 | Coding surface on macOS | Parked/idle wake | Active-turn input | Deferred behavior | Qualification |
 |---|---|---|---|---|
-| Claude Code | Native input is consumed between the session's tool calls | Between tool calls; a running tool is not interrupted | — | Supported desktop-launched contexts; a session inside a remote SSH shell registered but could not receive |
+| Claude Code | Qualified idle wake and new-turn input | Between tool calls; a running tool is not interrupted | — | Supported desktop-launched contexts; a session inside a remote SSH shell registered but could not receive |
 | Codex CLI 0.160.1 (owning app-server daemon) | Queued input wakes the parked original | Direct input reaches the expected active turn | — | Only a `codex-tui` 0.160.1 conversation already owned by its own daemon, verified by route PID, profile, thread, cwd, and originator over a private owner-only socket; CAC starts no daemon and uses no UI relay |
-| Codex CLI `--no-daemon` or older versions | No | No | Stop-bound: the current turn's end or the next prompt | Default when no owning daemon is present |
+| Codex CLI `--no-daemon` or any unqualified version (older or newer) | No | No | Stop-bound: the current turn's end or the next prompt | Default when no owning daemon is present |
 | Codex Native App (managed helper) | Qualified on the listed host | Qualified on the listed host | — | Intel macOS, Codex 0.159.2 in Native app 26.928.21956, trusted hooks available; does not qualify every host version |
 | Codex CLI experimental native queue | Provider-held queue input | No | Waits behind the current turn | Only under explicit `setup --enable-experimental-codex-native-queue`; not active by default |
 | Local Devin CLI/App | No — [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38) open | No | Next prompt or turn end | A conversation joins the peer list after its first prompt |
@@ -145,20 +145,46 @@ The Mac's CAC broker must be reachable when Grok sends work.
 GROK_DIR="$HOME/.config/cross-agent-chat/external/grok"
 CAC="$HOME/.local/bin/cross-agent-chat"
 
-# Enroll: writes a new mode-0600 credential file and prints the endpoint_id
-# (it refuses to overwrite an existing path). --device is this Mac's CAC
-# device name; it becomes part of the endpoint alias.
-"$CAC" external enroll --device thismac --name grok \
-  --context "owner Grokbot routine" --credential-file "$GROK_DIR/credential"
+# Enroll: writes a new mode-0600 credential file (it refuses to overwrite an
+# existing path) and prints a JSON result containing the endpoint_id.
+# --device is this Mac's CAC device name; it becomes part of the endpoint
+# alias.
+ENROLL=$("$CAC" external enroll --device thismac --name grok \
+  --context "owner Grokbot routine" --credential-file "$GROK_DIR/credential")
+ENDPOINT_ID=$(printf '%s' "$ENROLL" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["endpoint_id"])')
 
-# Bind the callback from the private JSON source file (see the contract);
-# this rotates the endpoint generation.
-"$CAC" external configure-callback ENDPOINT_ID \
+# Create the private callback source (exactly {"url","bearer"}) without
+# placing the Grok-issued values on a command line or in logs; paste the
+# webhook URL, then the key, at the hidden prompts. The file is created
+# mode-0600 and is never overwritten.
+mkdir -p "$GROK_DIR" && chmod 700 "$GROK_DIR"
+python3 - "$GROK_DIR/callback.json" <<'PY'
+import getpass, json, os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as stream:
+    json.dump(
+        {"url": getpass.getpass("callback URL: "),
+         "bearer": getpass.getpass("callback key: ")},
+        stream,
+    )
+PY
+
+# Bind the callback from that private JSON file; this rotates the endpoint
+# generation, so use the ENDPOINT_ID printed by enroll (or rotate).
+"$CAC" external configure-callback "$ENDPOINT_ID" \
   --config-file "$GROK_DIR/callback.json"
 
 # One-shot local-shell client: one JSON request object on standard input.
 "$CAC" external-call --credential-file "$GROK_DIR/credential" <<'JSON'
 {"name":"chat_peers","arguments":{}}
+JSON
+
+# Each callback POST carries the envelope's reply handle. The owner routine
+# reads the incoming envelope, does the work, and answers with a separate
+# send to that exact reply handle and a fresh request_id per event:
+"$CAC" external-call --credential-file "$GROK_DIR/credential" <<'JSON'
+{"name":"chat_send","arguments":{"to":"<reply handle from the received envelope>","message":"<the routine's answer>","request_id":"<fresh UUID>"}}
 JSON
 
 # Or serve a stdio MCP client with the same credential file path:
@@ -204,9 +230,10 @@ instead of invoking them. `chat_peers` accepts an optional `query` that
 narrows the same listing by case-insensitive substring on alias and title —
 a malformed value is refused before any probing — and its `sender` entry
 identifies your authenticated session by alias and exact handle. `chat_send`
-also resolves one peer's exact full alias or, for Codex and external peers,
-one exact provider title — refusing when it matches zero or several, or when
-title metadata is incomplete and cannot establish uniqueness. Peer rows may
+also resolves one peer's exact full alias or, for a Codex peer, its exact
+provider title — or, for an owner-enrolled external endpoint, its exact
+endpoint name — refusing when it matches zero or several, or when the
+metadata is incomplete and cannot establish uniqueness. Peer rows may
 show a descriptive title; a Devin row's is a stable opaque session label, not
 a provider title or selector. An exact handle or uniquely matching full alias
 always selects.

@@ -10,14 +10,15 @@
 - Send results document `destination_receiving` (route mode, mechanism,
   parked wake, and active-turn input as destination capability — never a
   receipt) alongside `reply_delivery` as the sender's return path.
-  `chat_peers` reports the sender's own alias and exact handle; Codex and
-  external peers may also be selected by an exact provider title, refusing
-  on incomplete metadata or duplicates.
+  `chat_peers` reports the sender's own alias and exact handle; a Codex peer
+  may also be selected by its exact provider title and an owner-enrolled
+  external endpoint by its exact endpoint name, refusing on incomplete
+  metadata or duplicates.
 - Codex CLI 0.160.1 conversations owned by their own app-server daemon gain
   qualified parked wake (`thread/queue/add`) and active-turn input
   (`turn/steer` with the pinned expected turn) over a private owner-only
-  socket; `--no-daemon` launches, older versions, and unqualified routes
-  stay Stop-bound. CAC starts no daemon.
+  socket; `--no-daemon` launches, older or newer unqualified versions, and
+  unqualified routes stay Stop-bound. CAC starts no daemon.
 - External callback bindings now publish atomically: each payload is written
   to an immutable generation-named file and a single endpoint-record commit
   selects destination and generation together, so a crash during callback

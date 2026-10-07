@@ -105,9 +105,10 @@ alone proves that an active recipient consumed an envelope.
   send time. Raw pre-upgrade handles, stale generations, ambiguous names, and
   name selection against an incomplete roster refuse before effect; an exact
   token needs only its own endpoint to answer. There is no binding store —
-  tokens are self-contained. Codex and external peers also accept an exact
-  provider title, but only when title metadata is complete and exactly one
-  matches; incomplete metadata or duplicates refuse before any effect.
+  tokens are self-contained. Codex peers also accept an exact provider title
+  and owner-enrolled external endpoints their exact endpoint name, but only
+  when the metadata is complete and exactly one matches; incomplete metadata
+  or duplicates refuse before any effect.
 - **Receiving contract:** send results carry `destination_receiving` —
   route `mode`, `mechanism`, `parked_wake`, `active_turn_input`, and
   `delivery_observation` — describing destination capability, never a
