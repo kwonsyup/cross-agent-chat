@@ -2633,7 +2633,9 @@ def _with_codex_titles(root: Path, targets: list[Target], deadline: float) -> li
             )
         )
     return [
-        target if target.remote else replace(target, title=titles.get(target.session_id or ""))
+        target
+        if target.remote or target.provider != "codex"
+        else replace(target, title=titles.get(target.session_id or ""))
         for target in targets
     ]
 

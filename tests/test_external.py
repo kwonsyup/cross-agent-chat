@@ -1689,3 +1689,49 @@ def test_callback_ref_accepts_only_exact_endpoint_owned_names(tmp_path: Path) ->
     ):
         with pytest.raises(ChatError, match="callback reference is invalid"):
             ExternalEndpoint.from_object({**record, "callback_ref": rejected})
+
+
+def test_local_enrolled_name_survives_codex_title_enrichment_and_selects_its_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex metadata must not erase an enrolled receiver's independently owned name."""
+    root = tmp_path / "state"
+    sender, credential = ExternalEndpointStore(root).enroll(
+        device="fixture", name="requester", context="owned source for name-selection regression"
+    )
+    receiver, _ = _enroll(root)
+    receiver = _callback(root, receiver)
+    event = str(uuid4())
+    submissions: list[dict[str, object]] = []
+
+    def callback(
+        config: external_callback.CallbackConfig,
+        envelope: dict[str, object],
+        **_: object,
+    ) -> str:
+        assert config.url == "https://receiver.example.com/enrolled"
+        submissions.append(envelope)
+        return "TRANSPORT_ACCEPTED"
+
+    # Real enrollment, binding publication, authentication, title selection and
+    # callback readback run; the final HTTP boundary stays wholly contained.
+    monkeypatch.setattr(external_callback, "post_callback", callback)
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
+    tool_result = cli._external_call_tool(root, credential, _send(receiver.name, event))
+    assert tool_result.get("isError") is not True, tool_result
+    result = _result(tool_result)
+
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+    assert result["event_id"] == event
+    assert result["to"] == receiver.alias
+    assert len(submissions) == 1
+    submitted = submissions[0]
+    assert submitted["source_alias"] == sender.alias
+    assert submitted["source_generation"] == sender.generation
+    assert submitted["target_alias"] == receiver.alias
+    assert submitted["generation"] == receiver.generation
+    reply = parse_recipient_token(str(submitted["reply_handle"]))
+    assert reply is not None
+    assert reply.handle == sender.key
+    assert reply.generation == sender.generation
