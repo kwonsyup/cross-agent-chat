@@ -105,7 +105,15 @@ def test_devin_sender_readiness_matches_its_own_roster_label(
     source = routes[4]
 
     readiness = runtime.sender_readiness_for_route(root, source)
-    assert readiness == {"status": "ready", "title": _expected_title(source)}
+    assert readiness == {
+        "status": "ready",
+        "title": _expected_title(source),
+        "provider": source.provider,
+        "alias": source.alias,
+        "handle": local_token(
+            root, session_key(source.provider, source.session_id), source.generation
+        ),
+    }
 
     listing = runtime.peers(root, include_remote=False)
     items = cast(list[dict[str, str]], listing["peers"])

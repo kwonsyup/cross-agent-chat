@@ -594,7 +594,7 @@ def test_chat_send_refuses_a_fuzzy_only_alias_before_effect(
     response = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert response["result"]["isError"] is True
     assert response["result"]["content"][0]["text"] == (
-        "recipient is not an exact handle or exact alias of one discovered peer; "
+        "recipient is not an exact handle, exact alias, or exact title of one discovered peer; "
         "call chat_peers and choose the recipient"
     )
     assert resolved == []
