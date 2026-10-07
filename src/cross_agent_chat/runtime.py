@@ -67,7 +67,6 @@ from cross_agent_chat.core import (
     Provider,
     Registry,
     Route,
-    UnknownDeliveryError,
     authenticate_sender,
     bounded_message,
     canonical_cwd,
@@ -82,6 +81,9 @@ from cross_agent_chat.core import (
     valid_session_id,
     valid_uuid,
 )
+from cross_agent_chat.core import (
+    UnknownDeliveryError as UnknownDeliveryError,
+)
 from cross_agent_chat.devin import (
     DEVIN_CAPABILITY_FIELD,
     DevinCapabilityStore,
@@ -95,7 +97,13 @@ from cross_agent_chat.devin import (
     parse_hook_input,
     parse_pretool_input,
 )
-from cross_agent_chat.external import ExternalEndpoint, ExternalEndpointStore, endpoint_effect_lock
+from cross_agent_chat.external import (
+    ExternalEndpoint,
+    ExternalEndpointStore,
+)
+from cross_agent_chat.external import (
+    endpoint_effect_lock as endpoint_effect_lock,
+)
 from cross_agent_chat.native_helper import (
     NATIVE_HELPER_MODEL,
     NATIVE_QUEUE_BINARY_ENV_VAR,

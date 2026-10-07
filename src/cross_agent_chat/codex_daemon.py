@@ -14,7 +14,7 @@ import os
 import socket
 import stat
 import struct
-import subprocess
+import subprocess as subprocess
 import time
 from pathlib import Path
 from typing import Final, cast

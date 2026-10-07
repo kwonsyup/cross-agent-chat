@@ -19,13 +19,15 @@ from uuid import uuid4
 
 from cross_agent_chat.core import (
     ChatError,
-    atomic_json,
     ensure_private_dir,
     require_private_file,
     state_lock,
     valid_device,
     valid_name,
     valid_uuid,
+)
+from cross_agent_chat.core import (
+    atomic_json as atomic_json,
 )
 from cross_agent_chat.recipient import local_origin, parse_recipient_token
 

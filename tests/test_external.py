@@ -1386,14 +1386,13 @@ def test_callback_commit_reported_failure_keeps_a_committed_binding(
             state["fail_dir_fsync"] = True
         real_atomic_json(path, value)
 
-    external.atomic_json = committing
-    os.fsync = fsync_with_post_commit_fault
+    monkeypatch.setattr(external, "atomic_json", committing)
+    monkeypatch.setattr(os, "fsync", fsync_with_post_commit_fault)
     try:
         with pytest.raises(OSError, match="fsync failure"):
             store.configure_callback(endpoint.endpoint_id, incoming)
     finally:
         external.atomic_json = real_atomic_json
-        os.fsync = real_fsync
 
     # The rename already committed, so the fresh reader sees the new
     # generation selecting the new binding -- which must still exist.
@@ -1487,7 +1486,7 @@ def test_callback_reconfigure_switches_generation_and_destination_together(
     )
     assert {path.name for path in root.glob("external-callback-*.json")} == {third.callback_ref}
     assert not (root / cast(str, endpoint.callback_ref)).exists()
-    assert not (root / cast(str, updated.callback_ref)).exists()
+    assert not (root / updated.callback_ref).exists()
     assert _delivered_urls(root, tmp_path, monkeypatch, third, third.generation) == [
         "https://replacement.example.com/third"
     ]

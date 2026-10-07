@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -108,14 +109,16 @@ def test_remote_sender_receives_negotiated_mechanism_without_extending_custody_f
         "independent remote task",
     )
     assert result["status"] == "TRANSPORT_ACCEPTED"
-    assert result["destination_receiving"]["mechanism"] == "stop_bound"
-    assert result["destination_receiving"]["parked_wake"] is False
+    receiving = cast(dict[str, object], result["destination_receiving"])
+    assert receiving["mechanism"] == "stop_bound"
+    assert receiving["parked_wake"] is False
     assert frames[0]["include_delivery_mechanism"] is True
     # A legacy strict reader sees exactly the old response until it asks for metadata.
     legacy = handle_broker_request(
         broker_root, {"schema_version": 1, "operation": "peers"}, "100.64.0.1"
     )
-    assert "delivery_mechanism" not in legacy["peers"][0]
+    legacy_peers = cast(list[dict[str, object]], legacy["peers"])
+    assert "delivery_mechanism" not in legacy_peers[0]
 
 
 def test_old_remote_broker_keeps_send_usable_and_receiving_unknown(
@@ -164,9 +167,10 @@ def test_old_remote_broker_keeps_send_usable_and_receiving_unknown(
         root, source, remote_token("nTarget", target.session_key, target.generation), "old task"
     )
     assert result["status"] == "TRANSPORT_ACCEPTED"
-    assert result["destination_receiving"]["mode"] == "unknown"
-    assert result["destination_receiving"]["mechanism"] == "unknown"
-    assert result["destination_receiving"]["parked_wake"] == "unknown"
+    receiving = cast(dict[str, object], result["destination_receiving"])
+    assert receiving["mode"] == "unknown"
+    assert receiving["mechanism"] == "unknown"
+    assert receiving["parked_wake"] == "unknown"
     assert sum(call["operation"] == "receive" for call in calls) == 1
 
 
@@ -198,11 +202,18 @@ def test_exact_title_selects_one_original_and_duplicate_title_refuses_before_eff
     monkeypatch.setattr(runtime, "_with_codex_titles", lambda _root, targets, _deadline: targets)
     monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
     selected: list[runtime.Target] = []
-    monkeypatch.setattr(
-        runtime,
-        "_send_local_target",
-        lambda _root, _source, target, _message, **_: selected.append(target) or {},
-    )
+
+    def capture(
+        _root: object,
+        _source: object,
+        target: runtime.Target,
+        _message: object,
+        **_: object,
+    ) -> dict[str, object]:
+        selected.append(target)
+        return {}
+
+    monkeypatch.setattr(runtime, "_send_local_target", capture)
     runtime.send(root, source, "review TASK", "one task")
     assert selected == [rows[0]]
     rows.append(target(second))
@@ -216,7 +227,9 @@ def test_exact_title_selects_one_original_and_duplicate_title_refuses_before_eff
 
 
 @pytest.mark.parametrize("mechanism", ["direct_queue", "native_helper"])
-def test_queue_health_alone_does_not_qualify_parked_wake_or_active_input(mechanism: str) -> None:
+def test_queue_health_alone_does_not_qualify_parked_wake_or_active_input(
+    mechanism: runtime.DeliveryMechanism,
+) -> None:
     """A queue route can be healthy while the original waits behind an active turn."""
     target = runtime.Target(
         alias="codex@test:task:123456789abc",
@@ -282,9 +295,14 @@ def test_title_dispatch_refuses_a_hidden_remote_duplicate_when_title_enrichment_
     )
     monkeypatch.setattr(runtime, "local_targets", lambda *_a, **_k: [local])
     monkeypatch.setattr(runtime, "_with_codex_titles", lambda _r, rows, _d: rows)
-    monkeypatch.setattr(
-        runtime, "_send_local_target", lambda _r, _s, target, _m, **_: effects.append(target) or {}
-    )
+
+    def capture(
+        _r: object, _s: object, target: runtime.Target, _m: object, **_: object
+    ) -> dict[str, object]:
+        effects.append(target)
+        return {}
+
+    monkeypatch.setattr(runtime, "_send_local_target", capture)
     # This exercises the real optional-negotiation failure, rather than supplying
     # two already complete duplicate-title rows to the selector.
     with pytest.raises(ChatError, match="title metadata is incomplete"):
@@ -331,9 +349,14 @@ def test_title_metadata_failure_preserves_exact_alias_selection(
         runtime, "_remote_discovery", lambda **_: ([unknown] if unknown_is_remote else [], True)
     )
     monkeypatch.setattr(runtime, "_with_codex_titles", lambda _r, rows, _d: rows)
-    monkeypatch.setattr(
-        runtime, "_send_local_target", lambda _r, _s, target, _m, **_: effects.append(target) or {}
-    )
+
+    def capture(
+        _r: object, _s: object, target: runtime.Target, _m: object, **_: object
+    ) -> dict[str, object]:
+        effects.append(target)
+        return {}
+
+    monkeypatch.setattr(runtime, "_send_local_target", capture)
     runtime.send(root, source, selected.alias, "exact alias task")
     assert effects == [selected]
     with pytest.raises(ChatError, match="title metadata is incomplete"):

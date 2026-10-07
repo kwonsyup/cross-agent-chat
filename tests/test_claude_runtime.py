@@ -1170,7 +1170,7 @@ def test_denied_marker_with_2_1_292_hook_denial_stream_is_unknown(
     # outcome stays fail-closed unknown -- the field-observed
     # claude_helper_stream_invalid surface -- even though the gate's own
     # marker records exactly why it denied.
-    use = {
+    use: dict[str, object] = {
         "type": "tool_use",
         "id": "tool-1",
         "name": "SendMessage",
@@ -1215,7 +1215,7 @@ def test_consumed_gate_with_2_1_292_measured_stream_is_decided(
     # contract: caller/recipient_kind extras on the use record, volatile outer
     # metadata, and the canonical {success, message} refusal payload.
     reason = "No agent named 'cross-agent-chat-courier [000000]' is reachable."
-    use = {
+    use: dict[str, object] = {
         "type": "tool_use",
         "id": "tool-1",
         "name": "SendMessage",

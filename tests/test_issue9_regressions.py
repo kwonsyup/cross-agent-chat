@@ -71,11 +71,14 @@ def test_non_exact_recipient_refuses_before_any_send(
         runtime.send(tmp_path / "state", source, "claude parser", "synthetic probe")
 
     assert str(caught.value) == (
-        "recipient is not an exact handle or exact alias of one discovered peer; "
+        "recipient is not an exact handle, exact alias, or exact title of one discovered peer; "
         "call chat_peers and choose the recipient"
     )
     # No intent row and no provider effect were created for the refused send.
-    assert not (tmp_path / "state").exists()
+    # Title discovery may create the private state directory itself, so the
+    # no-effect assertion is on its contents, not its existence.
+    state = tmp_path / "state"
+    assert not state.exists() or not any(state.iterdir())
 
 
 def test_exact_alias_selects_the_shorter_twin_while_a_fuzzy_form_refuses(
@@ -126,7 +129,7 @@ def test_exact_alias_selects_the_shorter_twin_while_a_fuzzy_form_refuses(
     assert result["to"] == plain.alias
     assert chosen == [plain]
 
-    with pytest.raises(ChatError, match="exact handle or exact alias"):
+    with pytest.raises(ChatError, match="exact handle, exact alias, or exact title"):
         runtime.send(root, source, "kluro", "synthetic probe")
     assert chosen == [plain]
 

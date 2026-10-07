@@ -121,7 +121,9 @@ def provider(
                             continue
                         params = request["params"]
                         if method == "initialize":
-                            result = {"codexHome": str(root if not profile_changed else tmp_path)}
+                            result: dict[str, object] = {
+                                "codexHome": str(root if not profile_changed else tmp_path)
+                            }
                         elif method == "thread/read":
                             assert params == {"threadId": route.session_id, "includeTurns": False}
                             result = {
