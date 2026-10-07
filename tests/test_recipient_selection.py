@@ -757,7 +757,9 @@ def test_alias_send_succeeds_when_the_selected_node_moved_addresses(
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     operations = [str(payload.get("operation")) for _a, payload in calls]
-    assert operations == ["peers", "peers", "receive"]
+    # Discovery probes base plus the negotiated title/mechanism pass, then
+    # dispatch re-attests once before the envelope.
+    assert operations == ["peers", "peers", "peers", "receive"]
     assert calls[-1][0] == MOVED
 
 
@@ -778,10 +780,12 @@ def test_alias_send_refuses_when_the_selected_node_left_the_tailnet(
     with pytest.raises(ChatError, match="not on the tailnet"):
         send(tmp_path, source, REMOTE_ALIAS, "hello")
 
-    # Discovery probed the owner once; dispatch touched nothing, and the stale
-    # address was never re-asked.
+    # Discovery probed the owner twice (base roster plus negotiated title
+    # enrichment); dispatch touched nothing, and the stale address was never
+    # re-asked.
     assert [(address, str(payload.get("operation"))) for address, payload in calls] == [
-        (OWNER, "peers")
+        (OWNER, "peers"),
+        (OWNER, "peers"),
     ]
 
 
@@ -795,8 +799,12 @@ def test_alias_send_refuses_when_the_generation_changed_after_selection(
         identities=[_identity(peers={OWNER_NODE: OWNER}), _identity(peers={OWNER_NODE: OWNER})],
         rosters={},
     )
+    # Discovery asks once for the base roster and once for the negotiated
+    # title/mechanism enrichment; the dispatch re-attestation asks a third
+    # time and sees the changed generation.
     rosters_seen = iter(
         [
+            [_peer(REMOTE_ALIAS, "studio", handle, generation)],
             [_peer(REMOTE_ALIAS, "studio", handle, generation)],
             [_peer(REMOTE_ALIAS, "studio", handle, str(uuid4()))],
         ]
@@ -1197,10 +1205,17 @@ def test_wire_request_and_response_key_sets_are_unchanged(
 
     peers_requests = [payload for _a, payload in sent if payload.get("operation") == "peers"]
     assert peers_requests
+    negotiated = {
+        "include_delivery_mode",
+        "include_delivery_mechanism",
+        "include_owning_daemon",
+    }
     assert all(
         set(payload)
         in (
+            {"schema_version", "operation", "handle", "include_devin"} | negotiated,
             {"schema_version", "operation", "handle", "include_devin"},
+            {"schema_version", "operation", "include_devin"} | negotiated,
             {"schema_version", "operation", "include_devin"},
             {"schema_version", "operation"},
         )

@@ -134,7 +134,12 @@ does not follow redirects or retry a callback after an uncertain write. A
 a Bot run started, read the message or returned it in the original
 conversation. If either endpoint is busy, CAC refuses before the POST with an
 explicit pre-effect result; it does not retry internally or promise a model
-wake. No external original-context callback has been qualified.
+wake. Callback binding publication is atomic: each payload is written under
+an immutable generation-named file, and one endpoint-record commit selects
+destination and generation together, so an interrupted reconfiguration
+cannot bind an older recipient handle to a newer destination or leave a
+live record without its file. This property is covered by contained
+fault-injection tests; it is not a live-callback claim.
 
 `external revoke ENDPOINT_ID` blocks future calls and changes the endpoint
 generation. Credential rotation and callback configuration also change the

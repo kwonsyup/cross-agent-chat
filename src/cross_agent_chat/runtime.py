@@ -56,6 +56,7 @@ from cross_agent_chat.codex import (
     native_account_digest,
     native_thread_titles,
 )
+from cross_agent_chat.codex_daemon import CodexDaemonIngress, discover_daemon_ingress
 from cross_agent_chat.core import (
     CODEX_ALIAS_DIGEST_LENGTH,
     MAX_MESSAGE_BYTES,
@@ -66,7 +67,6 @@ from cross_agent_chat.core import (
     Provider,
     Registry,
     Route,
-    UnknownDeliveryError,
     authenticate_sender,
     bounded_message,
     canonical_cwd,
@@ -81,6 +81,9 @@ from cross_agent_chat.core import (
     valid_session_id,
     valid_uuid,
 )
+from cross_agent_chat.core import (
+    UnknownDeliveryError as UnknownDeliveryError,
+)
 from cross_agent_chat.devin import (
     DEVIN_CAPABILITY_FIELD,
     DevinCapabilityStore,
@@ -94,7 +97,13 @@ from cross_agent_chat.devin import (
     parse_hook_input,
     parse_pretool_input,
 )
-from cross_agent_chat.external import ExternalEndpoint, ExternalEndpointStore, endpoint_effect_lock
+from cross_agent_chat.external import (
+    ExternalEndpoint,
+    ExternalEndpointStore,
+)
+from cross_agent_chat.external import (
+    endpoint_effect_lock as endpoint_effect_lock,
+)
 from cross_agent_chat.native_helper import (
     NATIVE_HELPER_MODEL,
     NATIVE_QUEUE_BINARY_ENV_VAR,
@@ -202,17 +211,26 @@ DeliveryMode = Literal[
     "claude_native_cross_session",
     "codex_stop_bound",
     "codex_experimental_queue",
+    "codex_daemon_input",
     "devin_stop_or_prompt_bound",
 ]
 DeliveryMechanism = Literal[
     "claude_native",
     "native_helper",
     "direct_queue",
+    "owning_daemon",
     "stop_bound",
     "devin_prompt_bound",
 ]
 DELIVERY_MECHANISMS: Final = frozenset(
-    {"claude_native", "devin_prompt_bound", "direct_queue", "native_helper", "stop_bound"}
+    {
+        "claude_native",
+        "devin_prompt_bound",
+        "direct_queue",
+        "native_helper",
+        "stop_bound",
+        "owning_daemon",
+    }
 )
 
 
@@ -654,6 +672,7 @@ class Target:
         include_handle: bool = True,
         handle: str | None = None,
         include_title: bool = True,
+        include_owning_daemon: bool = False,
     ) -> dict[str, str]:
         result = {
             "alias": self.alias,
@@ -666,14 +685,15 @@ class Target:
             result["handle"] = self.session_key if handle is None else handle
         if include_title and self.title is not None:
             result["title"] = self.title
+        # Retained strict readers cannot recognize a newly qualified mechanism.
+        # Its stronger ingress remains available, but old metadata stays conservative.
+        mode, mechanism = self.delivery_mode, self.delivery_mechanism
+        if mode == "codex_daemon_input" and not include_owning_daemon:
+            mode, mechanism = "codex_stop_bound", "stop_bound"
         if include_delivery_mode:
-            result["delivery_mode"] = (
-                "unknown" if self.delivery_mode is None else self.delivery_mode
-            )
+            result["delivery_mode"] = "unknown" if mode is None else mode
             if include_delivery_mechanism:
-                result["delivery_mechanism"] = (
-                    "unknown" if self.delivery_mechanism is None else self.delivery_mechanism
-                )
+                result["delivery_mechanism"] = "unknown" if mechanism is None else mechanism
         return result
 
 
@@ -1753,12 +1773,16 @@ def courier_accept(
     courier: CodexCourier | None,
     event_id: str,
     message: str,
+    *,
+    daemon_ingress: CodexDaemonIngress | None = None,
 ) -> dict[str, object]:
     """Attempt one provider delivery and report its exact effect boundary."""
     try:
         identifier = valid_uuid(event_id, "event id")
         body = bounded_message(message)
         if route.provider == "codex":
+            if daemon_ingress is not None:
+                return daemon_ingress.accept(identifier, body)
             if courier is None:
                 raise ChatError("Codex courier is unavailable")
             return courier.accept(identifier, body)
@@ -1931,6 +1955,8 @@ def courier_health(
     include_direct_delivery_mode: bool = False,
     include_delivery_mechanism: bool = False,
     native_helper: bool = False,
+    include_owning_daemon: bool = False,
+    daemon_ingress: CodexDaemonIngress | None = None,
 ) -> dict[str, object]:
     alias = route.alias
     if route.provider == "claude":
@@ -1958,6 +1984,11 @@ def courier_health(
         response["delivery_mechanism"] = _delivery_mechanism(
             route, courier, native_helper=native_helper
         )
+    if daemon_ingress is not None and include_owning_daemon:
+        if include_delivery_mode:
+            response["delivery_mode"] = "codex_daemon_input"
+        if include_delivery_mechanism:
+            response["delivery_mechanism"] = "owning_daemon"
     if include_direct_delivery_mode:
         response["direct_delivery_mode"] = _delivery_mode(route, courier)
     return response
@@ -2045,6 +2076,14 @@ def courier_server(
         if provider in {"codex", "devin"}
         else None
     )
+    daemon_ingress = None
+    if provider == "codex" and native_queue is None and not helper_lineage:
+        try:
+            daemon_binary = _courier_owner_binary(root, route)
+            if daemon_binary is not None:
+                daemon_ingress = discover_daemon_ingress(daemon_binary, dict(os.environ), route)
+        except (ChatError, OSError):
+            pass
     bound = path.lstat()
     # Many listers probe health at once while a delivery occupies the effect
     # lock; the backlog matches the broker listener so an ordinary burst is
@@ -2136,6 +2175,8 @@ def courier_server(
                                 include_delivery_mechanism=(
                                     request.get("include_delivery_mechanism") is True
                                 ),
+                                include_owning_daemon=request.get("include_owning_daemon") is True,
+                                daemon_ingress=daemon_ingress,
                                 native_helper=(
                                     NativeHelperStore(root).helper_for_original(
                                         route, Registry(root).routes()
@@ -2206,7 +2247,17 @@ def courier_server(
                             else:
                                 emit_frame_safely(
                                     connection,
-                                    courier_accept(route, courier, event_id, message),
+                                    courier_accept(
+                                        route,
+                                        courier,
+                                        event_id,
+                                        message,
+                                        **(
+                                            {"daemon_ingress": daemon_ingress}
+                                            if daemon_ingress
+                                            else {}
+                                        ),
+                                    ),
                                 )
                         finally:
                             accept_lock.release()
@@ -2428,6 +2479,7 @@ def _local_target(
                 "generation": route.generation,
                 "include_delivery_mode": True,
                 "include_delivery_mechanism": True,
+                "include_owning_daemon": True,
             },
             timeout=timeout,
         )
@@ -2455,6 +2507,7 @@ def _local_target(
                 "claude_native_cross_session",
                 "codex_stop_bound",
                 "codex_experimental_queue",
+                "codex_daemon_input",
                 "devin_stop_or_prompt_bound",
             }
         )
@@ -2580,13 +2633,19 @@ def _with_codex_titles(root: Path, targets: list[Target], deadline: float) -> li
             )
         )
     return [
-        target if target.remote else replace(target, title=titles.get(target.session_id or ""))
+        target
+        if target.remote or target.provider != "codex"
+        else replace(target, title=titles.get(target.session_id or ""))
         for target in targets
     ]
 
 
 class _ExternalDiscoveryOption(TypedDict, total=False):
     include_external: bool
+
+
+class _DeliveryDiscoveryOption(TypedDict, total=False):
+    include_delivery_mechanism: bool
 
 
 def _external_option(enabled: bool) -> _ExternalDiscoveryOption:
@@ -2598,7 +2657,9 @@ def _targets_from_tailnet(
     raw: object,
     *,
     include_delivery_mode: bool = False,
+    include_delivery_mechanism: bool = False,
     include_title: bool = False,
+    include_owning_daemon: bool = False,
     include_devin: bool = False,
     include_external: bool = False,
     node_id: str | None = None,
@@ -2623,6 +2684,7 @@ def _targets_from_tailnet(
         allowed = (
             required
             | ({"delivery_mode"} if include_delivery_mode else set())
+            | ({"delivery_mechanism"} if include_delivery_mechanism else set())
             | ({"title"} if include_title else set())
         )
         if not isinstance(raw_item, dict) or not required <= set(raw_item) <= allowed:
@@ -2656,11 +2718,18 @@ def _targets_from_tailnet(
                         "devin_stop_or_prompt_bound",
                         "unknown",
                     }
+                    | ({"codex_daemon_input"} if include_owning_daemon else set())
                 )
             )
         ):
             raise ChatError("Tailnet peer returned invalid discovery")
         observed_mode = item.get("delivery_mode")
+        observed_mechanism = item.get("delivery_mechanism")
+        if "delivery_mechanism" in item and (
+            not isinstance(observed_mechanism, str)
+            or observed_mechanism not in DELIVERY_MECHANISMS | {"unknown"}
+        ):
+            raise ChatError("Tailnet peer returned invalid discovery")
         title = item.get("title")
         if title is not None and (not include_title or not isinstance(title, str)):
             raise ChatError("Tailnet peer returned invalid discovery")
@@ -2680,6 +2749,11 @@ def _targets_from_tailnet(
                     if isinstance(observed_mode, str) and observed_mode != "unknown"
                     else None
                 ),
+                delivery_mechanism=(
+                    cast(DeliveryMechanism, observed_mechanism)
+                    if isinstance(observed_mechanism, str) and observed_mechanism != "unknown"
+                    else None
+                ),
                 title=valid_name(title, "remote title") if isinstance(title, str) else None,
             )
         )
@@ -2691,6 +2765,7 @@ def _remote_node_targets(
     deadline: float | None = None,
     *,
     include_delivery_mode: bool = False,
+    include_delivery_mechanism: bool = False,
     include_title: bool = False,
     include_devin: bool = False,
     include_external: bool = False,
@@ -2724,7 +2799,20 @@ def _remote_node_targets(
     if include_devin:
         variants.append(({**legacy, "include_devin": True}, False))
     variants.append((legacy, False))
+    # Ask newer brokers explicitly, then retain all old variants as fallback.
+    # No optional metadata is added to a response an old reader did not request.
+    if include_delivery_mechanism:
+        variants = [
+            (
+                {**payload, "include_delivery_mechanism": True, "include_owning_daemon": True},
+                mode_requested,
+            )
+            for payload, mode_requested in variants
+            if mode_requested
+        ] + variants
     base: list[Target] | None = None
+    mechanism_negotiated = False
+    owning_negotiated = False
     external_negotiated = False
     capacity_refused = False
     for payload, mode_requested in variants:
@@ -2768,11 +2856,19 @@ def _remote_node_targets(
                 address,
                 raw,
                 include_delivery_mode=mode_requested,
+                **(
+                    {"include_delivery_mechanism": True}
+                    if "include_delivery_mechanism" in payload
+                    else {}
+                ),
                 include_devin=include_devin,
+                **({"include_owning_daemon": True} if "include_owning_daemon" in payload else {}),
                 **_external_option(include_external),
                 node_id=node_id,
             )
             external_negotiated = "include_external" in payload
+            mechanism_negotiated = "include_delivery_mechanism" in payload
+            owning_negotiated = "include_owning_daemon" in payload
             break
         except (ChatError, UnknownDeliveryError):
             continue
@@ -2791,6 +2887,10 @@ def _remote_node_targets(
             "include_delivery_mode": True,
             "include_title": True,
         }
+        if mechanism_negotiated:
+            rich_payload["include_delivery_mechanism"] = True
+        if owning_negotiated:
+            rich_payload["include_owning_daemon"] = True
         if include_devin:
             rich_payload["include_devin"] = True
         if external_negotiated:
@@ -2806,7 +2906,9 @@ def _remote_node_targets(
             address,
             raw,
             include_delivery_mode=True,
+            **({"include_delivery_mechanism": True} if mechanism_negotiated else {}),
             include_title=True,
+            **({"include_owning_daemon": True} if owning_negotiated else {}),
             include_devin=include_devin,
             **_external_option(external_negotiated),
             node_id=node_id,
@@ -2829,6 +2931,7 @@ def _remote_node_targets(
 def _remote_discovery(
     *,
     include_delivery_mode: bool = False,
+    include_delivery_mechanism: bool = False,
     include_title: bool = False,
     include_devin: bool = True,
     include_external: bool = False,
@@ -2842,6 +2945,9 @@ def _remote_discovery(
     complete = True
     deadline = time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS
     workers = ThreadPoolExecutor(max_workers=min(16, len(identity.peers)))
+    metadata: _DeliveryDiscoveryOption = (
+        {"include_delivery_mechanism": True} if include_delivery_mechanism else {}
+    )
     futures = [
         workers.submit(
             _remote_node_targets,
@@ -2850,6 +2956,7 @@ def _remote_discovery(
             include_delivery_mode=include_delivery_mode,
             include_title=include_title,
             include_devin=include_devin,
+            **metadata,
             **_external_option(include_external),
             node_id=node_id,
         )
@@ -3155,6 +3262,35 @@ def _begin_delivery(
     return None
 
 
+def destination_receiving(target: Target | None) -> dict[str, object]:
+    """Describe observed routing, never receipt or unqualified wake/steer support.
+
+    A Stop/prompt boundary cannot wake a parked original or inject into its active
+    turn. Queue and native mechanisms need host-specific proof for those stronger
+    promises; a health response alone does not provide that proof. The owning
+    daemon 0.160.1 path is separately qualified for parked queue wake and
+    expected-active-turn steer; qualification still is not an event receipt.
+    """
+    mode = target.delivery_mode if target is not None else None
+    mechanism = target.delivery_mechanism if target is not None else None
+    deferred = mode in {"codex_stop_bound", "devin_stop_or_prompt_bound"}
+    return {
+        "mode": mode or "unknown",
+        "mechanism": mechanism or "unknown",
+        "parked_wake": True
+        if mode == "codex_daemon_input" and mechanism == "owning_daemon"
+        else False
+        if deferred
+        else "unknown",
+        "active_turn_input": True
+        if mode == "codex_daemon_input" and mechanism == "owning_daemon"
+        else False
+        if deferred
+        else "unknown",
+        "delivery_observation": "not_observed",
+    }
+
+
 def _existing_delivery(intent: Intent, target: Target) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -3164,6 +3300,8 @@ def _existing_delivery(intent: Intent, target: Target) -> dict[str, object]:
         "provider": target.provider,
         "delivery_observation": "not_observed",
         "reused_request": True,
+        # Current health cannot establish a historical event's receiving path.
+        "destination_receiving": destination_receiving(None),
     }
 
 
@@ -3239,6 +3377,7 @@ def _send_local_target(
         )
     if target.session_id is None or target.pid is None or target.cwd is None:
         raise ChatError("target route is incomplete")
+    receiving = destination_receiving(target)
     source_alias = canonical_source_alias(root, source, deadline=deadline)
     current_routes = Registry(root).routes()
     route_matches = [
@@ -3360,6 +3499,7 @@ def _send_local_target(
         "status": "TRANSPORT_ACCEPTED",
         "to": target.alias,
         "provider": target.provider,
+        "destination_receiving": receiving,
     }
 
 
@@ -3433,6 +3573,8 @@ def _send_remote_token_target(
     attested, _node_complete = _remote_node_targets(
         address,
         min(time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS, deadline),
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
         include_devin=True,
         **_external_option(include_external),
         handle=token.handle,
@@ -3539,7 +3681,9 @@ def send(
             "recipient handles are now opaque tokens; call chat_peers and send to the fresh handle"
         )
     local = _local_endpoint_targets(root) if include_external else local_targets(root)
-    remote, remote_complete = _remote_discovery(**_external_option(include_external))
+    remote, remote_complete = _remote_discovery(
+        include_title=True, **_external_option(include_external)
+    )
     if not remote_complete:
         raise ChatError(
             "remote peer discovery is incomplete; use an exact available recipient handle"
@@ -3552,13 +3696,38 @@ def send(
     elif len(exact_aliases) > 1:
         raise ChatError("target is ambiguous or unavailable")
     else:
-        # MCP dispatch never fuzzy-matches a recipient: a near alias like
-        # "...:Kluro" could silently resolve to "...:W_Kluro_2Oct1PM". Zero
-        # exact matches refuse before any intent or provider effect.
-        raise ChatError(
-            "recipient is not an exact handle or exact alias of one discovered peer; "
-            "call chat_peers and choose the recipient"
-        )
+        local = _with_codex_titles(root, local, deadline)
+        # Identity-complete discovery is not title-complete discovery: optional
+        # enrichment may have timed out while retaining an exact live identity.
+        # Missing Codex/enrolled-endpoint titles therefore cannot establish that
+        # one visible name is unique. Synthetic Devin labels are not selectors;
+        # Claude's provider name remains part of its authenticated full alias.
+        title_candidates = [
+            item for item in [*local, *remote] if item.provider in {"codex", "external"}
+        ]
+        title_metadata_complete = all(item.title is not None for item in title_candidates)
+        if not title_metadata_complete:
+            raise ChatError(
+                "recipient title metadata is incomplete; "
+                "use an exact available recipient handle or full alias"
+            )
+        exact_titles = [
+            item
+            for item in title_candidates
+            if item.title is not None and item.title.casefold() == target_query.casefold()
+        ]
+        if len(exact_titles) == 1:
+            target = exact_titles[0]
+        elif len(exact_titles) > 1:
+            raise ChatError("target is ambiguous or unavailable")
+        else:
+            # Dispatch never fuzzy-matches aliases or titles. Zero exact matches
+            # refuse before any intent or provider effect.
+            raise ChatError(
+                "recipient is not an exact handle, exact alias, or exact title "
+                "of one discovered peer; "
+                "call chat_peers and choose the recipient"
+            )
     if not target.remote:
         return _send_local_target(
             root,
@@ -3603,6 +3772,7 @@ def _send_remote_target(
 ) -> dict[str, object]:
     if target.tailnet_address is None:
         raise ChatError("remote target route is incomplete")
+    receiving = destination_receiving(target)
     source_alias = canonical_source_alias(root, source, deadline=deadline)
     event_id = str(uuid4()) if event_id is None else valid_uuid(event_id, "event id")
     source_token = remote_token(self_node_id, _source_key(source), source.generation)
@@ -3702,7 +3872,7 @@ def _send_remote_target(
         store.mark(event_id, "UNKNOWN_DELIVERY")
         raise UnknownDeliveryError("remote delivery state is unknown")
     store.mark(event_id, "TRANSPORT_ACCEPTED")
-    return expected
+    return {**expected, "destination_receiving": receiving}
 
 
 def authorize_remote(
@@ -4032,6 +4202,7 @@ def _send_external_target(
 ) -> dict[str, object]:
     if isinstance(source, ExternalEndpoint) and source_lock_fd is None:
         raise ChatError("external sender effect custody is unavailable; nothing was delivered")
+    receiving = destination_receiving(target)
     source_alias = canonical_source_alias(root, source, deadline=deadline)
     identifier = str(uuid4()) if event_id is None else valid_uuid(event_id, "event id")
     body = wrapped_message(
@@ -4076,7 +4247,7 @@ def _send_external_target(
         store.mark(identifier, "PRE_EFFECT_REJECTED")
         raise
     store.mark(identifier, "TRANSPORT_ACCEPTED")
-    return result
+    return {**result, "destination_receiving": receiving}
 
 
 def _target_handle_token(root: Path, target: Target) -> str | None:
@@ -4110,6 +4281,7 @@ def peers(
     include_delivery_mode: bool = False,
     include_delivery_mechanism: bool = False,
     include_title: bool = False,
+    include_owning_daemon: bool = False,
     include_devin: bool = True,
     include_external: bool = False,
     handle: str | None = None,
@@ -4135,6 +4307,7 @@ def peers(
                 _remote_discovery,
                 include_delivery_mode=include_delivery_mode,
                 include_title=display_titles,
+                **({"include_delivery_mechanism": True} if include_delivery_mechanism else {}),
                 identity=identity,
                 **_external_option(include_external),
             )
@@ -4176,6 +4349,7 @@ def peers(
             include_handle=not internal,
             handle=token,
             include_title=not internal or include_title,
+            include_owning_daemon=not internal or include_owning_daemon,
         )
         if internal:
             item["generation"] = target.generation
@@ -4256,7 +4430,16 @@ def sender_readiness_for_route(root: Path, source: Route) -> dict[str, str]:
         return {"status": "unavailable", "reason": "sender courier is unavailable", **label}
     if response.get("status") != "READY" or response.get("generation") != source.generation:
         return {"status": "unavailable", "reason": "sender courier is not ready", **label}
-    return {"status": "ready", **label}
+    alias = response.get("alias")
+    return {
+        "status": "ready",
+        "provider": source.provider,
+        "alias": alias if isinstance(alias, str) else source.alias,
+        "handle": local_token(
+            root, session_key(source.provider, source.session_id), source.generation
+        ),
+        **label,
+    }
 
 
 ReplyDelivery = Literal["while_idle", "next_turn", "unknown"]
@@ -4289,6 +4472,7 @@ def reply_delivery(root: Path, source: SourceIdentity) -> ReplyDelivery:
                     "operation": "health",
                     "generation": source.generation,
                     "include_delivery_mode": True,
+                    "include_owning_daemon": True,
                 },
                 timeout=REPLY_DELIVERY_TIMEOUT_SECONDS,
             )
@@ -4302,7 +4486,7 @@ def reply_delivery(root: Path, source: SourceIdentity) -> ReplyDelivery:
             and isinstance(raw, str)
             else None
         )
-    if mode in {"claude_native_cross_session", "codex_experimental_queue"}:
+    if mode in {"claude_native_cross_session", "codex_experimental_queue", "codex_daemon_input"}:
         return "while_idle"
     if mode in {"codex_stop_bound", "devin_stop_or_prompt_bound"}:
         return "next_turn"

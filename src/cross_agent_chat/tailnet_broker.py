@@ -107,6 +107,8 @@ def bind_broker_listener(
 
 class _ExternalDiscoveryOption(TypedDict, total=False):
     include_external: bool
+    include_delivery_mechanism: bool
+    include_owning_daemon: bool
 
 
 def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[str, object]:
@@ -128,6 +130,8 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
     if operation == "peers":
         include_flags = {
             "include_delivery_mode",
+            "include_delivery_mechanism",
+            "include_owning_daemon",
             "include_title",
             "include_devin",
             "include_external",
@@ -136,7 +140,10 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
         handle = request.get("handle")
         if (
             not optional <= (include_flags | {"handle"})
-            or ("include_title" in optional and "include_delivery_mode" not in optional)
+            or (
+                optional & {"include_title", "include_delivery_mechanism", "include_owning_daemon"}
+                and "include_delivery_mode" not in optional
+            )
             or request.get("schema_version") != SCHEMA_VERSION
             or any(request.get(key) is not True for key in optional & include_flags)
             or (
@@ -149,6 +156,10 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
         extra: _ExternalDiscoveryOption = (
             {"include_external": True} if "include_external" in optional else {}
         )
+        if "include_delivery_mechanism" in optional:
+            extra["include_delivery_mechanism"] = True
+        if "include_owning_daemon" in optional:
+            extra["include_owning_daemon"] = True
         return peers(
             root,
             include_remote=False,

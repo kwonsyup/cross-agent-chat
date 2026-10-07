@@ -47,6 +47,7 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 | `remote.py` / `transport.py` | Strict parsing and serialization of the trusted Tailnet envelope (`remote` parses inbound, `transport` builds outbound). |
 | `claude_runtime.py` | Claude Code discovery, constrained helper couriers, the exact argument-supply delivery gate, transient body file, receipt classification. |
 | `codex.py` | Codex CLI process-memory courier and Stop-bound handoff, stdio app-server metadata and experimental queue operations. |
+| `codex_daemon.py` | Owning-daemon ingress for `codex-tui` 0.160.1 originals: a private owner-only Unix WebSocket admitted by route-owner PID with exact profile, thread, cwd, and originator checks; `thread/queue/add` wakes a parked original and `turn/steer` with a pinned `expectedTurnId` inputs the expected active turn. CAC starts no daemon, resumes no thread, changes no permission, and never retries an uncertain effect; missing or unqualified routes stay Stop-bound. |
 | `native_helper.py` | Shared provider hook recipes/defaults and the private, body-free binding between original Codex conversations and managed native helpers. |
 | `devin.py` | Devin lifecycle-hook parsing and the filesystem-backed single-use capability store (`atomic_json` + `state_lock`). |
 | `install.py` | Provider selection (`resolve_providers`), selected-root resolution, read-only `SetupPlan`, config payload preparation, whole-file backups, guarded transactions/rollback, LaunchAgent lifecycle, schema-5 install metadata, uninstall/restore. Largest file; most of its size is the ownership/rollback matrix. |
@@ -80,6 +81,11 @@ alone proves that an active recipient consumed an envelope.
   endpoint/generation and uses `external_callback.py` to POST to its private
   owner-configured HTTPS destination. HTTP 2xx means callback custody only;
   original-context receiving and model consumption require separate evidence.
+  Callback bindings publish atomically: `external.py` writes each payload to
+  an immutable `external-callback-{id}-{generation}.json` and one record
+  commit selects destination and generation together; cleanup only removes a
+  copy the committed record provably does not select, and `revoke` commits
+  before deleting any binding file.
 - **Owner image anchor (update continuity):** `runtime.py`
   `_owner_anchor_document` builds the private per-generation sidecar
   `owner-<generation>.json` in the state root at registration, only when the
@@ -99,7 +105,19 @@ alone proves that an active recipient consumed an envelope.
   send time. Raw pre-upgrade handles, stale generations, ambiguous names, and
   name selection against an incomplete roster refuse before effect; an exact
   token needs only its own endpoint to answer. There is no binding store —
-  tokens are self-contained.
+  tokens are self-contained. Codex peers also accept an exact provider title
+  and owner-enrolled external endpoints their exact endpoint name, but only
+  when the metadata is complete and exactly one matches; incomplete metadata
+  or duplicates refuse before any effect.
+- **Receiving contract:** send results carry `destination_receiving` —
+  route `mode`, `mechanism`, `parked_wake`, `active_turn_input`, and
+  `delivery_observation` — describing destination capability, never a
+  receipt. Only `codex_daemon_input`/`owning_daemon` routes claim parked wake
+  and active-turn input; Stop/prompt-bound modes report `false` for both and
+  everything else is `unknown`. `reply_delivery` stays the sender's own
+  return path; `TRANSPORT_ACCEPTED` is custody, and
+  `chat_peers.sender` identifies the authenticated session by alias and
+  exact handle.
 - **Durable effects:** `core.py` intent store — event IDs, digests, statuses;
   `resolve_by_owner` is the only owner disposition and never proves delivery
   or makes resending equivalent uncertain work safe.

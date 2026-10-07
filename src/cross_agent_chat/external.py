@@ -10,7 +10,7 @@ import os
 import re
 import secrets
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,7 +19,6 @@ from uuid import uuid4
 
 from cross_agent_chat.core import (
     ChatError,
-    atomic_json,
     ensure_private_dir,
     require_private_file,
     state_lock,
@@ -27,9 +26,15 @@ from cross_agent_chat.core import (
     valid_name,
     valid_uuid,
 )
+from cross_agent_chat.core import (
+    atomic_json as atomic_json,
+)
 from cross_agent_chat.recipient import local_origin, parse_recipient_token
 
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
+_CALLBACK_VERSION = re.compile(
+    r"-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json\Z"
+)
 _CREDENTIAL = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.([0-9a-f]{64})\Z"
 )
@@ -76,11 +81,15 @@ class ExternalEndpoint:
             for recipient in self.allowed_recipients:
                 if parse_recipient_token(recipient) is None:
                     raise ChatError("external recipient scope is invalid")
-        if (
-            self.callback_ref is not None
-            and self.callback_ref != f"external-callback-{self.endpoint_id}.json"
-        ):
-            raise ChatError("external callback reference is invalid")
+        if self.callback_ref is not None:
+            prefix = f"external-callback-{self.endpoint_id}"
+            ref_suffix = (
+                self.callback_ref[len(prefix) :] if self.callback_ref.startswith(prefix) else None
+            )
+            if ref_suffix is None or not (
+                ref_suffix == ".json" or _CALLBACK_VERSION.fullmatch(ref_suffix)
+            ):
+                raise ChatError("external callback reference is invalid")
 
     @property
     def key(self) -> str:
@@ -327,19 +336,47 @@ class ExternalEndpointStore:
             ]
             if len(matches) != 1:
                 raise ChatError("external endpoint is unavailable")
+            # The new payload is published under an immutable generation-named
+            # file; one atomic record commit then switches destination and
+            # generation together. A crash before the commit leaves an
+            # unreachable copy and the still-live record keeps selecting the
+            # original file, so old handles can never be redirected to the new
+            # destination. A crash after the commit selects a complete file.
+            generation = str(uuid4())
             endpoint = replace(
                 matches[0],
-                generation=str(uuid4()),
-                callback_ref=f"external-callback-{identifier}.json",
+                generation=generation,
+                callback_ref=f"external-callback-{identifier}-{generation}.json",
             )
-            atomic_json(self.root / cast(str, endpoint.callback_ref), asdict(config))
-            atomic_json(
-                self.path,
-                [
-                    asdict(endpoint) if item.endpoint_id == identifier else asdict(item)
-                    for item in existing
-                ],
-            )
+            published = self.root / cast(str, endpoint.callback_ref)
+            atomic_json(published, asdict(config))
+            try:
+                atomic_json(
+                    self.path,
+                    [
+                        asdict(endpoint) if item.endpoint_id == identifier else asdict(item)
+                        for item in existing
+                    ],
+                )
+            except BaseException:
+                # The record write may already have committed: atomic_json can
+                # os.replace the record and only then fail the directory fsync.
+                # Drop the new file only when the on-disk record provably does
+                # not select it; an unreadable record leaves an unreachable
+                # orphan rather than deleting what could be the live binding.
+                orphan = False
+                with suppress(ChatError, OSError):
+                    orphan = not any(
+                        item.callback_ref == endpoint.callback_ref for item in self.endpoints()
+                    )
+                if orphan:
+                    with suppress(OSError):
+                        published.unlink()
+                raise
+            previous = matches[0].callback_ref
+            if previous is not None and previous != endpoint.callback_ref:
+                with suppress(OSError):
+                    (self.root / previous).unlink()
         return endpoint
 
     def revoke(self, endpoint_id: str) -> None:
@@ -351,9 +388,9 @@ class ExternalEndpointStore:
             existing = self.endpoints()
             if not any(item.endpoint_id == identifier for item in existing):
                 raise ChatError("external endpoint is unavailable")
-            callback = self.root / f"external-callback-{identifier}.json"
-            if callback.exists() or callback.is_symlink():
-                callback.unlink()
+            # Revocation commits before any file is removed: a crash between
+            # the two can only leave an unreachable copy, never a live binding
+            # whose destination file was deleted underneath it.
             atomic_json(
                 self.path,
                 [
@@ -363,6 +400,11 @@ class ExternalEndpointStore:
                     for item in existing
                 ],
             )
+            callbacks = [self.root / f"external-callback-{identifier}.json"]
+            callbacks.extend(self.root.glob(f"external-callback-{identifier}-*.json"))
+            for callback in callbacks:
+                if callback.exists() or callback.is_symlink():
+                    callback.unlink()
 
 
 @contextmanager

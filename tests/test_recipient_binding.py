@@ -595,8 +595,18 @@ def test_the_handle_probe_falls_back_to_the_legacy_roster(
         "operation": "peers",
         "handle": handle,
         "include_devin": True,
+        "include_delivery_mode": True,
+        "include_delivery_mechanism": True,
+        "include_owning_daemon": True,
     }
-    assert calls[1] == {"schema_version": 1, "operation": "peers", "include_devin": True}
+    assert calls[1] == {
+        "schema_version": 1,
+        "operation": "peers",
+        "include_devin": True,
+        "include_delivery_mode": True,
+        "include_delivery_mechanism": True,
+        "include_owning_daemon": True,
+    }
     assert calls[2].get("operation") == "receive"
 
 
@@ -951,7 +961,12 @@ def test_a_listing_mints_one_opaque_token_per_remote_row(
 def test_wire_request_and_response_key_sets_are_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The token lives inside existing fields: no wire payload gains a key."""
+    """The token lives inside existing fields: the envelope gains no key.
+
+    ``peers`` probes may additionally carry the negotiated optional include
+    flags (delivery mode, mechanism, owning daemon); the envelope and the
+    authorize contract keep their pinned key sets.
+    """
     handle = session_key("claude", str(uuid4()))
     generation = str(uuid4())
     sent: list[dict[str, object]] = []
@@ -991,10 +1006,17 @@ def test_wire_request_and_response_key_sets_are_unchanged(
 
     peers_requests = [payload for payload in sent if payload.get("operation") == "peers"]
     assert peers_requests
+    negotiated = {
+        "include_delivery_mode",
+        "include_delivery_mechanism",
+        "include_owning_daemon",
+    }
     assert all(
         set(payload)
         in (
+            {"schema_version", "operation", "handle", "include_devin"} | negotiated,
             {"schema_version", "operation", "handle", "include_devin"},
+            {"schema_version", "operation", "include_devin"} | negotiated,
             {"schema_version", "operation", "include_devin"},
             {"schema_version", "operation"},
         )

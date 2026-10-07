@@ -12,6 +12,7 @@ the outcome unknown.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shlex
@@ -22,11 +23,16 @@ from uuid import uuid4
 import pytest
 
 from cross_agent_chat.claude_runtime import (
+    COURIER_PLACEHOLDER_MESSAGE,
+    COURIER_PLACEHOLDER_TARGET,
     DENIAL_MARKERS,
     SEND_SUMMARY,
     ClaudeSendMessageRefused,
     ClaudeSendMessageUnknownDelivery,
     ClaudeUnknownPhase,
+    _pretool_resolution,
+    authoritative_tool_input,
+    run_pretool_gate,
     sendmessage,
 )
 from cross_agent_chat.core import ChatError, UnknownDeliveryError
@@ -1066,5 +1072,178 @@ def test_denied_marker_with_measured_metadata_is_decided(
     )
 
     error = _outcome(monkeypatch, stream, denied=DENIAL_MARKERS["pretool_gate_denied"])
+
+    _assert_refused(error, reason)
+
+
+# ---------------------------------------------------------------------------
+# Claude Code 2.1.292 provider normalization: the gate admits the measured
+# `recipient_kind` discriminator, constrains it to the `name [ref]` kind, and
+# still fails closed on every uncheckable shape.
+
+
+def _expected() -> dict[str, object]:
+    return {"recipient": _TARGET, "message": _BODY, "summary": SEND_SUMMARY}
+
+
+def _placeholder_tool_input() -> dict[str, object]:
+    return {
+        "to": COURIER_PLACEHOLDER_TARGET,
+        "recipient": COURIER_PLACEHOLDER_TARGET,
+        "message": COURIER_PLACEHOLDER_MESSAGE,
+        "content": COURIER_PLACEHOLDER_MESSAGE,
+        "type": "message",
+        "summary": SEND_SUMMARY,
+    }
+
+
+def _gate_payload(tool_input: dict[str, object] | None = None) -> dict[str, object]:
+    """One PreToolUse event for the courier's placeholder SendMessage."""
+    return {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "SendMessage",
+        "tool_input": tool_input if tool_input is not None else _placeholder_tool_input(),
+    }
+
+
+def _measured_2_1_292_tool_input() -> dict[str, object]:
+    """The normalized proposal Claude Code 2.1.292 presents to PreToolUse.
+
+    Measured on the installed 2.1.292 binary: the provider expands `to` into
+    `recipient` plus the `recipient_kind` discriminator and `message` into
+    `content` before the hook observes the call.
+    """
+    return {**_placeholder_tool_input(), "recipient_kind": "name"}
+
+
+def test_pretool_gate_accepts_measured_recipient_kind_normalization() -> None:
+    # The provider's own 2.1.292 normalization adds `recipient_kind` to the
+    # observed tool_input; the gate must not deny the provider's own shape.
+    phase, arguments = _pretool_resolution(
+        _expected(), _gate_payload(_measured_2_1_292_tool_input())
+    )
+
+    assert phase is None
+    assert arguments == authoritative_tool_input(_TARGET, _BODY, SEND_SUMMARY)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["uuid", "session_id", "session", "", None, 5, True],
+    ids=["uuid", "session_id", "session", "empty", "null", "int", "bool"],
+)
+def test_pretool_gate_denies_a_recipient_kind_that_is_not_name(kind: object) -> None:
+    # `recipient_kind` is routing metadata: an unchecked value could resolve
+    # the authoritative `name [ref]` address differently under a merging
+    # provider, so only the measured "name" kind may ride along unsupplied.
+    tool_input = {**_placeholder_tool_input(), "recipient_kind": kind}
+
+    phase, arguments = _pretool_resolution(_expected(), _gate_payload(tool_input))
+
+    assert phase == "sendmessage_payload_mismatch"
+    assert arguments is None
+
+
+def test_pretool_gate_allows_a_2_1_292_normalized_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    expected_path = tmp_path / "expected.json"
+    expected_path.write_text(json.dumps(_expected()), encoding="utf-8")
+    expected_path.chmod(0o600)
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO(json.dumps(_gate_payload(_measured_2_1_292_tool_input())))
+    )
+
+    assert run_pretool_gate(str(expected_path))
+    assert (tmp_path / "consumed").exists()
+    output = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert output["permissionDecision"] == "allow"
+    assert output["updatedInput"] == authoritative_tool_input(_TARGET, _BODY, SEND_SUMMARY)
+
+
+def test_denied_marker_with_2_1_292_hook_denial_stream_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Measured on Claude Code 2.1.292: a hook-denied SendMessage produces a
+    # tool_result whose content is the denial text as a bare string flagged
+    # is_error. That payload cannot be scanned for an effect marker, so the
+    # outcome stays fail-closed unknown -- the field-observed
+    # claude_helper_stream_invalid surface -- even though the gate's own
+    # marker records exactly why it denied.
+    use: dict[str, object] = {
+        "type": "tool_use",
+        "id": "tool-1",
+        "name": "SendMessage",
+        "caller": {"type": "direct"},
+        "input": _measured_2_1_292_tool_input(),
+    }
+    denial_result = {
+        "type": "tool_result",
+        "tool_use_id": "tool-1",
+        "content": "Cross Agent Chat rejected a mismatched action",
+        "is_error": True,
+    }
+    stream = _stream(
+        _init_record(),
+        _record({"type": "thinking", "thinking": "plan", "signature": "sig"}, use),
+        {
+            "type": "user",
+            "isSynthetic": True,
+            "message": {"role": "user", "content": [{"type": "text", "text": "hook"}]},
+        },
+        _record(denial_result, record_type="user"),
+        _terminal_record(
+            permission_denials=[
+                {
+                    "tool_name": "SendMessage",
+                    "tool_use_id": "tool-1",
+                    "tool_input": _measured_2_1_292_tool_input(),
+                }
+            ]
+        ),
+    )
+
+    error = _outcome(monkeypatch, stream, denied=DENIAL_MARKERS["sendmessage_payload_mismatch"])
+
+    _assert_unknown(error, "helper_stream_invalid")
+
+
+def test_consumed_gate_with_2_1_292_measured_stream_is_decided(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The executed-path stream measured on Claude Code 2.1.292 still fits the
+    # contract: caller/recipient_kind extras on the use record, volatile outer
+    # metadata, and the canonical {success, message} refusal payload.
+    reason = "No agent named 'cross-agent-chat-courier [000000]' is reachable."
+    use: dict[str, object] = {
+        "type": "tool_use",
+        "id": "tool-1",
+        "name": "SendMessage",
+        "caller": {"type": "direct"},
+        "input": _measured_2_1_292_tool_input(),
+    }
+    stream = _stream(
+        _init_record(),
+        {"type": "system", "subtype": "task_budget", "estimated_tokens": 12},
+        {
+            **_record(
+                {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                use,
+                role="assistant",
+            ),
+            "wire_tool_inputs": [],
+        },
+        {
+            **_record(
+                _result("tool-1", {"success": False, "message": reason}),
+                record_type="user",
+                role="user",
+            ),
+            "tool_use_result": {"interrupted": False},
+        },
+        _terminal_record(duration_ms=5, num_turns=2),
+    )
+
+    error = _outcome(monkeypatch, stream, consumed=True)
 
     _assert_refused(error, reason)

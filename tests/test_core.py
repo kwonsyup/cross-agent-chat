@@ -555,7 +555,13 @@ def test_sender_readiness_is_bound_to_the_existing_sender_identity(
         lambda *_args, **_kwargs: {"status": "READY", "generation": source.generation},
     )
 
-    assert sender_readiness(root, "codex", os.getppid(), source.session_id) == {"status": "ready"}
+    readiness = sender_readiness(root, "codex", os.getppid(), source.session_id)
+    assert readiness["status"] == "ready"
+    assert readiness["alias"] == source.alias
+    decoded = parse_recipient_token(readiness["handle"])
+    assert decoded is not None
+    assert decoded.handle == session_key(source.provider, source.session_id)
+    assert decoded.generation == source.generation
     assert sender_readiness(root, "codex", os.getppid(), str(uuid4())) == {
         "status": "unavailable",
         "reason": "exact Codex sender is unavailable",
