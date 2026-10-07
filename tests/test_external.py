@@ -16,7 +16,7 @@ from uuid import uuid4
 
 import pytest
 
-from cross_agent_chat import cli, external_callback, runtime
+from cross_agent_chat import cli, external, external_callback, runtime
 from cross_agent_chat.core import (
     ChatError,
     IntentStatus,
@@ -1232,3 +1232,357 @@ cli._external_call_tool(Path(sys.argv[1]), read_credential(Path(sys.argv[2])), r
                 os.kill(child_pid, signal.SIGKILL)
         for thread in workers:
             thread.join(timeout=3)
+
+
+def _callback_input(root: Path, url: str) -> Path:
+    config = root / f"callback-input-{uuid4().hex}.json"
+    atomic_json(config, {"url": url, "bearer": f"fixture-key-{uuid4().hex}"})
+    return config
+
+
+def _delivered_urls(
+    root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: ExternalEndpoint,
+    generation: str,
+) -> list[str]:
+    """Resolve one exact recipient handle through the real send path."""
+    urls: list[str] = []
+
+    def capture(
+        config: external_callback.CallbackConfig,
+        _envelope: dict[str, object],
+        *,
+        timeout_seconds: float,
+        lock_fds: tuple[int, ...],
+    ) -> external_callback.CallbackOutcome:
+        assert timeout_seconds > 0 and lock_fds
+        urls.append(config.url)
+        return "TRANSPORT_ACCEPTED"
+
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="fixture",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(source)
+    monkeypatch.setattr(external_callback, "post_callback", capture)
+    runtime.send(
+        root,
+        source,
+        local_token(root, endpoint.key, generation),
+        "callback binding fixture",
+        event_id=str(uuid4()),
+        include_external=True,
+    )
+    return urls
+
+
+@contextmanager
+def _fail_writes(root: Path, failing: Path) -> Iterator[None]:
+    real_atomic_json = external.atomic_json
+
+    def faulty(path: Path, value: object) -> None:
+        if path == failing:
+            raise OSError("injected write failure, not a real disk error")
+        real_atomic_json(path, value)
+
+    external.atomic_json = faulty
+    try:
+        yield
+    finally:
+        external.atomic_json = real_atomic_json
+
+
+def test_callback_update_commit_failure_never_redirects_old_handles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Crash between the binding copy and the record commit keeps old custody."""
+    root = tmp_path / "state"
+    endpoint, _credential = _enroll(root)
+    endpoint = _callback(root, endpoint)
+    old_url = external_callback.read_callback(root / cast(str, endpoint.callback_ref)).url
+
+    with (
+        _fail_writes(root, root / "external-endpoints-v1.json"),
+        pytest.raises(OSError, match="injected write failure"),
+    ):
+        ExternalEndpointStore(root).configure_callback(
+            endpoint.endpoint_id,
+            _callback_input(root, "https://replacement.example.com/new"),
+        )
+
+    # A fresh store models the restarted reader: the committed record still
+    # selects the original binding, so the old handle keeps the old destination
+    # instead of silently reaching the uncommitted replacement.
+    restarted = ExternalEndpointStore(root)
+    assert restarted.endpoints() == [endpoint] and restarted.current(endpoint)
+    retained = restarted.endpoints()[0]
+    assert external_callback.read_callback(root / cast(str, retained.callback_ref)).url == old_url
+    assert {path.name for path in root.glob("external-callback-*.json")} == {
+        cast(str, endpoint.callback_ref)
+    }
+    assert _delivered_urls(root, tmp_path, monkeypatch, endpoint, endpoint.generation) == [old_url]
+
+
+def test_callback_update_failure_before_any_write_leaves_state_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    endpoint, _credential = _enroll(root)
+    endpoint = _callback(root, endpoint)
+    old_url = external_callback.read_callback(root / cast(str, endpoint.callback_ref)).url
+    state_bytes = ExternalEndpointStore(root).path.read_bytes()
+
+    incoming = _callback_input(root, "https://replacement.example.com/new")
+    real_atomic_json = external.atomic_json
+
+    def fail_first(path: Path, value: object) -> None:
+        if path != ExternalEndpointStore(root).path:
+            raise OSError("injected write failure, not a real disk error")
+        real_atomic_json(path, value)
+
+    external.atomic_json = fail_first
+    try:
+        with pytest.raises(OSError, match="injected write failure"):
+            ExternalEndpointStore(root).configure_callback(endpoint.endpoint_id, incoming)
+    finally:
+        external.atomic_json = real_atomic_json
+
+    assert ExternalEndpointStore(root).path.read_bytes() == state_bytes
+    assert {path.name for path in root.glob("external-callback-*.json")} == {
+        cast(str, endpoint.callback_ref)
+    }
+    assert _delivered_urls(root, tmp_path, monkeypatch, endpoint, endpoint.generation) == [old_url]
+
+
+def test_callback_reconfigure_switches_generation_and_destination_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    endpoint, _credential = _enroll(root)
+    endpoint = _callback(root, endpoint)
+    store = ExternalEndpointStore(root)
+
+    updated = store.configure_callback(
+        endpoint.endpoint_id,
+        _callback_input(root, "https://replacement.example.com/second"),
+    )
+    assert updated.generation != endpoint.generation
+    assert updated.callback_ref is not None and updated.callback_ref != endpoint.callback_ref
+    # Exactly one live binding file remains after the atomic switch.
+    assert {path.name for path in root.glob("external-callback-*.json")} == {updated.callback_ref}
+    # The stale handle refuses rather than following the replaced binding.
+    with pytest.raises(ChatError, match="unavailable or changed"):
+        _delivered_urls(root, tmp_path, monkeypatch, endpoint, endpoint.generation)
+    assert _delivered_urls(root, tmp_path, monkeypatch, updated, updated.generation) == [
+        "https://replacement.example.com/second"
+    ]
+
+    third = store.configure_callback(
+        endpoint.endpoint_id,
+        _callback_input(root, "https://replacement.example.com/third"),
+    )
+    assert {path.name for path in root.glob("external-callback-*.json")} == {third.callback_ref}
+    assert not (root / cast(str, endpoint.callback_ref)).exists()
+    assert not (root / cast(str, updated.callback_ref)).exists()
+    assert _delivered_urls(root, tmp_path, monkeypatch, third, third.generation) == [
+        "https://replacement.example.com/third"
+    ]
+
+
+def test_callback_reconfigure_between_match_and_effect_refuses_stale_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A commit landing while a send waits for the effect lock stays refused."""
+    root = tmp_path / "state"
+    endpoint, _credential = _enroll(root)
+    endpoint = _callback(root, endpoint)
+    replacement = _callback_input(root, "https://replacement.example.com/new")
+    original_lock = runtime.endpoint_effect_lock
+    reconfigured = False
+
+    @contextmanager
+    def reconfigure_before_lock(
+        lock_root: Path, endpoint_id: str, *, wait: bool = False
+    ) -> Iterator[int]:
+        nonlocal reconfigured
+        if not reconfigured:
+            reconfigured = True
+            ExternalEndpointStore(root).configure_callback(endpoint.endpoint_id, replacement)
+        with original_lock(lock_root, endpoint_id, wait=wait) as descriptor:
+            yield descriptor
+
+    monkeypatch.setattr(runtime, "endpoint_effect_lock", reconfigure_before_lock)
+    monkeypatch.setattr(
+        external_callback,
+        "post_callback",
+        lambda *_a, **_k: pytest.fail("stale snapshot reached callback"),
+    )
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="fixture",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(source)
+    with pytest.raises(ChatError, match="changed before effect"):
+        runtime.send(
+            root,
+            source,
+            local_token(root, endpoint.key, endpoint.generation),
+            "stale snapshot fixture",
+            event_id=str(uuid4()),
+            include_external=True,
+        )
+    assert reconfigured
+
+
+def test_callback_binding_survives_scope_and_credential_updates(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    endpoint, _credential = _enroll(root)
+    endpoint = _callback(root, endpoint)
+    store = ExternalEndpointStore(root)
+    callback_ref = cast(str, endpoint.callback_ref)
+    callback_bytes = (root / callback_ref).read_bytes()
+
+    rotated, rotated_credential = store.rotate(endpoint.endpoint_id)
+    assert rotated.generation != endpoint.generation
+    assert rotated.callback_ref == callback_ref
+    assert store.authenticate(rotated_credential).callback_ref == callback_ref
+
+    scoped, changed = store.configure_scope(
+        endpoint.endpoint_id,
+        expected_generation=rotated.generation,
+        allowed_recipients=(local_token(root, "a" * 64, str(uuid4())),),
+    )
+    assert changed and scoped.callback_ref == callback_ref
+    assert (root / callback_ref).read_bytes() == callback_bytes
+
+    # A scope update armed against a pre-callback generation refuses cleanly.
+    with pytest.raises(ChatError, match="generation changed"):
+        store.configure_scope(
+            endpoint.endpoint_id,
+            expected_generation=endpoint.generation,
+            allowed_recipients=(local_token(root, "b" * 64, str(uuid4())),),
+        )
+    assert (root / callback_ref).read_bytes() == callback_bytes
+
+
+def test_configure_callback_waits_for_endpoint_effect_lock(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    endpoint, _credential = _enroll(root)
+    endpoint = _callback(root, endpoint)
+    incoming = _callback_input(root, "https://replacement.example.com/new")
+    started, finished = threading.Event(), threading.Event()
+    results: list[ExternalEndpoint] = []
+    errors: list[BaseException] = []
+
+    def configure() -> None:
+        started.set()
+        try:
+            results.append(
+                ExternalEndpointStore(root).configure_callback(endpoint.endpoint_id, incoming)
+            )
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=configure)
+    with endpoint_effect_lock(root, endpoint.endpoint_id):
+        thread.start()
+        assert started.wait(timeout=1)
+        assert not finished.wait(timeout=0.1)
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert errors == [] and len(results) == 1
+    assert results[0].generation != endpoint.generation
+
+
+def test_expired_endpoint_callback_update_refuses_without_writes(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = ExternalEndpointStore(root)
+    expired, _credential = store.enroll(
+        device="fixture",
+        name="expired",
+        context="fixture",
+        expires_at="2000-01-01T00:00:00+00:00",
+    )
+    state_bytes = store.path.read_bytes()
+    with pytest.raises(ChatError, match="unavailable"):
+        store.configure_callback(
+            expired.endpoint_id,
+            _callback_input(root, "https://replacement.example.com/new"),
+        )
+    assert store.path.read_bytes() == state_bytes
+    assert not list(root.glob("external-callback-*.json"))
+
+
+def test_revoke_removes_every_binding_generation_but_never_a_live_one(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    first, _ = _enroll(root)
+    first = _callback(root, first)
+    second, _ = _enroll(root)
+    second = _callback(root, second)
+    store = ExternalEndpointStore(root)
+
+    store.revoke(first.endpoint_id)
+    assert not list(root.glob(f"external-callback-{first.endpoint_id}-*.json"))
+    assert not (root / f"external-callback-{first.endpoint_id}.json").exists()
+    assert (root / cast(str, second.callback_ref)).exists()
+
+    # An unreachable versioned copy left by a crashed commit is still retired
+    # with its endpoint; a live sibling binding is never touched.
+    orphan = root / f"external-callback-{second.endpoint_id}-{uuid4()}.json"
+    atomic_json(orphan, {"url": "https://orphan.example.com/", "bearer": "fixture"})
+    live_bytes = (root / cast(str, second.callback_ref)).read_bytes()
+    store.revoke(second.endpoint_id)
+    assert not orphan.exists()
+    assert not list(root.glob("external-callback-*.json"))
+    assert live_bytes
+
+
+def test_revoke_commit_failure_keeps_the_live_binding(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    endpoint, _credential = _enroll(root)
+    endpoint = _callback(root, endpoint)
+    callback_path = root / cast(str, endpoint.callback_ref)
+    store = ExternalEndpointStore(root)
+
+    with (
+        _fail_writes(root, store.path),
+        pytest.raises(OSError, match="injected write failure"),
+    ):
+        store.revoke(endpoint.endpoint_id)
+    assert callback_path.exists() and store.current(endpoint)
+
+
+def test_callback_ref_accepts_only_exact_endpoint_owned_names(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    endpoint, _credential = _enroll(root)
+    record = asdict(endpoint)
+    eid, generation = endpoint.endpoint_id, str(uuid4())
+    for accepted in (
+        f"external-callback-{eid}.json",
+        f"external-callback-{eid}-{generation}.json",
+    ):
+        assert (
+            ExternalEndpoint.from_object({**record, "callback_ref": accepted}).callback_ref
+            == accepted
+        )
+    for rejected in (
+        "../outside.json",
+        f"external-callback-{eid}-not-a-uuid.json",
+        f"external-callback-{eid}-{generation}.json.bak",
+        f"external-callback-{uuid4()}-{generation}.json",
+        f"external-callback-{eid}-{generation[:-1]}z.json",
+    ):
+        with pytest.raises(ChatError, match="callback reference is invalid"):
+            ExternalEndpoint.from_object({**record, "callback_ref": rejected})
