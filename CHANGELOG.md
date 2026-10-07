@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- Claude Code 2.1.292 adds `recipient_kind` to the normalized SendMessage
+  hook input; the pre-tool gate now accepts an absent value or exactly
+  `"name"` while still substituting the same authoritative target and body.
+  Any other kind still refuses before any effect, and a denied call's
+  uncheckable result stays `UNKNOWN_DELIVERY`.
+- Send results document `destination_receiving` (route mode, mechanism,
+  parked wake, and active-turn input as destination capability — never a
+  receipt) alongside `reply_delivery` as the sender's return path.
+  `chat_peers` reports the sender's own alias and exact handle; Codex and
+  external peers may also be selected by an exact provider title, refusing
+  on incomplete metadata or duplicates.
+- Codex CLI 0.160.1 conversations owned by their own app-server daemon gain
+  qualified parked wake (`thread/queue/add`) and active-turn input
+  (`turn/steer` with the pinned expected turn) over a private owner-only
+  socket; `--no-daemon` launches, older versions, and unqualified routes
+  stay Stop-bound. CAC starts no daemon.
+- SECURITY: removed the stale "no original-context callback qualified"
+  sentence — the owner-enrolled Grokbot 0.66.0 idle round trip stands as
+  scoped evidence — and documented the bounded callback-publication repair
+  that is pending proof.
+
 ## 0.5.1 - 2026-10-05
 
 - Preserve the owner-selected Tailscale CLI in the broker startup environment. macOS system-daemon installations now use the same command binding in native sessions and launchd.

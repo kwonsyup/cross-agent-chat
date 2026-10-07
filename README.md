@@ -84,23 +84,27 @@ peer list.
 
 ## Supported today
 
-| Coding surface on macOS | Receiving behavior |
-|---|---|
-| Claude Code | Receives while idle in supported desktop-launched contexts. |
-| Codex Native App | Managed helper delivery reaches the original conversation while idle or during active work on the qualified host described below. Required provider capabilities and trusted hooks must be available. |
-| Codex CLI | By default, receives at a turn boundary: the current turn's end or the next prompt. An explicitly enabled experimental queue has different behavior. |
-| Local Devin CLI/App | Receives at the next prompt or turn end. A conversation joins the peer list after its first prompt; receiving into an already-idle conversation stays open in [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38), waiting on a supported provider interface for delivering into an existing running conversation. |
-| Grokbot 0.66.0 | One owner-enrolled Bot using a webhook and local shell completed a round trip to the same Grok conversation through an iMac-to-M1 Claude Opus 5.5 original running in bypass-permission mode. Idle webhook return was consumed; active-turn receiving is unverified. This does not certify another Bot, a fresh-user setup, or M2. |
+Idle wake and active-turn input are separate capabilities, qualified per
+harness and mode:
 
-Idle reception and input during an active turn are separate capabilities.
-The direct experimental Codex route uses `thread/queue/add`: a message can
-wait behind the current turn. The managed Native helper forwards through
-the app's `send_message_to_thread`. Active and idle delivery were verified
-on Intel macOS with Codex 0.159.2 in Native app 26.928.21956, including a cross-Mac return
-to the same active original turn. This does not qualify every host version.
-Default Codex CLI delivery remains turn-bound.
-`reply_delivery` describes the sender's return path, and
+| Coding surface on macOS | Parked/idle wake | Active-turn input | Deferred behavior | Qualification |
+|---|---|---|---|---|
+| Claude Code | Native input is consumed between the session's tool calls | Between tool calls; a running tool is not interrupted | — | Supported desktop-launched contexts; a session inside a remote SSH shell registered but could not receive |
+| Codex CLI 0.160.1 (owning app-server daemon) | Queued input wakes the parked original | Direct input reaches the expected active turn | — | Only a `codex-tui` 0.160.1 conversation already owned by its own daemon, verified by route PID, profile, thread, cwd, and originator over a private owner-only socket; CAC starts no daemon and uses no UI relay |
+| Codex CLI `--no-daemon` or older versions | No | No | Stop-bound: the current turn's end or the next prompt | Default when no owning daemon is present |
+| Codex Native App (managed helper) | Qualified on the listed host | Qualified on the listed host | — | Intel macOS, Codex 0.159.2 in Native app 26.928.21956, trusted hooks available; does not qualify every host version |
+| Codex CLI experimental native queue | Provider-held queue input | No | Waits behind the current turn | Only under explicit `setup --enable-experimental-codex-native-queue`; not active by default |
+| Local Devin CLI/App | No — [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38) open | No | Next prompt or turn end | A conversation joins the peer list after its first prompt |
+| Grokbot 0.66.0 (external endpoint) | One author-reported idle webhook return | Unqualified | — | One owner-enrolled Bot; does not certify another Bot, fresh-user setup, or M2 |
+
+`destination_receiving` in a send result describes the destination's observed
+route mode and mechanism — which of these capabilities apply — never a
+receipt. `reply_delivery` describes the sender's own return path, and
 `TRANSPORT_ACCEPTED` proves custody, not model consumption.
+The experimental Codex route uses `thread/queue/add`, and the managed Native
+helper forwards through the app's `send_message_to_thread`; the Native
+qualification above includes a cross-Mac return to the same active original
+turn.
 After requesting peer work, continue independent work within your task;
 finish when none remains instead of holding a turn open to wait.
 
@@ -136,6 +140,30 @@ value. The external MCP exposes chat_peers, chat_send, and chat_status.
 Scope, request, callback, and revocation details are in the
 [external-client contract](docs/source-map.md#external-client-contract).
 The Mac's CAC broker must be reachable when Grok sends work.
+
+```sh
+GROK_DIR="$HOME/.config/cross-agent-chat/external/grok"
+CAC="$HOME/.local/bin/cross-agent-chat"
+
+# Enroll: writes a new mode-0600 credential file and prints the endpoint_id
+# (it refuses to overwrite an existing path). --device is this Mac's CAC
+# device name; it becomes part of the endpoint alias.
+"$CAC" external enroll --device thismac --name grok \
+  --context "owner Grokbot routine" --credential-file "$GROK_DIR/credential"
+
+# Bind the callback from the private JSON source file (see the contract);
+# this rotates the endpoint generation.
+"$CAC" external configure-callback ENDPOINT_ID \
+  --config-file "$GROK_DIR/callback.json"
+
+# One-shot local-shell client: one JSON request object on standard input.
+"$CAC" external-call --credential-file "$GROK_DIR/credential" <<'JSON'
+{"name":"chat_peers","arguments":{}}
+JSON
+
+# Or serve a stdio MCP client with the same credential file path:
+"$CAC" external-mcp --credential-file "$GROK_DIR/credential"
+```
 
 <details>
 <summary>Custom profiles and installing with an agent</summary>
@@ -174,11 +202,14 @@ Sessions load three tools: `chat_peers` finds recipients, `chat_send` sends
 one message, `chat_status` reads sender-local custody. Plain language works
 instead of invoking them. `chat_peers` accepts an optional `query` that
 narrows the same listing by case-insensitive substring on alias and title —
-a malformed value is refused before any probing — and `chat_send` also
-resolves one peer's exact alias, refusing when it matches zero or several.
-Peer rows may show a descriptive title; a Devin row's is a stable opaque
-session label, not a provider title. Titles are display hints only — an
-exact handle or one uniquely matching full alias still selects.
+a malformed value is refused before any probing — and its `sender` entry
+identifies your authenticated session by alias and exact handle. `chat_send`
+also resolves one peer's exact full alias or, for Codex and external peers,
+one exact provider title — refusing when it matches zero or several, or when
+title metadata is incomplete and cannot establish uniqueness. Peer rows may
+show a descriptive title; a Devin row's is a stable opaque session label, not
+a provider title or selector. An exact handle or uniquely matching full alias
+always selects.
 
 `chat_send` reports `TRANSPORT_ACCEPTED` (custody, not a read receipt — do
 not re-send), a pre-delivery refusal (nothing was handed over; correcting
