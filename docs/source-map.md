@@ -81,10 +81,11 @@ alone proves that an active recipient consumed an envelope.
   endpoint/generation and uses `external_callback.py` to POST to its private
   owner-configured HTTPS destination. HTTP 2xx means callback custody only;
   original-context receiving and model consumption require separate evidence.
-  A bounded scoped repair to `external.py` callback binding publication is
-  pending proof: today the single callback file is replaced before the
-  endpoint record commits; the repair publishes an immutable
-  generation-named file selected by one atomic record commit.
+  Callback bindings publish atomically: `external.py` writes each payload to
+  an immutable `external-callback-{id}-{generation}.json` and one record
+  commit selects destination and generation together; cleanup only removes a
+  copy the committed record provably does not select, and `revoke` commits
+  before deleting any binding file.
 - **Owner image anchor (update continuity):** `runtime.py`
   `_owner_anchor_document` builds the private per-generation sidecar
   `owner-<generation>.json` in the state root at registration, only when the

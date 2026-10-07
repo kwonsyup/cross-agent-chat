@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.2 - 2026-10-06
 
 - Claude Code 2.1.292 adds `recipient_kind` to the normalized SendMessage
   hook input; the pre-tool gate now accepts an absent value or exactly
@@ -18,10 +18,14 @@
   (`turn/steer` with the pinned expected turn) over a private owner-only
   socket; `--no-daemon` launches, older versions, and unqualified routes
   stay Stop-bound. CAC starts no daemon.
+- External callback bindings now publish atomically: each payload is written
+  to an immutable generation-named file and a single endpoint-record commit
+  selects destination and generation together, so a crash during callback
+  reconfiguration can no longer bind an older recipient handle to the new
+  destination. Contained fault-injection coverage; no live-callback claim.
 - SECURITY: removed the stale "no original-context callback qualified"
   sentence — the owner-enrolled Grokbot 0.66.0 idle round trip stands as
-  scoped evidence — and documented the bounded callback-publication repair
-  that is pending proof.
+  scoped evidence.
 
 ## 0.5.1 - 2026-10-05
 
