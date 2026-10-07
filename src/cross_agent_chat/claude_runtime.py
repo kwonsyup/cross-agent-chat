@@ -96,12 +96,20 @@ COURIER_SESSION_DIRECTORY: Final = "cross-agent-chat"
 # delivering unverified content to a real session.
 COURIER_PLACEHOLDER_TARGET: Final = "cross-agent-chat-courier [000000]"
 COURIER_PLACEHOLDER_MESSAGE: Final = "placeholder"
-# The exact normalized key set the provider presents for SendMessage, measured
-# on Claude Code 2.1.274. Both the supplied arguments and any accepted proposal
-# stay inside it.
+# The exact normalized key set the provider presents for SendMessage. Claude
+# Code 2.1.274 measured to/recipient/message/content/type/summary; 2.1.292 adds
+# `recipient_kind`, the discriminator for how `recipient` resolves. Both the
+# supplied arguments and any accepted proposal stay inside the set.
 SENDMESSAGE_TOOL_INPUT_KEYS: Final = frozenset(
-    {"to", "recipient", "message", "content", "type", "summary"}
+    {"to", "recipient", "message", "content", "type", "summary", "recipient_kind"}
 )
+# `recipient_kind` is routing metadata, not inert prose: if a provider ever
+# merged the supplied arguments instead of replacing the proposal wholesale,
+# an unchecked kind would survive onto the authoritative `name [ref]` address
+# and could alter how it resolves. "name" is the only kind measured for that
+# address form (provider-normalized from `to` on Claude Code 2.1.292); any
+# other value is denied rather than carried.
+RECIPIENT_KIND_NAME: Final = "name"
 SUMMARY_REJECT_RE: Final = re.compile(r"[\x00-\x08\x0a-\x0d\x0e-\x1f\x7f-\x9f\u2028\u2029]")
 ClaudeUnknownPhase = Literal[
     "pretool_gate_unobserved",
@@ -391,6 +399,10 @@ def authoritative_tool_input(recipient: str, message: str, summary: str) -> dict
     adds ``type`` before PreToolUse observes the call, so the gate supplies that
     same normalized shape. Every value here comes from the original sender; no
     model contributes to it.
+
+    Claude Code 2.1.292 also derives ``recipient_kind`` from ``to`` during its
+    own normalization. It is deliberately not supplied: older providers keep
+    accepting this exact object, and a newer one re-derives the kind itself.
     """
     return {
         "to": recipient,
@@ -435,7 +447,13 @@ def _pretool_resolution(
     # key set makes that question irrelevant rather than assumed -- it depends on
     # no model-authored content, and it keeps holding across provider upgrades,
     # which a measurement of today's behaviour would not.
-    if not set(cast(dict[str, object], payload["tool_input"])) <= SENDMESSAGE_TOOL_INPUT_KEYS:
+    tool_input = cast(dict[str, object], payload["tool_input"])
+    if not set(tool_input) <= SENDMESSAGE_TOOL_INPUT_KEYS:
+        return "sendmessage_payload_mismatch", None
+    # A proposal `recipient_kind` absent from the supplied arguments must be
+    # the measured kind for the `name [ref]` form; anything else could resolve
+    # the authoritative address differently under a merging provider.
+    if tool_input.get("recipient_kind", RECIPIENT_KIND_NAME) != RECIPIENT_KIND_NAME:
         return "sendmessage_payload_mismatch", None
     # The gate is the authority on delivered content, so it re-applies the
     # product's own bound rather than trusting whoever wrote the expectation.
