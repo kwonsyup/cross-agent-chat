@@ -286,15 +286,18 @@ _SUBAGENT_FINISHED: Final = re.compile(
     rf"^Subagent (?:agent_id=)?({_AGENT_ID}) "
     r"(?:completed|failed|errored|was cancelled|was canceled|cancelled|canceled|was killed)\b"
 )
-_ENTRY_FIELDS: Final = frozenset({"children", "pending", "nesting", "uncertain"})
+_ENTRY_FIELDS: Final = frozenset({"children", "pending", "uncertain"})
 
 
-def _identifiers(value: object) -> list[str]:
-    if not isinstance(value, list) or not all(
-        isinstance(item, str) and 0 < len(item) <= 256 for item in value
+def _launches(value: object) -> dict[str, bool]:
+    """Map each unfinished launch id to whether its profile may nest."""
+
+    if not isinstance(value, dict) or not all(
+        isinstance(key, str) and 0 < len(key) <= 256 and isinstance(item, bool)
+        for key, item in cast(dict[object, object], value).items()
     ):
         raise ChatError("Devin subagent state is invalid")
-    return list(cast(list[str], value))
+    return dict(cast(dict[str, bool], value))
 
 
 class DevinSubagentStore:
@@ -303,17 +306,18 @@ class DevinSubagentStore:
     Devin fires a subagent's tool and Stop hooks with the root conversation's
     session and prompt ids, and hook input carries no actor or depth. While any
     launched subagent is not proven finished, a Stop or an ordinary tool
-    boundary can belong to a subagent. When every launch used a built-in,
-    non-nesting profile, ``run_subagent``/``read_subagent``/``ask_user_question``
-    boundaries are still the root's. Otherwise (a custom profile that may nest,
-    or a launch whose outcome was not observed) the message stays in custody
-    until the root's next prompt. Only a provider-reported terminal state ends a
-    child; elapsed time, a Stop, or a cap never does.
+    boundary can belong to a subagent. While every unfinished launch used a
+    built-in, non-nesting profile, ``run_subagent``/``read_subagent``/
+    ``ask_user_question`` boundaries are still the root's. While a custom
+    profile that may nest is unfinished, or a launch outcome was not observed,
+    the message stays in custody until the root's next prompt. Only a
+    provider-reported terminal state ends a child; elapsed time, a Stop, or a
+    cap never does.
     """
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.path = root / "devin-subagent-lifecycle.json"
+        self.path = root / "devin-subagent-lifecycle.v2.json"
         self.uncertain_root = root / "devin-subagent-uncertain"
 
     def _entries(self) -> dict[str, dict[str, object]]:
@@ -333,15 +337,13 @@ class DevinSubagentStore:
                 or re.fullmatch(r"[0-9a-f]{64}", key) is None
                 or not isinstance(value, dict)
                 or set(value) != _ENTRY_FIELDS
-                or not isinstance(value.get("nesting"), bool)
                 or not isinstance(value.get("uncertain"), bool)
             ):
                 raise ChatError("Devin subagent state is invalid")
             entry = cast(dict[str, object], value)
             entries[key] = {
-                "children": _identifiers(entry["children"]),
-                "pending": _identifiers(entry["pending"]),
-                "nesting": entry["nesting"],
+                "children": _launches(entry["children"]),
+                "pending": _launches(entry["pending"]),
                 "uncertain": entry["uncertain"],
             }
         return entries
@@ -349,11 +351,13 @@ class DevinSubagentStore:
     def _update(
         self,
         session_id: str,
-        change: Callable[[dict[str, object]], None],
+        change: Callable[[dict[str, bool], dict[str, bool]], bool],
         *,
         live_keys: frozenset[str] | None,
         create: bool,
     ) -> None:
+        """Apply ``change(children, pending)``; it returns whether evidence was lost."""
+
         key = session_key("devin", session_id)
         with state_lock(self.root, "devin-subagents"):
             entries = self._entries()
@@ -361,9 +365,12 @@ class DevinSubagentStore:
             if entry is None:
                 if not create:
                     return
-                entry = {"children": [], "pending": [], "nesting": False, "uncertain": False}
-            change(entry)
-            if entry["children"] or entry["pending"] or entry["uncertain"]:
+                entry = {"children": {}, "pending": {}, "uncertain": False}
+            children = cast(dict[str, bool], entry["children"])
+            pending = cast(dict[str, bool], entry["pending"])
+            if change(children, pending):
+                entry["uncertain"] = True
+            if children or pending or entry["uncertain"]:
                 entries[key] = entry
             else:
                 entries.pop(key, None)
@@ -385,7 +392,11 @@ class DevinSubagentStore:
         entry = self._entries().get(key)
         if entry is None:
             return None
-        return "hold" if entry["nesting"] or entry["uncertain"] else "root_tools"
+        children = cast(dict[str, bool], entry["children"])
+        pending = cast(dict[str, bool], entry["pending"])
+        if entry["uncertain"] or any(children.values()) or any(pending.values()):
+            return "hold"
+        return "root_tools"
 
     def launch(
         self,
@@ -395,13 +406,11 @@ class DevinSubagentStore:
         *,
         live_keys: frozenset[str] | None = None,
     ) -> None:
-        def change(entry: dict[str, object]) -> None:
+        def change(_children: dict[str, bool], pending: dict[str, bool]) -> bool:
             if tool_use_id is None:
-                entry["uncertain"] = True
-            else:
-                cast(list[str], entry["pending"]).append(tool_use_id)
-            if profile not in DEVIN_NON_NESTING_PROFILES:
-                entry["nesting"] = True
+                return True
+            pending[tool_use_id] = profile not in DEVIN_NON_NESTING_PROFILES
+            return False
 
         self._update(session_id, change, live_keys=live_keys, create=True)
 
@@ -415,19 +424,15 @@ class DevinSubagentStore:
     ) -> None:
         """Record what Devin reported when one ``run_subagent`` call returned."""
 
-        def change(entry: dict[str, object]) -> None:
-            pending = cast(list[str], entry["pending"])
-            if tool_use_id is not None and tool_use_id in pending:
-                pending.remove(tool_use_id)
-            else:
-                entry["uncertain"] = True
+        def change(children: dict[str, bool], pending: dict[str, bool]) -> bool:
+            observed = tool_use_id is not None and tool_use_id in pending
+            may_nest = pending.pop(tool_use_id, True) if tool_use_id is not None else True
             started = _SUBAGENT_STARTED.search(output)
-            finished = _SUBAGENT_FINISHED.match(output)
             if started is not None:
-                cast(list[str], entry["children"]).append(started.group(1))
-            elif finished is None:
-                # Moved to the background, failed to report, or unrecognized.
-                entry["uncertain"] = True
+                children[started.group(1)] = may_nest
+            # A missed launch, or a child moved to the background without an
+            # id, failed to report, or reported in an unrecognized way.
+            return not observed or (started is None and _SUBAGENT_FINISHED.match(output) is None)
 
         self._update(session_id, change, live_keys=live_keys, create=True)
 
@@ -445,10 +450,9 @@ class DevinSubagentStore:
         if not isinstance(agent_id, str) or finished is None or finished.group(1) != agent_id:
             return
 
-        def change(entry: dict[str, object]) -> None:
-            children = cast(list[str], entry["children"])
-            if agent_id in children:
-                children.remove(agent_id)
+        def change(children: dict[str, bool], _pending: dict[str, bool]) -> bool:
+            children.pop(agent_id, None)
+            return False
 
         self._update(session_id, change, live_keys=live_keys, create=False)
 

@@ -1301,6 +1301,28 @@ def test_nesting_capable_profile_keeps_messages_in_custody_until_the_next_prompt
     assert acknowledged == [[message]]
 
 
+def test_finished_custom_profile_leaves_only_its_built_in_descendant_restricted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A finished custom child cannot nest further; its built-in child cannot read subagents."""
+    session_id = str(uuid4())
+    _queued_devin_route(monkeypatch, tmp_path, [], session_id)
+    hooks = _DevinHooks(monkeypatch, tmp_path, capsys, session_id)
+    nester = {"profile": "nester", "is_background": False, "task": "t", "title": "t"}
+    hooks.pre("run_subagent", nester, "call_n#1")
+    hooks.background("call_c#1", "0bf3a912")
+    assert DevinSubagentStore(tmp_path).custody(session_id) == "hold"
+
+    hooks.post(
+        "run_subagent",
+        "Subagent agent_id=4ff488fb completed successfully:\n\nN",
+        nester,
+        "call_n#1",
+    )
+
+    assert DevinSubagentStore(tmp_path).custody(session_id) == "root_tools"
+
+
 def test_one_finished_child_and_a_send_now_prompt_do_not_release_a_running_sibling(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

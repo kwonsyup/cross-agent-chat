@@ -15,9 +15,12 @@
   - a custom profile (which may enable nesting with `max-nesting`), a launch
     whose outcome was not observed, or a bookkeeping failure keeps the message
     in custody until the root's next prompt;
-  - a child is retired only when Devin reports it finished; a Stop, elapsed
-    time or a cap never releases custody, and a Stop never delivers while a
-    subagent may run;
+  - a child is retired only when Devin reports it finished through
+    `read_subagent` or a foreground return; a Stop, elapsed time, a cap or a
+    completion notification the hooks cannot see never releases custody, and a
+    Stop never delivers while a subagent may run;
+  - a finished custom profile leaves its built-in descendants restricted to
+    root-only boundaries rather than holding everything;
   - state is forgotten only for sessions without a live route.
 - Truthful capability for mixed versions. A receiver affirms the new
   `devin_tool_boundary` delivery mode only when the sender negotiates
