@@ -86,16 +86,23 @@ from cross_agent_chat.core import (
 )
 from cross_agent_chat.devin import (
     DEVIN_CAPABILITY_FIELD,
+    DEVIN_LARGE_HOOK_INPUT_MAX_BYTES,
+    DEVIN_ROOT_ONLY_TOOLS,
+    DEVIN_SUBAGENT_TOOL,
     DevinCapabilityStore,
     DevinCapabilityTool,
     DevinHookEvent,
+    DevinSubagentStore,
+    build_post_tool_callback_payload,
     build_pretool_callback,
     build_stop_callback_payload,
     build_user_prompt_callback_payload,
+    devin_binaries,
     devin_binary,
     devin_profile_root,
     parse_hook_input,
     parse_pretool_input,
+    parse_tool_boundary,
 )
 from cross_agent_chat.external import (
     ExternalEndpoint,
@@ -273,7 +280,7 @@ def recipient_owner_identity(
         raise ChatError("provider process identity is unavailable")
     uid, start_seconds, start_microseconds = _process_identity_facts(pid)
     binary = Path(path_buffer.value.decode()).resolve(strict=True)
-    if provider == "devin" and binary != devin_binary():
+    if provider == "devin" and binary not in devin_binaries():
         raise ChatError("provider process identity is unavailable")
     root = Path(profile_root or recipient_profile_root(provider)).expanduser().resolve(strict=False)
     payload = f"{provider}\0{binary}\0{uid}\0{start_seconds}\0{start_microseconds}\0{root}".encode()
@@ -1593,6 +1600,7 @@ def unregister_devin(pid: int, state_root_value: str | None) -> None:
     event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="SessionEnd")
     root = state_root(state_root_value)
     DevinCapabilityStore(root).revoke_session(event.session_id)
+    DevinSubagentStore(root).clear(event.session_id)
     session_routes = [
         item
         for item in Registry(root).routes()
@@ -1620,7 +1628,18 @@ def devin_pretool(state_root_value: str | None) -> None:
 
     if not presence_is_enabled():
         return
-    event = parse_pretool_input(sys.stdin.read(MAX_FRAME_BYTES + 1))
+    text = sys.stdin.read(DEVIN_LARGE_HOOK_INPUT_MAX_BYTES + 1)
+    boundary = parse_tool_boundary(text)
+    if boundary.tool_name == DEVIN_SUBAGENT_TOOL:
+        # Recording is best effort: a failure must never block the subagent.
+        try:
+            root = state_root(state_root_value)
+            if _devin_route(root, boundary.session_id, os.getppid()) is not None:
+                DevinSubagentStore(root).mark(boundary.session_id)
+        except (ChatError, OSError) as error:
+            print(f"cross-agent-chat: {error}", file=sys.stderr)
+        return
+    event = parse_pretool_input(text)
     prefix = "mcp__cross-agent-chat__"
     if not event.tool_name.startswith(prefix):
         return
@@ -1717,14 +1736,24 @@ def _ack_devin(root: Path, route: Route, messages: list[dict[str, str]]) -> None
 def devin_stop(pid: int, state_root_value: str | None) -> None:
     if not presence_is_enabled():
         return
-    event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="Stop")
+    event = parse_hook_input(
+        sys.stdin.read(DEVIN_LARGE_HOOK_INPUT_MAX_BYTES + 1),
+        expected_event="Stop",
+        max_bytes=DEVIN_LARGE_HOOK_INPUT_MAX_BYTES,
+    )
     root = state_root(state_root_value)
     DevinCapabilityStore(root).revoke_session(event.session_id)
-    if event.stop_hook_active is True:
-        print("{}", flush=True)
-        return
     route = _devin_route(root, event.session_id, pid)
     if route is None or not _route_current(root, route):
+        print("{}", flush=True)
+        return
+    subagents = DevinSubagentStore(root)
+    possible_subagent = subagents.boundary(event.session_id) is not None
+    if possible_subagent:
+        subagents.observe(event.session_id, "stop")
+    if event.stop_hook_active is True or possible_subagent:
+        # A Stop while subagents may run can belong to one of them; a block
+        # would hand the message to that subagent instead of the root.
         print("{}", flush=True)
         return
     messages = _devin_messages(root, route)
@@ -1740,7 +1769,11 @@ def devin_stop(pid: int, state_root_value: str | None) -> None:
 def devin_user_prompt(pid: int, state_root_value: str | None, device: str | None = None) -> None:
     if not presence_is_enabled():
         return
-    event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="UserPromptSubmit")
+    event = parse_hook_input(
+        sys.stdin.read(DEVIN_LARGE_HOOK_INPUT_MAX_BYTES + 1),
+        expected_event="UserPromptSubmit",
+        max_bytes=DEVIN_LARGE_HOOK_INPUT_MAX_BYTES,
+    )
     root = state_root(state_root_value)
     route = (
         _devin_route(root, event.session_id, pid)
@@ -1750,11 +1783,40 @@ def devin_user_prompt(pid: int, state_root_value: str | None, device: str | None
     DevinCapabilityStore(root).revoke_session(event.session_id)
     if route is None or not _route_current(root, route):
         return
+    subagents = DevinSubagentStore(root)
+    if subagents.boundary(event.session_id) == "stop":
+        subagents.clear(event.session_id)
     messages = _devin_messages(root, route)
     if not messages:
         return
     selected = messages[0]
     payload = build_user_prompt_callback_payload(selected["message"])
+    _ack_devin(root, route, [selected])
+    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
+
+
+def devin_post_tool(pid: int, state_root_value: str | None) -> None:
+    """Hand one queued message to Devin's root conversation between tool calls."""
+
+    if not presence_is_enabled():
+        return
+    boundary = parse_tool_boundary(sys.stdin.read(DEVIN_LARGE_HOOK_INPUT_MAX_BYTES + 1))
+    if boundary.hook_event_name != "PostToolUse":
+        raise ChatError("Devin hook event does not match the expected event")
+    root = state_root(state_root_value)
+    route = _devin_route(root, boundary.session_id, pid)
+    if route is None or not _route_current(root, route):
+        return
+    subagents = DevinSubagentStore(root)
+    if subagents.boundary(boundary.session_id) is not None:
+        subagents.observe(boundary.session_id, "tool")
+        if boundary.tool_name not in DEVIN_ROOT_ONLY_TOOLS:
+            return
+    messages = _devin_messages(root, route)
+    if not messages:
+        return
+    selected = messages[0]
+    payload = build_post_tool_callback_payload(selected["event_id"], selected["message"])
     _ack_devin(root, route, [selected])
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
 
@@ -3270,22 +3332,25 @@ def destination_receiving(target: Target | None) -> dict[str, object]:
     promises; a health response alone does not provide that proof. The owning
     daemon 0.160.1 path is separately qualified for parked queue wake and
     expected-active-turn steer; qualification still is not an event receipt.
+    A local Devin route hands a message to its root conversation at the next
+    tool boundary of an active turn, but cannot wake an idle conversation.
     """
     mode = target.delivery_mode if target is not None else None
     mechanism = target.delivery_mechanism if target is not None else None
-    deferred = mode in {"codex_stop_bound", "devin_stop_or_prompt_bound"}
+    owning_daemon = mode == "codex_daemon_input" and mechanism == "owning_daemon"
+    devin = mode == "devin_stop_or_prompt_bound"
     return {
         "mode": mode or "unknown",
         "mechanism": mechanism or "unknown",
         "parked_wake": True
-        if mode == "codex_daemon_input" and mechanism == "owning_daemon"
+        if owning_daemon
         else False
-        if deferred
+        if devin or mode == "codex_stop_bound"
         else "unknown",
         "active_turn_input": True
-        if mode == "codex_daemon_input" and mechanism == "owning_daemon"
+        if owning_daemon or devin
         else False
-        if deferred
+        if mode == "codex_stop_bound"
         else "unknown",
         "delivery_observation": "not_observed",
     }
@@ -4451,9 +4516,11 @@ def reply_delivery(root: Path, source: SourceIdentity) -> ReplyDelivery:
     """Say how an answer sent to this authenticated source session reaches it.
 
     Claude and a queued Codex route receive a new message while idle. A Stop-bound
-    Codex route or a Devin route is handed a queued message only at its next turn
-    boundary: the end of the current turn if it has already arrived, otherwise the
-    user's next prompt. An unreachable, busy, or unrecognized courier reports unknown.
+    Codex route is handed a queued message only at its next turn boundary: the end
+    of the current turn if it has already arrived, otherwise the user's next prompt.
+    A Devin route also receives it at the next tool boundary of an active turn, but
+    an idle Devin conversation waits for the user's next prompt. An unreachable,
+    busy, or unrecognized courier reports unknown.
     Callers ask before sending: a slow or failing check must never turn an accepted
     send into an apparent failure that invites a resend.
     """

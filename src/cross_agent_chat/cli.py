@@ -34,6 +34,7 @@ from cross_agent_chat.runtime import (
     authenticate_mcp_sender,
     codex_stop,
     courier_server,
+    devin_post_tool,
     devin_pretool,
     devin_stop,
     devin_user_prompt,
@@ -226,6 +227,8 @@ def _doctor_installer(device: str | None) -> Installer | None:
 
 
 _PROVIDER_NAMES: Final = {"claude": "Claude Code", "codex": "Codex", "devin": "Devin"}
+# Devin treats hook exit code 2 as a block; these hooks must never deny the action.
+NON_BLOCKING_HOOK_COMMANDS: Final = frozenset({"_devin-prompt", "_devin-posttool", "_devin-stop"})
 _SESSION_PROVIDERS: Final = frozenset({"claude", "codex"})
 
 
@@ -915,6 +918,9 @@ def parser() -> argparse.ArgumentParser:
     devin_prompt_parser.add_argument("--state-root")
     devin_pretool_parser = commands.add_parser("_devin-pretool")
     devin_pretool_parser.add_argument("--state-root")
+    devin_posttool_parser = commands.add_parser("_devin-posttool")
+    devin_posttool_parser.add_argument("--pid", type=int, required=True)
+    devin_posttool_parser.add_argument("--state-root")
     courier = commands.add_parser("_courier")
     courier.add_argument("--provider", choices=("claude", "codex", "devin"), required=True)
     courier.add_argument("--state-root", required=True)
@@ -1162,6 +1168,8 @@ def run(arguments: argparse.Namespace) -> int:
         devin_user_prompt(arguments.pid, arguments.state_root, arguments.device)
     elif command == "_devin-pretool":
         devin_pretool(arguments.state_root)
+    elif command == "_devin-posttool":
+        devin_post_tool(arguments.pid, arguments.state_root)
     elif command == "_courier":
         courier_server(
             provider=arguments.provider,
@@ -1243,13 +1251,13 @@ def main(argv: list[str] | None = None) -> int:
         return run(arguments)
     except (ChatError, OSError) as error:
         print(f"cross-agent-chat: {error}", file=sys.stderr)
-        return 1 if arguments.command == "_devin-prompt" else 2
+        return 1 if arguments.command in NON_BLOCKING_HOOK_COMMANDS else 2
     except Exception as error:
         install = sys.modules.get("cross_agent_chat.install")
         if install is None or not isinstance(error, install.SettingsError):
             raise
         print(f"cross-agent-chat: {error}", file=sys.stderr)
-        return 1 if arguments.command == "_devin-prompt" else 2
+        return 1 if arguments.command in NON_BLOCKING_HOOK_COMMANDS else 2
 
 
 if __name__ == "__main__":

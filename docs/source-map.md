@@ -18,7 +18,9 @@ chat_peers / chat_send / chat_status    (MCP stdio: mcp_server.py session +
                                          re-attestation)
   → local courier or remote broker      (runtime.py → tailnet_broker.py)
   → recipient-local delivery            (claude_runtime.py, codex.py,
-                                         native_helper.py, devin.py)
+                                         native_helper.py, devin.py;
+                                         Devin: _devin-posttool between tool
+                                         calls, _devin-stop, _devin-prompt)
 
 external-call / external-mcp             (cli.py one-shot/stdio entrypoints)
   → owner-enrolled credential            (external.py; separate private state)
@@ -49,7 +51,7 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 | `codex.py` | Codex CLI process-memory courier and Stop-bound handoff, stdio app-server metadata and experimental queue operations. |
 | `codex_daemon.py` | Owning-daemon ingress for `codex-tui` 0.160.1 originals: a private owner-only Unix WebSocket admitted by route-owner PID with exact profile, thread, cwd, and originator checks; `thread/queue/add` wakes a parked original and `turn/steer` with a pinned `expectedTurnId` inputs the expected active turn. CAC starts no daemon, resumes no thread, changes no permission, and never retries an uncertain effect; missing or unqualified routes stay Stop-bound. |
 | `native_helper.py` | Shared provider hook recipes/defaults and the private, body-free binding between original Codex conversations and managed native helpers. |
-| `devin.py` | Devin lifecycle-hook parsing and the filesystem-backed single-use capability store (`atomic_json` + `state_lock`). |
+| `devin.py` | Devin lifecycle-hook parsing, the filesystem-backed single-use capability store, and the content-free subagent marker that limits Stop/PostToolUse delivery to root-only boundaries while a subagent may run (`atomic_json` + `state_lock`). |
 | `install.py` | Provider selection (`resolve_providers`), selected-root resolution, read-only `SetupPlan`, config payload preparation, whole-file backups, guarded transactions/rollback, LaunchAgent lifecycle, schema-5 install metadata, uninstall/restore. Largest file; most of its size is the ownership/rollback matrix. |
 
 Native eligibility is checked in `runtime.py`: `_native_desktop_client`
