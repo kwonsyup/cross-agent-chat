@@ -92,6 +92,7 @@ from cross_agent_chat.devin import (
     build_pretool_callback,
     build_stop_callback_payload,
     build_user_prompt_callback_payload,
+    devin_binaries,
     devin_binary,
     devin_profile_root,
     parse_hook_input,
@@ -273,7 +274,7 @@ def recipient_owner_identity(
         raise ChatError("provider process identity is unavailable")
     uid, start_seconds, start_microseconds = _process_identity_facts(pid)
     binary = Path(path_buffer.value.decode()).resolve(strict=True)
-    if provider == "devin" and binary != devin_binary():
+    if provider == "devin" and binary not in devin_binaries():
         raise ChatError("provider process identity is unavailable")
     root = Path(profile_root or recipient_profile_root(provider)).expanduser().resolve(strict=False)
     payload = f"{provider}\0{binary}\0{uid}\0{start_seconds}\0{start_microseconds}\0{root}".encode()

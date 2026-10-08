@@ -57,20 +57,34 @@ DEVIN_PRETOOL_OUTPUT_MAX_BYTES: Final = 64 * 1024
 DevinCapabilityTool = Literal["chat_peers", "chat_send", "chat_status"]
 
 
-def devin_binary() -> Path:
-    """Resolve the installed local Devin CLI used by both local surfaces."""
+def devin_binaries() -> tuple[Path, ...]:
+    """Resolve every installed local Devin CLI used by both local surfaces."""
 
     candidates = (DEVIN_APP_BINARY, Path(shutil.which("devin") or ""))
+    resolved: list[Path] = []
     for candidate in candidates:
         if not str(candidate):
             continue
         try:
-            resolved = candidate.expanduser().resolve(strict=True)
+            binary = candidate.expanduser().resolve(strict=True)
         except OSError:
             continue
-        if resolved.is_file() and os.access(resolved, os.X_OK) and resolved.name == "devin":
-            return resolved
-    raise ChatError("Devin CLI is unavailable")
+        if (
+            binary.is_file()
+            and os.access(binary, os.X_OK)
+            and binary.name == "devin"
+            and binary not in resolved
+        ):
+            resolved.append(binary)
+    if not resolved:
+        raise ChatError("Devin CLI is unavailable")
+    return tuple(resolved)
+
+
+def devin_binary() -> Path:
+    """Resolve the preferred installed local Devin CLI used by both local surfaces."""
+
+    return devin_binaries()[0]
 
 
 def devin_profile_root(home: Path | None = None) -> Path:

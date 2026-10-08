@@ -23,7 +23,7 @@ from uuid import uuid4
 
 import pytest
 
-from cross_agent_chat import claude_runtime, runtime
+from cross_agent_chat import claude_runtime, devin, runtime
 from cross_agent_chat.core import (
     ChatError,
     IntentStore,
@@ -531,7 +531,7 @@ def test_devin_prompt_registration_anchors_and_reuses_after_update(
     cwd = tmp_path / "project"
     cwd.mkdir()
     monkeypatch.setenv("DEVIN_PROJECT_DIR", str(cwd))
-    monkeypatch.setattr(runtime, "devin_binary", lambda: binary.resolve(strict=True))
+    monkeypatch.setattr(runtime, "devin_binaries", lambda: (binary.resolve(strict=True),))
     monkeypatch.setattr(runtime, "_spawn_courier", lambda *_args: None)
     session_id = "devin-session-1"
     event = DevinHookEvent(
@@ -553,6 +553,27 @@ def test_devin_prompt_registration_anchors_and_reuses_after_update(
     finally:
         process.kill()
         process.wait()
+
+
+def test_devin_identity_accepts_each_installed_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compiled: dict[str, Path]
+) -> None:
+    app = _install(compiled["sleeper"], tmp_path / "app").rename(tmp_path / "app" / "devin")
+    cli = _install(compiled["sleeper"], tmp_path / "cli").rename(tmp_path / "cli" / "devin")
+    monkeypatch.setattr(devin, "DEVIN_APP_BINARY", app)
+    monkeypatch.setattr(shutil, "which", lambda _name: str(cli))
+    accepted = _spawn(cli)
+    foreign = _spawn(_install(compiled["sleeper"], tmp_path / "other"))
+    try:
+        _, binary = runtime.recipient_owner_identity("devin", accepted.pid)
+        assert binary == cli.resolve(strict=True)
+        with pytest.raises(ChatError, match="provider process identity is unavailable"):
+            runtime.recipient_owner_identity("devin", foreign.pid)
+    finally:
+        accepted.kill()
+        accepted.wait()
+        foreign.kill()
+        foreign.wait()
 
 
 def test_courier_owner_binary_falls_back_only_for_anchored_routes(
