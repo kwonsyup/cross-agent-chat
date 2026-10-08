@@ -98,6 +98,7 @@ def test_non_registration_hooks_keep_their_timeouts() -> None:
         ("devin", "SessionEnd", 3),
         ("devin", "Stop", 3),
         ("devin", "PreToolUse", 5),
+        ("devin", "PostToolUse", 5),
     ):
         group = _hook_group(executable, provider, "studio", event)
         hook = cast(dict[str, object], cast(list[object], group["hooks"])[0])
@@ -379,6 +380,30 @@ def test_devin_prompt_cli_accepts_cached_hook_without_device(
     assert observed == [(123, None, expected_device)]
 
 
+@pytest.mark.parametrize(
+    ("command", "handler"),
+    [("_devin-posttool", "devin_post_tool"), ("_devin-stop", "devin_stop")],
+)
+def test_devin_tool_and_stop_hook_errors_never_block_the_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    handler: str,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        handler,
+        lambda *_args: (_ for _ in ()).throw(ChatError("Devin courier response is invalid")),
+    )
+
+    # Devin treats exit code 2 as a block of the tool call or Stop.
+    assert cli.main([command, "--pid", "123"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Devin courier response is invalid" in captured.err
+
+
 def test_devin_prompt_cli_error_is_nonblocking_without_route_or_output(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -491,9 +516,37 @@ def test_devin_global_hooks_and_user_mcp_are_owned_and_preserved(
     hooks_after = json.loads(installer.devin_hooks.read_text())["hooks"]
     assert all(
         event not in hooks_after
-        for event in ("SessionEnd", "Stop", "UserPromptSubmit", "PreToolUse")
+        for event in ("SessionEnd", "Stop", "UserPromptSubmit", "PreToolUse", "PostToolUse")
     )
     assert set(json.loads(installer.devin_mcp.read_text())["mcpServers"]) == {"keep"}
+
+
+def test_devin_setup_installs_tool_boundary_hooks_and_doctor_requires_them(
+    tmp_path: Path,
+) -> None:
+    executable = Path("/opt/cross-agent-chat")
+    installer = Installer(
+        home=tmp_path / "home", executable=executable, device="studio", devin_global=True
+    )
+    installer.setup(verify=lambda: True)
+    assert installer.devin_hooks is not None
+    document = json.loads(installer.devin_hooks.read_text())
+    hooks = document["hooks"]
+
+    pre = [item for item in hooks["PreToolUse"] if _owned_hook(item)]
+    assert [item["matcher"] for item in pre] == [
+        "^(mcp__cross-agent-chat__(chat_peers|chat_send|chat_status)|run_subagent)$"
+    ]
+    post = [item for item in hooks["PostToolUse"] if _owned_hook(item)]
+    assert post == [_hook_group(executable, "devin", "studio", "PostToolUse")]
+    assert "matcher" not in post[0]
+    assert post[0]["hooks"][0]["command"] == '/opt/cross-agent-chat _devin-posttool --pid "$PPID"'
+    assert installer.verify_configuration()
+
+    # A pre-upgrade installation without the PostToolUse hook needs setup again.
+    hooks["PostToolUse"] = [item for item in hooks["PostToolUse"] if not _owned_hook(item)]
+    installer.devin_hooks.write_text(json.dumps(document))
+    assert not installer.verify_configuration()
 
 
 def test_bare_doctor_uses_the_unique_installed_device_identity(

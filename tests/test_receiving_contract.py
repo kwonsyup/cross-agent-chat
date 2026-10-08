@@ -362,3 +362,22 @@ def test_title_metadata_failure_preserves_exact_alias_selection(
     with pytest.raises(ChatError, match="title metadata is incomplete"):
         runtime.send(root, source, "Review task", "must not guess")
     assert effects == [selected]
+
+
+def test_devin_route_reports_active_turn_input_without_parked_wake() -> None:
+    """Devin receives at the next root tool boundary but cannot wake while idle."""
+    target = runtime.Target(
+        alias="devin@test:task",
+        provider="devin",
+        device="test",
+        project="task",
+        generation=str(uuid4()),
+        session_key="a" * 64,
+        remote=False,
+        delivery_mode="devin_stop_or_prompt_bound",
+        delivery_mechanism="devin_prompt_bound",
+    )
+    receiving = runtime.destination_receiving(target)
+    assert receiving["parked_wake"] is False
+    assert receiving["active_turn_input"] is True
+    assert receiving["delivery_observation"] == "not_observed"

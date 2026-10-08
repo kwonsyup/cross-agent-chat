@@ -70,6 +70,18 @@ OWNED_TOML_RE: Final = re.compile(
     rf"\n?{re.escape(OWNED_TOML_START)}.*?{re.escape(OWNED_TOML_END)}\n?", re.DOTALL
 )
 SUPPORTED_PROVIDERS: Final = ("claude", "codex", "devin")
+DEVIN_HOOK_EVENTS: Final = (
+    "SessionStart",
+    "SessionEnd",
+    "Stop",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+)
+# The PreToolUse hook binds CAC tool calls and records subagent launches.
+DEVIN_PRETOOL_MATCHER: Final = (
+    "^(mcp__cross-agent-chat__(chat_peers|chat_send|chat_status)|run_subagent)$"
+)
 REGISTRATION_HOOK_TIMEOUT_SECONDS: Final = 30
 _PROVIDER_PATH_NAMES: Final[dict[str, tuple[str, ...]]] = {
     "claude": ("claude_settings", "claude_config"),
@@ -626,6 +638,8 @@ def _hook_command(
         return f'{binary} _devin-prompt --device {shlex.quote(device)} --pid "$PPID"'
     if provider == "devin" and event == "PreToolUse":
         return f"{binary} _devin-pretool"
+    if provider == "devin" and event == "PostToolUse":
+        return f'{binary} _devin-posttool --pid "$PPID"'
     raise SettingsError("unsupported provider hook")
 
 
@@ -674,6 +688,7 @@ def _owned_hook(value: object) -> bool:
             "_devin-stop",
             "_devin-prompt",
             "_devin-pretool",
+            "_devin-posttool",
             "_native-startup",
         }
     )
@@ -734,7 +749,7 @@ def _hook_group(
         ]
     }
     if provider == "devin" and event == "PreToolUse":
-        group["matcher"] = "^mcp__cross-agent-chat__(chat_peers|chat_send|chat_status)$"
+        group["matcher"] = DEVIN_PRETOOL_MATCHER
     return group
 
 
@@ -1929,13 +1944,7 @@ class Installer:
                 devin_hooks = cast(dict[str, object], raw_hooks)
             else:
                 raise SettingsError("Devin hooks must be an object")
-            for event in (
-                "SessionStart",
-                "SessionEnd",
-                "Stop",
-                "UserPromptSubmit",
-                "PreToolUse",
-            ):
+            for event in DEVIN_HOOK_EVENTS:
                 _merge_devin_hook(
                     devin_hooks,
                     event,
@@ -2911,13 +2920,7 @@ class Installer:
                 if not isinstance(raw_hooks, dict):
                     return False
                 devin_hooks = cast(dict[str, object], raw_hooks)
-                for event in (
-                    "SessionStart",
-                    "SessionEnd",
-                    "Stop",
-                    "UserPromptSubmit",
-                    "PreToolUse",
-                ):
+                for event in DEVIN_HOOK_EVENTS:
                     groups = devin_hooks.get(event)
                     if not isinstance(groups, list) or [
                         item for item in groups if _owned_hook(item)

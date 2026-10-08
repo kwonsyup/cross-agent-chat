@@ -26,6 +26,7 @@ from cross_agent_chat.core import (
     atomic_json,
     bounded_message,
     require_private_file,
+    session_key,
     state_lock,
     valid_session_id,
     valid_uuid,
@@ -54,6 +55,13 @@ DEVIN_CAPABILITY_MAX_ACTIVE: Final = 64
 DEVIN_CAPABILITY_TTL_SECONDS: Final = 120.0
 DEVIN_PRETOOL_INPUT_MAX_BYTES: Final = 64 * 1024
 DEVIN_PRETOOL_OUTPUT_MAX_BYTES: Final = 64 * 1024
+# Tool, Stop and prompt hooks carry tool responses, final messages or pasted
+# prompts; only identity fields are read from them.
+DEVIN_LARGE_HOOK_INPUT_MAX_BYTES: Final = 16 * 1024 * 1024
+# Devin withholds these tools from subagents by default, so their hook events
+# come from the root conversation even while subagents share its session id.
+DEVIN_ROOT_ONLY_TOOLS: Final = frozenset({"run_subagent", "read_subagent", "ask_user_question"})
+DEVIN_SUBAGENT_TOOL: Final = "run_subagent"
 DevinCapabilityTool = Literal["chat_peers", "chat_send", "chat_status"]
 
 
@@ -264,6 +272,91 @@ class DevinCapabilityStore:
                 atomic_json(self.path, [item.to_dict() for item in retained])
 
 
+DevinSubagentBoundary = Literal["tool", "stop"]
+DEVIN_SUBAGENT_STATE_MAX_ENTRIES: Final = 256
+DEVIN_SUBAGENT_STATE_TTL_SECONDS: Final = 7 * 24 * 60 * 60.0
+
+
+class DevinSubagentStore:
+    """Content-free marker for sessions whose subagents may still be running.
+
+    Devin fires a subagent's PostToolUse and Stop hooks with the root
+    conversation's session and prompt ids. While a marker exists, delivery is
+    limited to boundaries only the root conversation can produce. A marker is
+    cleared when a new user prompt follows a Stop with no later tool event: a
+    turn with a running background subagent stays active, so such a prompt
+    starts after every subagent has finished.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.path = root / "devin-subagents.json"
+
+    def _entries(self) -> dict[str, dict[str, object]]:
+        if not self.path.exists():
+            return {}
+        require_private_file(self.path)
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ChatError("Devin subagent state is invalid") from error
+        if not isinstance(raw, dict):
+            raise ChatError("Devin subagent state is invalid")
+        entries: dict[str, dict[str, object]] = {}
+        for key, value in cast(dict[object, object], raw).items():
+            if (
+                not isinstance(key, str)
+                or len(key) != 64
+                or not isinstance(value, dict)
+                or set(value) != {"boundary", "marked_at"}
+                or value.get("boundary") not in {"tool", "stop"}
+                or not isinstance(value.get("marked_at"), (int, float))
+                or isinstance(value.get("marked_at"), bool)
+                or not math.isfinite(cast(float, value.get("marked_at")))
+            ):
+                raise ChatError("Devin subagent state is invalid")
+            entries[key] = cast(dict[str, object], value)
+        return entries
+
+    def _write(self, entries: dict[str, dict[str, object]]) -> None:
+        now = time.time()
+        fresh = {
+            key: value
+            for key, value in entries.items()
+            if 0 <= now - cast(float, value["marked_at"]) <= DEVIN_SUBAGENT_STATE_TTL_SECONDS
+        }
+        newest = sorted(fresh.items(), key=lambda item: cast(float, item[1]["marked_at"]))
+        atomic_json(self.path, dict(newest[-DEVIN_SUBAGENT_STATE_MAX_ENTRIES:]))
+
+    def boundary(self, session_id: str) -> DevinSubagentBoundary | None:
+        entry = self._entries().get(session_key("devin", session_id))
+        return None if entry is None else cast(DevinSubagentBoundary, entry["boundary"])
+
+    def mark(self, session_id: str) -> None:
+        key = session_key("devin", session_id)
+        with state_lock(self.root, "devin-subagents"):
+            entries = self._entries()
+            entries[key] = {"boundary": "tool", "marked_at": time.time()}
+            self._write(entries)
+
+    def observe(self, session_id: str, boundary: DevinSubagentBoundary) -> None:
+        key = session_key("devin", session_id)
+        with state_lock(self.root, "devin-subagents"):
+            entries = self._entries()
+            entry = entries.get(key)
+            if entry is None or entry["boundary"] == boundary:
+                return
+            entries[key] = {"boundary": boundary, "marked_at": entry["marked_at"]}
+            self._write(entries)
+
+    def clear(self, session_id: str) -> None:
+        key = session_key("devin", session_id)
+        with state_lock(self.root, "devin-subagents"):
+            entries = self._entries()
+            if entries.pop(key, None) is not None:
+                self._write(entries)
+
+
 # ``bounded_message`` in the shared core reserves this encoded JSON budget for
 # a message.  Keep the same budget here before adding the callback envelope.
 _ENCODED_MESSAGE_MAX_BYTES: Final = 2 * MAX_MESSAGE_BYTES + 2
@@ -423,6 +516,33 @@ def parse_pretool_input(text: str) -> DevinPreToolEvent:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class DevinToolBoundary:
+    """Identity fields of one PreToolUse or PostToolUse event; never its content."""
+
+    hook_event_name: DevinHookName
+    session_id: str
+    prompt_id: str | None
+    tool_name: str
+
+
+def parse_tool_boundary(text: str) -> DevinToolBoundary:
+    """Read only identity fields from a possibly large tool hook payload."""
+
+    event = parse_hook_input(text, max_bytes=DEVIN_LARGE_HOOK_INPUT_MAX_BYTES)
+    if event.hook_event_name not in {"PreToolUse", "PostToolUse"}:
+        raise ChatError("Devin hook event does not match the expected event")
+    tool_name = _as_string_mapping(json.loads(text)).get("tool_name")
+    if not isinstance(tool_name, str) or not tool_name:
+        raise ChatError("Devin tool hook input is invalid")
+    return DevinToolBoundary(
+        hook_event_name=event.hook_event_name,
+        session_id=event.session_id,
+        prompt_id=event.prompt_id,
+        tool_name=tool_name,
+    )
+
+
 def build_pretool_callback(event: DevinPreToolEvent, token: str) -> dict[str, object]:
     if len(token) != 64 or any(character not in "0123456789abcdef" for character in token):
         raise ChatError("Devin sender capability is invalid")
@@ -524,4 +644,39 @@ def build_user_prompt_callback_payload(source_text: str) -> dict[str, object]:
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(encoded) > DEVIN_STOP_CALLBACK_MAX_BYTES:
         raise ChatError("Devin UserPromptSubmit callback exceeds the bounded limit")
+    return payload
+
+
+def _post_tool_payload(event_id: str, message: str) -> dict[str, object]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": _stop_reason(event_id, message),
+        }
+    }
+
+
+def _post_tool_byte_budget(event_id: str) -> int:
+    sample_source = "x"
+    sample_source_encoded = json.dumps(
+        sample_source, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    empty_payload = json.dumps(
+        _post_tool_payload(event_id, sample_source), ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return _ENCODED_MESSAGE_MAX_BYTES + len(empty_payload) - len(sample_source_encoded)
+
+
+def build_post_tool_callback_payload(event_id: str, source_text: str) -> dict[str, object]:
+    """Build one bounded PostToolUse context injection with exact source text.
+
+    Devin documents ``additionalContext`` for PostToolUse, which reaches the
+    conversation at its next model step without interrupting the turn.
+    """
+
+    identifier = valid_uuid(event_id, "event id")
+    payload = _post_tool_payload(identifier, bounded_message(source_text))
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > _post_tool_byte_budget(identifier):
+        raise ChatError("Devin PostToolUse callback exceeds the bounded limit")
     return payload

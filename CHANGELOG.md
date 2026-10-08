@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- Local Devin gains active-turn input: a new owned `PostToolUse` hook hands
+  one queued message to the root conversation after each tool call through
+  Devin's documented `additionalContext`, without interrupting the turn. An
+  idle Devin conversation still receives at its next prompt (#38 stays open).
+- Devin fires a subagent's tool and Stop hooks with the root conversation's
+  session id. The `PreToolUse` hook now also records `run_subagent`
+  launches in content-free private state; while a subagent may be running,
+  delivery waits for a root-only boundary (`run_subagent`, `read_subagent`,
+  `ask_user_question`) and no longer blocks a Stop that may be a subagent's.
+- A Devin session run by a separately installed CLI (for example Homebrew)
+  as well as the Desktop-bundled CLI is accepted as a Devin process identity.
+- Devin Stop, prompt and tool hooks accept provider payloads above 64 KiB
+  (long final answers, pasted prompts, tool output) and read only identity
+  fields from them. Errors in the Devin Stop and tool hooks exit 1, so they
+  can never be read as a block.
+- Wire values are unchanged (`devin_stop_or_prompt_bound`,
+  `devin_prompt_bound`) so mixed-version peers keep discovering each other;
+  `destination_receiving` for a Devin route now reports active-turn input.
+  Existing installations need `cross-agent-chat setup` to add the new hook.
+
 ## 0.5.2 - 2026-10-06
 
 - Claude Code 2.1.292 adds `recipient_kind` to the normalized SendMessage
