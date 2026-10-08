@@ -90,7 +90,7 @@ harness and mode:
 | Coding surface on macOS | Parked/idle wake | Active-turn input | Deferred behavior | Qualification |
 |---|---|---|---|---|
 | Claude Code | Qualified idle wake and new-turn input | Between tool calls; a running tool is not interrupted | — | Supported desktop-launched contexts; a session inside a remote SSH shell registered but could not receive |
-| Codex CLI 0.160.1 (owning app-server daemon) | Queued input wakes the parked original | Direct input reaches the expected active turn | — | Only a `codex-tui` 0.160.1 conversation already owned by its own daemon, verified by route PID, profile, thread, cwd, and originator over a private owner-only socket; CAC starts no daemon and uses no UI relay |
+| Codex CLI 0.160.1 / 0.162.0 (owning app-server daemon) | Queued input wakes the parked original | Direct input reaches the expected active turn | — | Only a `codex-tui` 0.160.1 or 0.162.0 conversation already owned by its own daemon, verified by route PID, profile, thread, cwd, and originator over a private owner-only socket; CAC starts no daemon and uses no UI relay |
 | Codex CLI `--no-daemon` or any unqualified version (older or newer) | No | No | Stop-bound: the current turn's end or the next prompt | Default when no owning daemon is present |
 | Codex Native App (managed helper) | Qualified on the listed host | Qualified on the listed host | — | Intel macOS, Codex 0.159.2 in Native app 26.928.21956, trusted hooks available; does not qualify every host version |
 | Codex CLI experimental native queue | Provider-held queue input | No | Waits behind the current turn | Only under explicit `setup --enable-experimental-codex-native-queue`; not active by default |

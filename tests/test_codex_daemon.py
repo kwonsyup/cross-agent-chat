@@ -300,8 +300,9 @@ def test_new_ingress_mode_is_negotiated_and_old_health_consumers_keep_their_shap
         )
 
 
+@pytest.mark.parametrize("version", ["0.160.1", "0.162.0"])
 def test_default_qualification_does_not_start_a_daemon(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
     with provider(tmp_path) as (ingress, calls, _):
         commands: list[list[str]] = []
@@ -316,7 +317,7 @@ def test_default_qualification_does_not_start_a_daemon(
                 json.dumps(
                     {
                         "status": "running",
-                        "appServerVersion": "0.160.1",
+                        "appServerVersion": version,
                         "socketPath": str(ingress.endpoint),
                     }
                 ),
@@ -328,6 +329,33 @@ def test_default_qualification_does_not_start_a_daemon(
         assert selected is not None
         assert commands == [["/bound/codex", "app-server", "daemon", "version"]]
         assert all(c["method"] in {"initialize", "initialized", "thread/read"} for c in calls)
+
+
+@pytest.mark.parametrize("version", ["0.161.0", "0.163.0", None, ["0.162.0"]])
+def test_unqualified_daemon_version_refuses_without_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: object
+) -> None:
+    with provider(tmp_path) as (ingress, calls, _):
+        import subprocess
+
+        monkeypatch.setattr(
+            codex_daemon.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args[0],
+                0,
+                json.dumps(
+                    {
+                        "status": "running",
+                        "appServerVersion": version,
+                        "socketPath": str(ingress.endpoint),
+                    }
+                ),
+                "",
+            ),
+        )
+        assert codex_daemon.discover_daemon_ingress(Path("/bound/codex"), {}, ingress.route) is None
+        assert calls == []
 
 
 def test_negotiated_daemon_roster_reaches_sender_capabilities_and_legacy_parser_stays_usable(

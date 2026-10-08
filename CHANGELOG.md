@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Qualify Codex CLI 0.162.0 owning-daemon input alongside 0.160.1, preserving exact owner/profile/thread checks and no replay after uncertain effects. Other versions remain Stop-bound. Existing couriers retain their loaded code and accepted in-memory queues across installation; do not restart them to activate this change.
+
 ## 0.5.3 - 2026-10-08
 
 - Local Devin gains active-turn input: a new owned `PostToolUse` hook hands
