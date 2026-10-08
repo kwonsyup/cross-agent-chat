@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
@@ -87,6 +87,7 @@ from cross_agent_chat.core import (
 from cross_agent_chat.devin import (
     DEVIN_CAPABILITY_FIELD,
     DEVIN_LARGE_HOOK_INPUT_MAX_BYTES,
+    DEVIN_READ_SUBAGENT_TOOL,
     DEVIN_ROOT_ONLY_TOOLS,
     DEVIN_SUBAGENT_TOOL,
     DevinCapabilityStore,
@@ -220,6 +221,7 @@ DeliveryMode = Literal[
     "codex_experimental_queue",
     "codex_daemon_input",
     "devin_stop_or_prompt_bound",
+    "devin_tool_boundary",
 ]
 DeliveryMechanism = Literal[
     "claude_native",
@@ -228,11 +230,13 @@ DeliveryMechanism = Literal[
     "owning_daemon",
     "stop_bound",
     "devin_prompt_bound",
+    "devin_tool_boundary",
 ]
 DELIVERY_MECHANISMS: Final = frozenset(
     {
         "claude_native",
         "devin_prompt_bound",
+        "devin_tool_boundary",
         "direct_queue",
         "native_helper",
         "stop_bound",
@@ -680,6 +684,7 @@ class Target:
         handle: str | None = None,
         include_title: bool = True,
         include_owning_daemon: bool = False,
+        include_devin_tool_boundary: bool = False,
     ) -> dict[str, str]:
         result = {
             "alias": self.alias,
@@ -697,6 +702,8 @@ class Target:
         mode, mechanism = self.delivery_mode, self.delivery_mechanism
         if mode == "codex_daemon_input" and not include_owning_daemon:
             mode, mechanism = "codex_stop_bound", "stop_bound"
+        if mode == "devin_tool_boundary" and not include_devin_tool_boundary:
+            mode, mechanism = "devin_stop_or_prompt_bound", "devin_prompt_bound"
         if include_delivery_mode:
             result["delivery_mode"] = "unknown" if mode is None else mode
             if include_delivery_mechanism:
@@ -1612,6 +1619,7 @@ def unregister_devin(pid: int, state_root_value: str | None) -> None:
             return
         raise ChatError("exact Devin session route is unavailable")
     Registry(root).remove(route.provider, route.session_id, route.pid, generation=route.generation)
+    devin_tool_boundary_path(root, route).unlink(missing_ok=True)
     with suppress(ChatError):
         request_socket(
             socket_path(root, route),
@@ -1631,13 +1639,18 @@ def devin_pretool(state_root_value: str | None) -> None:
     text = sys.stdin.read(DEVIN_LARGE_HOOK_INPUT_MAX_BYTES + 1)
     boundary = parse_tool_boundary(text)
     if boundary.tool_name == DEVIN_SUBAGENT_TOOL:
-        # Recording is best effort: a failure must never block the subagent.
-        try:
-            root = state_root(state_root_value)
-            if _devin_route(root, boundary.session_id, os.getppid()) is not None:
-                DevinSubagentStore(root).mark(boundary.session_id)
-        except (ChatError, OSError) as error:
-            print(f"cross-agent-chat: {error}", file=sys.stderr)
+        # A bookkeeping failure must never block the subagent, and must never
+        # leave its later hooks free to take the root's messages either.
+        root = state_root(state_root_value)
+        if _devin_route(root, boundary.session_id, os.getppid()) is None:
+            return
+        _record_devin_subagents(
+            root,
+            boundary.session_id,
+            lambda store, live: store.launch(
+                boundary.session_id, boundary.tool_use_id, boundary.profile, live_keys=live
+            ),
+        )
         return
     event = parse_pretool_input(text)
     prefix = "mcp__cross-agent-chat__"
@@ -1747,13 +1760,12 @@ def devin_stop(pid: int, state_root_value: str | None) -> None:
     if route is None or not _route_current(root, route):
         print("{}", flush=True)
         return
-    subagents = DevinSubagentStore(root)
-    possible_subagent = subagents.boundary(event.session_id) is not None
-    if possible_subagent:
-        subagents.observe(event.session_id, "stop")
-    if event.stop_hook_active is True or possible_subagent:
-        # A Stop while subagents may run can belong to one of them; a block
-        # would hand the message to that subagent instead of the root.
+    if (
+        event.stop_hook_active is True
+        or DevinSubagentStore(root).custody(event.session_id) is not None
+    ):
+        # While a subagent may run, this Stop can be its own; a block would
+        # hand the message to that subagent instead of the root.
         print("{}", flush=True)
         return
     messages = _devin_messages(root, route)
@@ -1783,9 +1795,6 @@ def devin_user_prompt(pid: int, state_root_value: str | None, device: str | None
     DevinCapabilityStore(root).revoke_session(event.session_id)
     if route is None or not _route_current(root, route):
         return
-    subagents = DevinSubagentStore(root)
-    if subagents.boundary(event.session_id) == "stop":
-        subagents.clear(event.session_id)
     messages = _devin_messages(root, route)
     if not messages:
         return
@@ -1807,11 +1816,28 @@ def devin_post_tool(pid: int, state_root_value: str | None) -> None:
     route = _devin_route(root, boundary.session_id, pid)
     if route is None or not _route_current(root, route):
         return
-    subagents = DevinSubagentStore(root)
-    if subagents.boundary(boundary.session_id) is not None:
-        subagents.observe(boundary.session_id, "tool")
-        if boundary.tool_name not in DEVIN_ROOT_ONLY_TOOLS:
-            return
+    _affirm_devin_tool_boundary(root, route)
+    if boundary.tool_name == DEVIN_SUBAGENT_TOOL:
+        _record_devin_subagents(
+            root,
+            boundary.session_id,
+            lambda store, live: store.launched(
+                boundary.session_id, boundary.tool_use_id, boundary.output, live_keys=live
+            ),
+        )
+    elif boundary.tool_name == DEVIN_READ_SUBAGENT_TOOL:
+        _record_devin_subagents(
+            root,
+            boundary.session_id,
+            lambda store, live: store.read(
+                boundary.session_id, boundary.agent_id, boundary.output, live_keys=live
+            ),
+        )
+    custody = DevinSubagentStore(root).custody(boundary.session_id)
+    if custody == "hold" or (
+        custody == "root_tools" and boundary.tool_name not in DEVIN_ROOT_ONLY_TOOLS
+    ):
+        return
     messages = _devin_messages(root, route)
     if not messages:
         return
@@ -1819,6 +1845,48 @@ def devin_post_tool(pid: int, state_root_value: str | None) -> None:
     payload = build_post_tool_callback_payload(selected["event_id"], selected["message"])
     _ack_devin(root, route, [selected])
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False), flush=True)
+
+
+def _live_devin_keys(root: Path) -> frozenset[str]:
+    return frozenset(
+        session_key("devin", route.session_id)
+        for route in Registry(root).routes()
+        if route.provider == "devin"
+    )
+
+
+def _record_devin_subagents(
+    root: Path,
+    session_id: str,
+    change: Callable[[DevinSubagentStore, frozenset[str]], None],
+) -> None:
+    """Apply one lifecycle change, falling back to holding custody on failure."""
+
+    store = DevinSubagentStore(root)
+    try:
+        change(store, _live_devin_keys(root))
+    except (ChatError, OSError) as error:
+        print(f"cross-agent-chat: {error}", file=sys.stderr)
+        try:
+            store.mark_uncertain(session_id)
+        except (ChatError, OSError) as fallback:
+            print(f"cross-agent-chat: {fallback}", file=sys.stderr)
+
+
+def devin_tool_boundary_path(root: Path, route: Route) -> Path:
+    """Private marker that this route's loaded Devin session ran the tool hook."""
+
+    return root / f"devin-tool-boundary-{valid_uuid(route.generation, 'route generation')}"
+
+
+def _affirm_devin_tool_boundary(root: Path, route: Route) -> None:
+    path = devin_tool_boundary_path(root, route)
+    if path.exists():
+        return
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+    except OSError as error:
+        print(f"cross-agent-chat: {error}", file=sys.stderr)
 
 
 def _route_current(root: Path, expected: Route) -> bool:
@@ -2019,6 +2087,8 @@ def courier_health(
     native_helper: bool = False,
     include_owning_daemon: bool = False,
     daemon_ingress: CodexDaemonIngress | None = None,
+    include_devin_tool_boundary: bool = False,
+    devin_tool_boundary_observed: bool = False,
 ) -> dict[str, object]:
     alias = route.alias
     if route.provider == "claude":
@@ -2051,6 +2121,13 @@ def courier_health(
             response["delivery_mode"] = "codex_daemon_input"
         if include_delivery_mechanism:
             response["delivery_mechanism"] = "owning_daemon"
+    if route.provider == "devin" and include_devin_tool_boundary and devin_tool_boundary_observed:
+        # Affirmed only by a receiver whose loaded Devin session has run the
+        # tool-boundary hook; an older receiver never sends these values.
+        if include_delivery_mode:
+            response["delivery_mode"] = "devin_tool_boundary"
+        if include_delivery_mechanism:
+            response["delivery_mechanism"] = "devin_tool_boundary"
     if include_direct_delivery_mode:
         response["direct_delivery_mode"] = _delivery_mode(route, courier)
     return response
@@ -2239,6 +2316,13 @@ def courier_server(
                                 ),
                                 include_owning_daemon=request.get("include_owning_daemon") is True,
                                 daemon_ingress=daemon_ingress,
+                                include_devin_tool_boundary=(
+                                    request.get("include_devin_tool_boundary") is True
+                                ),
+                                devin_tool_boundary_observed=(
+                                    route.provider == "devin"
+                                    and devin_tool_boundary_path(root, route).exists()
+                                ),
                                 native_helper=(
                                     NativeHelperStore(root).helper_for_original(
                                         route, Registry(root).routes()
@@ -2542,6 +2626,7 @@ def _local_target(
                 "include_delivery_mode": True,
                 "include_delivery_mechanism": True,
                 "include_owning_daemon": True,
+                "include_devin_tool_boundary": True,
             },
             timeout=timeout,
         )
@@ -2571,6 +2656,7 @@ def _local_target(
                 "codex_experimental_queue",
                 "codex_daemon_input",
                 "devin_stop_or_prompt_bound",
+                "devin_tool_boundary",
             }
         )
         or (observed_mechanism is not None and observed_mechanism not in DELIVERY_MECHANISMS)
@@ -2722,6 +2808,7 @@ def _targets_from_tailnet(
     include_delivery_mechanism: bool = False,
     include_title: bool = False,
     include_owning_daemon: bool = False,
+    include_devin_tool_boundary: bool = False,
     include_devin: bool = False,
     include_external: bool = False,
     node_id: str | None = None,
@@ -2781,6 +2868,7 @@ def _targets_from_tailnet(
                         "unknown",
                     }
                     | ({"codex_daemon_input"} if include_owning_daemon else set())
+                    | ({"devin_tool_boundary"} if include_devin_tool_boundary else set())
                 )
             )
         ):
@@ -2790,6 +2878,7 @@ def _targets_from_tailnet(
         if "delivery_mechanism" in item and (
             not isinstance(observed_mechanism, str)
             or observed_mechanism not in DELIVERY_MECHANISMS | {"unknown"}
+            or (observed_mechanism == "devin_tool_boundary" and not include_devin_tool_boundary)
         ):
             raise ChatError("Tailnet peer returned invalid discovery")
         title = item.get("title")
@@ -2864,17 +2953,25 @@ def _remote_node_targets(
     # Ask newer brokers explicitly, then retain all old variants as fallback.
     # No optional metadata is added to a response an old reader did not request.
     if include_delivery_mechanism:
-        variants = [
+        mechanism_variants = [
             (
                 {**payload, "include_delivery_mechanism": True, "include_owning_daemon": True},
                 mode_requested,
             )
             for payload, mode_requested in variants
             if mode_requested
-        ] + variants
+        ]
+        # A broker that predates the Devin tool-boundary flag refuses it, so
+        # each negotiated shape is retried without it before the next shape.
+        tool_boundary_variants: list[tuple[dict[str, object], bool]] = []
+        for shape, _ in mechanism_variants:
+            tool_boundary_variants.append(({**shape, "include_devin_tool_boundary": True}, True))
+            tool_boundary_variants.append((shape, True))
+        variants = tool_boundary_variants + variants
     base: list[Target] | None = None
     mechanism_negotiated = False
     owning_negotiated = False
+    tool_boundary_negotiated = False
     external_negotiated = False
     capacity_refused = False
     for payload, mode_requested in variants:
@@ -2925,12 +3022,18 @@ def _remote_node_targets(
                 ),
                 include_devin=include_devin,
                 **({"include_owning_daemon": True} if "include_owning_daemon" in payload else {}),
+                **(
+                    {"include_devin_tool_boundary": True}
+                    if "include_devin_tool_boundary" in payload
+                    else {}
+                ),
                 **_external_option(include_external),
                 node_id=node_id,
             )
             external_negotiated = "include_external" in payload
             mechanism_negotiated = "include_delivery_mechanism" in payload
             owning_negotiated = "include_owning_daemon" in payload
+            tool_boundary_negotiated = "include_devin_tool_boundary" in payload
             break
         except (ChatError, UnknownDeliveryError):
             continue
@@ -2953,6 +3056,8 @@ def _remote_node_targets(
             rich_payload["include_delivery_mechanism"] = True
         if owning_negotiated:
             rich_payload["include_owning_daemon"] = True
+        if tool_boundary_negotiated:
+            rich_payload["include_devin_tool_boundary"] = True
         if include_devin:
             rich_payload["include_devin"] = True
         if external_negotiated:
@@ -2971,6 +3076,7 @@ def _remote_node_targets(
             **({"include_delivery_mechanism": True} if mechanism_negotiated else {}),
             include_title=True,
             **({"include_owning_daemon": True} if owning_negotiated else {}),
+            **({"include_devin_tool_boundary": True} if tool_boundary_negotiated else {}),
             include_devin=include_devin,
             **_external_option(external_negotiated),
             node_id=node_id,
@@ -3332,25 +3438,24 @@ def destination_receiving(target: Target | None) -> dict[str, object]:
     promises; a health response alone does not provide that proof. The owning
     daemon 0.160.1 path is separately qualified for parked queue wake and
     expected-active-turn steer; qualification still is not an event receipt.
-    A local Devin route hands a message to its root conversation at the next
-    tool boundary of an active turn, but cannot wake an idle conversation.
+    A Devin route reports active-turn input only as the negotiated
+    ``devin_tool_boundary`` mode, which its receiver affirms after its loaded
+    session ran the tool hook; the legacy Devin mode stays deferred. Neither
+    wakes an idle Devin conversation.
     """
     mode = target.delivery_mode if target is not None else None
     mechanism = target.delivery_mechanism if target is not None else None
     owning_daemon = mode == "codex_daemon_input" and mechanism == "owning_daemon"
-    devin = mode == "devin_stop_or_prompt_bound"
+    tool_boundary = mode == "devin_tool_boundary" and mechanism == "devin_tool_boundary"
+    deferred = mode in {"codex_stop_bound", "devin_stop_or_prompt_bound"}
     return {
         "mode": mode or "unknown",
         "mechanism": mechanism or "unknown",
-        "parked_wake": True
-        if owning_daemon
-        else False
-        if devin or mode == "codex_stop_bound"
-        else "unknown",
+        "parked_wake": True if owning_daemon else False if deferred or tool_boundary else "unknown",
         "active_turn_input": True
-        if owning_daemon or devin
+        if owning_daemon or tool_boundary
         else False
-        if mode == "codex_stop_bound"
+        if deferred
         else "unknown",
         "delivery_observation": "not_observed",
     }
@@ -4347,6 +4452,7 @@ def peers(
     include_delivery_mechanism: bool = False,
     include_title: bool = False,
     include_owning_daemon: bool = False,
+    include_devin_tool_boundary: bool = False,
     include_devin: bool = True,
     include_external: bool = False,
     handle: str | None = None,
@@ -4415,6 +4521,7 @@ def peers(
             handle=token,
             include_title=not internal or include_title,
             include_owning_daemon=not internal or include_owning_daemon,
+            include_devin_tool_boundary=not internal or include_devin_tool_boundary,
         )
         if internal:
             item["generation"] = target.generation
@@ -4555,7 +4662,7 @@ def reply_delivery(root: Path, source: SourceIdentity) -> ReplyDelivery:
         )
     if mode in {"claude_native_cross_session", "codex_experimental_queue", "codex_daemon_input"}:
         return "while_idle"
-    if mode in {"codex_stop_bound", "devin_stop_or_prompt_bound"}:
+    if mode in {"codex_stop_bound", "devin_stop_or_prompt_bound", "devin_tool_boundary"}:
         return "next_turn"
     return "unknown"
 

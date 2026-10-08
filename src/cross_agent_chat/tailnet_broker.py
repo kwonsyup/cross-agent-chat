@@ -109,6 +109,7 @@ class _ExternalDiscoveryOption(TypedDict, total=False):
     include_external: bool
     include_delivery_mechanism: bool
     include_owning_daemon: bool
+    include_devin_tool_boundary: bool
 
 
 def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[str, object]:
@@ -132,6 +133,7 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
             "include_delivery_mode",
             "include_delivery_mechanism",
             "include_owning_daemon",
+            "include_devin_tool_boundary",
             "include_title",
             "include_devin",
             "include_external",
@@ -141,7 +143,13 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
         if (
             not optional <= (include_flags | {"handle"})
             or (
-                optional & {"include_title", "include_delivery_mechanism", "include_owning_daemon"}
+                optional
+                & {
+                    "include_title",
+                    "include_delivery_mechanism",
+                    "include_owning_daemon",
+                    "include_devin_tool_boundary",
+                }
                 and "include_delivery_mode" not in optional
             )
             or request.get("schema_version") != SCHEMA_VERSION
@@ -160,6 +168,8 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
             extra["include_delivery_mechanism"] = True
         if "include_owning_daemon" in optional:
             extra["include_owning_daemon"] = True
+        if "include_devin_tool_boundary" in optional:
+            extra["include_devin_tool_boundary"] = True
         return peers(
             root,
             include_remote=False,

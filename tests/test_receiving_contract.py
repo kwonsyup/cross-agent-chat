@@ -364,8 +364,18 @@ def test_title_metadata_failure_preserves_exact_alias_selection(
     assert effects == [selected]
 
 
-def test_devin_route_reports_active_turn_input_without_parked_wake() -> None:
-    """Devin receives at the next root tool boundary but cannot wake while idle."""
+@pytest.mark.parametrize(
+    ("mode", "mechanism", "active"),
+    [
+        # A v0.5.2-or-unnegotiated receiver presents only the legacy values.
+        ("devin_stop_or_prompt_bound", "devin_prompt_bound", False),
+        ("devin_tool_boundary", "devin_tool_boundary", True),
+    ],
+)
+def test_devin_active_turn_input_is_reported_only_when_the_receiver_affirms_it(
+    mode: runtime.DeliveryMode, mechanism: runtime.DeliveryMechanism, active: bool
+) -> None:
+    """Idle Devin never wakes; active-turn input needs the receiver's own affirmation."""
     target = runtime.Target(
         alias="devin@test:task",
         provider="devin",
@@ -374,10 +384,210 @@ def test_devin_route_reports_active_turn_input_without_parked_wake() -> None:
         generation=str(uuid4()),
         session_key="a" * 64,
         remote=False,
-        delivery_mode="devin_stop_or_prompt_bound",
-        delivery_mechanism="devin_prompt_bound",
+        delivery_mode=mode,
+        delivery_mechanism=mechanism,
     )
     receiving = runtime.destination_receiving(target)
     assert receiving["parked_wake"] is False
-    assert receiving["active_turn_input"] is True
+    assert receiving["active_turn_input"] is active
     assert receiving["delivery_observation"] == "not_observed"
+
+
+def _devin_route(tmp_path: Path) -> Route:
+    return Route.create(
+        provider="devin", session_id=str(uuid4()), device="m4", cwd=str(tmp_path), pid=os.getpid()
+    )
+
+
+def test_devin_receiver_affirms_tool_boundaries_only_when_asked_and_observed(
+    tmp_path: Path,
+) -> None:
+    """New receiver: old senders keep the legacy shape; new senders get evidence-based values."""
+    route = _devin_route(tmp_path)
+
+    def health(*, asked: bool, observed: bool) -> tuple[object, object]:
+        response = runtime.courier_health(
+            route,
+            include_delivery_mode=True,
+            include_delivery_mechanism=True,
+            include_devin_tool_boundary=asked,
+            devin_tool_boundary_observed=observed,
+        )
+        return response["delivery_mode"], response["delivery_mechanism"]
+
+    legacy = ("devin_stop_or_prompt_bound", "devin_prompt_bound")
+    assert health(asked=False, observed=True) == legacy
+    # Installed but not yet loaded: the session never ran the tool hook.
+    assert health(asked=True, observed=False) == legacy
+    assert health(asked=True, observed=True) == ("devin_tool_boundary", "devin_tool_boundary")
+
+
+def test_devin_tool_boundary_never_reaches_a_reader_that_did_not_negotiate_it() -> None:
+    target = runtime.Target(
+        alias="devin@m4:ws",
+        provider="devin",
+        device="m4",
+        project="ws",
+        generation=str(uuid4()),
+        session_key="b" * 64,
+        remote=False,
+        delivery_mode="devin_tool_boundary",
+        delivery_mechanism="devin_tool_boundary",
+    )
+
+    def roster(affirm: bool) -> dict[str, object]:
+        row = target.public(
+            include_delivery_mode=True,
+            include_delivery_mechanism=True,
+            include_owning_daemon=True,
+            include_devin_tool_boundary=affirm,
+            include_handle=False,
+        )
+        row.update(generation=target.generation, session_key=target.session_key)
+        return {"schema_version": 1, "peers": [row]}
+
+    def parse(raw: dict[str, object], *, negotiated: bool) -> list[runtime.Target]:
+        return runtime._targets_from_tailnet(
+            "100.64.0.2",
+            raw,
+            include_delivery_mode=True,
+            include_delivery_mechanism=True,
+            include_owning_daemon=True,
+            include_devin=True,
+            include_devin_tool_boundary=negotiated,
+        )
+
+    # New broker → old reader: the old reader never asks, so it gets legacy values.
+    [old_view] = parse(roster(False), negotiated=False)
+    assert old_view.delivery_mode == "devin_stop_or_prompt_bound"
+    assert runtime.destination_receiving(old_view)["active_turn_input"] is False
+    with pytest.raises(ChatError, match="invalid discovery"):
+        parse(roster(True), negotiated=False)
+    # New broker → new reader.
+    [new_view] = parse(roster(True), negotiated=True)
+    assert runtime.destination_receiving(new_view)["active_turn_input"] is True
+
+
+@pytest.mark.parametrize(
+    ("broker_knows_flag", "active"),
+    [(False, False), (True, True)],
+)
+def test_new_reader_negotiates_devin_tool_boundaries_and_stays_conservative_with_old_brokers(
+    monkeypatch: pytest.MonkeyPatch, broker_knows_flag: bool, active: bool
+) -> None:
+    """New reader → old (v0.5.2/83f3ce3) broker stays legacy; → new broker affirms."""
+    generation, handle = str(uuid4()), "c" * 64
+    requests: list[dict[str, object]] = []
+
+    def broker(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        requests.append(payload)
+        if "include_devin_tool_boundary" in payload and not broker_knows_flag:
+            raise ChatError("Tailnet broker request is invalid")
+        affirmed = "include_devin_tool_boundary" in payload
+        row: dict[str, object] = {
+            "alias": "devin@m4:ws",
+            "provider": "devin",
+            "device": "m4",
+            "project": "ws",
+            "status": "available",
+            "generation": generation,
+            "session_key": handle,
+            "delivery_mode": "devin_tool_boundary" if affirmed else "devin_stop_or_prompt_bound",
+            "delivery_mechanism": "devin_tool_boundary" if affirmed else "devin_prompt_bound",
+        }
+        return {"schema_version": 1, "peers": [row]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", broker)
+    [target], complete = runtime._remote_node_targets(
+        "100.64.0.2",
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
+        include_devin=True,
+    )
+
+    assert complete is True
+    assert "include_devin_tool_boundary" in requests[0]
+    assert runtime.destination_receiving(target)["active_turn_input"] is active
+
+
+@pytest.mark.parametrize(
+    ("response_mode", "active"),
+    [
+        # A receiver courier that predates the flag ignores it and answers legacy.
+        (("devin_stop_or_prompt_bound", "devin_prompt_bound"), False),
+        (("devin_tool_boundary", "devin_tool_boundary"), True),
+    ],
+)
+def test_local_devin_capability_comes_from_the_receivers_own_health_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response_mode: tuple[str, str],
+    active: bool,
+) -> None:
+    route = _devin_route(tmp_path)
+    asked: list[dict[str, object]] = []
+
+    def courier(_path: object, payload: dict[str, object], **_: object) -> dict[str, object]:
+        asked.append(payload)
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+            "delivery_mode": response_mode[0],
+            "delivery_mechanism": response_mode[1],
+        }
+
+    monkeypatch.setattr(runtime, "request_socket", courier)
+    target = runtime._local_target(tmp_path, route)
+
+    assert target is not None
+    assert asked[0]["include_devin_tool_boundary"] is True
+    assert runtime.destination_receiving(target)["active_turn_input"] is active
+
+
+def test_devin_tool_hook_records_that_its_loaded_session_runs_the_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route = _devin_route(tmp_path)
+    monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
+    monkeypatch.setattr(runtime, "_devin_route", lambda *_args, **_kwargs: route)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_devin_messages", lambda *_args: [])
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "session_id": route.session_id,
+        "prompt_id": str(uuid4()),
+        "tool_name": "exec",
+        "tool_input": {},
+        "tool_response": {"success": True, "output": "", "error": None},
+    }
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(payload)))
+    marker = runtime.devin_tool_boundary_path(tmp_path, route)
+    assert not marker.exists()
+
+    runtime.devin_post_tool(route.pid, str(tmp_path))
+
+    assert marker.exists() and marker.stat().st_mode & 0o777 == 0o600
+
+
+def test_broker_accepts_the_tool_boundary_flag_only_with_delivery_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import tailnet_broker
+
+    seen: list[dict[str, object]] = []
+
+    def peers(_root: Path, **kwargs: object) -> dict[str, object]:
+        seen.append(kwargs)
+        return {"schema_version": 1, "peers": []}
+
+    monkeypatch.setattr(tailnet_broker, "peers", peers)
+    base = {"schema_version": 1, "operation": "peers", "include_devin_tool_boundary": True}
+
+    tailnet_broker.handle_broker_request(
+        tmp_path, {**base, "include_delivery_mode": True}, "100.64.0.9"
+    )
+    assert seen[-1]["include_devin_tool_boundary"] is True
+    with pytest.raises(ChatError, match="request is invalid"):
+        tailnet_broker.handle_broker_request(tmp_path, base, "100.64.0.9")

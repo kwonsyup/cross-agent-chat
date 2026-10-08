@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import shutil
 import time
@@ -25,6 +26,7 @@ from cross_agent_chat.core import (
     Route,
     atomic_json,
     bounded_message,
+    ensure_private_dir,
     require_private_file,
     session_key,
     state_lock,
@@ -58,10 +60,12 @@ DEVIN_PRETOOL_OUTPUT_MAX_BYTES: Final = 64 * 1024
 # Tool, Stop and prompt hooks carry tool responses, final messages or pasted
 # prompts; only identity fields are read from them.
 DEVIN_LARGE_HOOK_INPUT_MAX_BYTES: Final = 16 * 1024 * 1024
-# Devin withholds these tools from subagents by default, so their hook events
-# come from the root conversation even while subagents share its session id.
+# Devin withholds these tools from built-in subagents, so while only built-in
+# profiles were launched their hook events come from the root conversation even
+# though subagents share its session id. A custom profile may enable them.
 DEVIN_ROOT_ONLY_TOOLS: Final = frozenset({"run_subagent", "read_subagent", "ask_user_question"})
 DEVIN_SUBAGENT_TOOL: Final = "run_subagent"
+DEVIN_READ_SUBAGENT_TOOL: Final = "read_subagent"
 DevinCapabilityTool = Literal["chat_peers", "chat_send", "chat_status"]
 
 
@@ -272,25 +276,49 @@ class DevinCapabilityStore:
                 atomic_json(self.path, [item.to_dict() for item in retained])
 
 
-DevinSubagentBoundary = Literal["tool", "stop"]
-DEVIN_SUBAGENT_STATE_MAX_ENTRIES: Final = 256
-DEVIN_SUBAGENT_STATE_TTL_SECONDS: Final = 7 * 24 * 60 * 60.0
+# Built-in profiles that Devin documents as unable to spawn subagents. Any
+# other profile may opt in to nesting with ``max-nesting``.
+DEVIN_NON_NESTING_PROFILES: Final = frozenset({"subagent_explore", "subagent_general"})
+DevinSubagentCustody = Literal["root_tools", "hold"]
+_AGENT_ID: Final = r"[0-9A-Za-z][0-9A-Za-z_-]{0,63}"
+_SUBAGENT_STARTED: Final = re.compile(rf"Background subagent started with agent_id=({_AGENT_ID})\b")
+_SUBAGENT_FINISHED: Final = re.compile(
+    rf"^Subagent (?:agent_id=)?({_AGENT_ID}) "
+    r"(?:completed|failed|errored|was cancelled|was canceled|cancelled|canceled|was killed)\b"
+)
+_ENTRY_FIELDS: Final = frozenset({"children", "pending", "uncertain"})
+
+
+def _launches(value: object) -> dict[str, bool]:
+    """Map each unfinished launch id to whether its profile may nest."""
+
+    if not isinstance(value, dict) or not all(
+        isinstance(key, str) and 0 < len(key) <= 256 and isinstance(item, bool)
+        for key, item in cast(dict[object, object], value).items()
+    ):
+        raise ChatError("Devin subagent state is invalid")
+    return dict(cast(dict[str, bool], value))
 
 
 class DevinSubagentStore:
-    """Content-free marker for sessions whose subagents may still be running.
+    """Content-free lifecycle evidence for subagents of each Devin session.
 
-    Devin fires a subagent's PostToolUse and Stop hooks with the root
-    conversation's session and prompt ids. While a marker exists, delivery is
-    limited to boundaries only the root conversation can produce. A marker is
-    cleared when a new user prompt follows a Stop with no later tool event: a
-    turn with a running background subagent stays active, so such a prompt
-    starts after every subagent has finished.
+    Devin fires a subagent's tool and Stop hooks with the root conversation's
+    session and prompt ids, and hook input carries no actor or depth. While any
+    launched subagent is not proven finished, a Stop or an ordinary tool
+    boundary can belong to a subagent. While every unfinished launch used a
+    built-in, non-nesting profile, ``run_subagent``/``read_subagent``/
+    ``ask_user_question`` boundaries are still the root's. While a custom
+    profile that may nest is unfinished, or a launch outcome was not observed,
+    the message stays in custody until the root's next prompt. Only a
+    provider-reported terminal state ends a child; elapsed time, a Stop, or a
+    cap never does.
     """
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.path = root / "devin-subagents.json"
+        self.path = root / "devin-subagent-lifecycle.v2.json"
+        self.uncertain_root = root / "devin-subagent-uncertain"
 
     def _entries(self) -> dict[str, dict[str, object]]:
         if not self.path.exists():
@@ -306,55 +334,146 @@ class DevinSubagentStore:
         for key, value in cast(dict[object, object], raw).items():
             if (
                 not isinstance(key, str)
-                or len(key) != 64
+                or re.fullmatch(r"[0-9a-f]{64}", key) is None
                 or not isinstance(value, dict)
-                or set(value) != {"boundary", "marked_at"}
-                or value.get("boundary") not in {"tool", "stop"}
-                or not isinstance(value.get("marked_at"), (int, float))
-                or isinstance(value.get("marked_at"), bool)
-                or not math.isfinite(cast(float, value.get("marked_at")))
+                or set(value) != _ENTRY_FIELDS
+                or not isinstance(value.get("uncertain"), bool)
             ):
                 raise ChatError("Devin subagent state is invalid")
-            entries[key] = cast(dict[str, object], value)
+            entry = cast(dict[str, object], value)
+            entries[key] = {
+                "children": _launches(entry["children"]),
+                "pending": _launches(entry["pending"]),
+                "uncertain": entry["uncertain"],
+            }
         return entries
 
-    def _write(self, entries: dict[str, dict[str, object]]) -> None:
-        now = time.time()
-        fresh = {
-            key: value
-            for key, value in entries.items()
-            if 0 <= now - cast(float, value["marked_at"]) <= DEVIN_SUBAGENT_STATE_TTL_SECONDS
-        }
-        newest = sorted(fresh.items(), key=lambda item: cast(float, item[1]["marked_at"]))
-        atomic_json(self.path, dict(newest[-DEVIN_SUBAGENT_STATE_MAX_ENTRIES:]))
+    def _update(
+        self,
+        session_id: str,
+        change: Callable[[dict[str, bool], dict[str, bool]], bool],
+        *,
+        live_keys: frozenset[str] | None,
+        create: bool,
+    ) -> None:
+        """Apply ``change(children, pending)``; it returns whether evidence was lost."""
 
-    def boundary(self, session_id: str) -> DevinSubagentBoundary | None:
-        entry = self._entries().get(session_key("devin", session_id))
-        return None if entry is None else cast(DevinSubagentBoundary, entry["boundary"])
-
-    def mark(self, session_id: str) -> None:
-        key = session_key("devin", session_id)
-        with state_lock(self.root, "devin-subagents"):
-            entries = self._entries()
-            entries[key] = {"boundary": "tool", "marked_at": time.time()}
-            self._write(entries)
-
-    def observe(self, session_id: str, boundary: DevinSubagentBoundary) -> None:
         key = session_key("devin", session_id)
         with state_lock(self.root, "devin-subagents"):
             entries = self._entries()
             entry = entries.get(key)
-            if entry is None or entry["boundary"] == boundary:
-                return
-            entries[key] = {"boundary": boundary, "marked_at": entry["marked_at"]}
-            self._write(entries)
+            if entry is None:
+                if not create:
+                    return
+                entry = {"children": {}, "pending": {}, "uncertain": False}
+            children = cast(dict[str, bool], entry["children"])
+            pending = cast(dict[str, bool], entry["pending"])
+            if change(children, pending):
+                entry["uncertain"] = True
+            if children or pending or entry["uncertain"]:
+                entries[key] = entry
+            else:
+                entries.pop(key, None)
+            # Only a session that no longer has a live route is forgotten.
+            if live_keys is not None:
+                entries = {
+                    item: value
+                    for item, value in entries.items()
+                    if item == key or item in live_keys
+                }
+            atomic_json(self.path, entries)
+
+    def custody(self, session_id: str) -> DevinSubagentCustody | None:
+        """Return how delivery is limited for this session, or None if it is not."""
+
+        key = session_key("devin", session_id)
+        if (self.uncertain_root / key).exists():
+            return "hold"
+        entry = self._entries().get(key)
+        if entry is None:
+            return None
+        children = cast(dict[str, bool], entry["children"])
+        pending = cast(dict[str, bool], entry["pending"])
+        if entry["uncertain"] or any(children.values()) or any(pending.values()):
+            return "hold"
+        return "root_tools"
+
+    def launch(
+        self,
+        session_id: str,
+        tool_use_id: str | None,
+        profile: object,
+        *,
+        live_keys: frozenset[str] | None = None,
+    ) -> None:
+        def change(_children: dict[str, bool], pending: dict[str, bool]) -> bool:
+            if tool_use_id is None:
+                return True
+            pending[tool_use_id] = profile not in DEVIN_NON_NESTING_PROFILES
+            return False
+
+        self._update(session_id, change, live_keys=live_keys, create=True)
+
+    def launched(
+        self,
+        session_id: str,
+        tool_use_id: str | None,
+        output: str,
+        *,
+        live_keys: frozenset[str] | None = None,
+    ) -> None:
+        """Record what Devin reported when one ``run_subagent`` call returned."""
+
+        def change(children: dict[str, bool], pending: dict[str, bool]) -> bool:
+            observed = tool_use_id is not None and tool_use_id in pending
+            may_nest = pending.pop(tool_use_id, True) if tool_use_id is not None else True
+            started = _SUBAGENT_STARTED.search(output)
+            if started is not None:
+                children[started.group(1)] = may_nest
+            # A missed launch, or a child moved to the background without an
+            # id, failed to report, or reported in an unrecognized way.
+            return not observed or (started is None and _SUBAGENT_FINISHED.match(output) is None)
+
+        self._update(session_id, change, live_keys=live_keys, create=True)
+
+    def read(
+        self,
+        session_id: str,
+        agent_id: object,
+        output: str,
+        *,
+        live_keys: frozenset[str] | None = None,
+    ) -> None:
+        """Retire one child only when Devin reports it finished."""
+
+        finished = _SUBAGENT_FINISHED.match(output)
+        if not isinstance(agent_id, str) or finished is None or finished.group(1) != agent_id:
+            return
+
+        def change(children: dict[str, bool], _pending: dict[str, bool]) -> bool:
+            children.pop(agent_id, None)
+            return False
+
+        self._update(session_id, change, live_keys=live_keys, create=False)
+
+    def mark_uncertain(self, session_id: str) -> None:
+        """Fallback evidence when lifecycle state cannot be written."""
+
+        ensure_private_dir(self.uncertain_root)
+        descriptor = os.open(
+            self.uncertain_root / session_key("devin", session_id),
+            os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+        )
+        os.close(descriptor)
 
     def clear(self, session_id: str) -> None:
         key = session_key("devin", session_id)
+        (self.uncertain_root / key).unlink(missing_ok=True)
         with state_lock(self.root, "devin-subagents"):
             entries = self._entries()
             if entries.pop(key, None) is not None:
-                self._write(entries)
+                atomic_json(self.path, entries)
 
 
 # ``bounded_message`` in the shared core reserves this encoded JSON budget for
@@ -518,28 +637,50 @@ def parse_pretool_input(text: str) -> DevinPreToolEvent:
 
 @dataclass(frozen=True, slots=True)
 class DevinToolBoundary:
-    """Identity fields of one PreToolUse or PostToolUse event; never its content."""
+    """Identity and subagent-lifecycle fields of one tool hook; never message content.
+
+    ``output`` is a bounded prefix of the tool's reported result, kept in memory
+    only so a ``run_subagent``/``read_subagent`` outcome can be classified.
+    """
 
     hook_event_name: DevinHookName
     session_id: str
     prompt_id: str | None
     tool_name: str
+    tool_use_id: str | None = None
+    profile: object = None
+    agent_id: object = None
+    output: str = ""
+
+
+_TOOL_OUTPUT_PREFIX_CHARS: Final = 512
 
 
 def parse_tool_boundary(text: str) -> DevinToolBoundary:
-    """Read only identity fields from a possibly large tool hook payload."""
+    """Read only identity and lifecycle fields from a possibly large tool hook payload."""
 
     event = parse_hook_input(text, max_bytes=DEVIN_LARGE_HOOK_INPUT_MAX_BYTES)
     if event.hook_event_name not in {"PreToolUse", "PostToolUse"}:
         raise ChatError("Devin hook event does not match the expected event")
-    tool_name = _as_string_mapping(json.loads(text)).get("tool_name")
+    fields = _as_string_mapping(json.loads(text))
+    tool_name = fields.get("tool_name")
     if not isinstance(tool_name, str) or not tool_name:
         raise ChatError("Devin tool hook input is invalid")
+    tool_use_id = fields.get("tool_use_id")
+    raw_input = fields.get("tool_input")
+    tool_input = cast(dict[object, object], raw_input) if isinstance(raw_input, dict) else {}
+    raw_response = fields.get("tool_response")
+    response = cast(dict[object, object], raw_response) if isinstance(raw_response, dict) else {}
+    output = response.get("output")
     return DevinToolBoundary(
         hook_event_name=event.hook_event_name,
         session_id=event.session_id,
         prompt_id=event.prompt_id,
         tool_name=tool_name,
+        tool_use_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
+        profile=tool_input.get("profile"),
+        agent_id=tool_input.get("agent_id"),
+        output=output[:_TOOL_OUTPUT_PREFIX_CHARS] if isinstance(output, str) else "",
     )
 
 
