@@ -1072,29 +1072,50 @@ def test_devin_originates_remote_send_with_exact_source_alias_and_intent(
 
 
 def _tool_hook(
-    event: str, tool_name: str, *, session_id: str, response_bytes: int = 0
+    event: str,
+    tool_name: str,
+    *,
+    session_id: str,
+    response_bytes: int = 0,
+    tool_input: dict[str, object] | None = None,
+    output: str | None = None,
+    tool_use_id: str = "call_1#2",
 ) -> io.StringIO:
     payload: dict[str, object] = {
         "hook_event_name": event,
         "session_id": session_id,
         "prompt_id": str(uuid4()),
         "tool_name": tool_name,
-        "tool_input": {"command": "true"},
-        "tool_use_id": "call_1#2",
+        "tool_input": tool_input if tool_input is not None else {"command": "true"},
+        "tool_use_id": tool_use_id,
     }
     if event == "PostToolUse":
-        payload["tool_response"] = {"success": True, "output": "x" * response_bytes, "error": None}
+        payload["tool_response"] = {
+            "success": True,
+            "output": output if output is not None else "x" * response_bytes,
+            "error": None,
+        }
     return io.StringIO(json.dumps(payload))
 
 
 def _queued_devin_route(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, messages: list[dict[str, str]]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    messages: list[dict[str, str]],
+    session_id: str | None = None,
 ) -> list[list[dict[str, str]]]:
-    route = object()
+    route = Route.create(
+        provider="devin",
+        session_id=session_id or str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=123,
+    )
     monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
     monkeypatch.setattr(runtime, "state_root", lambda _value: tmp_path)
     monkeypatch.setattr(runtime, "_devin_route", lambda *_args, **_kwargs: route)
     monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_live_devin_keys", lambda _root: frozenset())
     monkeypatch.setattr(runtime, "_devin_messages", lambda *_args: list(messages))
     acknowledged: list[list[dict[str, str]]] = []
 
@@ -1107,13 +1128,78 @@ def _queued_devin_route(
     return acknowledged
 
 
+class _DevinHooks:
+    """Drive the installed hook entrypoints in the order Devin fires them."""
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        session_id: str,
+    ) -> None:
+        self.monkeypatch, self.root, self.capsys, self.session_id = (
+            monkeypatch,
+            tmp_path,
+            capsys,
+            session_id,
+        )
+
+    def _run(self, stdin: io.StringIO, hook: Callable[[], None]) -> str:
+        self.monkeypatch.setattr("sys.stdin", stdin)
+        hook()
+        return self.capsys.readouterr().out
+
+    def pre(self, tool: str, tool_input: dict[str, object], call: str) -> str:
+        stdin = _tool_hook(
+            "PreToolUse", tool, session_id=self.session_id, tool_input=tool_input, tool_use_id=call
+        )
+        return self._run(stdin, lambda: runtime.devin_pretool(str(self.root)))
+
+    def post(
+        self,
+        tool: str,
+        output: str = "ok",
+        tool_input: dict[str, object] | None = None,
+        call: str = "c",
+    ) -> str:
+        stdin = _tool_hook(
+            "PostToolUse",
+            tool,
+            session_id=self.session_id,
+            tool_input=tool_input,
+            output=output,
+            tool_use_id=call,
+        )
+        return self._run(stdin, lambda: runtime.devin_post_tool(123, str(self.root)))
+
+    def stop(self) -> str:
+        stdin = io.StringIO(_hook("Stop", session_id=self.session_id))
+        return self._run(stdin, lambda: runtime.devin_stop(123, str(self.root)))
+
+    def prompt(self) -> str:
+        stdin = io.StringIO(_hook("UserPromptSubmit", session_id=self.session_id))
+        return self._run(stdin, lambda: runtime.devin_user_prompt(123, str(self.root)))
+
+    def background(self, call: str, agent_id: str, profile: str = "subagent_general") -> None:
+        run = {"profile": profile, "is_background": True, "task": "t", "title": "t"}
+        assert self.pre("run_subagent", run, call) == ""
+        self.post(
+            "run_subagent",
+            f"Background subagent started with agent_id={agent_id}. You can wait for this agent "
+            "to finish using the read_subagent tool.",
+            run,
+            call,
+        )
+
+
 def test_devin_post_tool_hands_one_message_to_the_active_turn(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     session_id = str(uuid4())
     first = {"event_id": str(uuid4()), "message": "between tools"}
     second = {"event_id": str(uuid4()), "message": "next boundary"}
-    acknowledged = _queued_devin_route(monkeypatch, tmp_path, [first, second])
+    acknowledged = _queued_devin_route(monkeypatch, tmp_path, [first, second], session_id)
     # A tool response far above the 64 KiB lifecycle bound still delivers.
     monkeypatch.setattr(
         "sys.stdin",
@@ -1156,90 +1242,187 @@ def test_devin_post_tool_rejects_other_events(
     assert acknowledged == []
 
 
-def test_devin_pretool_records_a_subagent_launch_without_output(
+def test_built_in_background_subagent_holds_ordinary_boundaries_until_it_finishes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Working control: the tested default-profile path still delivers to the root."""
+    session_id = str(uuid4())
+    queue: list[dict[str, str]] = []
+    acknowledged = _queued_devin_route(monkeypatch, tmp_path, queue, session_id)
+    hooks = _DevinHooks(monkeypatch, tmp_path, capsys, session_id)
+    hooks.background("call_a#1", "06a38a7f")
+    first = {"event_id": str(uuid4()), "message": "for the root"}
+    second = {"event_id": str(uuid4()), "message": "after the child"}
+    queue.extend([first, second])
+    monkeypatch.setattr(runtime, "_devin_messages", lambda *_args: list(queue))
+
+    # A child's exec and Stop share the root's session id: nothing is handed over.
+    assert hooks.post("exec") == ""
+    assert hooks.stop() == "{}\n"
+    assert acknowledged == []
+
+    # Only the root can read a built-in child, so this boundary is the root's.
+    running = hooks.post("read_subagent", "Subagent is still running.", {"agent_id": "06a38a7f"})
+    assert "for the root" in json.loads(running)["hookSpecificOutput"]["additionalContext"]
+    assert acknowledged == [[first]]
+
+    finished = hooks.post(
+        "read_subagent",
+        "Subagent 06a38a7f completed successfully:\n\nDONE",
+        {"agent_id": "06a38a7f"},
+    )
+    assert "after the child" in finished
+    assert DevinSubagentStore(tmp_path).custody(session_id) is None
+    # With every child finished, ordinary boundaries deliver again.
+    queue.append({"event_id": str(uuid4()), "message": "main thread again"})
+    assert "main thread again" in hooks.post("exec")
+
+
+def test_nesting_capable_profile_keeps_messages_in_custody_until_the_next_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review 2A: a max-nesting child calls run_subagent/read_subagent with the root's ids."""
+    session_id = str(uuid4())
+    message = {"event_id": str(uuid4()), "message": "root only"}
+    acknowledged = _queued_devin_route(monkeypatch, tmp_path, [message], session_id)
+    hooks = _DevinHooks(monkeypatch, tmp_path, capsys, session_id)
+    nester = {"profile": "nester", "is_background": False, "task": "t", "title": "t"}
+    hooks.pre("run_subagent", nester, "call_n#1")
+    # Inside the custom child: it launches and reads its own built-in child.
+    hooks.background("call_c#1", "0bf3a912")
+    assert hooks.post("read_subagent", "Subagent is still running.", {"agent_id": "0bf3a912"}) == ""
+    assert hooks.post("run_subagent", "x", {"profile": "subagent_general"}, "call_x#1") == ""
+    assert hooks.stop() == "{}\n"
+    assert acknowledged == []
+    assert DevinSubagentStore(tmp_path).custody(session_id) == "hold"
+
+    # A user prompt is always the root's own boundary.
+    assert "root only" in json.loads(hooks.prompt())["hookSpecificOutput"]["additionalContext"]
+    assert acknowledged == [[message]]
+
+
+def test_one_finished_child_and_a_send_now_prompt_do_not_release_a_running_sibling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review 2B: a Stop is not evidence that every child finished."""
+    session_id = str(uuid4())
+    acknowledged = _queued_devin_route(monkeypatch, tmp_path, [], session_id)
+    hooks = _DevinHooks(monkeypatch, tmp_path, capsys, session_id)
+    hooks.background("call_a#1", "aaaa1111")
+    hooks.background("call_b#1", "bbbb2222")
+    hooks.post(
+        "read_subagent", "Subagent aaaa1111 completed successfully:\n\nA", {"agent_id": "aaaa1111"}
+    )
+    assert hooks.stop() == "{}\n"
+    hooks.prompt()
+
+    message = {"event_id": str(uuid4()), "message": "must not reach child B"}
+    monkeypatch.setattr(runtime, "_devin_messages", lambda *_args: [message])
+    assert hooks.post("exec") == ""
+    assert acknowledged == []
+    assert DevinSubagentStore(tmp_path).custody(session_id) == "root_tools"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Subagent moved to the background.",
+        "",
+    ],
+)
+def test_unrecognized_launch_outcomes_hold_custody(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    output: str,
+) -> None:
+    session_id = str(uuid4())
+    _queued_devin_route(
+        monkeypatch, tmp_path, [{"event_id": str(uuid4()), "message": "m"}], session_id
+    )
+    hooks = _DevinHooks(monkeypatch, tmp_path, capsys, session_id)
+    run = {"profile": "subagent_general", "is_background": False, "task": "t", "title": "t"}
+    hooks.pre("run_subagent", run, "call_f#1")
+    assert hooks.post("run_subagent", output, run, "call_f#1") == ""
+    assert DevinSubagentStore(tmp_path).custody(session_id) == "hold"
+
+
+def test_launch_seen_only_after_the_fact_holds_custody(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missed PreToolUse means a child may have run unobserved."""
+    session_id = str(uuid4())
+    _queued_devin_route(
+        monkeypatch, tmp_path, [{"event_id": str(uuid4()), "message": "m"}], session_id
+    )
+    hooks = _DevinHooks(monkeypatch, tmp_path, capsys, session_id)
+    assert (
+        hooks.post("run_subagent", "Subagent agent_id=4ff488fb completed successfully:\n\nN") == ""
+    )
+    assert DevinSubagentStore(tmp_path).custody(session_id) == "hold"
+
+
+def test_foreground_built_in_child_releases_when_devin_reports_it_finished(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     session_id = str(uuid4())
-    _queued_devin_route(monkeypatch, tmp_path, [])
-    monkeypatch.setattr(
-        "sys.stdin",
-        _tool_hook("PreToolUse", "run_subagent", session_id=session_id),
+    message = {"event_id": str(uuid4()), "message": "after foreground"}
+    _queued_devin_route(monkeypatch, tmp_path, [message], session_id)
+    hooks = _DevinHooks(monkeypatch, tmp_path, capsys, session_id)
+    run = {"profile": "subagent_explore", "is_background": False, "task": "t", "title": "t"}
+    hooks.pre("run_subagent", run, "call_e#1")
+    assert hooks.post("exec") == ""
+    out = hooks.post(
+        "run_subagent", "Subagent agent_id=4ff488fb completed successfully:\n\nE", run, "call_e#1"
     )
-
-    runtime.devin_pretool(str(tmp_path))
-
-    assert capsys.readouterr().out == ""
-    assert DevinSubagentStore(tmp_path).boundary(session_id) == "tool"
+    assert "after foreground" in out
+    assert DevinSubagentStore(tmp_path).custody(session_id) is None
 
 
-def test_devin_pretool_subagent_record_failure_never_blocks_the_launch(
+def test_lifecycle_write_failure_never_blocks_the_launch_and_holds_custody(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _queued_devin_route(monkeypatch, tmp_path, [])
-
-    def fail(_self: DevinSubagentStore, _session_id: str) -> None:
-        raise ChatError("state unavailable")
-
-    monkeypatch.setattr(DevinSubagentStore, "mark", fail)
-    monkeypatch.setattr(
-        "sys.stdin", _tool_hook("PreToolUse", "run_subagent", session_id=str(uuid4()))
+    session_id = str(uuid4())
+    _queued_devin_route(
+        monkeypatch, tmp_path, [{"event_id": str(uuid4()), "message": "m"}], session_id
     )
 
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise ChatError("state unavailable")
+
+    monkeypatch.setattr(DevinSubagentStore, "launch", fail)
+    hooks = _DevinHooks(monkeypatch, tmp_path, capsys, session_id)
+    monkeypatch.setattr(
+        "sys.stdin",
+        _tool_hook(
+            "PreToolUse",
+            "run_subagent",
+            session_id=session_id,
+            tool_input={"profile": "subagent_general"},
+        ),
+    )
     runtime.devin_pretool(str(tmp_path))
 
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "state unavailable" in captured.err
+    assert DevinSubagentStore(tmp_path).custody(session_id) == "hold"
+    assert hooks.post("read_subagent") == ""
+    assert hooks.stop() == "{}\n"
 
 
-def test_devin_delivery_waits_for_a_root_only_boundary_while_subagents_may_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    session_id = str(uuid4())
-    message = {"event_id": str(uuid4()), "message": "for the root"}
-    acknowledged = _queued_devin_route(monkeypatch, tmp_path, [message])
-    DevinSubagentStore(tmp_path).mark(session_id)
-
-    # A subagent's tool call and Stop share the root's session id.
-    monkeypatch.setattr("sys.stdin", _tool_hook("PostToolUse", "exec", session_id=session_id))
-    runtime.devin_post_tool(123, str(tmp_path))
-    monkeypatch.setattr("sys.stdin", io.StringIO(_hook("Stop", session_id=session_id)))
-    runtime.devin_stop(123, str(tmp_path))
-    assert capsys.readouterr().out == "{}\n"
-    assert acknowledged == []
-    assert DevinSubagentStore(tmp_path).boundary(session_id) == "stop"
-
-    # Only the root can read a subagent, so this boundary is the root's.
-    monkeypatch.setattr(
-        "sys.stdin", _tool_hook("PostToolUse", "read_subagent", session_id=session_id)
-    )
-    runtime.devin_post_tool(123, str(tmp_path))
-
-    output = json.loads(capsys.readouterr().out)
-    assert "for the root" in output["hookSpecificOutput"]["additionalContext"]
-    assert acknowledged == [[message]]
-    assert DevinSubagentStore(tmp_path).boundary(session_id) == "tool"
-
-
-@pytest.mark.parametrize(
-    ("last_boundary", "cleared"),
-    [("stop", True), ("tool", False)],
-)
-def test_devin_prompt_clears_the_subagent_marker_only_after_a_completed_turn(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, last_boundary: str, cleared: bool
-) -> None:
-    session_id = str(uuid4())
-    _queued_devin_route(monkeypatch, tmp_path, [])
+def test_lifecycle_state_forgets_only_sessions_without_a_live_route(tmp_path: Path) -> None:
     store = DevinSubagentStore(tmp_path)
-    store.mark(session_id)
-    if last_boundary == "stop":
-        store.observe(session_id, "stop")
-    monkeypatch.setattr("sys.stdin", io.StringIO(_hook("UserPromptSubmit", session_id=session_id)))
+    live, ended, current = str(uuid4()), str(uuid4()), str(uuid4())
+    store.launch(live, "c1", "subagent_general")
+    store.launch(ended, "c2", "subagent_general")
+    store.launch(
+        current, "c3", "subagent_general", live_keys=frozenset({session_key("devin", live)})
+    )
 
-    runtime.devin_user_prompt(123, str(tmp_path))
-
-    # A prompt that interrupts an active turn leaves parked subagents marked.
-    assert (store.boundary(session_id) is None) is cleared
+    assert store.custody(live) == "root_tools"
+    assert store.custody(current) == "root_tools"
+    assert store.custody(ended) is None
 
 
 def test_devin_stop_and_prompt_accept_payloads_above_the_lifecycle_bound(
@@ -1247,7 +1430,7 @@ def test_devin_stop_and_prompt_accept_payloads_above_the_lifecycle_bound(
 ) -> None:
     session_id = str(uuid4())
     message = {"event_id": str(uuid4()), "message": "after a long answer"}
-    acknowledged = _queued_devin_route(monkeypatch, tmp_path, [message])
+    acknowledged = _queued_devin_route(monkeypatch, tmp_path, [message], session_id)
     stop = json.loads(_hook("Stop", session_id=session_id))
     stop["last_assistant_message"] = "y" * (DEVIN_HOOK_INPUT_MAX_BYTES + 1)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(stop)))
@@ -1266,20 +1449,18 @@ def test_devin_stop_and_prompt_accept_payloads_above_the_lifecycle_bound(
 def test_devin_subagent_store_is_private_content_free_and_validated(tmp_path: Path) -> None:
     session_id = str(uuid4())
     store = DevinSubagentStore(tmp_path)
-    store.mark(session_id)
-    store.observe(session_id, "stop")
-    store.observe(str(uuid4()), "stop")
+    store.launch(session_id, "call_1#2", "subagent_general")
 
     raw = json.loads(store.path.read_text())
     assert list(raw) == [session_key("devin", session_id)]
     assert session_id not in store.path.read_text()
     assert store.path.stat().st_mode & 0o777 == 0o600
     store.clear(session_id)
-    assert store.boundary(session_id) is None
+    assert store.custody(session_id) is None
     store.path.write_text(json.dumps({"x": 1}))
     store.path.chmod(0o600)
     with pytest.raises(ChatError, match="subagent state is invalid"):
-        store.boundary(session_id)
+        store.custody(session_id)
 
 
 @pytest.mark.parametrize("character", ['"', "\\"])

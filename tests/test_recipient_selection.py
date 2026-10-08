@@ -1210,11 +1210,14 @@ def test_wire_request_and_response_key_sets_are_unchanged(
         "include_delivery_mechanism",
         "include_owning_daemon",
     }
+    tool_boundary = negotiated | {"include_devin_tool_boundary"}
     assert all(
         set(payload)
         in (
+            {"schema_version", "operation", "handle", "include_devin"} | tool_boundary,
             {"schema_version", "operation", "handle", "include_devin"} | negotiated,
             {"schema_version", "operation", "handle", "include_devin"},
+            {"schema_version", "operation", "include_devin"} | tool_boundary,
             {"schema_version", "operation", "include_devin"} | negotiated,
             {"schema_version", "operation", "include_devin"},
             {"schema_version", "operation"},

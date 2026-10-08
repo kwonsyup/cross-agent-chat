@@ -1,26 +1,36 @@
 # Changelog
 
-## Unreleased
+## 0.5.3 - 2026-10-08
 
 - Local Devin gains active-turn input: a new owned `PostToolUse` hook hands
-  one queued message to the root conversation after each tool call through
+  one queued message to the root conversation after a tool call through
   Devin's documented `additionalContext`, without interrupting the turn. An
   idle Devin conversation still receives at its next prompt (#38 stays open).
-- Devin fires a subagent's tool and Stop hooks with the root conversation's
-  session id. The `PreToolUse` hook now also records `run_subagent`
-  launches in content-free private state; while a subagent may be running,
-  delivery waits for a root-only boundary (`run_subagent`, `read_subagent`,
-  `ask_user_question`) and no longer blocks a Stop that may be a subagent's.
-- A Devin session run by a separately installed CLI (for example Homebrew)
-  as well as the Desktop-bundled CLI is accepted as a Devin process identity.
-- Devin Stop, prompt and tool hooks accept provider payloads above 64 KiB
-  (long final answers, pasted prompts, tool output) and read only identity
-  fields from them. Errors in the Devin Stop and tool hooks exit 1, so they
-  can never be read as a block.
-- Wire values are unchanged (`devin_stop_or_prompt_bound`,
-  `devin_prompt_bound`) so mixed-version peers keep discovering each other;
-  `destination_receiving` for a Devin route now reports active-turn input.
-  Existing installations need `cross-agent-chat setup` to add the new hook.
+- Root versus subagent custody. Devin fires subagent tool and Stop hooks with
+  the root's session id and no actor or depth, so delivery now follows
+  provider-reported subagent lifecycle evidence kept in content-free private
+  state (hashed session keys and opaque agent/tool-use ids):
+  - while only built-in, non-nesting profiles run, delivery waits for the
+    root's `run_subagent`, `read_subagent` or `ask_user_question` boundary;
+  - a custom profile (which may enable nesting with `max-nesting`), a launch
+    whose outcome was not observed, or a bookkeeping failure keeps the message
+    in custody until the root's next prompt;
+  - a child is retired only when Devin reports it finished; a Stop, elapsed
+    time or a cap never releases custody, and a Stop never delivers while a
+    subagent may run;
+  - state is forgotten only for sessions without a live route.
+- Truthful capability for mixed versions. A receiver affirms the new
+  `devin_tool_boundary` delivery mode only when the sender negotiates
+  `include_devin_tool_boundary` and that receiver's own Devin session has run
+  the tool hook. Older receivers and brokers keep the legacy
+  `devin_stop_or_prompt_bound` values, which `destination_receiving` reports as
+  no active-turn input; older readers never see the new values.
+- A Devin session run by a separately installed CLI (for example Homebrew) as
+  well as the Desktop-bundled CLI is accepted as a Devin process identity.
+- Devin Stop, prompt and tool hooks accept provider payloads above 64 KiB and
+  read only identity and lifecycle fields. Errors in the Devin Stop and tool
+  hooks exit 1, so they can never be read as a block. Existing installations
+  need `cross-agent-chat setup` (the installer runs it) to add the new hook.
 
 ## 0.5.2 - 2026-10-06
 

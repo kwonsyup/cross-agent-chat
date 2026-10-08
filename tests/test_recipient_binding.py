@@ -590,16 +590,7 @@ def test_the_handle_probe_falls_back_to_the_legacy_roster(
     result = send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hello")
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
-    assert calls[0] == {
-        "schema_version": 1,
-        "operation": "peers",
-        "handle": handle,
-        "include_devin": True,
-        "include_delivery_mode": True,
-        "include_delivery_mechanism": True,
-        "include_owning_daemon": True,
-    }
-    assert calls[1] == {
+    negotiated = {
         "schema_version": 1,
         "operation": "peers",
         "include_devin": True,
@@ -607,7 +598,12 @@ def test_the_handle_probe_falls_back_to_the_legacy_roster(
         "include_delivery_mechanism": True,
         "include_owning_daemon": True,
     }
-    assert calls[2].get("operation") == "receive"
+    assert calls[:3] == [
+        {**negotiated, "handle": handle, "include_devin_tool_boundary": True},
+        {**negotiated, "handle": handle},
+        {**negotiated, "include_devin_tool_boundary": True},
+    ]
+    assert calls[3].get("operation") == "receive"
 
 
 def test_a_seeded_recipients_file_has_no_routing_influence(
@@ -1011,11 +1007,14 @@ def test_wire_request_and_response_key_sets_are_unchanged(
         "include_delivery_mechanism",
         "include_owning_daemon",
     }
+    tool_boundary = negotiated | {"include_devin_tool_boundary"}
     assert all(
         set(payload)
         in (
+            {"schema_version", "operation", "handle", "include_devin"} | tool_boundary,
             {"schema_version", "operation", "handle", "include_devin"} | negotiated,
             {"schema_version", "operation", "handle", "include_devin"},
+            {"schema_version", "operation", "include_devin"} | tool_boundary,
             {"schema_version", "operation", "include_devin"} | negotiated,
             {"schema_version", "operation", "include_devin"},
             {"schema_version", "operation"},
