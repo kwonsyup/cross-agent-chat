@@ -113,9 +113,6 @@ def test_real_cli_doctor_reports_fresh_profile_without_writes(
     if json_output:
         assert json.loads(result.stdout) == {
             "codex_native_queue": "stop-bound",
-            "codex_native_queue_basis": (
-                "experimental configuration setting, not an observed receiving mode"
-            ),
             "integration": "needs setup",
             "local_broker": "unavailable",
             "next": "cross-agent-chat setup",
@@ -127,8 +124,6 @@ def test_real_cli_doctor_reports_fresh_profile_without_writes(
             "version: 0.5.3\n"
             "integration: needs setup\n"
             "codex_native_queue: stop-bound\n"
-            "codex_native_queue_basis: experimental configuration setting, "
-            "not an observed receiving mode\n"
             "local_broker: unavailable\n"
             "remote_trust: tailscale_acl\n"
             "next: cross-agent-chat setup\n"

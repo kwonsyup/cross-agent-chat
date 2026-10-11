@@ -1091,9 +1091,6 @@ def run(arguments: argparse.Namespace) -> int:
                 if doctor_installer is not None and doctor_installer._codex_native_queue_enabled()
                 else "stop-bound"
             ),
-            "codex_native_queue_basis": (
-                "experimental configuration setting, not an observed receiving mode"
-            ),
             "local_broker": "healthy" if broker_healthy else "unavailable",
             "remote_trust": "tailscale_acl",
             "next": _doctor_next(doctor_installer, healthy),

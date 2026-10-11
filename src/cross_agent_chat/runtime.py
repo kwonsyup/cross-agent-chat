@@ -5324,8 +5324,8 @@ def _receiving_observation(root: Path, intent: Intent) -> dict[str, object]:
             "stage": "unknown",
             "reason": "courier_unavailable",
             "detail": (
-                "the receiving courier cannot answer; volatile receiving state is "
-                "unobservable, for example after a receiver restart"
+                "the receiving courier did not answer inspect; it may predate this "
+                "observation or have restarted, so volatile receiving state is unobservable"
             ),
         }
     expected = {
