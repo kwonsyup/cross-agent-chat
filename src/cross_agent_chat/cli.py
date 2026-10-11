@@ -457,7 +457,13 @@ def _mcp_call_tool(
             return _mcp_tool_error(error)
         return _mcp_tool_result(result)
     if name == "chat_status":
-        if set(typed_arguments) != {"event_id"} or not isinstance(typed_arguments["event_id"], str):
+        if (
+            not set(typed_arguments) <= {"event_id", "recipient"}
+            or not isinstance(typed_arguments.get("event_id"), str)
+            or (
+                "recipient" in typed_arguments and not isinstance(typed_arguments["recipient"], str)
+            )
+        ):
             _fail("event id is invalid")
         if provider == "codex" and thread_id is None:
             _fail("Codex host thread identity is required")
@@ -468,7 +474,12 @@ def _mcp_call_tool(
             else authenticate_mcp_sender(root, provider, os.getppid(), thread_id)
         )
         try:
-            result = event_status(root, source, typed_arguments["event_id"])
+            result = event_status(
+                root,
+                source,
+                cast(str, typed_arguments["event_id"]),
+                recipient=cast(str | None, typed_arguments.get("recipient")),
+            )
         except ChatError as error:
             return _mcp_tool_error(error)
         return _mcp_tool_result(result)
@@ -575,11 +586,26 @@ def _mcp_tools(provider: str, presence_enabled: bool) -> list[dict[str, object]]
                 "event created by this exact sender. "
                 "It does not contact a provider, replay "
                 "a message, or prove consumption; "
-                "not_observed is not a negative receipt."
+                "not_observed is not a negative receipt. "
+                "The optional exact remote recipient "
+                "handle asks that one node for its own "
+                "volatile receiving observation."
             ),
             "inputSchema": {
                 "type": "object",
-                "properties": {"event_id": {"type": "string"}},
+                "properties": {
+                    "event_id": {"type": "string"},
+                    "recipient": {
+                        "type": "string",
+                        "description": (
+                            "Optional exact remote recipient handle that "
+                            "presented this event's recorded target; asks that "
+                            "one node for its read-only receiving observation. "
+                            "A handle that does not match the recorded target "
+                            "refuses before any probe."
+                        ),
+                    },
+                },
                 "required": ["event_id"],
                 "additionalProperties": False,
             },
@@ -717,9 +743,20 @@ def _external_call_tool(
         }
         return _mcp_tool_result(result)
     if name == "chat_status":
-        if set(arguments) != {"event_id"} or not isinstance(arguments["event_id"], str):
+        if (
+            not set(arguments) <= {"event_id", "recipient"}
+            or not isinstance(arguments.get("event_id"), str)
+            or ("recipient" in arguments and not isinstance(arguments["recipient"], str))
+        ):
             _fail("event id is invalid")
-        return _mcp_tool_result(event_status(root, source, arguments["event_id"]))
+        return _mcp_tool_result(
+            event_status(
+                root,
+                source,
+                cast(str, arguments["event_id"]),
+                recipient=cast(str | None, arguments.get("recipient")),
+            )
+        )
     if name == "chat_send":
         request_id = arguments.get("request_id")
         if not isinstance(request_id, str):
@@ -888,6 +925,13 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     status_parser.add_argument("event_id")
+    status_parser.add_argument(
+        "--recipient",
+        help=(
+            "exact remote recipient handle that presented the recorded target; "
+            "asks that one node for its own read-only receiving observation"
+        ),
+    )
     status_parser.add_argument("--json", action="store_true")
     resolve_parser = commands.add_parser(
         "resolve",
@@ -1143,7 +1187,9 @@ def run(arguments: argparse.Namespace) -> int:
                     )
                 )
     elif command == "status":
-        payload = owner_event_status(state_root(), arguments.event_id)
+        payload = owner_event_status(
+            state_root(), arguments.event_id, recipient=arguments.recipient
+        )
         if arguments.json:
             print(json.dumps(payload, sort_keys=True))
         else:

@@ -23,6 +23,7 @@ from cross_agent_chat.runtime import (
     MAX_FRAME_BYTES,
     authorize_remote,
     emit_frame_safely,
+    inspect_remote_receiving,
     peers,
     read_frame,
     receive_remote,
@@ -184,6 +185,30 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
             include_devin="include_devin" in optional,
             handle=cast(str | None, handle if "handle" in optional else None),
             **extra,
+        )
+    inspect_fields = {
+        "schema_version",
+        "operation",
+        "event_id",
+        "target_key",
+        "target_generation",
+    }
+    if operation == "inspect" and set(request) == inspect_fields:
+        # One read-only custody question from a permitted peer: it answers with
+        # closed body-free volatile state and can never authorize, enqueue,
+        # wake, acknowledge, or reorder anything.
+        valid_tailnet_address(peer_address)
+        inspect_values = cast(dict[str, object], request)
+        if request.get("schema_version") != SCHEMA_VERSION or not all(
+            isinstance(inspect_values[field], str)
+            for field in ("event_id", "target_key", "target_generation")
+        ):
+            raise ChatError("Tailnet broker request is invalid")
+        return inspect_remote_receiving(
+            root,
+            event_id=cast(str, inspect_values["event_id"]),
+            target_key=cast(str, inspect_values["target_key"]),
+            target_generation=cast(str, inspect_values["target_generation"]),
         )
     authorization_fields = {
         "schema_version",
