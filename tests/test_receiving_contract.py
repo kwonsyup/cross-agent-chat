@@ -15,6 +15,7 @@ from cross_agent_chat import runtime
 from cross_agent_chat.codex import CodexCourier
 from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, session_key
 from cross_agent_chat.devin import DevinCurrentBoundary
+from cross_agent_chat.native_helper import NativeDispatchStore, NativeHelperStore
 from cross_agent_chat.recipient import local_token, remote_token
 from cross_agent_chat.tailnet import TailnetIdentity
 from cross_agent_chat.tailnet_broker import handle_broker_request
@@ -439,7 +440,12 @@ def test_one_observed_basis_grades_receiving_and_reply_identically() -> None:
     assert runtime._receiving_qualification("codex_experimental_queue", "native_helper") == (
         "unknown",
         "unknown",
-        "while_idle",
+        "unknown",
+    )
+    assert runtime._receiving_qualification("claude_native_cross_session", "claude_native") == (
+        "unknown",
+        "unknown",
+        "unknown",
     )
     assert runtime._receiving_qualification("codex_daemon_input", "owning_daemon") == (
         True,
@@ -1125,4 +1131,663 @@ def test_cli_status_prints_the_observation_and_stays_read_only(
     observation = cast(dict[str, object], payload["receiving_observation"])
     assert observation["stage"] == "pending_in_courier"
     assert "message" not in json.dumps(payload)
+    assert store.path.read_bytes() == before
+
+
+def _bound_helper_pair(root: Path, base: Path) -> tuple[Route, Route]:
+    """Register one live native helper bound to an exact original Codex route."""
+    profile = base / f"profile-{uuid4().hex[:12]}"
+    profile.mkdir(parents=True, exist_ok=True)
+    original = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="test",
+        cwd=str(base),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+        profile_root=str(profile),
+    )
+    registry = Registry(root)
+    registry.upsert(original)
+    store = NativeHelperStore(root)
+    binding, nonce = store.reserve(original, "a" * 64)
+    helper_root = base / binding.helper_directory
+    helper_root.mkdir()
+    helper = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="test",
+        cwd=str(helper_root),
+        pid=os.getpid(),
+        owner_identity="a" * 64,
+        profile_root=str(profile),
+    )
+    registry.upsert(helper)
+    store.register(helper, nonce, original, "a" * 64)
+    return original, helper
+
+
+def _inspect_answer(generation: str, state: str, **extra: object) -> dict[str, object]:
+    answer: dict[str, object] = {
+        "schema_version": 1,
+        "status": "INSPECTED",
+        "generation": generation,
+        "courier_version": "0.5.4",
+        "courier_incarnation": "inc-1",
+        "event_state": state,
+    }
+    answer.update(extra)
+    return answer
+
+
+def _accepted_intent(root: Path, source: Route, target: Route) -> tuple[IntentStore, str]:
+    store = IntentStore(root)
+    event_id = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    store.mark(event_id, "TRANSPORT_ACCEPTED")
+    return store, event_id
+
+
+def test_status_observes_the_bound_helper_courier_never_the_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The send addressed the bound helper's queue; the original courier's
+    'unseen' must not be read as the event never arriving."""
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    original, helper = _bound_helper_pair(root, tmp_path)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    store, event_id = _accepted_intent(root, source, original)
+    before = store.path.read_bytes()
+    asked: list[str] = []
+
+    def socket(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        generation = str(payload["generation"])
+        asked.append(generation)
+        assert payload["operation"] == "inspect"
+        assert set(payload) == {"schema_version", "operation", "generation", "event_id"}
+        if generation == helper.generation:
+            return _inspect_answer(
+                generation, "pending", pending_count=1, oldest_pending_age_seconds=2.0
+            )
+        # The original courier was never offered the event.
+        return _inspect_answer(generation, "unseen")
+
+    monkeypatch.setattr(runtime, "request_socket", socket)
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
+    )
+    assert observation["observer"] == "native_helper"
+    assert observation["stage"] == "pending_in_courier"
+    assert observation["pending_count"] == 1
+    assert asked == [helper.generation]
+    assert store.path.read_bytes() == before
+
+
+def test_status_never_touches_an_unrelated_helper_with_the_same_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the exact bound helper may answer; another original's helper that
+    happens to hold the event id is never inspected."""
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    original, helper = _bound_helper_pair(root, tmp_path)
+    _other_original, unrelated = _bound_helper_pair(root, tmp_path)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    _store, event_id = _accepted_intent(root, source, original)
+    asked: list[str] = []
+
+    def socket(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        asked.append(str(payload["generation"]))
+        # Even the unrelated helper claims the event pending; only the bound
+        # helper's queue is this event's receiving owner.
+        return _inspect_answer(
+            str(payload["generation"]),
+            "pending",
+            pending_count=1,
+            oldest_pending_age_seconds=1.0,
+        )
+
+    monkeypatch.setattr(runtime, "request_socket", socket)
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
+    )
+    assert observation["observer"] == "native_helper"
+    assert observation["stage"] == "pending_in_courier"
+    assert asked == [helper.generation]
+    assert unrelated.generation not in asked
+
+
+@pytest.mark.parametrize("variant", ["dead", "stale_generation", "not_current"])
+def test_status_stays_unknown_when_the_bound_helper_cannot_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    """A dead, generation-stale, or no-longer-owner-current bound helper cannot
+    be inspected; falling back to the original courier would fabricate a
+    misleading 'unseen' for a queue that never held the event."""
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    original, helper = _bound_helper_pair(root, tmp_path)
+    _store, event_id = _accepted_intent(root, source, original)
+    asked: list[str] = []
+
+    def socket(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        asked.append(str(payload["generation"]))
+        return _inspect_answer(str(payload["generation"]), "pending", pending_count=1)
+
+    monkeypatch.setattr(runtime, "request_socket", socket)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    if variant == "dead":
+        monkeypatch.setattr(Route, "process_is_live", lambda route: route != helper)
+    elif variant == "stale_generation":
+        restarted = Route.create(
+            provider="codex",
+            session_id=helper.session_id,
+            device=helper.device,
+            cwd=helper.cwd,
+            pid=helper.pid,
+            owner_identity=helper.owner_identity,
+            profile_root=helper.profile_root,
+        )
+        Registry(root).upsert(restarted)
+        monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    else:
+        monkeypatch.setattr(runtime, "_route_current", lambda _root, route: route != helper)
+
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
+    )
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == "helper_unavailable"
+    assert asked == []
+
+
+def test_status_reports_a_bound_dispatch_claim_as_still_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A native dispatch row bound to the exact event/original/helper is a
+    claim, not a success; it stays UNKNOWN in the observation."""
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    original, helper = _bound_helper_pair(root, tmp_path)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    _store, event_id = _accepted_intent(root, source, original)
+    NativeDispatchStore(root).claim(helper, original, event_id, "an opaque body")
+    claims_before = (root / "native-dispatches.json").read_bytes()
+
+    monkeypatch.setattr(
+        runtime,
+        "request_socket",
+        lambda _path, payload, **_k: _inspect_answer(
+            str(payload["generation"]),
+            "handed_off",
+            pending_count=0,
+            oldest_pending_age_seconds=None,
+        ),
+    )
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
+    )
+    assert observation["observer"] == "native_helper"
+    assert observation["stage"] == "handed_off"
+    assert observation["native_dispatch_claim"] == "UNKNOWN"
+    assert "never evidence the original session consumed" in cast(str, observation["detail"])
+    assert "original forwarding remains unobserved" in cast(str, observation["detail"])
+    assert (root / "native-dispatches.json").read_bytes() == claims_before
+    # An unrelated event's claim is never bound to this observation.
+    other = _accepted_intent(root, source, original)[1]
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, other)["receiving_observation"]
+    )
+    assert "native_dispatch_claim" not in observation
+
+
+def _remote_intent(root: Path, source: Route, tmp_path: Path) -> tuple[IntentStore, Route, str]:
+    """An intent whose recorded target lives on another node (no local route)."""
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="remote",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    store, event_id = _accepted_intent(root, source, target)
+    return store, target, event_id
+
+
+def test_status_recipient_asks_only_the_node_that_presented_the_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One bounded inspect to the token's exact node; no discovery fanout."""
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    store, target, event_id = _remote_intent(root, source, tmp_path)
+    before = store.path.read_bytes()
+    token = remote_token(
+        "nTarget", session_key(target.provider, target.session_id), target.generation
+    )
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(
+            self_node_id="nSender", peers={"nTarget": "100.64.0.2", "nOther": "100.64.0.3"}
+        ),
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def wire(address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        calls.append((address, payload))
+        return {
+            "schema_version": 1,
+            "status": "INSPECTED",
+            "event_id": event_id,
+            "observer": "native_helper",
+            "event_state": "handed_off",
+            "courier_version": "0.5.4",
+            "courier_incarnation": "inc-9",
+            "dispatch_claim": "UNKNOWN",
+        }
+
+    monkeypatch.setattr(runtime, "request_tailnet", wire)
+    observation = cast(
+        dict[str, object],
+        runtime.owner_event_status(root, event_id, recipient=token)["receiving_observation"],
+    )
+    assert calls == [
+        (
+            "100.64.0.2",
+            {
+                "schema_version": 1,
+                "operation": "inspect",
+                "event_id": event_id,
+                "target_key": session_key(target.provider, target.session_id),
+                "target_generation": target.generation,
+            },
+        )
+    ]
+    assert observation["stage"] == "handed_off"
+    assert observation["observer"] == "native_helper"
+    assert observation["native_dispatch_claim"] == "UNKNOWN"
+    assert "never evidence the original session consumed" in cast(str, observation["detail"])
+    assert store.path.read_bytes() == before
+
+
+def test_status_recipient_mismatch_refuses_before_any_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A token for another handle, generation, or scope is refused before the
+    tailnet is even read."""
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    _store, target, event_id = _remote_intent(root, source, tmp_path)
+    probed: list[str] = []
+
+    def identity() -> None:
+        probed.append("identity")
+
+    def wire(*_args: object, **_kwargs: object) -> dict[str, object]:
+        probed.append("wire")
+        return {}
+
+    monkeypatch.setattr(runtime, "tailnet_identity", identity)
+    monkeypatch.setattr(runtime, "request_tailnet", wire)
+    wrong_handle = remote_token("nTarget", "b" * 64, target.generation)
+    with pytest.raises(ChatError, match="recorded target"):
+        runtime.owner_event_status(root, event_id, recipient=wrong_handle)
+    wrong_generation = remote_token(
+        "nTarget", session_key(target.provider, target.session_id), str(uuid4())
+    )
+    with pytest.raises(ChatError, match="recorded target"):
+        runtime.owner_event_status(root, event_id, recipient=wrong_generation)
+    local = local_token(root, session_key(target.provider, target.session_id), target.generation)
+    with pytest.raises(ChatError, match="remote recipient handle"):
+        runtime.owner_event_status(root, event_id, recipient=local)
+    with pytest.raises(ChatError):
+        runtime.owner_event_status(root, event_id, recipient="not-a-token")
+    assert probed == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "reason"),
+    [
+        ("no_tailscale", "remote_unavailable"),
+        ("node_offline", "remote_node_unavailable"),
+        ("broker_error", "remote_broker_unavailable"),
+        ("old_broker", "remote_broker_unavailable"),
+        ("extra_field", "remote_observation_invalid"),
+        ("no_receiver", "remote_no_receiver"),
+    ],
+)
+def test_status_recipient_failures_stay_unknown_with_a_safe_next_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, reason: str
+) -> None:
+    """Stale node, offline broker, old broker, and hostile answers are all
+    unknown -- never a guessed custody and never a replay instruction."""
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    _store, target, event_id = _remote_intent(root, source, tmp_path)
+    token = remote_token(
+        "nTarget", session_key(target.provider, target.session_id), target.generation
+    )
+    if mode == "no_tailscale":
+        monkeypatch.setattr(runtime, "tailnet_identity", lambda: None)
+    else:
+        monkeypatch.setattr(
+            runtime,
+            "tailnet_identity",
+            lambda: TailnetIdentity(
+                self_node_id="nSender",
+                peers={} if mode == "node_offline" else {"nTarget": "100.64.0.2"},
+            ),
+        )
+
+    def wire(_address: str, _payload: dict[str, object], **_: object) -> dict[str, object]:
+        if mode in {"broker_error", "old_broker"}:
+            raise ChatError("Tailnet broker request is invalid")
+        if mode == "extra_field":
+            return {
+                "schema_version": 1,
+                "status": "INSPECTED",
+                "event_id": event_id,
+                "observer": "original_courier",
+                "event_state": "handed_off",
+                "courier_version": "0.5.4",
+                "courier_incarnation": "inc-1",
+                "message": "an injected body must be rejected",
+            }
+        return {
+            "schema_version": 1,
+            "status": "INSPECTED",
+            "event_id": event_id,
+            "observer": "none",
+            "reason": "no_local_receiver",
+        }
+
+    monkeypatch.setattr(runtime, "request_tailnet", wire)
+    observation = cast(
+        dict[str, object],
+        runtime.owner_event_status(root, event_id, recipient=token)["receiving_observation"],
+    )
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == reason
+    detail = cast(str, observation["detail"])
+    assert "normal provider transcript" in detail
+    assert "do not replay" in detail
+    assert "run `cross-agent-chat status`" not in detail
+    assert "message" not in detail and "injected" not in detail
+
+
+def test_broker_inspect_answers_the_bound_courier_without_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ACL-permitted inspect reads only volatile courier state: no
+    authorize, receive, peek, ack, or durable write."""
+    root = tmp_path / "receiver"
+    original, helper = _bound_helper_pair(root, tmp_path)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    event_id = str(uuid4())
+    # Inbound remote custody lives at the sender. The receiving courier can
+    # answer inspection even though owner status has no local intent to read.
+    with pytest.raises(ChatError, match="event is unavailable"):
+        runtime.owner_event_status(root, event_id)
+    asked: list[dict[str, object]] = []
+
+    def socket(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        asked.append(payload)
+        return _inspect_answer(
+            str(payload["generation"]),
+            "pending",
+            pending_count=1,
+            oldest_pending_age_seconds=0.5,
+        )
+
+    monkeypatch.setattr(runtime, "request_socket", socket)
+    request = {
+        "schema_version": 1,
+        "operation": "inspect",
+        "event_id": event_id,
+        "target_key": session_key(original.provider, original.session_id),
+        "target_generation": original.generation,
+    }
+    response = handle_broker_request(root, request, "100.64.0.9")
+    assert response == {
+        "schema_version": 1,
+        "status": "INSPECTED",
+        "event_id": event_id,
+        "observer": "native_helper",
+        "event_state": "pending",
+        "courier_version": "0.5.4",
+        "courier_incarnation": "inc-1",
+        "pending_count": 1,
+        "oldest_pending_age_seconds": 0.5,
+    }
+    assert [item["generation"] for item in asked] == [helper.generation]
+    assert {item["operation"] for item in asked} == {"inspect"}
+    # No receiver or an unreadable answer reports "none" with a closed reason.
+    asked.clear()
+    response = handle_broker_request(root, {**request, "event_id": str(uuid4())}, "100.64.0.9")
+    assert response["observer"] == "native_helper"
+    response = handle_broker_request(
+        root, {**request, "target_generation": str(uuid4())}, "100.64.0.9"
+    )
+    assert response == {
+        "schema_version": 1,
+        "status": "INSPECTED",
+        "event_id": event_id,
+        "observer": "none",
+        "reason": "no_local_receiver",
+    }
+    # A non-tailnet peer and malformed shapes are refused outright.
+    with pytest.raises(ChatError, match="invalid"):
+        handle_broker_request(root, request, "127.0.0.1")
+    with pytest.raises(ChatError, match="invalid"):
+        handle_broker_request(root, {**request, "message": "x"}, "100.64.0.9")
+    with pytest.raises(ChatError, match="invalid"):
+        handle_broker_request(root, {**request, "target_key": "z" * 64}, "100.64.0.9")
+
+
+def test_chat_status_schema_and_callers_carry_the_optional_recipient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The advertised schema names the optional recipient, and both the native
+    and external caller paths pass it through unchanged."""
+    from cross_agent_chat import cli
+
+    tools = cli._mcp_tools("claude", True)
+    status_tool = next(tool for tool in tools if tool["name"] == "chat_status")
+    schema = cast(dict[str, object], status_tool["inputSchema"])
+    assert set(cast(dict[str, object], schema["properties"])) == {"event_id", "recipient"}
+    assert schema["required"] == ["event_id"]
+
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    _target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="remote",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    store = IntentStore(root)
+    event_id = store.begin(source, _target, source_alias=source.alias, payload_digest="a" * 64)
+    seen: list[str | None] = []
+
+    def fake_status(
+        _root: Path, _source: object, _event: str, *, recipient: str | None = None
+    ) -> dict[str, object]:
+        seen.append(recipient)
+        return {"schema_version": 1, "event_id": _event, "status": "PENDING"}
+
+    monkeypatch.setattr(cli, "event_status", fake_status)
+    monkeypatch.setattr(cli, "authenticate_mcp_sender", lambda *_args: source)
+    result = cli._mcp_call_tool(
+        "claude",
+        root,
+        {
+            "name": "chat_status",
+            "arguments": {"event_id": event_id, "recipient": "cac2.fixture"},
+        },
+    )
+    assert seen == ["cac2.fixture"]
+    assert not result.get("isError")
+    cli._mcp_call_tool("claude", root, {"name": "chat_status", "arguments": {"event_id": event_id}})
+    assert seen == ["cac2.fixture", None]
+    with pytest.raises(ChatError, match="event id is invalid"):
+        cli._mcp_call_tool(
+            "claude",
+            root,
+            {"name": "chat_status", "arguments": {"event_id": event_id, "recipient": 7}},
+        )
+    with pytest.raises(ChatError, match="event id is invalid"):
+        cli._mcp_call_tool(
+            "claude",
+            root,
+            {"name": "chat_status", "arguments": {"event_id": event_id, "extra": "x"}},
+        )
+    # The external endpoint caller takes the same optional argument.
+    _endpoint, credential = _external_endpoint(root)
+    seen.clear()
+    result = cli._external_call_tool(
+        root,
+        credential,
+        {
+            "name": "chat_status",
+            "arguments": {"event_id": event_id, "recipient": "cac2.fixture"},
+        },
+    )
+    assert seen == ["cac2.fixture"]
+    assert not result.get("isError")
+
+
+def _external_endpoint(root: Path) -> tuple[object, str]:
+    from cross_agent_chat.external import ExternalEndpointStore
+
+    return ExternalEndpointStore(root).enroll(
+        device="test", name="status", context="status fixture"
+    )
+
+
+def test_cli_status_recipient_flag_reaches_the_owner_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from cross_agent_chat import cli
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = home / ".local/state/cross-agent-chat"
+    monkeypatch.setenv("HOME", str(home))
+    source = _route(root, tmp_path)
+    _store, target, event_id = _remote_intent(root, source, tmp_path)
+    token = remote_token(
+        "nTarget", session_key(target.provider, target.session_id), target.generation
+    )
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSender", peers={"nTarget": "100.64.0.2"}),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "request_tailnet",
+        lambda _address, _payload, **_k: {
+            "schema_version": 1,
+            "status": "INSPECTED",
+            "event_id": event_id,
+            "observer": "original_courier",
+            "event_state": "pending",
+            "courier_version": "0.5.4",
+            "courier_incarnation": "inc-1",
+            "pending_count": 1,
+            "oldest_pending_age_seconds": 1.5,
+        },
+    )
+    assert (
+        cli.run(cli.parser().parse_args(["status", event_id, "--recipient", token, "--json"])) == 0
+    )
+    payload = cast(dict[str, object], json.loads(capsys.readouterr().out))
+    observation = cast(dict[str, object], payload["receiving_observation"])
+    assert observation["stage"] == "pending_in_courier"
+    assert observation["observer"] == "original_courier"
+
+
+@pytest.mark.parametrize("malformed", [[], {}])
+def test_status_malformed_local_inspect_state_stays_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, malformed: object
+) -> None:
+    root = tmp_path / "state"
+    source, target = _route(root, tmp_path), _route(root, tmp_path)
+    store, event_id = _accepted_intent(root, source, target)
+    before = store.path.read_bytes()
+    response = _inspect_answer(target.generation, "unseen")
+    response["event_state"] = malformed
+    monkeypatch.setattr(runtime, "request_socket", lambda *_a, **_k: response)
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
+    )
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == "observation_invalid"
+    assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["observer", "event_state", "reason"])
+@pytest.mark.parametrize("malformed", [[], {}])
+def test_status_malformed_remote_inspect_fields_stay_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, malformed: object
+) -> None:
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    store, target, event_id = _remote_intent(root, source, tmp_path)
+    before = store.path.read_bytes()
+    recipient = remote_token(
+        "nTarget", session_key(target.provider, target.session_id), target.generation
+    )
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSender", peers={"nTarget": "100.64.0.2"}),
+    )
+    response: dict[str, object] = {
+        "schema_version": 1,
+        "status": "INSPECTED",
+        "event_id": event_id,
+        "observer": "original_courier",
+        "event_state": "handed_off",
+        "courier_version": "0.5.5",
+        "courier_incarnation": "inc-1",
+    }
+    if field == "reason":
+        response = {
+            "schema_version": 1,
+            "status": "INSPECTED",
+            "event_id": event_id,
+            "observer": "none",
+            "reason": "courier_unavailable",
+        }
+    response[field] = malformed
+    monkeypatch.setattr(runtime, "request_tailnet", lambda *_a, **_k: response)
+    observation = cast(
+        dict[str, object],
+        runtime.owner_event_status(root, event_id, recipient=recipient)["receiving_observation"],
+    )
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == "remote_observation_invalid"
+    assert store.path.read_bytes() == before
+
+
+def test_status_bound_helper_with_stale_original_cannot_claim_a_current_receiving_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    original, _helper = _bound_helper_pair(root, tmp_path)
+    store, event_id = _accepted_intent(root, source, original)
+    before = store.path.read_bytes()
+    monkeypatch.setattr(runtime, "_route_current", lambda _root, route: route != original)
+    calls: list[object] = []
+    monkeypatch.setattr(runtime, "request_socket", lambda *args, **_kw: calls.append(args))
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
+    )
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == "original_unavailable"
+    assert calls == []
     assert store.path.read_bytes() == before

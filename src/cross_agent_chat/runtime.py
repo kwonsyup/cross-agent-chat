@@ -3630,12 +3630,10 @@ def _receiving_qualification(
         return False, True, "next_turn"
     if deferred:
         return False, False, "next_turn"
-    if mode == "claude_native_cross_session" or (
-        mode == "codex_experimental_queue" and mechanism == "native_helper"
-    ):
-        # These mechanisms deliver while the destination is live and able to
-        # act, but their wake behavior is not separately qualified.
-        return "unknown", "unknown", "while_idle"
+    # Generic Claude/helper labels do not attest the current host's wake
+    # behavior or the helper-to-original boundary. Historical qualification
+    # for one context cannot turn an unknown current wake into an idle reply
+    # promise. Delivery still uses the same native path.
     return "unknown", "unknown", "unknown"
 
 
@@ -3645,7 +3643,7 @@ def destination_receiving(target: Target | None) -> dict[str, object]:
     A Stop/prompt boundary cannot wake a parked original or inject into its active
     turn. Queue and native mechanisms need host-specific proof for those stronger
     promises; a health response alone does not provide that proof. The owning
-    daemon 0.160.1 path is separately qualified for parked queue wake and
+    daemon's admitted versions are separately qualified for parked queue wake and
     expected-active-turn steer; qualification still is not an event receipt.
     A Devin route reports active-turn input only as the negotiated
     ``devin_tool_boundary`` mode, which its receiver affirms after its loaded
@@ -4849,8 +4847,10 @@ REPLY_DELIVERY_TIMEOUT_SECONDS: Final = 1.0
 def reply_delivery(root: Path, source: SourceIdentity) -> ReplyDelivery:
     """Say how an answer sent to this authenticated source session reaches it.
 
-    Claude and a queued Codex route receive a new message while idle. A Stop-bound
-    Codex route is handed a queued message only at its next turn boundary: the end
+    A qualified owning-daemon route receives a new message while idle. Generic
+    Claude, Native helper, and experimental queue labels leave current host
+    qualification unknown. A Stop-bound Codex route is handed a queued message
+    only at its next turn boundary: the end
     of the current turn if it has already arrived, otherwise the user's next prompt.
     A Devin route also receives it at the next tool boundary of an active turn, but
     an idle Devin conversation waits for the user's next prompt. An unreachable,
@@ -5284,31 +5284,124 @@ def native_dispatch(root: Path, helper: Route, event_id: str) -> dict[str, objec
 # the send's own budgets apply, and it must never be able to stall delivery.
 INSPECT_TIMEOUT_SECONDS: Final = 1.0
 
+ReceivingObserver = Literal["original_courier", "native_helper"]
 
-def _receiving_observation(root: Path, intent: Intent) -> dict[str, object]:
-    """Body-free view of where the recorded target generation's courier holds
-    this event. It only reads volatile courier state: nothing is sent, woken,
-    acknowledged, dequeued, or reordered, and an unreachable answer stays
-    ``unknown`` rather than guessing at custody."""
+_COURIER_EVENT_STATES: Final = frozenset({"pending", "handed_off", "unseen", "no_courier_queue"})
+# The failure tokens a remote inspect answer may carry; the requester maps each
+# to its own prose, so a peer can never inject body text into a status read.
+_RECEIVER_CHECK_ACTION: Final = (
+    "check the intended original through its normal provider transcript or "
+    "next natural turn on the receiving Mac; do not replay this event"
+)
+_REMOTE_INSPECT_DETAILS: Final = {
+    "original_unavailable": (
+        "the recorded original's owner is no longer current; its bound helper "
+        "cannot establish a current receiving path. Use the original's normal "
+        "resume lifecycle when convenient; do not replay this event"
+    ),
+    "no_local_receiver": (
+        "the recipient node found no live receiver owning the recorded target "
+        f"generation; {_RECEIVER_CHECK_ACTION}"
+    ),
+    "helper_binding_ambiguous": (
+        "the recipient node could not resolve the recorded target's native "
+        f"helper binding unambiguously; {_RECEIVER_CHECK_ACTION}"
+    ),
+    "helper_unavailable": (
+        "the event was addressed to the recorded target's registered native "
+        f"helper, which is not live; {_RECEIVER_CHECK_ACTION}"
+    ),
+    "courier_unavailable": (
+        "the receiving courier on the recipient node did not answer inspect; it "
+        f"may predate this observation or have restarted; {_RECEIVER_CHECK_ACTION}"
+    ),
+    "observation_invalid": (
+        "the receiving courier on the recipient node returned an answer that "
+        f"was not a valid inspect response; {_RECEIVER_CHECK_ACTION}"
+    ),
+}
+_REMOTE_INSPECT_REASONS: Final = frozenset(_REMOTE_INSPECT_DETAILS)
+_REMOTE_INSPECT_REASON_NAMES: Final = {
+    "original_unavailable": "remote_original_unavailable",
+    "no_local_receiver": "remote_no_receiver",
+    "helper_binding_ambiguous": "remote_helper_binding_ambiguous",
+    "helper_unavailable": "remote_helper_unavailable",
+    "courier_unavailable": "remote_courier_unavailable",
+    "observation_invalid": "remote_observation_invalid",
+}
 
-    route = next(
+
+def _receiving_unknown(reason: str, detail: str) -> dict[str, object]:
+    return {"stage": "unknown", "reason": reason, "detail": detail}
+
+
+def _receiving_delivery(
+    root: Path, routes: list[Route], target_key: str, target_generation: str
+) -> tuple[Route | None, Route | None, ReceivingObserver | None, str | None]:
+    """Resolve the exact courier a recorded target's event was addressed to.
+
+    Returns ``(original, delivery, observer, failure)``. A registered live
+    native helper owns receiving exactly as on the send path -- the original
+    courier was never offered the event -- so only the bound helper's socket
+    may be inspected. A dead, ambiguous, or stale binding leaves ``delivery``
+    None and the observation unknown; no unrelated helper is ever consulted.
+    """
+
+    original = next(
         (
             item
-            for item in Registry(root).routes()
-            if session_key(item.provider, item.session_id) == intent.target_key
-            and item.generation == intent.target_generation
+            for item in routes
+            if session_key(item.provider, item.session_id) == target_key
+            and item.generation == target_generation
         ),
         None,
     )
-    if route is None:
-        return {
-            "stage": "unknown",
-            "reason": "no_local_receiver",
-            "detail": (
-                "no live local receiver owns the recorded target generation; "
-                "a remote receiver's custody cannot be observed"
-            ),
-        }
+    if original is None:
+        return None, None, None, "no_local_receiver"
+    if original.provider != "codex" or not any(
+        item.state == "REGISTERED"
+        and item.original_session_id == original.session_id
+        and item.original_generation == original.generation
+        for item in NativeHelperStore(root).bindings()
+    ):
+        return original, original, "original_courier", None
+    if not _route_current(root, original):
+        return original, None, None, "original_unavailable"
+    try:
+        helper = NativeHelperStore(root).helper_for_original(original, routes)
+    except ChatError:
+        return original, None, None, "helper_binding_ambiguous"
+    if helper is None or not _route_current(root, helper):
+        return original, None, None, "helper_unavailable"
+    return original, helper, "native_helper", None
+
+
+def _pending_fields_valid(raw: dict[str, object]) -> bool:
+    if "pending_count" not in raw:
+        return "oldest_pending_age_seconds" not in raw
+    count = raw.get("pending_count")
+    age = raw.get("oldest_pending_age_seconds")
+    return (
+        isinstance(count, int)
+        and not isinstance(count, bool)
+        and count >= 0
+        and "oldest_pending_age_seconds" in raw
+        and (
+            age is None
+            or (isinstance(age, (int, float)) and not isinstance(age, bool) and age >= 0)
+        )
+    )
+
+
+def _inspect_receiving_courier(
+    root: Path, route: Route, event_id: str
+) -> tuple[dict[str, object] | None, str | None]:
+    """One bounded read-only inspect of the courier that would hold the event.
+
+    Returns ``(fields, None)`` with the validated body-free answer, or
+    ``(None, reason)``. Nothing is enqueued, woken, acknowledged, or reordered.
+    """
+
     try:
         response = request_socket(
             socket_path(root, route),
@@ -5316,19 +5409,12 @@ def _receiving_observation(root: Path, intent: Intent) -> dict[str, object]:
                 "schema_version": SCHEMA_VERSION,
                 "operation": "inspect",
                 "generation": route.generation,
-                "event_id": intent.event_id,
+                "event_id": event_id,
             },
             timeout=INSPECT_TIMEOUT_SECONDS,
         )
     except (ChatError, OSError):
-        return {
-            "stage": "unknown",
-            "reason": "courier_unavailable",
-            "detail": (
-                "the receiving courier did not answer inspect; it may predate this "
-                "observation or have restarted, so volatile receiving state is unobservable"
-            ),
-        }
+        return None, "courier_unavailable"
     expected = {
         "schema_version",
         "status",
@@ -5345,54 +5431,86 @@ def _receiving_observation(root: Path, intent: Intent) -> dict[str, object]:
         or response.get("generation") != route.generation
         or not isinstance(response.get("courier_version"), str)
         or not isinstance(response.get("courier_incarnation"), str)
-        or state not in {"pending", "handed_off", "unseen", "no_courier_queue"}
+        or not isinstance(state, str)
+        or state not in _COURIER_EVENT_STATES
+        or not _pending_fields_valid(response)
     ):
-        return {
-            "stage": "unknown",
-            "reason": "observation_invalid",
-            "detail": "the receiving courier's answer was not a valid inspect response",
-        }
-    pending_count = response.get("pending_count")
-    pending_age = response.get("oldest_pending_age_seconds")
-    if "pending_count" in response and (
-        not isinstance(pending_count, int)
-        or isinstance(pending_count, bool)
-        or pending_count < 0
-        or not (
-            pending_age is None
-            or (
-                isinstance(pending_age, (int, float))
-                and not isinstance(pending_age, bool)
-                and pending_age >= 0
-            )
-        )
-    ):
-        return {
-            "stage": "unknown",
-            "reason": "observation_invalid",
-            "detail": "the receiving courier's answer was not a valid inspect response",
-        }
-    observation: dict[str, object] = {
+        return None, "observation_invalid"
+    fields: dict[str, object] = {
+        "event_state": state,
         "courier_version": response["courier_version"],
         "courier_incarnation": response["courier_incarnation"],
+    }
+    if "pending_count" in response:
+        fields["pending_count"] = response["pending_count"]
+        fields["oldest_pending_age_seconds"] = response["oldest_pending_age_seconds"]
+    return fields, None
+
+
+def _native_dispatch_claim(root: Path, original: Route, helper: Route, event_id: str) -> str | None:
+    """The durable claim this exact bound pair recorded for this event.
+
+    A NativeDispatchStore row is only ever a claim of a possible native effect:
+    it stays UNKNOWN and is never evidence the original session consumed the
+    event.
+    """
+
+    claims = [
+        item
+        for item in NativeDispatchStore(root).dispatches()
+        if item.event_id == event_id
+        and item.helper_session_id == helper.session_id
+        and item.helper_generation == helper.generation
+        and item.original_session_id == original.session_id
+        and item.original_generation == original.generation
+    ]
+    return claims[0].state if len(claims) == 1 else None
+
+
+def _receiving_state_observation(
+    fields: dict[str, object], intent_status: str, observer: ReceivingObserver
+) -> dict[str, object]:
+    """Map one validated body-free courier answer to a custody stage."""
+
+    state = fields["event_state"]
+    pending_count = fields.get("pending_count")
+    pending_age = fields.get("oldest_pending_age_seconds")
+    if observer == "native_helper":
+        # Helper handoff is only the helper boundary: it is never original
+        # dispatch evidence and never original-session consumption.
+        holder = "the bound native helper's courier"
+        boundary = "the helper session's provider boundary"
+    else:
+        holder = "the receiving courier"
+        boundary = "the provider boundary"
+    observation: dict[str, object] = {
+        "observer": observer,
+        "courier_version": fields["courier_version"],
+        "courier_incarnation": fields["courier_incarnation"],
     }
     if state == "pending" and isinstance(pending_count, int):
         observation["stage"] = "pending_in_courier"
         observation["pending_count"] = pending_count
         observation["oldest_pending_age_seconds"] = pending_age
-        observation["detail"] = (
-            "the receiving courier still holds the event; the provider boundary has not taken it"
-        )
+        observation["detail"] = f"{holder} still holds the event; {boundary} has not taken it"
     elif state == "handed_off":
         observation["stage"] = "handed_off"
         if isinstance(pending_count, int):
             observation["pending_count"] = pending_count
             observation["oldest_pending_age_seconds"] = pending_age
         observation["detail"] = (
-            "the receiving courier recorded handing the event to the provider "
-            "boundary; that is never evidence the original session consumed it"
+            f"{holder} recorded handing the event to {boundary}; "
+            "that is never evidence the original session consumed it"
         )
-    elif state == "no_courier_queue" and intent.status == "TRANSPORT_ACCEPTED":
+        if observer == "native_helper":
+            observation["detail"] = (
+                f"{observation['detail']}; original forwarding remains unobserved"
+            )
+    elif (
+        state == "no_courier_queue"
+        and intent_status == "TRANSPORT_ACCEPTED"
+        and observer == "original_courier"
+    ):
         # A provider-native route (Claude, direct Devin) accepted the event at
         # transport and holds no CAC queue; custody ended at the provider side.
         observation["stage"] = "handed_off"
@@ -5404,17 +5522,222 @@ def _receiving_observation(root: Path, intent: Intent) -> dict[str, object]:
         observation["stage"] = "unknown"
         observation["reason"] = "no_courier_record"
         observation["detail"] = (
-            "the live receiving courier holds no record of the event; a "
+            f"the live {holder} holds no record of the event; a "
             "same-generation courier restart forgets volatile custody"
         )
     else:
         observation["stage"] = "unknown"
         observation["reason"] = "unqualified_state"
-        observation["detail"] = "the receiving courier's state does not map to a custody stage"
+        observation["detail"] = f"{holder} reported a state that does not map to a custody stage"
     return observation
 
 
-def _event_status_payload(root: Path, intent: Intent) -> dict[str, object]:
+def _receiving_observation(
+    root: Path, intent: Intent, *, recipient: str | None = None
+) -> dict[str, object]:
+    """Body-free view of where the recorded target generation's courier holds
+    this event. It only reads volatile courier state: nothing is sent, woken,
+    acknowledged, dequeued, or reordered, and an unreachable answer stays
+    ``unknown`` rather than guessing at custody."""
+
+    if recipient is not None:
+        return _remote_receiving_observation(intent, recipient)
+    original, delivery, observer, failure = _receiving_delivery(
+        root, Registry(root).routes(), intent.target_key, intent.target_generation
+    )
+    if failure == "no_local_receiver":
+        return _receiving_unknown(
+            "no_local_receiver",
+            "no live local receiver owns the recorded target generation; inspect "
+            "with that receiver's exact matching remote handle (status --recipient "
+            "or the chat_status recipient argument), or "
+            f"{_RECEIVER_CHECK_ACTION}",
+        )
+    if failure == "helper_binding_ambiguous":
+        return _receiving_unknown(
+            "helper_binding_ambiguous",
+            "the recorded target's native helper binding is ambiguous; "
+            "receiving state is unobservable",
+        )
+    if failure == "original_unavailable":
+        return _receiving_unknown(
+            "original_unavailable", _REMOTE_INSPECT_DETAILS["original_unavailable"]
+        )
+    if failure == "helper_unavailable":
+        return _receiving_unknown(
+            "helper_unavailable",
+            "the event was addressed to the recorded target's registered native "
+            "helper, which is not currently live; the original courier was "
+            "never offered it, so volatile receiving state is unobservable",
+        )
+    assert original is not None and delivery is not None and observer is not None
+    fields, inspect_failure = _inspect_receiving_courier(root, delivery, intent.event_id)
+    if inspect_failure == "courier_unavailable":
+        return _receiving_unknown(
+            "courier_unavailable",
+            "the receiving courier did not answer inspect; it may predate this "
+            "observation or have restarted, so volatile receiving state is unobservable",
+        )
+    if fields is None:
+        return _receiving_unknown(
+            "observation_invalid",
+            "the receiving courier's answer was not a valid inspect response",
+        )
+    observation = _receiving_state_observation(fields, intent.status, observer)
+    if observer == "native_helper":
+        claim = _native_dispatch_claim(root, original, delivery, intent.event_id)
+        if claim is not None:
+            observation["native_dispatch_claim"] = claim
+    return observation
+
+
+def _remote_receiving_observation(intent: Intent, recipient: str) -> dict[str, object]:
+    """Observe custody on the exact node that presented the recorded target.
+
+    The token must name the recorded target before anything is probed, and the
+    probe is one bounded read-only broker inspect resolved through the local
+    Tailnet identity -- never an authorize, receive, peek, ack, or discovery
+    fanout. Every failure stays ``unknown`` with a safe next action rather than
+    guessing custody.
+    """
+
+    token = parse_recipient_token(recipient)
+    if token is None or token.scope != "remote" or token.node_id is None:
+        raise ChatError(
+            "recipient must be an exact remote recipient handle presented for "
+            "this event's recorded target"
+        )
+    if token.handle != intent.target_key or token.generation != intent.target_generation:
+        raise ChatError(
+            "recipient does not match this event's recorded target; refusing before any probe"
+        )
+    identity = tailnet_identity()
+    if identity is None:
+        return _receiving_unknown(
+            "remote_unavailable",
+            "Tailscale is unavailable, so the recipient node cannot be resolved; "
+            f"{_RECEIVER_CHECK_ACTION}",
+        )
+    address = identity.peers.get(token.node_id)
+    if address is None:
+        return _receiving_unknown(
+            "remote_node_unavailable",
+            "the node that presented the recorded recipient is not currently "
+            f"online on the tailnet; {_RECEIVER_CHECK_ACTION}",
+        )
+    try:
+        response = request_tailnet(
+            address,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "operation": "inspect",
+                "event_id": intent.event_id,
+                "target_key": intent.target_key,
+                "target_generation": intent.target_generation,
+            },
+            timeout=INSPECT_TIMEOUT_SECONDS,
+        )
+    except (ChatError, OSError):
+        return _receiving_unknown(
+            "remote_broker_unavailable",
+            "the recipient node's broker did not answer one bounded inspect; it "
+            "may be offline, at capacity, or older than this operation; "
+            f"{_RECEIVER_CHECK_ACTION}",
+        )
+    base = {"schema_version", "status", "event_id", "observer"}
+    observed = base | {"event_state", "courier_version", "courier_incarnation"}
+    observer = response.get("observer")
+    valid_failure = (
+        set(response) == base | {"reason"}
+        and observer == "none"
+        and isinstance(response.get("reason"), str)
+        and response.get("reason") in _REMOTE_INSPECT_REASONS
+    )
+    valid_observation = (
+        isinstance(observer, str)
+        and observer in {"original_courier", "native_helper"}
+        and observed <= set(response)
+        and set(response) - observed
+        <= {"pending_count", "oldest_pending_age_seconds", "dispatch_claim"}
+        and ("pending_count" in response) == ("oldest_pending_age_seconds" in response)
+        and response.get("dispatch_claim", "UNKNOWN") == "UNKNOWN"
+        and isinstance(response.get("courier_version"), str)
+        and isinstance(response.get("courier_incarnation"), str)
+        and isinstance(response.get("event_state"), str)
+        and response.get("event_state") in _COURIER_EVENT_STATES
+        and _pending_fields_valid(response)
+    )
+    if (
+        response.get("schema_version") != SCHEMA_VERSION
+        or response.get("status") != "INSPECTED"
+        or response.get("event_id") != intent.event_id
+        or not (valid_failure or valid_observation)
+    ):
+        return _receiving_unknown(
+            "remote_observation_invalid",
+            "the recipient node's answer was not a valid inspect response; "
+            f"{_RECEIVER_CHECK_ACTION}",
+        )
+    if observer == "none":
+        reason = cast(str, response["reason"])
+        return _receiving_unknown(
+            _REMOTE_INSPECT_REASON_NAMES[reason], _REMOTE_INSPECT_DETAILS[reason]
+        )
+    fields = {
+        "event_state": response["event_state"],
+        "courier_version": response["courier_version"],
+        "courier_incarnation": response["courier_incarnation"],
+    }
+    if "pending_count" in response:
+        fields["pending_count"] = response["pending_count"]
+        fields["oldest_pending_age_seconds"] = response["oldest_pending_age_seconds"]
+    observation = _receiving_state_observation(
+        fields, intent.status, cast(ReceivingObserver, observer)
+    )
+    if "dispatch_claim" in response:
+        observation["native_dispatch_claim"] = "UNKNOWN"
+    return observation
+
+
+def inspect_remote_receiving(
+    root: Path, *, event_id: str, target_key: str, target_generation: str
+) -> dict[str, object]:
+    """Answer one ACL-permitted broker inspect with this node's own read-only
+    receiving observation as closed body-free fields. The remote requester
+    re-derives every verdict locally; nothing here is enqueued, authorized,
+    woken, acknowledged, or reordered.
+    """
+
+    identifier = valid_uuid(event_id, "event id")
+    if re.fullmatch(r"[0-9a-f]{64}", target_key) is None:
+        raise ChatError("Tailnet broker request is invalid")
+    generation = valid_uuid(target_generation, "target generation")
+    answer: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "INSPECTED",
+        "event_id": identifier,
+    }
+    original, delivery, observer, failure = _receiving_delivery(
+        root, Registry(root).routes(), target_key, generation
+    )
+    if delivery is None or observer is None:
+        return {**answer, "observer": "none", "reason": failure or "no_local_receiver"}
+    fields, inspect_failure = _inspect_receiving_courier(root, delivery, identifier)
+    if fields is None:
+        return {**answer, "observer": "none", "reason": inspect_failure or "courier_unavailable"}
+    answer.update({"observer": observer, **fields})
+    if (
+        observer == "native_helper"
+        and original is not None
+        and _native_dispatch_claim(root, original, delivery, identifier) is not None
+    ):
+        answer["dispatch_claim"] = "UNKNOWN"
+    return answer
+
+
+def _event_status_payload(
+    root: Path, intent: Intent, *, recipient: str | None = None
+) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
         "event_id": intent.event_id,
@@ -5424,12 +5747,18 @@ def _event_status_payload(root: Path, intent: Intent) -> dict[str, object]:
         "target_generation": intent.target_generation,
         "timestamp": intent.timestamp,
         "delivery_observation": "not_observed",
-        "receiving_observation": _receiving_observation(root, intent),
+        "receiving_observation": _receiving_observation(root, intent, recipient=recipient),
     }
 
 
-def event_status(root: Path, source: SourceIdentity, event_id: str) -> dict[str, object]:
-    """Return body-free custody state for one exact authenticated source event."""
+def event_status(
+    root: Path, source: SourceIdentity, event_id: str, *, recipient: str | None = None
+) -> dict[str, object]:
+    """Return body-free custody state for one exact authenticated source event.
+
+    ``recipient`` is the exact remote handle that presented the recorded
+    target; supplying it asks that one node for its own volatile observation.
+    """
     if not _source_current(root, source):
         raise ChatError("event is unavailable")
     intent = IntentStore(root).intent_for_source(
@@ -5439,20 +5768,23 @@ def event_status(root: Path, source: SourceIdentity, event_id: str) -> dict[str,
     )
     if intent is None:
         raise ChatError("event is unavailable")
-    return _event_status_payload(root, intent)
+    return _event_status_payload(root, intent, recipient=recipient)
 
 
-def owner_event_status(root: Path, event_id: str) -> dict[str, object]:
+def owner_event_status(
+    root: Path, event_id: str, *, recipient: str | None = None
+) -> dict[str, object]:
     """Body-free status for one owner-side event id, exactly as read-only as
     ``event_status``: the owner already sees every recorded row, and this adds
     only the same volatile receiving observation -- no durable write, no wake,
-    no acknowledgement."""
+    no acknowledgement. ``recipient`` asks the exact remote node that presented
+    the recorded target for its own read."""
 
     identifier = valid_uuid(event_id, "event id")
     matches = [item for item in IntentStore(root).intents() if item.event_id == identifier]
     if len(matches) != 1:
         raise ChatError("event is unavailable")
-    return _event_status_payload(root, matches[0])
+    return _event_status_payload(root, matches[0], recipient=recipient)
 
 
 def codex_stop(pid: int, state_root_value: str | None) -> None:

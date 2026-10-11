@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.5 - 2026-10-11
+
+- Keep receiving and reply timing on the same qualification basis. Generic
+  Claude and Native-helper labels now leave `reply_delivery` unknown, matching
+  their unknown current-host wake capability. The admitted owning-daemon
+  path still reports idle wake and active input; delivery mechanisms and
+  recorded context-specific qualifications are unchanged.
+- Inspect the exact bound Native helper and identify its observation boundary.
+  A helper handoff is not forwarding into the original, and neither handoff
+  nor an uncertain native dispatch claim proves original consumption.
+- Allow read-only status to select one remote receiver with an exact matching
+  recipient token. Its session/generation must match the recorded event; the
+  existing Tailnet node binding chooses one broker without fanout or a new
+  ledger. Old or unavailable observations remain unknown with a safe next
+  action, never a resend.
+- Correct experimental-queue wording, the source map's admitted Codex versions,
+  and loaded activation guidance. Ordinary re-registration can retain an
+  answering or busy courier; a normal lifecycle transition and loaded-state
+  readback are required to establish adoption.
+- Local Devin idle receiving remains unsupported: CLI 3000.11.3 and the
+  Desktop-bundled CLI 3000.10.48 expose hooks and ACP but no supported inlet
+  to an already-running idle original. Issue #38 stays open. This corrective
+  macOS beta does not establish universal production compatibility, current
+  Native alpha qualification, or all-three-provider unattended round trips.
+
 ## 0.5.4 - 2026-10-10
 
 - A Devin SessionEnd whose PID or workspace does not match the current route now refuses before touching anything. Previously it cleared the live session's capabilities and subagent custody, so a later tool boundary could hand a held message to a running child. Validation and cleanup now share the session's registration lock.
