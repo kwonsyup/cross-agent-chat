@@ -1212,13 +1212,19 @@ def test_wire_request_and_response_key_sets_are_unchanged(
     }
     tool_boundary = negotiated | {"include_devin_tool_boundary"}
     boundary = tool_boundary | {"include_current_boundary"}
+    acp_host = tool_boundary | {"include_devin_acp_host"}
+    acp_boundary = boundary | {"include_devin_acp_host"}
     assert all(
         set(payload)
         in (
+            {"schema_version", "operation", "handle", "include_devin"} | acp_boundary,
+            {"schema_version", "operation", "handle", "include_devin"} | acp_host,
             {"schema_version", "operation", "handle", "include_devin"} | boundary,
             {"schema_version", "operation", "handle", "include_devin"} | tool_boundary,
             {"schema_version", "operation", "handle", "include_devin"} | negotiated,
             {"schema_version", "operation", "handle", "include_devin"},
+            {"schema_version", "operation", "include_devin"} | acp_boundary,
+            {"schema_version", "operation", "include_devin"} | acp_host,
             {"schema_version", "operation", "include_devin"} | boundary,
             {"schema_version", "operation", "include_devin"} | tool_boundary,
             {"schema_version", "operation", "include_devin"} | negotiated,
