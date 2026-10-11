@@ -45,6 +45,7 @@ from cross_agent_chat.devin import (
 ACP_FRAME_MAX_BYTES: Final = 64 * 1024 * 1024
 DELIVERY_POLL_SECONDS: Final = 1.0
 ENGINE_EXIT_GRACE_SECONDS: Final = 5.0
+MAX_QUEUED_PROMPTS: Final = 4
 REGISTRY_AGENT_ID: Final = "cross-agent-chat-devin"
 DEFAULT_REGISTRY: Final = Path("~/.windsurf/acp/registry.json")
 PLATFORMS: Final = ("darwin-aarch64", "darwin-x86_64")
@@ -66,7 +67,7 @@ class _Session:
     host_prompts: set[int] = field(default_factory=set)
     cac_prompt: int | None = None
     claiming: bool = False
-    submitted: bool = False
+    in_transit: set[int] = field(default_factory=set)
     cancel_pending: Frame | None = None
     queued: deque[Frame] = field(default_factory=deque)
 
@@ -203,13 +204,42 @@ class Mediator:
             if method == "session/prompt" and session_id is not None:
                 session = self._sessions.setdefault(session_id, _Session())
                 if session.cac_prompt is not None or session.claiming or session.queued:
-                    session.queued.append(frame)
-                    return
-                internal = self._allocate(pending)
-                session.host_prompts.add(internal)
+                    if len(session.queued) < MAX_QUEUED_PROMPTS:
+                        session.queued.append(frame)
+                        return
+                    refusal: Frame = {
+                        "jsonrpc": "2.0",
+                        "id": frame["id"],
+                        "error": {"code": -32000, "message": "too many prompts are waiting"},
+                    }
+                else:
+                    internal = self._allocate(pending)
+                    session.host_prompts.add(internal)
+                    session.in_transit.add(internal)
+                    refusal = {}
             else:
                 internal = self._allocate(pending)
-        self._to_engine({**frame, "id": internal})
+                refusal = {}
+        if refusal:
+            self._to_host(refusal)
+        elif method == "session/prompt" and session_id is not None:
+            self._send_prompt(session_id, {**frame, "id": internal})
+        else:
+            self._to_engine({**frame, "id": internal})
+
+    def _send_prompt(self, session_id: str, frame: Frame) -> None:
+        """Write one allocated prompt, then release a cancel that waited for it."""
+
+        self._to_engine(frame)
+        with self._lock:
+            session = self._sessions.get(session_id)
+            cancel = None
+            if session is not None:
+                session.in_transit.discard(cast(int, frame["id"]))
+                if not session.in_transit and not session.claiming:
+                    cancel, session.cancel_pending = session.cancel_pending, None
+        if cancel is not None:
+            self._to_engine(cancel)
 
     def _cancel(self, frame: Frame, session_id: str) -> None:
         with self._lock:
@@ -218,11 +248,11 @@ class Mediator:
             forward = True
             if session is not None:
                 session.queued.clear()
-                if session.claiming or (session.cac_prompt is not None and not session.submitted):
-                    # A peer prompt is being taken or written right now; the
-                    # cancel must follow it to the engine, not overtake it.
+                if session.claiming or session.in_transit:
+                    # A prompt is being taken or written right now; the cancel
+                    # must follow it to the engine, never overtake it.
                     session.cancel_pending = frame
-                    forward = bool(session.host_prompts)
+                    forward = False
                 else:
                     forward = session.cac_prompt is not None or bool(session.host_prompts)
         for prompt in queued:
@@ -265,7 +295,7 @@ class Mediator:
             if pending is None or not isinstance(internal, int):
                 self._diagnostic("dropped an engine response with no requester")
                 return
-            release = self._settle(pending, internal, frame)
+            due, answers = self._settle(pending, internal, frame)
         if pending.owner == "cac":
             result = frame.get("result")
             stop = (
@@ -276,10 +306,14 @@ class Mediator:
             self._diagnostic(f"peer turn finished: {stop}")
         else:
             self._to_host({**frame, "id": pending.original_id})
-        self._release(release)
+        for answer in answers:
+            self._to_host(answer)
+        self._release(due)
 
-    def _settle(self, pending: _Pending, internal: int, frame: Frame) -> list[Frame]:
-        """Update session state for one engine response; return host prompts now due."""
+    def _settle(
+        self, pending: _Pending, internal: int, frame: Frame
+    ) -> tuple[list[Frame], list[Frame]]:
+        """Update state for one engine response: (prompts now due, host answers)."""
 
         result = frame.get("result")
         sid = pending.session_id
@@ -287,24 +321,26 @@ class Mediator:
             created = cast(dict[str, object], result).get("sessionId")
             if isinstance(created, str):
                 self._sessions.setdefault(created, _Session())
-            return []
+            return [], []
         if sid is None:
-            return []
+            return [], []
         if pending.method in {"session/load", "session/resume"} and "result" in frame:
             self._sessions.setdefault(sid, _Session())
-            return []
+            return [], []
         if pending.method in {"session/delete", "session/close"} and "result" in frame:
-            self._sessions.pop(sid, None)
-            return []
+            closed = self._sessions.pop(sid, None)
+            # Prompts that waited behind a peer turn never reached the engine.
+            return [], [
+                {"jsonrpc": "2.0", "id": queued["id"], "result": {"stopReason": "cancelled"}}
+                for queued in (closed.queued if closed is not None else ())
+            ]
         session = self._sessions.get(sid)
         if session is None or pending.method != "session/prompt":
-            return []
+            return [], []
         session.host_prompts.discard(internal)
         if session.cac_prompt == internal:
             session.cac_prompt = None
-            session.submitted = False
-            session.cancel_pending = None
-        return self._due(sid, session)
+        return self._due(sid, session), []
 
     def _due(self, session_id: str, session: _Session) -> list[Frame]:
         if session.busy() or not session.queued:
@@ -312,11 +348,16 @@ class Mediator:
         frame = session.queued.popleft()
         internal = self._allocate(_Pending("host", frame["id"], "session/prompt", session_id))
         session.host_prompts.add(internal)
+        session.in_transit.add(internal)
         return [{**frame, "id": internal}]
 
     def _release(self, frames: list[Frame]) -> None:
         for frame in frames:
-            self._to_engine(frame)
+            session_id = _session_of(frame)
+            if session_id is None:
+                self._to_engine(frame)
+            else:
+                self._send_prompt(session_id, frame)
 
     # -- CAC delivery ------------------------------------------------------
 
@@ -345,13 +386,15 @@ class Mediator:
                     continue
                 session.claiming = False
                 if taken is None:
-                    session.cancel_pending = None
                     release = self._due(sid, session)
+                    if not session.in_transit:
+                        # Nothing was submitted, so nothing remains to cancel.
+                        session.cancel_pending = None
                 else:
                     message_id = str(uuid4())
                     internal = self._allocate(_Pending("cac", None, "session/prompt", sid))
                     session.cac_prompt = internal
-                    session.submitted = False
+                    session.in_transit.add(internal)
                     release = []
             if taken is None:
                 self._release(release)
@@ -365,15 +408,7 @@ class Mediator:
                 self._diagnostic(f"event {event_id} may not have reached the engine")
                 self._stopped.set()
                 return
-            with self._lock:
-                current = self._sessions.get(sid)
-                cancel = None
-                if current is not None and current.cac_prompt == internal:
-                    current.submitted = True
-                    cancel, current.cancel_pending = current.cancel_pending, None
             self._diagnostic(f"submitted event {event_id} to its idle session")
-            if cancel is not None:
-                self._to_engine(cancel)
 
     def _submit(self, sid: str, internal: int, message_id: str, text: str) -> None:
         self._to_host(
@@ -393,7 +428,8 @@ class Mediator:
                 },
             }
         )
-        self._to_engine(
+        self._send_prompt(
+            sid,
             {
                 "jsonrpc": "2.0",
                 "id": internal,
@@ -403,7 +439,7 @@ class Mediator:
                     "prompt": [{"type": "text", "text": text}],
                     "_meta": {"cognition.ai/clientMessageId": message_id},
                 },
-            }
+            },
         )
 
     def _is_open(self, session_id: str) -> bool:

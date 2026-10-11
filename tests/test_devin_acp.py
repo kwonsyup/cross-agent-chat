@@ -452,3 +452,68 @@ def test_cancel_during_take_follows_the_peer_prompt_instead_of_overtaking_it(
     assert w.engine.recv() == cancel
     w.engine.send(_end(prompt, "cancelled"))
     assert w.host.quiet()
+
+
+def test_cancel_after_promotion_reaches_the_engine_after_that_prompt(wired: Wired) -> None:
+    w = wired
+    _new_session(w, "sess-alpha1")
+    _human_turn(w, "sess-alpha1", 2)
+    w.inbox.pending["sess-alpha1"] = [(EVENT, "peer task")]
+    _echo, cac = _deliver(w)
+    w.host.send(_prompt("sess-alpha1", 3))
+    assert w.engine.quiet()
+    w.engine.send(_end(cac))
+    promoted = w.engine.recv()
+    cancel: Frame = {
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": "sess-alpha1"},
+    }
+    w.host.send(cancel)
+    # Whatever the interleaving, the engine never sees the cancel before the prompt.
+    assert w.engine.recv() == cancel
+    w.engine.send(_end(promoted, "cancelled"))
+    assert w.host.recv() == {"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "cancelled"}}
+
+
+def test_session_close_answers_every_prompt_still_waiting(wired: Wired) -> None:
+    w = wired
+    _new_session(w, "sess-alpha1")
+    _human_turn(w, "sess-alpha1", 2)
+    w.inbox.pending["sess-alpha1"] = [(EVENT, "peer task")]
+    _echo, cac = _deliver(w)
+    for host_id in (3, "q-4"):
+        w.host.send(_prompt("sess-alpha1", host_id))
+    w.host.send(
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "session/close",
+            "params": {"sessionId": "sess-alpha1"},
+        }
+    )
+    close = w.engine.recv()
+    assert close["method"] == "session/close"
+    w.engine.send({"jsonrpc": "2.0", "id": close["id"], "result": {}})
+    answers = [w.host.recv() for _ in range(3)]
+    assert answers[0] == {"jsonrpc": "2.0", "id": 5, "result": {}}
+    assert answers[1:] == [
+        {"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "cancelled"}},
+        {"jsonrpc": "2.0", "id": "q-4", "result": {"stopReason": "cancelled"}},
+    ]
+    w.engine.send(_end(cac))
+    assert w.engine.quiet() and w.host.quiet()
+
+
+def test_waiting_prompts_are_bounded_with_an_explicit_refusal(wired: Wired) -> None:
+    w = wired
+    _new_session(w, "sess-alpha1")
+    _human_turn(w, "sess-alpha1", 2)
+    w.inbox.pending["sess-alpha1"] = [(EVENT, "peer task")]
+    _deliver(w)
+    for host_id in range(10, 10 + devin_acp.MAX_QUEUED_PROMPTS):
+        w.host.send(_prompt("sess-alpha1", host_id))
+    w.host.send(_prompt("sess-alpha1", 99))
+    refusal = w.host.recv()
+    assert refusal["id"] == 99 and "error" in refusal
+    assert w.engine.quiet()
