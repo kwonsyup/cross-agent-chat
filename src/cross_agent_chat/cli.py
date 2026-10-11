@@ -965,7 +965,7 @@ def parser() -> argparse.ArgumentParser:
         "--registry", type=Path, default=None, help="default: ~/.windsurf/acp/registry.json"
     )
     devin_acp_registry.add_argument(
-        "--command", type=Path, default=None, help="entrypoint the host launches"
+        "--entrypoint", type=Path, default=None, help="entrypoint the host launches"
     )
 
     register_parser = commands.add_parser("_register")
@@ -1264,7 +1264,9 @@ def run(arguments: argparse.Namespace) -> int:
         registry_path = arguments.registry or devin_acp.DEFAULT_REGISTRY
         if arguments.action == "add":
             print(
-                devin_acp.register(registry_path, arguments.command or devin_acp.default_command())
+                devin_acp.register(
+                    registry_path, arguments.entrypoint or devin_acp.default_command()
+                )
             )
             print(
                 "Next: in Devin Desktop open Devin User Settings > Agents, enable "

@@ -383,3 +383,29 @@ def test_registry_add_and_remove_touch_only_the_cac_entry(tmp_path: Path) -> Non
     with pytest.raises(ChatError):
         devin_acp.register(registry, command)
     assert registry.read_text() == "{not json"
+
+
+def test_registry_cli_dispatches_and_reports(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from cross_agent_chat import cli
+
+    registry = tmp_path / "registry.json"
+    entrypoint = tmp_path / "cross-agent-chat"
+    assert (
+        cli.main(
+            [
+                "devin-acp-registry",
+                "add",
+                "--registry",
+                str(registry),
+                "--entrypoint",
+                str(entrypoint),
+            ]
+        )
+        == 0
+    )
+    assert cli.main(["devin-acp-registry", "status", "--registry", str(registry)]) == 0
+    assert '"registered": true' in capsys.readouterr().out
+    assert cli.main(["devin-acp-registry", "remove", "--registry", str(registry)]) == 0
+    assert not registry.exists()

@@ -571,5 +571,5 @@ def default_command() -> Path:
         return invoked
     found = shutil.which("cross-agent-chat")
     if found is None:
-        raise ChatError("cross-agent-chat entrypoint is unavailable; pass --command")
+        raise ChatError("cross-agent-chat entrypoint is unavailable; pass --entrypoint")
     return Path(found).absolute()
