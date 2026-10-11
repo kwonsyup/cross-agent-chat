@@ -3663,9 +3663,10 @@ def destination_receiving(target: Target | None) -> dict[str, object]:
         # The receiver's custody guard holds every queued body until the root's
         # next prompt; a tool boundary cannot inject while it does.
         active_turn_input = False
-    elif boundary == "root_tools_only":
+    elif boundary == "root_tools_only" and qualified_input is True:
         # Only the documented root-only tools can deliver mid-turn; a child may
-        # be running, so the unqualified promise degrades rather than lies.
+        # be running, so the qualified promise degrades rather than lies. A
+        # restriction never upgrades a deferred or unknown route's promise.
         active_turn_input = "limited"
     result: dict[str, object] = {
         "mode": mode or "unknown",

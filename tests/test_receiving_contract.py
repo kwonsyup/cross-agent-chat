@@ -493,6 +493,27 @@ def test_devin_current_restriction_narrows_active_input_and_is_disclosed(
     assert receiving["current_boundary"] == boundary
 
 
+@pytest.mark.parametrize(
+    ("mode", "mechanism", "active"),
+    [
+        ("devin_stop_or_prompt_bound", "devin_prompt_bound", False),
+        (None, None, "unknown"),
+    ],
+)
+def test_root_only_restriction_never_upgrades_a_deferred_or_unknown_route(
+    mode: runtime.DeliveryMode | None,
+    mechanism: runtime.DeliveryMechanism | None,
+    active: object,
+) -> None:
+    """Custody evidence is a restriction, not proof the loaded receiver can
+    take tool-boundary input: a retained legacy courier stays deferred."""
+    receiving = runtime.destination_receiving(
+        _target(provider="devin", mode=mode, mechanism=mechanism, boundary="root_tools_only")
+    )
+    assert receiving["active_turn_input"] == active
+    assert receiving["current_boundary"] == "root_tools_only"
+
+
 def test_restriction_refines_the_same_evidence_custody_enforces(
     tmp_path: Path,
 ) -> None:
