@@ -855,6 +855,12 @@ def _stop_reason(event_id: str, source_text: str) -> str:
     )
 
 
+def acp_peer_prompt(event_id: str, source_text: str) -> str:
+    """Frame one peer message as the native prompt an ACP adapter submits."""
+
+    return _stop_reason(valid_uuid(event_id, "event id"), bounded_message(source_text))
+
+
 def _callback_byte_budget(event_id: str) -> int:
     """Derive the callback budget from the core message budget and envelope."""
 

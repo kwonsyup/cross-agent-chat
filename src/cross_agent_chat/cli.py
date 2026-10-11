@@ -944,6 +944,29 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     resolve_parser.add_argument("event_id")
+    devin_acp_parser = commands.add_parser(
+        "devin-acp",
+        help=(
+            "ACP agent command for a host such as Devin Desktop: runs the native "
+            "`devin acp` and lets its sessions receive Cross Agent Chat messages while idle"
+        ),
+    )
+    devin_acp_parser.add_argument("--state-root")
+    devin_acp_parser.add_argument("--devin", type=Path, help="installed Devin CLI to launch")
+    devin_acp_parser.add_argument(
+        "engine_args", nargs=argparse.REMAINDER, help="arguments passed to `devin acp` after --"
+    )
+    devin_acp_registry = commands.add_parser(
+        "devin-acp-registry",
+        help="add, remove, or show only the Cross Agent Chat entry in a local ACP registry",
+    )
+    devin_acp_registry.add_argument("action", choices=("add", "remove", "status"))
+    devin_acp_registry.add_argument(
+        "--registry", type=Path, default=None, help="default: ~/.windsurf/acp/registry.json"
+    )
+    devin_acp_registry.add_argument(
+        "--command", type=Path, default=None, help="entrypoint the host launches"
+    )
 
     register_parser = commands.add_parser("_register")
     register_parser.add_argument("--provider", choices=("claude", "codex", "devin"), required=True)
@@ -1227,6 +1250,31 @@ def run(arguments: argparse.Namespace) -> int:
             )
             + "Do not re-send that same task under a new event, wording, or transport."
         )
+    elif command == "devin-acp":
+        from cross_agent_chat import devin_acp
+
+        return devin_acp.run(
+            state_root_value=arguments.state_root,
+            devin=arguments.devin,
+            engine_args=arguments.engine_args,
+        )
+    elif command == "devin-acp-registry":
+        from cross_agent_chat import devin_acp
+
+        registry_path = arguments.registry or devin_acp.DEFAULT_REGISTRY
+        if arguments.action == "add":
+            print(
+                devin_acp.register(registry_path, arguments.command or devin_acp.default_command())
+            )
+            print(
+                "Next: in Devin Desktop open Devin User Settings > Agents, enable "
+                "'Devin + Cross Agent Chat', run 'Reload ACP Connections', then start a new "
+                "conversation with that agent."
+            )
+        elif arguments.action == "remove":
+            print(devin_acp.unregister(registry_path))
+        else:
+            print(json.dumps(devin_acp.registry_status(registry_path), sort_keys=True))
     elif command == "_register":
         if arguments.provider == "devin":
             register_devin(arguments.device, arguments.pid, arguments.state_root)
