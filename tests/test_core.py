@@ -596,7 +596,9 @@ def test_event_status_reads_only_an_exact_source_owned_intent(
             "stage": "unknown",
             "reason": "no_local_receiver",
             "detail": "no live local receiver owns the recorded target generation; "
-            "a remote receiver's custody cannot be observed",
+            "run `cross-agent-chat status` on the receiving Mac, or ask again "
+            "with that receiver's exact remote handle (status --recipient or "
+            "the chat_status recipient argument)",
         },
     }
     assert store.path.read_bytes() == before
