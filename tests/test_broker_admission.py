@@ -74,7 +74,8 @@ _NODE_ADDRESSES = {
 _CAPACITY_LABEL = "ChatError:recipient broker is at capacity; nothing was delivered; send again"
 _PRE_EFFECT_LABEL_PREFIX = "ChatError:remote target rejected the message before provider effect"
 _REVALIDATION_LABEL = (
-    "ChatError:recipient is unavailable or changed; call chat_peers and choose the recipient again"
+    "ChatError:recipient is unavailable or changed; nothing was delivered; "
+    "call chat_peers and choose the recipient again"
 )
 
 
@@ -553,7 +554,7 @@ def test_slow_and_offline_peers_amid_reciprocal_traffic(
         # intent or transport attempt, so its refusal is truthful and no
         # delivery journal entry can exist for it.
         assert refused == [
-            "ChatError:recipient is unavailable or changed; "
+            "ChatError:recipient is unavailable or changed; nothing was delivered; "
             "call chat_peers and choose the recipient again"
         ], labels
         assert _count_labels(results, machine_b.name) == {"TRANSPORT_ACCEPTED": 1}

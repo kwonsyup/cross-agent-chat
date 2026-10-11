@@ -3975,7 +3975,7 @@ def _send_remote_token_target(
     ]
     if len(claimants) != 1:
         raise ChatError(
-            "recipient is unavailable or changed; "
+            "recipient is unavailable or changed; nothing was delivered; "
             + ("external recipients require an external-aware broker; " if include_external else "")
             + "call chat_peers and choose the recipient again"
         )
