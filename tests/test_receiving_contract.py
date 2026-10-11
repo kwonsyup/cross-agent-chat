@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from uuid import uuid4
 
 import pytest
 
 from cross_agent_chat import runtime
 from cross_agent_chat.codex import CodexCourier
-from cross_agent_chat.core import ChatError, Registry, Route, session_key
+from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, session_key
+from cross_agent_chat.devin import DevinCurrentBoundary
 from cross_agent_chat.recipient import local_token, remote_token
 from cross_agent_chat.tailnet import TailnetIdentity
 from cross_agent_chat.tailnet_broker import handle_broker_request
@@ -399,6 +401,404 @@ def _devin_route(tmp_path: Path) -> Route:
     )
 
 
+def _target(
+    *,
+    provider: Literal["codex", "devin"] = "codex",
+    mode: runtime.DeliveryMode | None = None,
+    mechanism: runtime.DeliveryMechanism | None = None,
+    boundary: DevinCurrentBoundary | None = None,
+) -> runtime.Target:
+    return runtime.Target(
+        alias=f"{provider}@test:task" + (":123456789abc" if provider == "codex" else ""),
+        provider=provider,
+        device="test",
+        project="task",
+        generation=str(uuid4()),
+        session_key="a" * 64,
+        remote=False,
+        delivery_mode=mode,
+        delivery_mechanism=mechanism,
+        current_boundary=boundary,
+    )
+
+
+def test_one_observed_basis_grades_receiving_and_reply_identically() -> None:
+    """The direct-queue contradiction's counterexample, on the shared basis.
+
+    Before the fix, `reply_delivery` read only the mode and called every
+    `codex_experimental_queue` "while_idle" while `destination_receiving`
+    reported parked wake "unknown" for the same unqualified direct queue.
+    Now both derive from one (mode, mechanism) qualification, so the only way
+    to say "while_idle" is a mechanism that is actually qualified for it.
+    """
+    assert runtime._receiving_qualification("codex_experimental_queue", "direct_queue") == (
+        "unknown",
+        "unknown",
+        "unknown",
+    )
+    assert runtime._receiving_qualification("codex_experimental_queue", "native_helper") == (
+        "unknown",
+        "unknown",
+        "while_idle",
+    )
+    assert runtime._receiving_qualification("codex_daemon_input", "owning_daemon") == (
+        True,
+        True,
+        "while_idle",
+    )
+    assert runtime._receiving_qualification("codex_stop_bound", "stop_bound") == (
+        False,
+        False,
+        "next_turn",
+    )
+    # A daemon-qualified mechanism plugs in only by reporting the pair: no
+    # version string appears anywhere in the basis, so Lane A's qualification
+    # needs no second codepath here.
+    receiving = runtime.destination_receiving(
+        _target(mode="codex_experimental_queue", mechanism="direct_queue")
+    )
+    assert receiving["parked_wake"] == "unknown"
+    assert receiving["active_turn_input"] == "unknown"
+    assert "current_boundary" not in receiving
+    receiving = runtime.destination_receiving(
+        _target(mode="codex_daemon_input", mechanism="owning_daemon")
+    )
+    assert receiving["parked_wake"] is True
+    assert receiving["active_turn_input"] is True
+
+
+@pytest.mark.parametrize(
+    ("boundary", "active"),
+    [
+        ("next_prompt_custom_subagent", False),
+        ("next_prompt_unobserved_launch", False),
+        ("root_tools_only", "limited"),
+        ("unrestricted", True),
+    ],
+)
+def test_devin_current_restriction_narrows_active_input_and_is_disclosed(
+    boundary: DevinCurrentBoundary, active: object
+) -> None:
+    """A held Devin can never be reported as accepting active-turn input."""
+    receiving = runtime.destination_receiving(
+        _target(
+            provider="devin",
+            mode="devin_tool_boundary",
+            mechanism="devin_tool_boundary",
+            boundary=boundary,
+        )
+    )
+    assert receiving["parked_wake"] is False
+    assert receiving["active_turn_input"] == active
+    assert receiving["current_boundary"] == boundary
+
+
+def test_restriction_refines_the_same_evidence_custody_enforces(
+    tmp_path: Path,
+) -> None:
+    """Store-level mapping: each hold reason names its own boundary, and any
+    remaining child bookkeeping without a hold is root-tools only."""
+    from cross_agent_chat.devin import DevinSubagentStore
+
+    root = tmp_path / "state"
+    IntentStore(root)
+    store = DevinSubagentStore(root)
+    session = "devin-restriction"
+    assert store.custody(session) is None
+    assert store.restriction(session) == "unrestricted"
+    store.mark_uncertain(session)
+    assert store.custody(session) == "hold"
+    assert store.restriction(session) == "next_prompt_unobserved_launch"
+    store.clear(session)
+    # An observed custom launch that may nest holds until the next prompt.
+    store.launch(session, "tool-1", object())
+    store.launched(session, "tool-1", "Background subagent started with agent_id=child-1")
+    assert store.custody(session) == "hold"
+    assert store.restriction(session) == "next_prompt_custom_subagent"
+    # A finished non-nesting launch leaves bookkeeping without a hold: only
+    # root-only tool boundaries remain provable.
+    other = "devin-restriction-other"
+    store.launch(other, "tool-2", "subagent_explore")
+    store.launched(other, "tool-2", "Background subagent started with agent_id=child-2 finished")
+    assert store.custody(other) == "root_tools"
+    assert store.restriction(other) == "root_tools_only"
+
+
+def test_devin_hold_disclosed_on_a_legacy_mode_never_promises_active_input() -> None:
+    """Custody can hold before the tool hook ever ran; the reader must see it."""
+    receiving = runtime.destination_receiving(
+        _target(
+            provider="devin",
+            mode="devin_stop_or_prompt_bound",
+            mechanism="devin_prompt_bound",
+            boundary="next_prompt_unobserved_launch",
+        )
+    )
+    assert receiving["active_turn_input"] is False
+    assert receiving["current_boundary"] == "next_prompt_unobserved_launch"
+
+
+def test_current_boundary_stays_off_rows_a_reader_did_not_negotiate() -> None:
+    """Old readers get byte-identical shapes; old couriers keep the peer."""
+    held = _target(
+        provider="devin",
+        mode="devin_tool_boundary",
+        mechanism="devin_tool_boundary",
+        boundary="next_prompt_custom_subagent",
+    )
+    old_shape = held.public(
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
+        include_devin_tool_boundary=True,
+        include_handle=False,
+    )
+    assert "current_boundary" not in old_shape
+    row = held.public(
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
+        include_devin_tool_boundary=True,
+        include_current_boundary=True,
+        include_handle=False,
+    )
+    assert row["current_boundary"] == "next_prompt_custom_subagent"
+    roster_row = dict(row)
+    roster_row.update(generation=held.generation, session_key=held.session_key)
+    roster = {"schema_version": 1, "peers": [roster_row]}
+
+    def parse(raw: dict[str, object], *, negotiated: bool) -> list[runtime.Target]:
+        return runtime._targets_from_tailnet(
+            "100.64.0.2",
+            raw,
+            include_delivery_mode=True,
+            include_delivery_mechanism=True,
+            include_devin=True,
+            include_devin_tool_boundary=True,
+            include_current_boundary=negotiated,
+        )
+
+    # A reader that never asked must reject the new key outright, not drop the
+    # peer silently or half-apply it.
+    with pytest.raises(ChatError, match="invalid discovery"):
+        parse(roster, negotiated=False)
+    [parsed] = parse(roster, negotiated=True)
+    assert parsed.current_boundary == "next_prompt_custom_subagent"
+    assert runtime.destination_receiving(parsed)["active_turn_input"] is False
+    # An old courier simply omits the key: the peer is retained and the
+    # boundary stays conservatively unobserved, never read as unrestricted.
+    old_row = dict(old_shape)
+    old_row.update(generation=held.generation, session_key=held.session_key)
+    [legacy] = parse({"schema_version": 1, "peers": [old_row]}, negotiated=True)
+    assert legacy.current_boundary is None
+    assert "current_boundary" not in runtime.destination_receiving(legacy)
+    assert runtime.destination_receiving(legacy)["active_turn_input"] is True
+    # The restriction is Devin-only: another provider's row carrying it is
+    # malformed rather than silently kept.
+    foreign = _target(provider="codex", mode="codex_stop_bound", mechanism="stop_bound")
+    foreign_row = foreign.public(
+        include_delivery_mode=True, include_delivery_mechanism=True, include_handle=False
+    )
+    foreign_row.update(
+        generation=foreign.generation,
+        session_key=foreign.session_key,
+        current_boundary="unrestricted",
+    )
+    with pytest.raises(ChatError, match="invalid discovery"):
+        parse({"schema_version": 1, "peers": [foreign_row]}, negotiated=True)
+
+
+def test_devin_health_publishes_current_boundary_only_when_asked(
+    tmp_path: Path,
+) -> None:
+    route = _devin_route(tmp_path)
+    asked = runtime.courier_health(
+        route,
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
+        include_current_boundary=True,
+        devin_current_boundary="root_tools_only",
+    )
+    assert asked["current_boundary"] == "root_tools_only"
+    unasked = runtime.courier_health(
+        route,
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
+        devin_current_boundary="root_tools_only",
+    )
+    assert "current_boundary" not in unasked
+    # Never emitted for another provider even when the requester asks.
+    codex = _route(tmp_path / "state", tmp_path)
+    assert "current_boundary" not in runtime.courier_health(
+        codex,
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
+        include_current_boundary=True,
+        devin_current_boundary="root_tools_only",
+    )
+
+
+def test_local_target_reads_the_custody_store_and_validates_the_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The local boundary comes from the shared store: exact even when the
+    courier answering health cannot emit the negotiated field."""
+    from cross_agent_chat.devin import DevinSubagentStore
+
+    root = tmp_path / "state"
+    route = _devin_route(tmp_path)
+    IntentStore(root)  # creates the root with private modes before the store write
+    DevinSubagentStore(root).mark_uncertain(route.session_id)
+    SocketStub = Callable[[Path, dict[str, object]], dict[str, object]]
+
+    def answer(boundary: object = "next_prompt_unobserved_launch") -> SocketStub:
+        def socket(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+            assert payload["include_current_boundary"] is True
+            response: dict[str, object] = {
+                "schema_version": 1,
+                "status": "READY",
+                "generation": route.generation,
+                "alias": route.alias,
+                "delivery_mode": "devin_tool_boundary",
+                "delivery_mechanism": "devin_tool_boundary",
+            }
+            if boundary is not None:
+                response["current_boundary"] = boundary
+            return response
+
+        return socket
+
+    monkeypatch.setattr(runtime, "request_socket", answer())
+    parsed = runtime._local_target(root, route)
+    assert parsed is not None
+    assert parsed.current_boundary == "next_prompt_unobserved_launch"
+    # An old courier ignores the flag and omits the key: keep the peer, and
+    # the boundary still comes from the store the courier itself reads.
+    monkeypatch.setattr(runtime, "request_socket", answer(boundary=None))
+    legacy = runtime._local_target(root, route)
+    assert legacy is not None
+    assert legacy.current_boundary == "next_prompt_unobserved_launch"
+    # An unrecognized restriction is an invalid shape, not a guess.
+    monkeypatch.setattr(runtime, "request_socket", answer(boundary="probably_fine"))
+    assert runtime._local_target(root, route) is None
+    # And it never attaches to a non-Devin route.
+    codex_route = _route(root, tmp_path)
+    monkeypatch.setattr(
+        runtime,
+        "request_socket",
+        lambda _p, _payload, **_k: {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": codex_route.generation,
+            "alias": codex_route.alias,
+            "delivery_mode": "codex_stop_bound",
+            "delivery_mechanism": "stop_bound",
+            "current_boundary": "unrestricted",
+        },
+    )
+    assert runtime._local_target(root, codex_route) is None
+
+
+def test_courier_inspect_reports_volatile_custody_without_bodies() -> None:
+    """Pending, handed-off and unseen are distinguishable; no body leaks."""
+    courier = CodexCourier(alias="codex@test:task:123456789abc", generation=str(uuid4()))
+    pending, handed, unseen = str(uuid4()), str(uuid4()), str(uuid4())
+    courier.accept(pending, "a secret body that must never appear in an observation")
+    courier.accept(handed, "another opaque body")
+    assert courier.inspect(pending)["event_state"] == "pending"
+    assert courier.inspect(unseen)["event_state"] == "unseen"
+    courier.acknowledge([handed])
+    observed = courier.inspect(handed)
+    assert observed["event_state"] == "handed_off"
+    assert observed["pending_count"] == 1
+    assert isinstance(observed["oldest_pending_age_seconds"], float)
+    rendered = json.dumps(observed)
+    assert "secret" not in rendered
+    assert "body" not in rendered
+    # A same-incarnation restart analogue: clear() forgets everything, and
+    # the event degrades to unseen -- never still reported as handed off.
+    courier.clear()
+    assert courier.inspect(pending)["event_state"] == "unseen"
+
+
+def test_owner_event_status_reads_courier_custody_without_touching_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source, target = _route(root, tmp_path), _route(root, tmp_path)
+    store = IntentStore(root)
+    event_id = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    store.mark(event_id, "TRANSPORT_ACCEPTED")
+    before = store.path.read_bytes()
+    requests: list[dict[str, object]] = []
+    SocketStub = Callable[[Path, dict[str, object]], dict[str, object]]
+
+    def courier_answer(state: str) -> dict[str, object]:
+        base: dict[str, object] = {
+            "schema_version": 1,
+            "status": "INSPECTED",
+            "generation": target.generation,
+            "courier_version": "0.5.3",
+            "courier_incarnation": "incarnation-1",
+            "event_state": state,
+        }
+        if state in {"pending", "handed_off", "unseen"}:
+            base["pending_count"] = 2
+            base["oldest_pending_age_seconds"] = 4.25
+        return base
+
+    def socket(answer: dict[str, object]) -> SocketStub:
+        def stub(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+            requests.append(payload)
+            assert payload["operation"] == "inspect"
+            assert payload["event_id"] == event_id
+            assert set(payload) == {"schema_version", "operation", "generation", "event_id"}
+            return answer
+
+        return stub
+
+    monkeypatch.setattr(runtime, "request_socket", socket(courier_answer("pending")))
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
+    )
+    assert observation["stage"] == "pending_in_courier"
+    assert observation["pending_count"] == 2
+    assert observation["oldest_pending_age_seconds"] == 4.25
+    assert observation["courier_version"] == "0.5.3"
+    assert observation["courier_incarnation"] == "incarnation-1"
+
+    monkeypatch.setattr(runtime, "request_socket", socket(courier_answer("handed_off")))
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
+    )
+    # "Handed off" must never present as consumption: the only sentence about
+    # consumption explicitly denies it.
+    assert observation["stage"] == "handed_off"
+    assert "never evidence the original session consumed" in cast(str, observation["detail"])
+
+    monkeypatch.setattr(runtime, "request_socket", socket(courier_answer("unseen")))
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
+    )
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == "no_courier_record"
+
+    def unavailable(*_a: object, **_k: object) -> dict[str, object]:
+        raise ChatError("session courier is unavailable")
+
+    monkeypatch.setattr(runtime, "request_socket", unavailable)
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
+    )
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == "courier_unavailable"
+
+    # Inspect is a read-only operation: the only request it ever issues is
+    # "inspect", the durable intent bytes never change, and no message field
+    # appears in what the courier was asked or what the caller receives.
+    assert {request["operation"] for request in requests} == {"inspect"}
+    assert store.path.read_bytes() == before
+    assert "message" not in json.dumps(observation)
+
+
 def test_devin_receiver_affirms_tool_boundaries_only_when_asked_and_observed(
     tmp_path: Path,
 ) -> None:
@@ -546,6 +946,55 @@ def test_local_devin_capability_comes_from_the_receivers_own_health_answer(
     assert runtime.destination_receiving(target)["active_turn_input"] is active
 
 
+@pytest.mark.parametrize("broker_knows_flag", [False, True])
+def test_new_reader_negotiates_current_boundary_and_stays_conservative_with_old_brokers(
+    monkeypatch: pytest.MonkeyPatch, broker_knows_flag: bool
+) -> None:
+    """A broker that predates the flag refuses it; the reader retries without
+    it, keeps the peer, and reports the boundary as unobserved -- never
+    unrestricted."""
+    generation, handle = str(uuid4()), "d" * 64
+    requests: list[dict[str, object]] = []
+
+    def broker(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+        requests.append(payload)
+        if "include_current_boundary" in payload and not broker_knows_flag:
+            raise ChatError("Tailnet broker request is invalid")
+        row: dict[str, object] = {
+            "alias": "devin@m4:ws",
+            "provider": "devin",
+            "device": "m4",
+            "project": "ws",
+            "status": "available",
+            "generation": generation,
+            "session_key": handle,
+            "delivery_mode": "devin_tool_boundary",
+            "delivery_mechanism": "devin_tool_boundary",
+        }
+        if "include_current_boundary" in payload:
+            row["current_boundary"] = "next_prompt_custom_subagent"
+        return {"schema_version": 1, "peers": [row]}
+
+    monkeypatch.setattr(runtime, "request_tailnet", broker)
+    [target], complete = runtime._remote_node_targets(
+        "100.64.0.2",
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
+        include_devin=True,
+        include_current_boundary=True,
+    )
+
+    assert complete is True
+    assert requests[0]["include_current_boundary"] is True
+    if broker_knows_flag:
+        assert target.current_boundary == "next_prompt_custom_subagent"
+        assert runtime.destination_receiving(target)["active_turn_input"] is False
+    else:
+        assert target.current_boundary is None
+        assert "current_boundary" not in runtime.destination_receiving(target)
+        assert len(requests) == 2
+
+
 def test_devin_tool_hook_records_that_its_loaded_session_runs_the_hook(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -591,3 +1040,68 @@ def test_broker_accepts_the_tool_boundary_flag_only_with_delivery_mode(
     assert seen[-1]["include_devin_tool_boundary"] is True
     with pytest.raises(ChatError, match="request is invalid"):
         tailnet_broker.handle_broker_request(tmp_path, base, "100.64.0.9")
+
+
+def test_broker_accepts_the_current_boundary_flag_only_with_delivery_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cross_agent_chat import tailnet_broker
+
+    seen: list[dict[str, object]] = []
+
+    def peers(_root: Path, **kwargs: object) -> dict[str, object]:
+        seen.append(kwargs)
+        return {"schema_version": 1, "peers": []}
+
+    monkeypatch.setattr(tailnet_broker, "peers", peers)
+    base = {"schema_version": 1, "operation": "peers", "include_current_boundary": True}
+
+    tailnet_broker.handle_broker_request(
+        tmp_path, {**base, "include_delivery_mode": True}, "100.64.0.9"
+    )
+    assert seen[-1]["include_current_boundary"] is True
+    with pytest.raises(ChatError, match="request is invalid"):
+        tailnet_broker.handle_broker_request(tmp_path, base, "100.64.0.9")
+
+
+def test_cli_status_prints_the_observation_and_stays_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from cross_agent_chat import cli
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = home / ".local/state/cross-agent-chat"
+    monkeypatch.setenv("HOME", str(home))
+    source, target = _route(root, tmp_path), _route(root, tmp_path)
+    store = IntentStore(root)
+    event_id = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    store.mark(event_id, "TRANSPORT_ACCEPTED")
+    before = store.path.read_bytes()
+
+    def courier(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        assert payload["operation"] == "inspect"
+        return {
+            "schema_version": 1,
+            "status": "INSPECTED",
+            "generation": target.generation,
+            "courier_version": "0.5.3",
+            "courier_incarnation": "incarnation-1",
+            "event_state": "pending",
+            "pending_count": 1,
+            "oldest_pending_age_seconds": 2.5,
+        }
+
+    monkeypatch.setattr(runtime, "request_socket", courier)
+    assert cli.run(cli.parser().parse_args(["status", event_id])) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "stage: pending_in_courier" in lines
+    assert "pending_count: 1" in lines
+    assert "courier_incarnation: incarnation-1" in lines
+
+    assert cli.run(cli.parser().parse_args(["status", event_id, "--json"])) == 0
+    payload = cast(dict[str, object], json.loads(capsys.readouterr().out))
+    observation = cast(dict[str, object], payload["receiving_observation"])
+    assert observation["stage"] == "pending_in_courier"
+    assert "message" not in json.dumps(payload)
+    assert store.path.read_bytes() == before

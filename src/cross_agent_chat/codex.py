@@ -26,6 +26,10 @@ from cross_agent_chat.core import (
 )
 
 DEFAULT_CAPACITY: Final = 32
+# Completed handoff observations live only while the courier itself does; the
+# bound keeps the set from growing past a few queue lengths, and eviction
+# degrades an inspect answer to "unseen" rather than claiming a handoff.
+RETIRED_EVENT_LIMIT: Final = 8 * DEFAULT_CAPACITY
 MAX_PEEK_FRAME_BYTES: Final = 64 * 1024
 NATIVE_QUEUE_TIMEOUT_SECONDS: Final = 15.0
 MAX_NATIVE_STDOUT_BYTES: Final = 64 * 1024
@@ -384,7 +388,9 @@ class CodexCourier:
         self.native_queue = native_queue
         self.native_helper = native_helper
         self.provider = provider
-        self._pending: OrderedDict[str, str] = OrderedDict()
+        # Each pending body is stored with its monotonic enqueue time so a
+        # read-only inspect can report the oldest pending age without the body.
+        self._pending: OrderedDict[str, tuple[str, float]] = OrderedDict()
         # _unresolved holds the staged event ids whose helper notice RPC is
         # still in flight, and _handed_off the subset whose body already left
         # through a guarded native dispatch. A handoff observation must outlive
@@ -393,6 +399,13 @@ class CodexCourier:
         # that one effect is unresolved and stay bounded by the queue capacity.
         self._unresolved: set[str] = set()
         self._handed_off: set[str] = set()
+        # _retired records event ids this courier incarnation provably handed
+        # to the provider boundary (hook dequeue, provider queue acceptance, or
+        # owning-daemon input). It is what lets a read-only inspect say
+        # "handed off" only for work this courier itself completed; an id it
+        # never saw -- or one a same-generation restart or bound eviction
+        # forgot -- stays "unseen" instead of being misreported as delivered.
+        self._retired: OrderedDict[str, float] = OrderedDict()
         # The courier listener and the one delivery worker share this queue, so
         # every read or mutation takes the short lock; the native-queue RPC in
         # accept is deliberately outside it so queue controls never wait on a
@@ -407,7 +420,7 @@ class CodexCourier:
             if self.native_helper:
                 with self._lock:
                     if identifier in self._pending:
-                        if self._pending[identifier] != body:
+                        if self._pending[identifier][0] != body:
                             raise UnknownDeliveryError(
                                 "Codex courier event conflicts with a pending message"
                             )
@@ -421,7 +434,8 @@ class CodexCourier:
                     elif len(self._pending) >= self.capacity:
                         raise ChatError("Codex courier queue is full")
                     else:
-                        self._pending[identifier] = body
+                        self._pending[identifier] = (body, time.monotonic())
+                        self._retired.pop(identifier, None)
                         self._unresolved.add(identifier)
                         newly_admitted = True
             binary, environment, thread_id = self.native_queue
@@ -461,6 +475,11 @@ class CodexCourier:
                 with self._lock:
                     self._handed_off.discard(identifier)
                     self._unresolved.discard(identifier)
+            if not self.native_helper:
+                # The provider queue accepted the body; this courier's custody
+                # ends as a completed handoff, so an inspect must not call the
+                # event unseen or pretend it is still queued here.
+                self.retire(identifier)
             return {
                 "schema_version": 1,
                 "event_id": identifier,
@@ -470,14 +489,15 @@ class CodexCourier:
             }
         with self._lock:
             if identifier in self._pending:
-                if self._pending[identifier] != body:
+                if self._pending[identifier][0] != body:
                     raise UnknownDeliveryError(
                         "Codex courier event conflicts with a pending message"
                     )
             elif len(self._pending) >= self.capacity:
                 raise ChatError("Codex courier queue is full")
             else:
-                self._pending[identifier] = body
+                self._pending[identifier] = (body, time.monotonic())
+                self._retired.pop(identifier, None)
         return {
             "schema_version": 1,
             "event_id": identifier,
@@ -490,7 +510,7 @@ class CodexCourier:
         """Return the oldest whole messages that fit in one courier response."""
         messages: list[dict[str, str]] = []
         with self._lock:
-            for event_id, message in self._pending.items():
+            for event_id, (message, _enqueued) in self._pending.items():
                 candidate = [*messages, {"event_id": event_id, "message": message}]
                 response = {
                     "schema_version": 1,
@@ -524,6 +544,46 @@ class CodexCourier:
                 raise ChatError("Codex courier acknowledgement is stale")
             for event_id in event_ids:
                 del self._pending[event_id]
+                self._retire(event_id)
+
+    def _retire(self, identifier: str) -> None:
+        """Record a completed provider-boundary handoff; caller holds the lock."""
+        self._retired.pop(identifier, None)
+        self._retired[identifier] = time.monotonic()
+        while len(self._retired) > RETIRED_EVENT_LIMIT:
+            self._retired.popitem(last=False)
+
+    def retire(self, event_id: str) -> None:
+        """Record that this courier handed one accepted event onward."""
+        with self._lock:
+            self._retire(valid_uuid(event_id, "event id"))
+
+    def inspect(self, event_id: str) -> dict[str, object]:
+        """Body-free view of one event and the queue this courier holds.
+
+        "handed_off" means only that this courier incarnation passed the event
+        to the provider boundary (hook dequeue, provider queue, or owning
+        daemon) -- never that the original session consumed it. "unseen" means
+        this incarnation holds no record: it may never have accepted the event,
+        or a same-generation restart or bound eviction forgot it.
+        """
+
+        identifier = valid_uuid(event_id, "event id")
+        with self._lock:
+            if identifier in self._handed_off or identifier in self._retired:
+                state = "handed_off"
+            elif identifier in self._pending:
+                state = "pending"
+            else:
+                state = "unseen"
+            enqueued = [at for _body, at in self._pending.values()]
+            return {
+                "event_state": state,
+                "pending_count": len(self._pending),
+                "oldest_pending_age_seconds": (
+                    None if not enqueued else max(0.0, time.monotonic() - min(enqueued))
+                ),
+            }
 
     def native_dispatch_message(self, event_id: str) -> str:
         """Read one opaque event while its durable native claim is prepared."""
@@ -531,7 +591,7 @@ class CodexCourier:
         identifier = valid_uuid(event_id, "event id")
         with self._lock:
             try:
-                body = self._pending[identifier]
+                body, _enqueued = self._pending[identifier]
             except KeyError as error:
                 raise ChatError("native helper dispatch is unavailable") from error
             if identifier in self._unresolved:
@@ -547,6 +607,7 @@ class CodexCourier:
             self._pending.clear()
             self._unresolved.clear()
             self._handed_off.clear()
+            self._retired.clear()
 
 
 def hook_context(messages: list[dict[str, str]]) -> str:

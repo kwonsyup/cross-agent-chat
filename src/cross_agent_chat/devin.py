@@ -280,6 +280,27 @@ class DevinCapabilityStore:
 # other profile may opt in to nesting with ``max-nesting``.
 DEVIN_NON_NESTING_PROFILES: Final = frozenset({"subagent_explore", "subagent_general"})
 DevinSubagentCustody = Literal["root_tools", "hold"]
+# The content-free current receive restriction a courier may report: which
+# boundary the next message can cross right now. ``unrestricted`` means
+# delivery follows the route's ordinary mode boundaries; ``root_tools_only``
+# means only root-only tool boundaries while built-in children may run; the
+# ``next_prompt_*`` values hold everything until the root's next prompt,
+# naming why the hold exists. None of them release a held body; they only
+# describe the restriction the delivery guard already enforces.
+DevinCurrentBoundary = Literal[
+    "unrestricted",
+    "root_tools_only",
+    "next_prompt_custom_subagent",
+    "next_prompt_unobserved_launch",
+]
+DEVIN_CURRENT_BOUNDARIES: Final = frozenset(
+    {
+        "unrestricted",
+        "root_tools_only",
+        "next_prompt_custom_subagent",
+        "next_prompt_unobserved_launch",
+    }
+)
 _AGENT_ID: Final = r"[0-9A-Za-z][0-9A-Za-z_-]{0,63}"
 _SUBAGENT_STARTED: Final = re.compile(rf"Background subagent started with agent_id=({_AGENT_ID})\b")
 _SUBAGENT_FINISHED: Final = re.compile(
@@ -397,6 +418,29 @@ class DevinSubagentStore:
         if entry["uncertain"] or any(children.values()) or any(pending.values()):
             return "hold"
         return "root_tools"
+
+    def restriction(self, session_id: str) -> DevinCurrentBoundary:
+        """Return the content-free receive restriction ``custody`` enforces.
+
+        This refines the same evidence ``custody`` reads into a reason a peer
+        may be shown; it changes no delivery decision.
+        """
+
+        key = session_key("devin", session_id)
+        if (self.uncertain_root / key).exists():
+            return "next_prompt_unobserved_launch"
+        entry = self._entries().get(key)
+        if entry is None:
+            return "unrestricted"
+        children = cast(dict[str, bool], entry["children"])
+        pending = cast(dict[str, bool], entry["pending"])
+        if entry["uncertain"]:
+            return "next_prompt_unobserved_launch"
+        if any(children.values()) or any(pending.values()):
+            return "next_prompt_custom_subagent"
+        # Any remaining bookkeeping means only root-only tool boundaries are
+        # provable, matching the ``root_tools`` custody this entry holds.
+        return "root_tools_only"
 
     def launch(
         self,
