@@ -12,7 +12,7 @@ import queue
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, cast
@@ -34,8 +34,10 @@ class FakeInbox:
     asked: list[str] = field(default_factory=list)
     fail: bool = False
 
-    def take(self, session_id: str) -> tuple[str, str] | None:
+    def take(self, session_id: str, still_open: Callable[[], bool]) -> tuple[str, str] | None:
         self.asked.append(session_id)
+        if not still_open():
+            return None
         if self.fail:
             raise ChatError("Devin courier response is invalid")
         items = self.pending.get(session_id) or []
@@ -315,7 +317,9 @@ def test_courier_inbox_takes_only_the_exact_engine_route(
     )
     monkeypatch.setattr(runtime, "_ack_devin", lambda _root, r, items: taken.append((r, items)))
     inbox = devin_acp.CourierInbox(tmp_path, engine_pid=42)
-    assert inbox.take("sess-alpha1") == (EVENT, "m42")
+    # A session the host closed after the peek consumes nothing.
+    assert inbox.take("sess-alpha1", lambda: False) is None and taken == []
+    assert inbox.take("sess-alpha1", lambda: True) == (EVENT, "m42")
     assert taken == [(routes[1], [{"event_id": EVENT, "message": "m42"}])]
 
     def stale(_root: Path, _route: Route, _items: list[dict[str, str]]) -> None:
@@ -324,8 +328,8 @@ def test_courier_inbox_takes_only_the_exact_engine_route(
     monkeypatch.setattr(runtime, "_ack_devin", stale)
     # A hook that acknowledged first wins; the mediator then delivers nothing.
     with pytest.raises(ChatError):
-        inbox.take("sess-alpha1")
-    assert devin_acp.CourierInbox(tmp_path, engine_pid=43).take("sess-alpha1") is None
+        inbox.take("sess-alpha1", lambda: True)
+    assert devin_acp.CourierInbox(tmp_path, engine_pid=43).take("sess-alpha1", lambda: True) is None
 
 
 def test_host_attestation_names_only_the_live_owned_engine(tmp_path: Path) -> None:
@@ -348,10 +352,14 @@ def test_host_attestation_names_only_the_live_owned_engine(tmp_path: Path) -> No
         assert not devin.acp_host_observed(root, owned)
         with pytest.raises(ChatError):
             devin.write_acp_host(root, adapter_pid=os.getppid(), engine_pid=child.pid)
+        devin.prune_acp_hosts(root)
+        assert path.exists()
     finally:
         child.kill()
         child.wait()
     assert not devin.acp_host_observed(root, owned)
+    devin.prune_acp_hosts(root)
+    assert not path.exists()
 
 
 def test_registry_add_and_remove_touch_only_the_cac_entry(tmp_path: Path) -> None:
@@ -420,10 +428,10 @@ def test_cancel_during_take_follows_the_peer_prompt_instead_of_overtaking_it(
     entered, release = threading.Event(), threading.Event()
     original = w.inbox.take
 
-    def slow_take(session_id: str) -> tuple[str, str] | None:
+    def slow_take(session_id: str, still_open: Callable[[], bool]) -> tuple[str, str] | None:
         entered.set()
         release.wait(5)
-        return original(session_id)
+        return original(session_id, still_open)
 
     w.inbox.pending["sess-alpha1"] = [(EVENT, "peer task")]
     w.inbox.take = slow_take  # type: ignore[method-assign]

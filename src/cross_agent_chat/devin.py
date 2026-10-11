@@ -18,6 +18,7 @@ import shutil
 import sys
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal, cast
@@ -141,6 +142,22 @@ def acp_host_path(root: Path, engine_pid: int, engine: ProcessFacts) -> Path:
     """Private, content-free attestation that one live adapter owns this engine."""
 
     return root / f"devin-acp-host-{engine_pid}-{engine.start_seconds}-{engine.start_microseconds}"
+
+
+def prune_acp_hosts(root: Path) -> None:
+    """Remove attestations whose engine birth no longer names a live process."""
+
+    for path in root.glob("devin-acp-host-*"):
+        parts = path.name.removeprefix("devin-acp-host-").split("-")
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            continue
+        engine = process_facts(int(parts[0]))
+        if engine is None or [engine.start_seconds, engine.start_microseconds] != [
+            int(parts[1]),
+            int(parts[2]),
+        ]:
+            with suppress(OSError):
+                path.unlink()
 
 
 def write_acp_host(root: Path, *, adapter_pid: int, engine_pid: int) -> Path:

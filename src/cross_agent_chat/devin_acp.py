@@ -27,13 +27,20 @@ from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import IO, Final, Protocol, cast
 from uuid import uuid4
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import ChatError, Registry
-from cross_agent_chat.devin import acp_peer_prompt, devin_binaries, devin_binary, write_acp_host
+from cross_agent_chat.devin import (
+    acp_peer_prompt,
+    devin_binaries,
+    devin_binary,
+    prune_acp_hosts,
+    write_acp_host,
+)
 
 ACP_FRAME_MAX_BYTES: Final = 64 * 1024 * 1024
 DELIVERY_POLL_SECONDS: Final = 1.0
@@ -46,8 +53,12 @@ Frame = dict[str, object]
 
 
 class Inbox(Protocol):
-    def take(self, session_id: str) -> tuple[str, str] | None:
-        """Acknowledge and return one ``(event_id, message)`` for this exact session."""
+    def take(self, session_id: str, still_open: Callable[[], bool]) -> tuple[str, str] | None:
+        """Acknowledge and return one ``(event_id, message)`` for this exact session.
+
+        ``still_open`` is checked immediately before acknowledging, so a session
+        the host closed meanwhile never consumes a message.
+        """
 
 
 @dataclass
@@ -322,7 +333,7 @@ class Mediator:
                 self._sessions[sid].claiming = True
         for sid in idle:
             try:
-                taken = self._inbox.take(sid)
+                taken = self._inbox.take(sid, partial(self._is_open, sid))
             except (ChatError, OSError) as error:
                 self._diagnostic(f"inbox unavailable: {error}")
                 taken = None
@@ -395,6 +406,10 @@ class Mediator:
             }
         )
 
+    def _is_open(self, session_id: str) -> bool:
+        with self._lock:
+            return session_id in self._sessions and not self._stopped.is_set()
+
     def stopped(self) -> threading.Event:
         return self._stopped
 
@@ -406,7 +421,7 @@ class CourierInbox:
         self.root = root
         self.engine_pid = engine_pid
 
-    def take(self, session_id: str) -> tuple[str, str] | None:
+    def take(self, session_id: str, still_open: Callable[[], bool]) -> tuple[str, str] | None:
         from cross_agent_chat.runtime import _ack_devin, _devin_messages, _route_current
 
         routes = [
@@ -423,6 +438,8 @@ class CourierInbox:
         if not messages:
             return None
         selected = messages[0]
+        if not still_open():
+            return None
         # Acknowledging first makes this the only consumer: a racing Stop,
         # prompt or tool hook that loses the acknowledgement delivers nothing.
         _ack_devin(self.root, route, [selected])
@@ -457,6 +474,7 @@ def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[s
     inbox: Inbox | None = None
     if presence_is_enabled():
         try:
+            prune_acp_hosts(root)
             attestation = write_acp_host(root, adapter_pid=os.getpid(), engine_pid=engine.pid)
             inbox = CourierInbox(root, engine.pid)
         except (ChatError, OSError) as error:
