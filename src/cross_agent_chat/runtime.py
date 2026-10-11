@@ -712,9 +712,13 @@ class Target:
         if mode == "codex_daemon_input" and not include_owning_daemon:
             mode, mechanism = "codex_stop_bound", "stop_bound"
         if mode == "devin_acp_hosted" and not include_devin_acp_host:
-            # An ACP-hosted engine still runs the root tool-boundary hook, so
-            # the downgrade lands on the next layer the reader may know.
-            mode, mechanism = "devin_tool_boundary", "devin_tool_boundary"
+            # Fall back to the strongest older layer this route has evidence
+            # for: the tool boundary only when its hook was observed.
+            mode, mechanism = (
+                ("devin_tool_boundary", "devin_tool_boundary")
+                if mechanism == "devin_tool_boundary"
+                else ("devin_stop_or_prompt_bound", "devin_prompt_bound")
+            )
         if mode == "devin_tool_boundary" and not include_devin_tool_boundary:
             mode, mechanism = "devin_stop_or_prompt_bound", "devin_prompt_bound"
         if include_delivery_mode:
@@ -2178,13 +2182,15 @@ def courier_health(
         if include_delivery_mechanism:
             response["delivery_mechanism"] = "devin_tool_boundary"
     if route.provider == "devin" and include_devin_acp_host and devin_acp_host_observed:
-        # Affirmed only by a receiver whose exact engine is owned by a live
-        # CAC ACP adapter right now; the idle wake it adds takes precedence
-        # over the tool boundary, and an older reader never sends the flag.
+        # Affirmed only while a live CAC ACP adapter relays this exact
+        # session; an older reader never sends the flag. The mechanism keeps
+        # the tool-boundary evidence, which alone qualifies active-turn input.
         if include_delivery_mode:
             response["delivery_mode"] = "devin_acp_hosted"
         if include_delivery_mechanism:
-            response["delivery_mechanism"] = "devin_acp_host"
+            response["delivery_mechanism"] = (
+                "devin_tool_boundary" if devin_tool_boundary_observed else "devin_acp_host"
+            )
     if (
         include_current_boundary
         and route.provider == "devin"
@@ -3663,16 +3669,19 @@ def _receiving_qualification(
     queue acceptance says nothing about when the original session can act.
     """
     owning_daemon = mode == "codex_daemon_input" and mechanism == "owning_daemon"
-    acp_hosted = mode == "devin_acp_hosted" and mechanism == "devin_acp_host"
+    acp_hosted = mode == "devin_acp_hosted" and mechanism in {
+        "devin_acp_host",
+        "devin_tool_boundary",
+    }
     tool_boundary = mode == "devin_tool_boundary" and mechanism == "devin_tool_boundary"
     deferred = mode in {"codex_stop_bound", "devin_stop_or_prompt_bound"}
     if owning_daemon:
         return True, True, "while_idle"
     if acp_hosted:
         # The live CAC adapter submits a queued CAC message as a native
-        # prompt while the engine idles; inside a turn the same engine still
-        # runs the root tool-boundary hook.
-        return True, True, "while_idle"
+        # prompt while the engine idles. Active-turn input additionally needs
+        # the session's observed root tool-boundary hook.
+        return True, mechanism == "devin_tool_boundary", "while_idle"
     if tool_boundary:
         # The Devin tool hook can only inject after a tool call inside a turn
         # that is already running; it never wakes a parked conversation.

@@ -160,13 +160,17 @@ def prune_acp_hosts(root: Path) -> None:
                 path.unlink()
 
 
-def write_acp_host(root: Path, *, adapter_pid: int, engine_pid: int) -> Path:
-    """Publish that ``adapter_pid`` launched and owns the native engine ``engine_pid``."""
+def write_acp_host(
+    root: Path, *, adapter_pid: int, engine_pid: int, sessions: frozenset[str] = frozenset()
+) -> Path:
+    """Publish that ``adapter_pid`` launched ``engine_pid`` and relays ``sessions``."""
 
     adapter = process_facts(adapter_pid)
     engine = process_facts(engine_pid)
     if adapter is None or engine is None or engine.ppid != adapter_pid:
         raise ChatError("Devin ACP engine ownership is unavailable")
+    for session_id in sessions:
+        valid_session_id("devin", session_id, "Devin ACP session id")
     path = acp_host_path(root, engine_pid, engine)
     atomic_json(
         path,
@@ -175,18 +179,20 @@ def write_acp_host(root: Path, *, adapter_pid: int, engine_pid: int) -> Path:
             "adapter_start": [adapter.start_seconds, adapter.start_microseconds],
             "engine_pid": engine_pid,
             "engine_start": [engine.start_seconds, engine.start_microseconds],
+            "sessions": sorted(sessions),
         },
     )
     return path
 
 
 def acp_host_observed(root: Path, route: Route) -> bool:
-    """Whether a live CAC ACP adapter is the launching parent of this Devin route.
+    """Whether a live CAC ACP adapter relays this exact Devin route's session.
 
-    True only when the route's exact engine process is alive, its private
-    attestation names that same birth, and the attested adapter is alive with
-    its recorded birth and is still the engine's parent. Anything else,
-    including an unreadable or foreign record, is False.
+    True only when the route's engine process is alive, its private
+    attestation names that same birth and lists the route's session as one the
+    adapter relays, and the attested adapter is alive with its recorded birth
+    and is still the engine's parent. Anything else, including an unreadable
+    or foreign record, is False.
     """
 
     if route.provider != "devin":
@@ -205,12 +211,16 @@ def acp_host_observed(root: Path, route: Route) -> bool:
         "adapter_start",
         "engine_pid",
         "engine_start",
+        "sessions",
     }:
         return False
     adapter_pid = raw["adapter_pid"]
+    sessions = raw["sessions"]
     if (
         not isinstance(adapter_pid, int)
         or isinstance(adapter_pid, bool)
+        or not isinstance(sessions, list)
+        or route.session_id not in sessions
         or raw["engine_pid"] != route.pid
         or raw["engine_start"] != [engine.start_seconds, engine.start_microseconds]
         or engine.ppid != adapter_pid

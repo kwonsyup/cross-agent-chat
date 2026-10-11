@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -33,7 +35,7 @@ from typing import IO, Final, Protocol, cast
 from uuid import uuid4
 
 from cross_agent_chat import __version__
-from cross_agent_chat.core import ChatError, Registry
+from cross_agent_chat.core import SCHEMA_VERSION, ChatError, Registry, UnknownDeliveryError
 from cross_agent_chat.devin import (
     acp_peer_prompt,
     devin_binaries,
@@ -57,8 +59,7 @@ class Inbox(Protocol):
     def take(self, session_id: str, still_open: Callable[[], bool]) -> tuple[str, str] | None:
         """Acknowledge and return one ``(event_id, message)`` for this exact session.
 
-        ``still_open`` is checked immediately before acknowledging, so a session
-        the host closed meanwhile never consumes a message.
+        ``still_open`` is checked immediately before acknowledging.
         """
 
 
@@ -67,12 +68,15 @@ class _Session:
     host_prompts: set[int] = field(default_factory=set)
     cac_prompt: int | None = None
     claiming: bool = False
-    in_transit: set[int] = field(default_factory=set)
-    cancel_pending: Frame | None = None
+    cancel_claim: bool = False
+    closing: bool = False
     queued: deque[Frame] = field(default_factory=deque)
+    deferred: list[Frame] = field(default_factory=list)
 
     def busy(self) -> bool:
-        return bool(self.host_prompts) or self.cac_prompt is not None or self.claiming
+        return (
+            bool(self.host_prompts) or self.cac_prompt is not None or self.claiming or self.closing
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,14 +96,22 @@ def _session_of(frame: Frame) -> str | None:
     return None
 
 
+def _cancelled(request_id: object) -> Frame:
+    return {"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "cancelled"}}
+
+
 class Mediator:
     """Relay one host connection to one native engine and own CAC prompt effects.
 
     Host request ids are remapped into one adapter-owned id space toward the
-    engine, so adapter-originated prompts can never collide with them and every
+    engine, so adapter-originated prompts never collide with them and every
     engine response returns to its real requester. Engine-originated requests
     such as permission prompts pass through unchanged; their replies come back
     from the host with the engine's own id.
+
+    Every frame bound for the engine is decided and enqueued under one lock and
+    written by one writer thread, so the engine receives prompts, cancels and
+    closes in exactly the order they were decided.
     """
 
     def __init__(
@@ -112,6 +124,7 @@ class Mediator:
         inbox: Inbox | None,
         poll_seconds: float = DELIVERY_POLL_SECONDS,
         diagnostic: Callable[[str], None] | None = None,
+        on_sessions: Callable[[frozenset[str]], None] | None = None,
     ) -> None:
         self._host_in = host_in
         self._host_out = host_out
@@ -122,13 +135,30 @@ class Mediator:
         self._diagnostic = diagnostic or (
             lambda text: print(f"cross-agent-chat devin-acp: {text}", file=sys.stderr, flush=True)
         )
+        self._on_sessions = on_sessions
         self._lock = threading.Lock()
         self._host_write = threading.Lock()
-        self._engine_write = threading.Lock()
+        self._engine_queue: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
         self._next_id = 0
         self._pending: dict[int, _Pending] = {}
         self._sessions: dict[str, _Session] = {}
         self._stopped = threading.Event()
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def start(self, *, deliver: bool = True) -> None:
+        loops = [self.host_loop, self.engine_loop, self.writer_loop]
+        if deliver:
+            loops.append(self.delivery_loop)
+        for loop in loops:
+            threading.Thread(target=loop, daemon=True).start()
+
+    def stopped(self) -> threading.Event:
+        return self._stopped
+
+    def _stop(self) -> None:
+        self._stopped.set()
+        self._engine_queue.put(None)
 
     # -- framing -----------------------------------------------------------
 
@@ -141,26 +171,51 @@ class Mediator:
             raise ChatError("ACP frame exceeds the bounded limit")
         return line
 
-    def _write(self, stream: IO[bytes], lock: threading.Lock, frame: Frame | bytes) -> None:
-        data = (
-            frame
-            if isinstance(frame, bytes)
-            else (json.dumps(frame, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
-        )
-        with lock:
-            stream.write(data)
-            stream.flush()
+    @staticmethod
+    def _encode(frame: Frame | bytes) -> bytes:
+        if isinstance(frame, bytes):
+            return frame
+        return (json.dumps(frame, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
 
     def _to_host(self, frame: Frame | bytes) -> None:
-        self._write(self._host_out, self._host_write, frame)
+        data = self._encode(frame)
+        with self._host_write:
+            self._host_out.write(data)
+            self._host_out.flush()
 
     def _to_engine(self, frame: Frame | bytes) -> None:
-        self._write(self._engine_in, self._engine_write, frame)
+        """Enqueue one engine-bound frame; callers decide order under ``_lock``."""
+
+        self._engine_queue.put(self._encode(frame))
+
+    def writer_loop(self) -> None:
+        try:
+            while (data := self._engine_queue.get()) is not None:
+                self._engine_in.write(data)
+                self._engine_in.flush()
+        except OSError:
+            self._diagnostic("the engine stopped accepting input")
+        finally:
+            self._stopped.set()
 
     def _allocate(self, pending: _Pending) -> int:
         self._next_id += 1
         self._pending[self._next_id] = pending
         return self._next_id
+
+    def _track(self, session_id: str) -> _Session:
+        session = self._sessions.get(session_id)
+        if session is None:
+            session = self._sessions[session_id] = _Session()
+            self._publish_sessions()
+        return session
+
+    def _publish_sessions(self) -> None:
+        if self._on_sessions is not None:
+            try:
+                self._on_sessions(frozenset(self._sessions))
+            except (ChatError, OSError) as error:
+                self._diagnostic(f"session attestation failed: {error}")
 
     # -- host -> engine ----------------------------------------------------
 
@@ -169,7 +224,7 @@ class Mediator:
             while (line := self._read(self._host_in)) is not None:
                 self._from_host(line)
         finally:
-            self._stopped.set()
+            self._stop()
 
     def _from_host(self, line: bytes) -> None:
         try:
@@ -196,72 +251,60 @@ class Mediator:
         if "id" not in frame:
             if method == "session/cancel" and session_id is not None:
                 self._cancel(frame, session_id)
-                return
-            self._to_engine(frame)
+            else:
+                self._to_engine(frame)
             return
+        refusal: Frame | None = None
         with self._lock:
-            pending = _Pending("host", frame["id"], method, session_id)
+            session = self._sessions.get(session_id) if session_id is not None else None
             if method == "session/prompt" and session_id is not None:
-                session = self._sessions.setdefault(session_id, _Session())
+                session = self._track(session_id)
                 if session.cac_prompt is not None or session.claiming or session.queued:
                     if len(session.queued) < MAX_QUEUED_PROMPTS:
                         session.queued.append(frame)
-                        return
-                    refusal: Frame = {
-                        "jsonrpc": "2.0",
-                        "id": frame["id"],
-                        "error": {"code": -32000, "message": "too many prompts are waiting"},
-                    }
+                    else:
+                        refusal = {
+                            "jsonrpc": "2.0",
+                            "id": frame["id"],
+                            "error": {"code": -32000, "message": "too many prompts are waiting"},
+                        }
                 else:
-                    internal = self._allocate(pending)
+                    internal = self._allocate(_Pending("host", frame["id"], method, session_id))
                     session.host_prompts.add(internal)
-                    session.in_transit.add(internal)
-                    refusal = {}
+                    self._to_engine({**frame, "id": internal})
             else:
-                internal = self._allocate(pending)
-                refusal = {}
-        if refusal:
+                internal = self._allocate(_Pending("host", frame["id"], method, session_id))
+                remapped = {**frame, "id": internal}
+                if session is not None and method in {"session/delete", "session/close"}:
+                    session.closing = True
+                    if session.claiming:
+                        # A message may be mid-acknowledgement for this session;
+                        # the close follows whatever that claim submits.
+                        session.deferred.append(remapped)
+                        remapped = {}
+                if remapped:
+                    self._to_engine(remapped)
+        if refusal is not None:
             self._to_host(refusal)
-        elif method == "session/prompt" and session_id is not None:
-            self._send_prompt(session_id, {**frame, "id": internal})
-        else:
-            self._to_engine({**frame, "id": internal})
-
-    def _send_prompt(self, session_id: str, frame: Frame) -> None:
-        """Write one allocated prompt, then release a cancel that waited for it."""
-
-        self._to_engine(frame)
-        with self._lock:
-            session = self._sessions.get(session_id)
-            cancel = None
-            if session is not None:
-                session.in_transit.discard(cast(int, frame["id"]))
-                if not session.in_transit and not session.claiming:
-                    cancel, session.cancel_pending = session.cancel_pending, None
-        if cancel is not None:
-            self._to_engine(cancel)
 
     def _cancel(self, frame: Frame, session_id: str) -> None:
         with self._lock:
             session = self._sessions.get(session_id)
-            queued = list(session.queued) if session is not None else []
-            forward = True
-            if session is not None:
+            queued: list[Frame] = []
+            if session is None:
+                self._to_engine(frame)
+            else:
+                queued = list(session.queued)
                 session.queued.clear()
-                if session.claiming or session.in_transit:
-                    # A prompt is being taken or written right now; the cancel
-                    # must follow it to the engine, never overtake it.
-                    session.cancel_pending = frame
-                    forward = False
-                else:
-                    forward = session.cac_prompt is not None or bool(session.host_prompts)
+                if session.claiming:
+                    # A peer message is being taken right now; if one is
+                    # submitted, this cancel follows it.
+                    session.cancel_claim = True
+                elif session.cac_prompt is not None or session.host_prompts:
+                    self._to_engine(frame)
         for prompt in queued:
             # The human stopped a prompt that never reached the engine.
-            self._to_host(
-                {"jsonrpc": "2.0", "id": prompt["id"], "result": {"stopReason": "cancelled"}}
-            )
-        if forward:
-            self._to_engine(frame)
+            self._to_host(_cancelled(prompt["id"]))
 
     # -- engine -> host ----------------------------------------------------
 
@@ -270,7 +313,7 @@ class Mediator:
             while (line := self._read(self._engine_out)) is not None:
                 self._from_engine(line)
         finally:
-            self._stopped.set()
+            self._stop()
 
     def _from_engine(self, line: bytes) -> None:
         try:
@@ -295,7 +338,7 @@ class Mediator:
             if pending is None or not isinstance(internal, int):
                 self._diagnostic("dropped an engine response with no requester")
                 return
-            due, answers = self._settle(pending, internal, frame)
+            answers = self._settle(pending, internal, frame)
         if pending.owner == "cac":
             result = frame.get("result")
             stop = (
@@ -308,62 +351,62 @@ class Mediator:
             self._to_host({**frame, "id": pending.original_id})
         for answer in answers:
             self._to_host(answer)
-        self._release(due)
 
-    def _settle(
-        self, pending: _Pending, internal: int, frame: Frame
-    ) -> tuple[list[Frame], list[Frame]]:
-        """Update state for one engine response: (prompts now due, host answers)."""
+    def _settle(self, pending: _Pending, internal: int, frame: Frame) -> list[Frame]:
+        """Update state for one engine response; return extra host answers."""
 
         result = frame.get("result")
         sid = pending.session_id
         if pending.method == "session/new" and isinstance(result, dict):
             created = cast(dict[str, object], result).get("sessionId")
             if isinstance(created, str):
-                self._sessions.setdefault(created, _Session())
-            return [], []
+                self._track(created)
+            return []
         if sid is None:
-            return [], []
+            return []
         if pending.method in {"session/load", "session/resume"} and "result" in frame:
-            self._sessions.setdefault(sid, _Session())
-            return [], []
-        if pending.method in {"session/delete", "session/close"} and "result" in frame:
-            closed = self._sessions.pop(sid, None)
-            # Prompts that waited behind a peer turn never reached the engine.
-            return [], [
-                {"jsonrpc": "2.0", "id": queued["id"], "result": {"stopReason": "cancelled"}}
-                for queued in (closed.queued if closed is not None else ())
-            ]
+            self._track(sid)
+            return []
         session = self._sessions.get(sid)
-        if session is None or pending.method != "session/prompt":
-            return [], []
+        if session is None:
+            return []
+        if pending.method in {"session/delete", "session/close"}:
+            if "result" not in frame:
+                session.closing = False
+                self._due(sid, session)
+                return []
+            del self._sessions[sid]
+            self._publish_sessions()
+            # Prompts that waited behind a peer turn never reached the engine.
+            return [_cancelled(queued["id"]) for queued in session.queued]
+        if pending.method != "session/prompt":
+            return []
         session.host_prompts.discard(internal)
         if session.cac_prompt == internal:
             session.cac_prompt = None
-        return self._due(sid, session), []
+        self._due(sid, session)
+        return []
 
-    def _due(self, session_id: str, session: _Session) -> list[Frame]:
+    def _due(self, session_id: str, session: _Session) -> None:
+        """Submit the oldest waiting host prompt once the session is free."""
+
         if session.busy() or not session.queued:
-            return []
+            return
         frame = session.queued.popleft()
         internal = self._allocate(_Pending("host", frame["id"], "session/prompt", session_id))
         session.host_prompts.add(internal)
-        session.in_transit.add(internal)
-        return [{**frame, "id": internal}]
-
-    def _release(self, frames: list[Frame]) -> None:
-        for frame in frames:
-            session_id = _session_of(frame)
-            if session_id is None:
-                self._to_engine(frame)
-            else:
-                self._send_prompt(session_id, frame)
+        self._to_engine({**frame, "id": internal})
 
     # -- CAC delivery ------------------------------------------------------
 
     def delivery_loop(self) -> None:
         while not self._stopped.wait(self._poll_seconds):
             self.deliver_once()
+
+    def _still_open(self, session_id: str) -> bool:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            return session is not None and not session.closing and not self._stopped.is_set()
 
     def deliver_once(self) -> None:
         if self._inbox is None:
@@ -374,80 +417,72 @@ class Mediator:
                 self._sessions[sid].claiming = True
         for sid in idle:
             try:
-                taken = self._inbox.take(sid, partial(self._is_open, sid))
+                taken = self._inbox.take(sid, partial(self._still_open, sid))
+            except UnknownDeliveryError as error:
+                # The acknowledgement may have consumed a message: report, never retry.
+                self._diagnostic(f"acknowledgement outcome is unknown; nothing submitted: {error}")
+                taken = None
             except (ChatError, OSError) as error:
                 self._diagnostic(f"inbox unavailable: {error}")
                 taken = None
+            message_id = str(uuid4())
+            text = acp_peer_prompt(*taken) if taken is not None else ""
+            if taken is not None:
+                # Shown before the engine can stream anything for this turn.
+                self._to_host(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": sid,
+                            "update": {
+                                "sessionUpdate": "user_message_chunk",
+                                "content": {"type": "text", "text": text},
+                                "_meta": {
+                                    "cognition.ai/clientMessageId": message_id,
+                                    "cognition.ai/messageSubIndex": 0,
+                                },
+                            },
+                        },
+                    }
+                )
             with self._lock:
                 session = self._sessions.get(sid)
                 if session is None:
                     if taken is not None:
-                        self._diagnostic(f"event {taken[0]} was taken for a closed session")
+                        self._diagnostic(f"event {taken[0]} was taken for a session that ended")
                     continue
                 session.claiming = False
-                if taken is None:
-                    release = self._due(sid, session)
-                    if not session.in_transit:
-                        # Nothing was submitted, so nothing remains to cancel.
-                        session.cancel_pending = None
-                else:
-                    message_id = str(uuid4())
+                if taken is not None:
                     internal = self._allocate(_Pending("cac", None, "session/prompt", sid))
                     session.cac_prompt = internal
-                    session.in_transit.add(internal)
-                    release = []
-            if taken is None:
-                self._release(release)
-                continue
-            event_id, message = taken
-            text = acp_peer_prompt(event_id, message)
-            try:
-                self._submit(sid, internal, message_id, text)
-            except OSError:
-                # Acknowledged but possibly not submitted: report, never retry.
-                self._diagnostic(f"event {event_id} may not have reached the engine")
-                self._stopped.set()
-                return
-            self._diagnostic(f"submitted event {event_id} to its idle session")
-
-    def _submit(self, sid: str, internal: int, message_id: str, text: str) -> None:
-        self._to_host(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": sid,
-                    "update": {
-                        "sessionUpdate": "user_message_chunk",
-                        "content": {"type": "text", "text": text},
-                        "_meta": {
-                            "cognition.ai/clientMessageId": message_id,
-                            "cognition.ai/messageSubIndex": 0,
-                        },
-                    },
-                },
-            }
-        )
-        self._send_prompt(
-            sid,
-            {
-                "jsonrpc": "2.0",
-                "id": internal,
-                "method": "session/prompt",
-                "params": {
-                    "sessionId": sid,
-                    "prompt": [{"type": "text", "text": text}],
-                    "_meta": {"cognition.ai/clientMessageId": message_id},
-                },
-            },
-        )
-
-    def _is_open(self, session_id: str) -> bool:
-        with self._lock:
-            return session_id in self._sessions and not self._stopped.is_set()
-
-    def stopped(self) -> threading.Event:
-        return self._stopped
+                    self._to_engine(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": internal,
+                            "method": "session/prompt",
+                            "params": {
+                                "sessionId": sid,
+                                "prompt": [{"type": "text", "text": text}],
+                                "_meta": {"cognition.ai/clientMessageId": message_id},
+                            },
+                        }
+                    )
+                    if session.cancel_claim:
+                        self._to_engine(
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "session/cancel",
+                                "params": {"sessionId": sid},
+                            }
+                        )
+                session.cancel_claim = False
+                for deferred in session.deferred:
+                    self._to_engine(deferred)
+                session.deferred.clear()
+                self._due(sid, session)
+            if taken is not None:
+                self._diagnostic(f"submitted event {taken[0]} to its idle session")
 
 
 class CourierInbox:
@@ -458,7 +493,12 @@ class CourierInbox:
         self.engine_pid = engine_pid
 
     def take(self, session_id: str, still_open: Callable[[], bool]) -> tuple[str, str] | None:
-        from cross_agent_chat.runtime import _ack_devin, _devin_messages, _route_current
+        from cross_agent_chat.runtime import (
+            _devin_messages,
+            _route_current,
+            request_socket,
+            socket_path,
+        )
 
         routes = [
             route
@@ -476,9 +516,26 @@ class CourierInbox:
         selected = messages[0]
         if not still_open():
             return None
-        # Acknowledging first makes this the only consumer: a racing Stop,
-        # prompt or tool hook that loses the acknowledgement delivers nothing.
-        _ack_devin(self.root, route, [selected])
+        # Acknowledging first makes this the only consumer: the courier
+        # removes the event exactly once, so a racing Stop, prompt or tool
+        # hook that loses the acknowledgement delivers nothing. The prompt goes
+        # to the ACP root session itself, never to a subagent sharing its
+        # hook identity, so the hooks' subagent custody hold does not apply.
+        acknowledged = request_socket(
+            socket_path(self.root, route),
+            {
+                "schema_version": SCHEMA_VERSION,
+                "operation": "ack",
+                "generation": route.generation,
+                "event_ids": [selected["event_id"]],
+            },
+        )
+        if acknowledged != {
+            "schema_version": SCHEMA_VERSION,
+            "status": "ACKNOWLEDGED",
+            "event_ids": [selected["event_id"]],
+        }:
+            raise UnknownDeliveryError("Devin courier acknowledgement is not exact")
         return selected["event_id"], selected["message"]
 
 
@@ -519,20 +576,21 @@ def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[s
                 file=sys.stderr,
                 flush=True,
             )
+
+    def attest(sessions: frozenset[str]) -> None:
+        write_acp_host(root, adapter_pid=os.getpid(), engine_pid=engine.pid, sessions=sessions)
+
     mediator = Mediator(
         host_in=sys.stdin.buffer,
         host_out=sys.stdout.buffer,
         engine_in=engine.stdin,
         engine_out=engine.stdout,
         inbox=inbox,
+        on_sessions=attest if attestation is not None else None,
     )
-    threads = [
-        threading.Thread(target=mediator.host_loop, daemon=True),
-        threading.Thread(target=mediator.engine_loop, daemon=True),
-        threading.Thread(target=mediator.delivery_loop, daemon=True),
-    ]
-    for thread in threads:
-        thread.start()
+    # The host ends an agent with SIGTERM; exit through the cleanup below.
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(143))
+    mediator.start()
     try:
         mediator.stopped().wait()
     finally:

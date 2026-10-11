@@ -98,8 +98,7 @@ def wired() -> Iterator[Wired]:
         inbox=inbox,
         diagnostic=lambda _text: None,
     )
-    threading.Thread(target=mediator.host_loop, daemon=True).start()
-    threading.Thread(target=mediator.engine_loop, daemon=True).start()
+    mediator.start(deliver=False)
     host = Side(os.fdopen(med_to_host_r, "rb"), host_writer)
     engine = Side(os.fdopen(med_to_engine_r, "rb"), engine_writer)
     yield Wired(mediator, host, engine, inbox, host_writer, engine_writer)
@@ -305,28 +304,36 @@ def test_courier_inbox_takes_only_the_exact_engine_route(
 
     def route(session_id: str, pid: int) -> Route:
         return cast(
-            Route, type("R", (), {"provider": "devin", "session_id": session_id, "pid": pid})
+            Route,
+            type(
+                "R",
+                (),
+                {"provider": "devin", "session_id": session_id, "pid": pid, "generation": "g"},
+            ),
         )
 
     routes = [route("sess-alpha1", 41), route("sess-alpha1", 42), route("sess-other", 42)]
     monkeypatch.setattr(core.Registry, "routes", lambda _self: routes)
     monkeypatch.setattr(runtime, "_route_current", lambda _root, _route: True)
-    taken: list[tuple[object, list[dict[str, str]]]] = []
+    monkeypatch.setattr(runtime, "socket_path", lambda _root, r: r)
     monkeypatch.setattr(
         runtime, "_devin_messages", lambda _root, r: [{"event_id": EVENT, "message": f"m{r.pid}"}]
     )
-    monkeypatch.setattr(runtime, "_ack_devin", lambda _root, r, items: taken.append((r, items)))
+    acks: list[tuple[object, object]] = []
+    reply: dict[str, object] = {"schema_version": 1, "status": "ACKNOWLEDGED", "event_ids": [EVENT]}
+
+    def request(target: object, payload: dict[str, object]) -> dict[str, object]:
+        acks.append((target, payload["event_ids"]))
+        return reply
+
+    monkeypatch.setattr(runtime, "request_socket", request)
     inbox = devin_acp.CourierInbox(tmp_path, engine_pid=42)
     # A session the host closed after the peek consumes nothing.
-    assert inbox.take("sess-alpha1", lambda: False) is None and taken == []
+    assert inbox.take("sess-alpha1", lambda: False) is None and acks == []
     assert inbox.take("sess-alpha1", lambda: True) == (EVENT, "m42")
-    assert taken == [(routes[1], [{"event_id": EVENT, "message": "m42"}])]
-
-    def stale(_root: Path, _route: Route, _items: list[dict[str, str]]) -> None:
-        raise ChatError("Cross Agent Chat courier closed without a response")
-
-    monkeypatch.setattr(runtime, "_ack_devin", stale)
-    # A hook that acknowledged first wins; the mediator then delivers nothing.
+    assert acks == [(routes[1], [EVENT])]
+    # A losing or malformed acknowledgement never yields a message to submit.
+    reply = {"schema_version": 1, "status": "ACKNOWLEDGED", "event_ids": []}
     with pytest.raises(ChatError):
         inbox.take("sess-alpha1", lambda: True)
     assert devin_acp.CourierInbox(tmp_path, engine_pid=43).take("sess-alpha1", lambda: True) is None
@@ -337,14 +344,31 @@ def test_host_attestation_names_only_the_live_owned_engine(tmp_path: Path) -> No
     root.mkdir(mode=0o700)
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
-        owned = cast(Route, type("R", (), {"provider": "devin", "pid": child.pid}))
-        foreign = cast(Route, type("R", (), {"provider": "devin", "pid": os.getppid()}))
+
+        def route(pid: int, session_id: str = "sess-alpha1") -> Route:
+            return cast(
+                Route, type("R", (), {"provider": "devin", "pid": pid, "session_id": session_id})
+            )
+
+        owned, foreign = route(child.pid), route(os.getppid())
         assert not devin.acp_host_observed(root, owned)
         path = devin.write_acp_host(root, adapter_pid=os.getpid(), engine_pid=child.pid)
+        # The engine is owned, but this session is not one the adapter relays.
+        assert not devin.acp_host_observed(root, owned)
+        path = devin.write_acp_host(
+            root, adapter_pid=os.getpid(), engine_pid=child.pid, sessions=frozenset({"sess-alpha1"})
+        )
         assert devin.acp_host_observed(root, owned)
+        assert not devin.acp_host_observed(root, route(child.pid, "sess-other1"))
         assert not devin.acp_host_observed(root, foreign)
         record = json.loads(path.read_text())
-        assert set(record) == {"adapter_pid", "adapter_start", "engine_pid", "engine_start"}
+        assert set(record) == {
+            "adapter_pid",
+            "adapter_start",
+            "engine_pid",
+            "engine_start",
+            "sessions",
+        }
         path.write_text(json.dumps({**record, "adapter_pid": os.getppid()}))
         assert not devin.acp_host_observed(root, owned)
         path.write_text(json.dumps(record))

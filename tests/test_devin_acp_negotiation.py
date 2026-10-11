@@ -23,6 +23,7 @@ def _devin_route(cwd: Path) -> Route:
 def _acp_target(
     *,
     boundary: DevinCurrentBoundary | None = None,
+    tool_hook: bool = True,
 ) -> runtime.Target:
     return runtime.Target(
         alias="devin@m4:ws",
@@ -33,7 +34,7 @@ def _acp_target(
         session_key="b" * 64,
         remote=False,
         delivery_mode="devin_acp_hosted",
-        delivery_mechanism="devin_acp_host",
+        delivery_mechanism="devin_tool_boundary" if tool_hook else "devin_acp_host",
         current_boundary=boundary,
     )
 
@@ -43,7 +44,8 @@ def test_courier_health_reports_acp_host_only_when_asked_and_observed(
 ) -> None:
     """The new pair needs the negotiated flag AND a live attested adapter."""
     route = _devin_route(tmp_path)
-    acp = ("devin_acp_hosted", "devin_acp_host")
+    acp = ("devin_acp_hosted", "devin_tool_boundary")
+    acp_without_tool_hook = ("devin_acp_hosted", "devin_acp_host")
     tool_boundary = ("devin_tool_boundary", "devin_tool_boundary")
     legacy = ("devin_stop_or_prompt_bound", "devin_prompt_bound")
 
@@ -59,8 +61,9 @@ def test_courier_health_reports_acp_host_only_when_asked_and_observed(
         )
         return response["delivery_mode"], response["delivery_mechanism"]
 
-    # Observed + asked: the ACP wake takes precedence over the tool boundary.
+    # Observed + asked: ACP mode; the mechanism keeps the tool-hook evidence.
     assert health(asked=True, observed=True) == acp
+    assert health(asked=True, observed=True, tool_observed=False) == acp_without_tool_hook
     # Adapter exited between probes: fall back to today's tool-boundary truth.
     assert health(asked=True, observed=False) == tool_boundary
     assert health(asked=True, observed=False, tool_observed=False) == legacy
@@ -102,6 +105,14 @@ def test_acp_hosted_values_never_reach_a_reader_that_did_not_negotiate() -> None
     downgraded = row(tool_boundary=True)
     assert downgraded["delivery_mode"] == "devin_tool_boundary"
     assert downgraded["delivery_mechanism"] == "devin_tool_boundary"
+    # Without observed tool-hook evidence the downgrade never claims it.
+    unhooked = _acp_target(tool_hook=False).public(
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
+        include_handle=False,
+        include_devin_tool_boundary=True,
+    )
+    assert unhooked["delivery_mode"] == "devin_stop_or_prompt_bound"
     legacy = row(tool_boundary=False)
     assert legacy["delivery_mode"] == "devin_stop_or_prompt_bound"
     assert legacy["delivery_mechanism"] == "devin_prompt_bound"
@@ -112,18 +123,31 @@ def test_acp_hosted_values_never_reach_a_reader_that_did_not_negotiate() -> None
         parse(affirmed, negotiated=False)
     parsed = parse(affirmed, negotiated=True)
     assert parsed.delivery_mode == "devin_acp_hosted"
-    assert parsed.delivery_mechanism == "devin_acp_host"
+    assert parsed.delivery_mechanism == "devin_tool_boundary"
+    unhooked_row = _acp_target(tool_hook=False).public(
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
+        include_handle=False,
+        include_devin_tool_boundary=True,
+        include_devin_acp_host=True,
+    )
+    unhooked_row.update(generation=target.generation, session_key=target.session_key)
+    with pytest.raises(ChatError, match="invalid discovery"):
+        parse(unhooked_row, negotiated=False)
 
 
 def test_acp_hosted_qualifies_parked_wake_active_input_and_while_idle_reply() -> None:
-    """The adapter prompts the idle engine; the same engine keeps tool input."""
-    parked, active, reply = runtime._receiving_qualification("devin_acp_hosted", "devin_acp_host")
-    assert (parked, active, reply) == (True, True, "while_idle")
+    """The adapter prompts the idle engine; active input needs observed hook evidence."""
+    qualify = runtime._receiving_qualification
+    assert qualify("devin_acp_hosted", "devin_tool_boundary") == (True, True, "while_idle")
+    assert qualify("devin_acp_hosted", "devin_acp_host") == (True, False, "while_idle")
     receiving = runtime.destination_receiving(_acp_target())
     assert receiving["mode"] == "devin_acp_hosted"
-    assert receiving["mechanism"] == "devin_acp_host"
     assert receiving["parked_wake"] is True
     assert receiving["active_turn_input"] is True
+    unhooked = runtime.destination_receiving(_acp_target(tool_hook=False))
+    assert unhooked["parked_wake"] is True
+    assert unhooked["active_turn_input"] is False
 
 
 def test_a_hold_still_narrows_acp_hosted_input_and_never_upgrades_other_modes() -> None:
@@ -180,7 +204,7 @@ def test_local_health_probe_negotiates_the_acp_host_flag(
             "generation": route.generation,
             "alias": route.alias,
             "delivery_mode": "devin_acp_hosted",
-            "delivery_mechanism": "devin_acp_host",
+            "delivery_mechanism": "devin_tool_boundary",
         }
 
     monkeypatch.setattr(runtime, "request_socket", courier)
@@ -206,7 +230,7 @@ def test_new_reader_negotiates_acp_host_and_stays_conservative_with_old_brokers(
         if "include_devin_acp_host" in payload and not broker_knows_flag:
             raise ChatError("Tailnet broker request is invalid")
         if "include_devin_acp_host" in payload:
-            mode, mechanism = "devin_acp_hosted", "devin_acp_host"
+            mode, mechanism = "devin_acp_hosted", "devin_tool_boundary"
         elif "include_devin_tool_boundary" in payload:
             mode, mechanism = "devin_tool_boundary", "devin_tool_boundary"
         else:
