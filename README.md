@@ -24,16 +24,16 @@ secrets those files hold (see [setup and data handling](SECURITY.md)).
 Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
 limits the set.
 
-Install v0.5.5 with:
+Install v0.5.6 with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.5/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.6/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
-This builds the released `v0.5.5` tag and installs the command at
+This builds the released `v0.5.6` tag and installs the command at
 `~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
 Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
 not found in your shell, use the full path the installer reports. Run it on
@@ -95,7 +95,31 @@ harness and mode:
 | Codex Native App (managed helper) | Qualified on the listed host | Qualified on the listed host | — | Intel macOS, Codex 0.159.2 in Native app 26.928.21956, trusted hooks available; does not qualify every host version |
 | Codex CLI experimental native queue | Unknown: provider queue acceptance alone does not qualify wake | Unknown | May wait behind the current turn or until resume | Only under explicit `setup --enable-experimental-codex-native-queue`; not active by default. A qualified owning daemon on the same route takes precedence over this queue |
 | Local Devin CLI/App | No — [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38) open | Between the root conversation's tool calls; a running tool is not interrupted. While a built-in subagent (`subagent_general`, `subagent_explore`) is running, only after the root's own subagent or question tool calls; while a custom profile (which may nest) runs or a launch outcome was not observed, the message waits for the next prompt. A child counts as running until Devin reports it finished to the root (`read_subagent` or a foreground return); one known only through Devin's completion notification keeps that session restricted until it ends | An idle conversation receives at its next prompt | Reported as active-turn input only when the receiving Mac runs 0.5.3 or later and that session has already run its tool hook; otherwise reported conservatively. A 0.5.4 or later receiver also reports its current subagent restriction as `current_boundary`, and `active_turn_input` is then `false` (held until the next prompt) or `limited` (root-only tools). Qualified 8 Oct 2026 with Devin CLI 3000.11.3 and the Desktop-bundled CLI 3000.10.48 (Apple silicon) receiving from Codex CLI 0.162.0 and Claude Code 2.1.294 across Macs; the Desktop app window itself was not exercised |
+| New Devin conversation in Devin Desktop through the "Devin + Cross Agent Chat" ACP agent | Yes: an idle root conversation is woken with the peer message as a native prompt | Same root tool-boundary rules as local Devin | A message that arrives during a turn waits for that turn to finish (or its tool boundary) | Qualified 11 Oct 2026 on Apple silicon with Devin Desktop 3.10.48 hosting Devin CLI 3000.11.3 (`devin acp`): idle round trips with a Codex CLI 0.162.1 owning-daemon original and a Claude Code 2.1.296 original, both receiving ends idle, plus a Devin CLI original. Desktop shows the peer task, tool calls, native permission prompts and the answer in the same conversation, but **no busy indicator or Stop button for a peer-started turn**; to stop one, send any message and press Stop on it. Only conversations started with this agent; not existing Devin Local, CLI, or Desktop originals (#38) |
 | Grokbot 0.66.0 (external endpoint) | One author-reported idle webhook return | Unqualified | — | One owner-enrolled Bot; does not certify another Bot, fresh-user setup, or M2 |
+
+### Devin idle receiving through Devin Desktop
+
+A Devin conversation can receive peer requests while idle when Devin Desktop
+starts it through Cross Agent Chat's ACP agent entry, which launches the
+normal `devin acp` with your existing Devin login, models, permissions, and
+hooks:
+
+```bash
+cross-agent-chat devin-acp-registry add   # adds only its own entry to ~/.windsurf/acp/registry.json
+```
+
+Then in Devin Desktop open **Devin User Settings → Agents**, enable
+**Devin + Cross Agent Chat**, run **Reload ACP Connections** (restart Desktop
+if the agent does not appear), and start a new conversation with that agent.
+It joins the peer list after its first prompt, and peers see its mode as
+`devin_acp_hosted`. Peer tasks appear in the conversation as messages framed
+as untrusted peer input; tool permissions are asked exactly as for your own
+prompts. Closing the conversation's Desktop window or quitting Desktop ends
+that receiving path; a queued message then waits for the next prompt, and a
+conversation reopened after a Desktop restart receives again after its next
+prompt.
+`cross-agent-chat devin-acp-registry remove` removes only that entry.
 
 `destination_receiving` in a send result describes the destination's observed
 route mode and mechanism — which of these capabilities apply — never a

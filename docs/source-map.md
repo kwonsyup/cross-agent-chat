@@ -52,6 +52,7 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 | `codex_daemon.py` | Owning-daemon ingress for `codex-tui` 0.160.1, 0.162.0, and 0.162.1 originals: a private owner-only Unix WebSocket admitted by route-owner PID with exact profile, thread, cwd, and originator checks; `thread/queue/add` wakes a parked original and `turn/steer` with a pinned `expectedTurnId` inputs the expected active turn. CAC starts no daemon, resumes no thread, changes no permission, and never retries an uncertain effect; missing or unqualified routes stay Stop-bound. |
 | `native_helper.py` | Shared provider hook recipes/defaults and the private, body-free binding between original Codex conversations and managed native helpers. |
 | `devin.py` | Devin lifecycle-hook parsing, the filesystem-backed single-use capability store, and the content-free subagent lifecycle record that holds Stop/PostToolUse delivery to root-only boundaries (built-in profiles) or to the next prompt (custom profiles, unobserved launches) while a subagent may run (`atomic_json` + `state_lock`). |
+| `devin_acp.py` | `devin-acp` ACP mediator between a host and the native `devin acp` engine it launches: remaps host request ids into one adapter-owned id space, passes engine permission requests through, serializes prompts per session, and while a session is idle acknowledges one message from that exact route's courier and submits it as a native `session/prompt` (host prompts wait for real completion; a host cancel stops the peer turn and answers queued prompts). Also adds/removes only its own local ACP registry entry. The private `devin-acp-host-*` attestation in `devin.py` lets the courier report `devin_acp_hosted` only while that adapter is alive and is the engine's parent. |
 | `install.py` | Provider selection (`resolve_providers`), selected-root resolution, read-only `SetupPlan`, config payload preparation, whole-file backups, guarded transactions/rollback, LaunchAgent lifecycle, schema-5 install metadata, uninstall/restore. Largest file; most of its size is the ownership/rollback matrix. |
 
 Native eligibility is checked in `runtime.py`: `_native_desktop_client`
@@ -211,9 +212,11 @@ original. `--resume` in another process and the Cloud message API do not
 prove this outcome. [Issue #38](https://github.com/kwonsyup/cross-agent-chat/issues/38)
 remains open.
 
-A supported owning-host input channel could let CAC submit ACP
-`session/prompt` to the existing original, with owner/session checks and no
-fallback after an uncertain effect. Alternatively, a host can create its
-original through ACP and retain that input channel from launch; that is an
-explicit ACP-host lifecycle, not ordinary local CLI/Desktop compatibility.
-CAC currently implements neither alternative.
+A host can instead create its original through ACP and retain that input
+channel from launch. `devin_acp.py` implements that explicit lifecycle for
+Devin Desktop's local ACP registry: conversations started with the
+"Devin + Cross Agent Chat" agent receive while idle. This does not attach to
+an already-running ordinary CLI or built-in Desktop original, so #38 stays
+open for those. Desktop 3.10.48 (ACP v1) renders a peer-started turn but does
+not show it as busy or offer Stop for it; ACP v2's `state_update` is not
+honored in a v1 session.

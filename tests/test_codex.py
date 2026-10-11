@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 
+from cross_agent_chat import __version__
 from cross_agent_chat.codex import (
     CodexCourier,
     deliver_at_stop,
@@ -376,7 +377,7 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
             "id": 0,
             "method": "initialize",
             "params": {
-                "clientInfo": {"name": "cross-agent-chat", "version": "0.5.5"},
+                "clientInfo": {"name": "cross-agent-chat", "version": __version__},
                 "capabilities": {"experimentalApi": True},
             },
         }
