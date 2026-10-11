@@ -17,6 +17,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -581,7 +582,8 @@ def test_event_status_reads_only_an_exact_source_owned_intent(
 
     status = event_status(root, source, event_id)
 
-    assert status == {
+    observation = cast(dict[str, object], status["receiving_observation"])
+    assert {key: value for key, value in status.items() if key != "receiving_observation"} == {
         "schema_version": 1,
         "event_id": event_id,
         "status": "PENDING",
@@ -590,17 +592,16 @@ def test_event_status_reads_only_an_exact_source_owned_intent(
         "target_generation": target.generation,
         "timestamp": store.intents()[0].timestamp,
         "delivery_observation": "not_observed",
-        # The target route was never registered, so no live local receiver can
-        # answer for it; the observation stays honestly unknown and body-free.
-        "receiving_observation": {
-            "stage": "unknown",
-            "reason": "no_local_receiver",
-            "detail": "no live local receiver owns the recorded target generation; "
-            "run `cross-agent-chat status` on the receiving Mac, or ask again "
-            "with that receiver's exact remote handle (status --recipient or "
-            "the chat_status recipient argument)",
-        },
     }
+    # No local target exists. A receiver may have no sender-owned intent either,
+    # so guidance must not promise its owner status command can find this event.
+    assert set(observation) == {"stage", "reason", "detail"}
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == "no_local_receiver"
+    detail = cast(str, observation["detail"])
+    assert "exact matching remote handle" in detail
+    assert "normal provider transcript" in detail
+    assert "do not replay" in detail
     assert store.path.read_bytes() == before
     with pytest.raises(ChatError, match="event is unavailable"):
         event_status(root, target, event_id)

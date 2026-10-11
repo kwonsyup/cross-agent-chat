@@ -1510,7 +1510,9 @@ def test_status_recipient_failures_stay_unknown_with_a_safe_next_action(
     assert observation["stage"] == "unknown"
     assert observation["reason"] == reason
     detail = cast(str, observation["detail"])
-    assert "status` on the receiving Mac" in detail
+    assert "normal provider transcript" in detail
+    assert "do not replay" in detail
+    assert "run `cross-agent-chat status`" not in detail
     assert "message" not in detail and "injected" not in detail
 
 
@@ -1523,6 +1525,10 @@ def test_broker_inspect_answers_the_bound_courier_without_effects(
     original, helper = _bound_helper_pair(root, tmp_path)
     monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
     event_id = str(uuid4())
+    # Inbound remote custody lives at the sender. The receiving courier can
+    # answer inspection even though owner status has no local intent to read.
+    with pytest.raises(ChatError, match="event is unavailable"):
+        runtime.owner_event_status(root, event_id)
     asked: list[dict[str, object]] = []
 
     def socket(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
