@@ -365,8 +365,9 @@ def test_a_stale_token_is_replaced_only_by_a_fresh_listing(
     assert deliveries == [OWNER]
 
 
+@pytest.mark.parametrize("include_external", [False, True])
 def test_the_selected_node_not_claiming_refuses_before_any_effect(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, include_external: bool
 ) -> None:
     """The token's node answers but no longer presents the handle: refuse."""
     handle = session_key("claude", str(uuid4()))
@@ -392,8 +393,14 @@ def test_the_selected_node_not_claiming_refuses_before_any_effect(
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
-        send(tmp_path, source, remote_token(OWNER_NODE, handle, str(uuid4())), "hello")
+    with pytest.raises(ChatError, match="unavailable or changed; nothing was delivered"):
+        send(
+            tmp_path,
+            source,
+            remote_token(OWNER_NODE, handle, str(uuid4())),
+            "hello",
+            include_external=include_external,
+        )
 
     assert not (tmp_path / "intents.json").exists()
     # Only the selected node was asked; there is no unrelated-node fallback.
