@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.4 - 2026-10-10
 
 - A Devin SessionEnd whose PID or workspace does not match the current route now refuses before touching anything. Previously it cleared the live session's capabilities and subagent custody, so a later tool boundary could hand a held message to a running child. Validation and cleanup now share the session's registration lock.
 - `doctor` reports a Claude or Codex MCP entry that points at a different executable or argument list as needing setup, instead of accepting any entry named `cross-agent-chat`. It still changes nothing.
