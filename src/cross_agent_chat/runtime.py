@@ -5292,6 +5292,7 @@ _COURIER_EVENT_STATES: Final = frozenset({"pending", "handed_off", "unseen", "no
 _REMOTE_INSPECT_REASONS: Final = frozenset(
     {
         "no_local_receiver",
+        "original_unavailable",
         "helper_binding_ambiguous",
         "helper_unavailable",
         "courier_unavailable",
@@ -5299,6 +5300,11 @@ _REMOTE_INSPECT_REASONS: Final = frozenset(
     }
 )
 _REMOTE_INSPECT_DETAILS: Final = {
+    "original_unavailable": (
+        "the recorded original's owner is no longer current; its bound helper "
+        "cannot establish a current receiving path. Use the original's normal "
+        "resume lifecycle when convenient; do not replay this event"
+    ),
     "no_local_receiver": (
         "the recipient node found no live receiver owning the recorded target "
         "generation; run `cross-agent-chat status` on the receiving Mac for the "
@@ -5326,6 +5332,7 @@ _REMOTE_INSPECT_DETAILS: Final = {
     ),
 }
 _REMOTE_INSPECT_REASON_NAMES: Final = {
+    "original_unavailable": "remote_original_unavailable",
     "no_local_receiver": "remote_no_receiver",
     "helper_binding_ambiguous": "remote_helper_binding_ambiguous",
     "helper_unavailable": "remote_helper_unavailable",
@@ -5368,6 +5375,8 @@ def _receiving_delivery(
         for item in NativeHelperStore(root).bindings()
     ):
         return original, original, "original_courier", None
+    if not _route_current(root, original):
+        return original, None, None, "original_unavailable"
     try:
         helper = NativeHelperStore(root).helper_for_original(original, routes)
     except ChatError:
@@ -5432,6 +5441,7 @@ def _inspect_receiving_courier(
         or response.get("generation") != route.generation
         or not isinstance(response.get("courier_version"), str)
         or not isinstance(response.get("courier_incarnation"), str)
+        or not isinstance(state, str)
         or state not in _COURIER_EVENT_STATES
         or not _pending_fields_valid(response)
     ):
@@ -5479,7 +5489,7 @@ def _receiving_state_observation(
         # Helper handoff is only the helper boundary: it is never original
         # dispatch evidence and never original-session consumption.
         holder = "the bound native helper's courier"
-        boundary = "the original session's provider boundary"
+        boundary = "the helper session's provider boundary"
     else:
         holder = "the receiving courier"
         boundary = "the provider boundary"
@@ -5502,7 +5512,15 @@ def _receiving_state_observation(
             f"{holder} recorded handing the event to {boundary}; "
             "that is never evidence the original session consumed it"
         )
-    elif state == "no_courier_queue" and intent_status == "TRANSPORT_ACCEPTED":
+        if observer == "native_helper":
+            observation["detail"] = (
+                f"{observation['detail']}; original forwarding remains unobserved"
+            )
+    elif (
+        state == "no_courier_queue"
+        and intent_status == "TRANSPORT_ACCEPTED"
+        and observer == "original_courier"
+    ):
         # A provider-native route (Claude, direct Devin) accepted the event at
         # transport and holds no CAC queue; custody ended at the provider side.
         observation["stage"] = "handed_off"
@@ -5550,6 +5568,10 @@ def _receiving_observation(
             "helper_binding_ambiguous",
             "the recorded target's native helper binding is ambiguous; "
             "receiving state is unobservable",
+        )
+    if failure == "original_unavailable":
+        return _receiving_unknown(
+            "original_unavailable", _REMOTE_INSPECT_DETAILS["original_unavailable"]
         )
     if failure == "helper_unavailable":
         return _receiving_unknown(
@@ -5639,10 +5661,12 @@ def _remote_receiving_observation(intent: Intent, recipient: str) -> dict[str, o
     valid_failure = (
         set(response) == base | {"reason"}
         and observer == "none"
+        and isinstance(response.get("reason"), str)
         and response.get("reason") in _REMOTE_INSPECT_REASONS
     )
     valid_observation = (
-        observer in {"original_courier", "native_helper"}
+        isinstance(observer, str)
+        and observer in {"original_courier", "native_helper"}
         and observed <= set(response)
         and set(response) - observed
         <= {"pending_count", "oldest_pending_age_seconds", "dispatch_claim"}
@@ -5650,6 +5674,7 @@ def _remote_receiving_observation(intent: Intent, recipient: str) -> dict[str, o
         and response.get("dispatch_claim", "UNKNOWN") == "UNKNOWN"
         and isinstance(response.get("courier_version"), str)
         and isinstance(response.get("courier_incarnation"), str)
+        and isinstance(response.get("event_state"), str)
         and response.get("event_state") in _COURIER_EVENT_STATES
         and _pending_fields_valid(response)
     )

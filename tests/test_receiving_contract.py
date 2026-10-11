@@ -1275,8 +1275,9 @@ def test_status_stays_unknown_when_the_bound_helper_cannot_answer(
         return _inspect_answer(str(payload["generation"]), "pending", pending_count=1)
 
     monkeypatch.setattr(runtime, "request_socket", socket)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
     if variant == "dead":
-        monkeypatch.setattr(Route, "process_is_live", lambda _route: False)
+        monkeypatch.setattr(Route, "process_is_live", lambda route: route != helper)
     elif variant == "stale_generation":
         restarted = Route.create(
             provider="codex",
@@ -1290,7 +1291,7 @@ def test_status_stays_unknown_when_the_bound_helper_cannot_answer(
         Registry(root).upsert(restarted)
         monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
     else:
-        monkeypatch.setattr(runtime, "_route_current", lambda *_args: False)
+        monkeypatch.setattr(runtime, "_route_current", lambda _root, route: route != helper)
 
     observation = cast(
         dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
@@ -1330,6 +1331,7 @@ def test_status_reports_a_bound_dispatch_claim_as_still_unknown(
     assert observation["stage"] == "handed_off"
     assert observation["native_dispatch_claim"] == "UNKNOWN"
     assert "never evidence the original session consumed" in cast(str, observation["detail"])
+    assert "original forwarding remains unobserved" in cast(str, observation["detail"])
     assert (root / "native-dispatches.json").read_bytes() == claims_before
     # An unrelated event's claim is never bound to this observation.
     other = _accepted_intent(root, source, original)[1]
@@ -1699,3 +1701,87 @@ def test_cli_status_recipient_flag_reaches_the_owner_observation(
     observation = cast(dict[str, object], payload["receiving_observation"])
     assert observation["stage"] == "pending_in_courier"
     assert observation["observer"] == "original_courier"
+
+
+@pytest.mark.parametrize("malformed", [[], {}])
+def test_status_malformed_local_inspect_state_stays_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, malformed: object
+) -> None:
+    root = tmp_path / "state"
+    source, target = _route(root, tmp_path), _route(root, tmp_path)
+    store, event_id = _accepted_intent(root, source, target)
+    before = store.path.read_bytes()
+    response = _inspect_answer(target.generation, "unseen")
+    response["event_state"] = malformed
+    monkeypatch.setattr(runtime, "request_socket", lambda *_a, **_k: response)
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
+    )
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == "observation_invalid"
+    assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["observer", "event_state", "reason"])
+@pytest.mark.parametrize("malformed", [[], {}])
+def test_status_malformed_remote_inspect_fields_stay_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, malformed: object
+) -> None:
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    store, target, event_id = _remote_intent(root, source, tmp_path)
+    before = store.path.read_bytes()
+    recipient = remote_token(
+        "nTarget", session_key(target.provider, target.session_id), target.generation
+    )
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSender", peers={"nTarget": "100.64.0.2"}),
+    )
+    response: dict[str, object] = {
+        "schema_version": 1,
+        "status": "INSPECTED",
+        "event_id": event_id,
+        "observer": "original_courier",
+        "event_state": "handed_off",
+        "courier_version": "0.5.5",
+        "courier_incarnation": "inc-1",
+    }
+    if field == "reason":
+        response = {
+            "schema_version": 1,
+            "status": "INSPECTED",
+            "event_id": event_id,
+            "observer": "none",
+            "reason": "courier_unavailable",
+        }
+    response[field] = malformed
+    monkeypatch.setattr(runtime, "request_tailnet", lambda *_a, **_k: response)
+    observation = cast(
+        dict[str, object],
+        runtime.owner_event_status(root, event_id, recipient=recipient)["receiving_observation"],
+    )
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == "remote_observation_invalid"
+    assert store.path.read_bytes() == before
+
+
+def test_status_bound_helper_with_stale_original_cannot_claim_a_current_receiving_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    original, _helper = _bound_helper_pair(root, tmp_path)
+    store, event_id = _accepted_intent(root, source, original)
+    before = store.path.read_bytes()
+    monkeypatch.setattr(runtime, "_route_current", lambda _root, route: route != original)
+    calls: list[object] = []
+    monkeypatch.setattr(runtime, "request_socket", lambda *args, **_kw: calls.append(args))
+    observation = cast(
+        dict[str, object], runtime.owner_event_status(root, event_id)["receiving_observation"]
+    )
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == "original_unavailable"
+    assert calls == []
+    assert store.path.read_bytes() == before
