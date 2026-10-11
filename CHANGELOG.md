@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.4 - 2026-10-10
+
+- A Devin SessionEnd whose PID or workspace does not match the current route now refuses before touching anything. Previously it cleared the live session's capabilities and subagent custody, so a later tool boundary could hand a held message to a running child. Validation and cleanup now share the session's registration lock.
+- `doctor` reports a Claude or Codex MCP entry that points at a different executable or argument list as needing setup, instead of accepting any entry named `cross-agent-chat`. It still changes nothing.
+- Receiving metadata is derived from one mechanism-keyed rule. An unqualified experimental direct queue now reports `reply_delivery` and `parked_wake` as `unknown` instead of promising idle return. Devin peers disclose a negotiated `current_boundary` (`root_tools_only`, `next_prompt_custom_subagent`, `next_prompt_unobserved_launch`), and `active_turn_input` is `false` or `limited` while that restriction holds. Older readers and couriers keep their previous shapes.
+- Human `peers` shows each row's mode and current blocker, and labels same-alias Devin sessions so they can be told apart. A new read-only `status EVENT_ID` command, and an additive `receiving_observation` in `chat_status`, report whether a local receiver's courier still holds the event (with pending count and oldest age), handed it to the provider boundary, or cannot be observed. Neither ever means the original read it, and neither stores or shows a message body.
+- Qualify Codex CLI 0.162.0 and 0.162.1 owning-daemon input alongside 0.160.1, preserving exact owner/profile/thread checks and no replay after uncertain effects. Other versions remain Stop-bound. When the explicit experimental direct-queue flag is set and an exact qualified owning daemon passes every check for the same route, the daemon is selected instead of the queue. Codex 0.162.x's own CLI refuses to queue through a separately spawned app-server while a local daemon runs, and the owner path adds owner-PID verification and exact active-turn input. This removes the route's dependence on the embedded-server queue implicated in repeated pre-effect refusals; the provider's exact reason for those refusals was not reproduced. Unqualified or absent daemons keep the explicit queue behavior unchanged. Existing couriers retain their loaded code and accepted in-memory queues across installation; do not restart them to activate this change.
+
 ## 0.5.3 - 2026-10-08
 
 - Local Devin gains active-turn input: a new owned `PostToolUse` hook hands

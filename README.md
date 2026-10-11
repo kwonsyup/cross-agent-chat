@@ -24,16 +24,16 @@ secrets those files hold (see [setup and data handling](SECURITY.md)).
 Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
 limits the set.
 
-Install v0.5.3 with:
+Install v0.5.4 with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.3/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.4/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
-This builds the released `v0.5.3` tag and installs the command at
+This builds the released `v0.5.4` tag and installs the command at
 `~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
 Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
 not found in your shell, use the full path the installer reports. Run it on
@@ -90,11 +90,11 @@ harness and mode:
 | Coding surface on macOS | Parked/idle wake | Active-turn input | Deferred behavior | Qualification |
 |---|---|---|---|---|
 | Claude Code | Qualified idle wake and new-turn input | Between tool calls; a running tool is not interrupted | — | Supported desktop-launched contexts; a session inside a remote SSH shell registered but could not receive |
-| Codex CLI 0.160.1 (owning app-server daemon) | Queued input wakes the parked original | Direct input reaches the expected active turn | — | Only a `codex-tui` 0.160.1 conversation already owned by its own daemon, verified by route PID, profile, thread, cwd, and originator over a private owner-only socket; CAC starts no daemon and uses no UI relay |
+| Codex CLI 0.160.1 / 0.162.0 / 0.162.1 (owning app-server daemon) | Queued input wakes the parked original | Direct input reaches the expected active turn | — | Only a `codex-tui` 0.160.1, 0.162.0, or 0.162.1 conversation already owned by its own daemon, verified by route PID, profile, thread, cwd, and originator over a private owner-only socket; CAC starts no daemon and uses no UI relay |
 | Codex CLI `--no-daemon` or any unqualified version (older or newer) | No | No | Stop-bound: the current turn's end or the next prompt | Default when no owning daemon is present |
 | Codex Native App (managed helper) | Qualified on the listed host | Qualified on the listed host | — | Intel macOS, Codex 0.159.2 in Native app 26.928.21956, trusted hooks available; does not qualify every host version |
-| Codex CLI experimental native queue | Provider-held queue input | No | Waits behind the current turn | Only under explicit `setup --enable-experimental-codex-native-queue`; not active by default |
-| Local Devin CLI/App | No — [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38) open | Between the root conversation's tool calls; a running tool is not interrupted. While a built-in subagent (`subagent_general`, `subagent_explore`) is running, only after the root's own subagent or question tool calls; while a custom profile (which may nest) runs or a launch outcome was not observed, the message waits for the next prompt. A child counts as running until Devin reports it finished to the root (`read_subagent` or a foreground return); one known only through Devin's completion notification keeps that session restricted until it ends | An idle conversation receives at its next prompt | Reported as active-turn input only when the receiving Mac runs 0.5.3 and that session has already run its tool hook; otherwise reported conservatively. Qualified 8 Oct 2026 with Devin CLI 3000.11.3 and the Desktop-bundled CLI 3000.10.48 (Apple silicon) receiving from Codex CLI 0.162.0 and Claude Code 2.1.294 across Macs; the Desktop app window itself was not exercised |
+| Codex CLI experimental native queue | Provider-held queue input | No | Waits behind the current turn | Only under explicit `setup --enable-experimental-codex-native-queue`; not active by default. A qualified owning daemon on the same route takes precedence over this queue |
+| Local Devin CLI/App | No — [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38) open | Between the root conversation's tool calls; a running tool is not interrupted. While a built-in subagent (`subagent_general`, `subagent_explore`) is running, only after the root's own subagent or question tool calls; while a custom profile (which may nest) runs or a launch outcome was not observed, the message waits for the next prompt. A child counts as running until Devin reports it finished to the root (`read_subagent` or a foreground return); one known only through Devin's completion notification keeps that session restricted until it ends | An idle conversation receives at its next prompt | Reported as active-turn input only when the receiving Mac runs 0.5.3 or later and that session has already run its tool hook; otherwise reported conservatively. A 0.5.4 or later receiver also reports its current subagent restriction as `current_boundary`, and `active_turn_input` is then `false` (held until the next prompt) or `limited` (root-only tools). Qualified 8 Oct 2026 with Devin CLI 3000.11.3 and the Desktop-bundled CLI 3000.10.48 (Apple silicon) receiving from Codex CLI 0.162.0 and Claude Code 2.1.294 across Macs; the Desktop app window itself was not exercised |
 | Grokbot 0.66.0 (external endpoint) | One author-reported idle webhook return | Unqualified | — | One owner-enrolled Bot; does not certify another Bot, fresh-user setup, or M2 |
 
 `destination_receiving` in a send result describes the destination's observed
@@ -251,11 +251,17 @@ work safe to resend. Its `reply_delivery` — `while_idle`, `next_turn`, or
 ```sh
 "$HOME/.local/bin/cross-agent-chat" doctor --json
 "$HOME/.local/bin/cross-agent-chat" peers --json
+"$HOME/.local/bin/cross-agent-chat" status EVENT_ID
 "$HOME/.local/bin/cross-agent-chat" resolve EVENT_ID
 ```
 
 `doctor` reports what it can check about setup and the broker — not whether a
-model read a task. A missing peer warrants one read-only relist, not a
+model read a task. Its `codex_native_queue` value is the configured
+experimental setting, not an observed receiving mode; `peers` shows each
+session's actual mode and current blocker. `status` is read-only and
+body-free: for a local receiver it says whether the event is still pending in
+courier memory (with count and oldest age), was handed to the provider
+boundary, or is unknown — handed off never means read. A missing peer warrants one read-only relist, not a
 replay; persistent absence may need the provider's normal registration event
 (resume the Claude conversation, or prompt the original Devin workspace), not
 idle supervision. `resolve` records an owner's disposition of an undecided

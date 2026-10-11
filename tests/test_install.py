@@ -713,7 +713,7 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
         "submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
-        "version": "0.5.3",
+        "version": "0.5.4",
     }
 
 
@@ -829,7 +829,7 @@ def test_doctor_omits_the_terminal_diagnostic_without_the_marker(
         "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
         "submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
-        "version": "0.5.3",
+        "version": "0.5.4",
     }
 
     assert cli.run(parser().parse_args(["doctor"])) == 0
@@ -1542,6 +1542,124 @@ def test_verify_configuration_requires_codex_auto_approval(
     )
 
     assert not installer.verify_configuration()
+
+
+def test_verify_configuration_requires_the_exact_claude_mcp_binding(
+    tmp_path: Path,
+) -> None:
+    """Presence of the owned name is not the owned binding."""
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    assert installer.verify_configuration()
+    config = json.loads(installer.claude_config.read_text())
+    server = cast(dict[str, object], config["mcpServers"]["cross-agent-chat"])
+
+    # A same-named command bound to another executable is not our install.
+    server["command"] = "/opt/elsewhere/cross-agent-chat"
+    installer.claude_config.write_text(json.dumps(config))
+    assert not installer.verify_configuration()
+
+    # The right executable with another device's arguments is not ours either.
+    server["command"] = "/opt/cross-agent-chat"
+    server["args"] = ["_mcp", "--provider", "claude", "--device", "other"]
+    installer.claude_config.write_text(json.dumps(config))
+    assert not installer.verify_configuration()
+
+    server["args"] = []
+    installer.claude_config.write_text(json.dumps(config))
+    assert not installer.verify_configuration()
+
+    server["env"] = {"UNEXPECTED": "value"}
+    installer.claude_config.write_text(json.dumps(config))
+    assert not installer.verify_configuration()
+
+
+def test_verify_configuration_requires_the_exact_codex_mcp_binding(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    assert installer.verify_configuration()
+    original = installer.codex_config.read_text()
+    command = 'command = "/opt/cross-agent-chat"'
+    args = 'args = ["_mcp", "--provider", "codex", "--device", "studio"]'
+    assert command in original and args in original
+
+    # A same-basename command path the installer never wrote is a false green.
+    installer.codex_config.write_text(
+        original.replace(command, 'command = "/opt/elsewhere/cross-agent-chat"')
+    )
+    assert not installer.verify_configuration()
+
+    installer.codex_config.write_text(original.replace(args, 'args = ["_mcp"]'))
+    assert not installer.verify_configuration()
+
+    installer.codex_config.write_text(original.replace(f"{args}\n", ""))
+    assert not installer.verify_configuration()
+
+    installer.codex_config.write_text(original)
+    assert installer.verify_configuration()
+
+
+def test_doctor_flags_a_repointed_mcp_binding_without_mutating_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Both doctor device modes must refuse a same-named foreign binding."""
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    config = json.loads(installer.claude_config.read_text())
+    server = cast(dict[str, object], config["mcpServers"]["cross-agent-chat"])
+    server["command"] = "/opt/elsewhere/cross-agent-chat"
+    installer.claude_config.write_text(json.dumps(config))
+    # Auto device detection still resolves the device from the intact args.
+    assert installed_device(home=home, codex_home=None, claude_config_dir=None) == "studio"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: Path("/opt/cross-agent-chat"))
+    monkeypatch.setattr(Installer, "broker_is_healthy", lambda self, **_: True)
+    snapshot = {path: path.read_bytes() for path in installer.config_paths if path.exists()}
+
+    assert cli.run(parser().parse_args(["doctor", "--json"])) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["integration"] == "needs setup"
+    assert report["next"] == "/opt/cross-agent-chat setup"
+    assert set(report) == {
+        "codex_native_queue",
+        "integration",
+        "local_broker",
+        "next",
+        "remote_trust",
+        "version",
+    }
+
+    assert cli.run(parser().parse_args(["doctor", "--device", "studio", "--json"])) == 1
+    assert json.loads(capsys.readouterr().out)["integration"] == "needs setup"
+    assert {path: path.read_bytes() for path in snapshot} == snapshot
+
+
+def test_doctor_explicit_device_flags_codex_args_that_detection_would_reject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Explicit --device bypasses detection; the binding check still applies."""
+    home = tmp_path / "home"
+    installer = Installer(home=home, executable=Path("/opt/cross-agent-chat"), device="studio")
+    installer.setup()
+    original = installer.codex_config.read_text()
+    args = 'args = ["_mcp", "--provider", "codex", "--device", "studio"]'
+    installer.codex_config.write_text(original.replace(args, 'args = ["_mcp"]'))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(cli, "known_tailnet_address", lambda: None)
+    monkeypatch.setattr(cli, "discover_executable", lambda _: Path("/opt/cross-agent-chat"))
+    monkeypatch.setattr(Installer, "broker_is_healthy", lambda self, **_: True)
+    snapshot = {path: path.read_bytes() for path in installer.config_paths if path.exists()}
+
+    assert cli.run(parser().parse_args(["doctor", "--device", "studio", "--json"])) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["integration"] == "needs setup"
+    assert {path: path.read_bytes() for path in snapshot} == snapshot
 
 
 def test_setup_removes_owned_tool_approval_overrides_and_preserves_other_properties(
@@ -3956,7 +4074,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         f"#!{stage / 'bin' / 'python'}\n"
         "import sys\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('cross-agent-chat 0.5.3')\n"
+        "    print('cross-agent-chat 0.5.4')\n"
         "elif sys.argv[1:] == ['_broker', '--help']:\n"
         "    print('broker help')\n"
         "else:\n"
@@ -3982,7 +4100,7 @@ def test_staged_install_executes_non_relocated_venv_after_cutover(
         check=False,
     )
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "cross-agent-chat 0.5.3"
+    assert completed.stdout.strip() == "cross-agent-chat 0.5.4"
     assert stage.exists()
 
 
@@ -5424,7 +5542,7 @@ def test_verify_requires_loaded_responsive_background_broker(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.5.3",
+            "version": "0.5.4",
             "module_path": str(module),
         },
     )
@@ -5602,7 +5720,7 @@ def test_broker_health_uses_bounded_ten_second_local_request(
             "schema_version": 1,
             "status": "READY",
             "pid": 4242,
-            "version": "0.5.3",
+            "version": "0.5.4",
             "module_path": str(module),
         }
 

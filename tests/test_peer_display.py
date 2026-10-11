@@ -10,6 +10,7 @@ exact handles and generation checks remain the only selection path.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -196,6 +197,88 @@ def test_identical_devin_aliases_stay_unselectable_and_tokens_stay_pinned(
             "must not reach the successor",
             deadline=time.monotonic() + 5.0,
         )
+
+
+def test_human_peers_rows_distinguish_same_alias_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two live Devin sessions sharing one alias must read as different rows."""
+    from cross_agent_chat import cli
+
+    listing: dict[str, object] = {
+        "schema_version": 1,
+        "remote_discovery": "not_requested",
+        "peers": [
+            {
+                "alias": "devin@studio:/",
+                "status": "available",
+                "handle": "cac.local.a" + "1" * 40,
+                "title": "session aaaabbbbcccc",
+                "delivery_mode": "devin_tool_boundary",
+                "current_boundary": "next_prompt_custom_subagent",
+            },
+            {
+                "alias": "devin@studio:/",
+                "status": "available",
+                "handle": "cac.local.b" + "2" * 40,
+                "title": "session ddddeeeeffff",
+                "delivery_mode": "devin_stop_or_prompt_bound",
+            },
+        ],
+    }
+    requested: dict[str, object] = {}
+
+    def fake_peers(*_args: object, **kwargs: object) -> dict[str, object]:
+        requested.update(kwargs)
+        return listing
+
+    monkeypatch.setattr(cli, "peers", fake_peers)
+    assert cli.run(cli.parser().parse_args(["peers", "--local-only"])) == 0
+    rows = capsys.readouterr().out.splitlines()
+    assert len(rows) == 2
+    assert rows[0] != rows[1]
+    assert rows[0].split("\t") == [
+        "devin@studio:/",
+        "available",
+        "session aaaabbbbcccc",
+        "devin_tool_boundary",
+        "next_prompt_custom_subagent",
+    ]
+    assert rows[1].split("\t") == [
+        "devin@studio:/",
+        "available",
+        "session ddddeeeeffff",
+        "devin_stop_or_prompt_bound",
+        "-",
+    ]
+    # Human rows request the receiving metadata; they never become selectors.
+    assert requested["include_delivery_mode"] is True
+    assert requested["include_delivery_mechanism"] is True
+
+
+def test_peers_json_keeps_the_exact_handle_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--json output must not grow display fields or new request metadata."""
+    from cross_agent_chat import cli
+
+    row = {
+        "alias": "devin@studio:/",
+        "status": "available",
+        "handle": "cac.local.a" + "1" * 40,
+    }
+    requested: dict[str, object] = {}
+
+    def fake_peers(*_args: object, **kwargs: object) -> dict[str, object]:
+        requested.update(kwargs)
+        return {"schema_version": 1, "remote_discovery": "not_requested", "peers": [row]}
+
+    monkeypatch.setattr(cli, "peers", fake_peers)
+    assert cli.run(cli.parser().parse_args(["peers", "--local-only", "--json"])) == 0
+    payload = cast(dict[str, object], json.loads(capsys.readouterr().out))
+    assert cast(list[dict[str, str]], payload["peers"]) == [row]
+    assert "include_delivery_mode" not in requested
+    assert "include_delivery_mechanism" not in requested
 
 
 def test_a_malformed_peers_query_is_refused_before_any_discovery(

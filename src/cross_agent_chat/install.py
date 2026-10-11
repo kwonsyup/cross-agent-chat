@@ -2818,7 +2818,11 @@ class Installer:
             if "claude" in self.providers:
                 claude = _json_object(self.claude_config)
                 servers = claude.get("mcpServers")
-                if not isinstance(servers, dict) or SERVER_NAME not in servers:
+                # Presence is not enough: the owned entry must bind this exact
+                # executable and argument list, not merely a same-named command.
+                if not isinstance(servers, dict) or servers.get(SERVER_NAME) != _mcp_route(
+                    self.executable, "claude", self.device
+                ):
                     return False
                 if settings.get("crossSessionInbound") != "accept":
                     return False
@@ -2842,6 +2846,10 @@ class Installer:
                     return False
                 codex_server = codex_servers.get(SERVER_NAME)
                 if not isinstance(codex_server, dict):
+                    return False
+                if codex_server.get("command") != str(self.executable) or codex_server.get(
+                    "args"
+                ) != ["_mcp", "--provider", "codex", "--device", self.device]:
                     return False
                 if codex_server.get("default_tools_approval_mode") != "approve":
                     return False

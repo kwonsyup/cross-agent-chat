@@ -1,8 +1,9 @@
 """Exact original input through an already running, owning Codex CLI daemon.
 
 No daemon is started, thread resumed, permission changed, or failed effect retried.
-The supported 0.160.1 protocol uses a private Unix WebSocket: queue/add wakes an
-idle TUI original; steer targets the exact active turn without interrupting tools.
+The qualified 0.160.1, 0.162.0, and 0.162.1 protocols use a private Unix WebSocket.
+queue/add wakes an idle TUI original; steer targets the exact active turn without
+interrupting tools.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from cross_agent_chat.core import (
     valid_uuid,
 )
 
-SUPPORTED_VERSION: Final = "0.160.1"
+SUPPORTED_VERSIONS: Final = frozenset({"0.160.1", "0.162.0", "0.162.1"})
 PROBE_SECONDS: Final = 2.0
 ACCEPT_SECONDS: Final = 10.0
 MAX_RESPONSE_BYTES: Final = 256 * 1024
@@ -322,7 +323,8 @@ def discover_daemon_ingress(
         if (
             not isinstance(report, dict)
             or report.get("status") != "running"
-            or report.get("appServerVersion") != SUPPORTED_VERSION
+            or not isinstance(report.get("appServerVersion"), str)
+            or report.get("appServerVersion") not in SUPPORTED_VERSIONS
             or not isinstance(report.get("socketPath"), str)
         ):
             return None
