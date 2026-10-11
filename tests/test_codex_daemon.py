@@ -8,7 +8,10 @@ import json
 import os
 import socket
 import struct
+import subprocess
+import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,8 +22,15 @@ from uuid import uuid4
 import pytest
 
 from cross_agent_chat import codex_daemon, runtime
+from cross_agent_chat.codex import CodexCourier
 from cross_agent_chat.codex_daemon import CodexDaemonIngress
-from cross_agent_chat.core import ChatError, Route, UnknownDeliveryError
+from cross_agent_chat.core import ChatError, Registry, Route, UnknownDeliveryError
+from cross_agent_chat.native_helper import (
+    NATIVE_QUEUE_BINARY_ENV_VAR,
+    NATIVE_QUEUE_ENV_VALUE,
+    NATIVE_QUEUE_ENV_VAR,
+)
+from cross_agent_chat.runtime import request_socket
 
 
 @contextmanager
@@ -300,8 +310,9 @@ def test_new_ingress_mode_is_negotiated_and_old_health_consumers_keep_their_shap
         )
 
 
+@pytest.mark.parametrize("version", ["0.160.1", "0.162.0", "0.162.1"])
 def test_default_qualification_does_not_start_a_daemon(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
     with provider(tmp_path) as (ingress, calls, _):
         commands: list[list[str]] = []
@@ -316,7 +327,7 @@ def test_default_qualification_does_not_start_a_daemon(
                 json.dumps(
                     {
                         "status": "running",
-                        "appServerVersion": "0.160.1",
+                        "appServerVersion": version,
                         "socketPath": str(ingress.endpoint),
                     }
                 ),
@@ -328,6 +339,48 @@ def test_default_qualification_does_not_start_a_daemon(
         assert selected is not None
         assert commands == [["/bound/codex", "app-server", "daemon", "version"]]
         assert all(c["method"] in {"initialize", "initialized", "thread/read"} for c in calls)
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "0.161.0",
+        "0.162.2",
+        "0.163.0",
+        "0.162.1-alpha",
+        "0.162.1-alpha.1",
+        "0.162",
+        "0.162.1 ",
+        " 0.162.1",
+        "v0.162.1",
+        None,
+        ["0.162.1"],
+    ],
+)
+def test_unqualified_daemon_version_refuses_without_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: object
+) -> None:
+    with provider(tmp_path) as (ingress, calls, _):
+        import subprocess
+
+        monkeypatch.setattr(
+            codex_daemon.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args[0],
+                0,
+                json.dumps(
+                    {
+                        "status": "running",
+                        "appServerVersion": version,
+                        "socketPath": str(ingress.endpoint),
+                    }
+                ),
+                "",
+            ),
+        )
+        assert codex_daemon.discover_daemon_ingress(Path("/bound/codex"), {}, ingress.route) is None
+        assert calls == []
 
 
 def test_negotiated_daemon_roster_reaches_sender_capabilities_and_legacy_parser_stays_usable(
@@ -385,3 +438,337 @@ def test_negotiated_daemon_roster_reaches_sender_capabilities_and_legacy_parser_
         assert legacy.delivery_mode == "codex_stop_bound"
         assert legacy.session_key == parsed.session_key
         assert legacy.generation == parsed.generation
+
+
+def _running_daemon_report(version: str, endpoint: Path) -> Callable[..., object]:
+    def running(command: list[str], **_: object) -> object:
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps(
+                {
+                    "status": "running",
+                    "appServerVersion": version,
+                    "socketPath": str(endpoint),
+                }
+            ),
+            "",
+        )
+
+    return running
+
+
+def _started_courier(root: Path, route: Route) -> threading.Thread:
+    worker = threading.Thread(
+        target=runtime.courier_server,
+        kwargs={
+            "provider": route.provider,
+            "state_root_value": str(root),
+            "session_id": route.session_id,
+            "cwd": route.cwd,
+            "generation": route.generation,
+            "pid": route.pid,
+        },
+        daemon=True,
+    )
+    worker.start()
+    path = runtime.socket_path(root, route)
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            bootstrap = request_socket(
+                path,
+                {
+                    "schema_version": 1,
+                    "operation": "bootstrap",
+                    "generation": route.generation,
+                },
+                timeout=0.5,
+            )
+        except ChatError:
+            time.sleep(0.01)
+            continue
+        if bootstrap == {
+            "schema_version": 1,
+            "status": "BOOTSTRAPPED",
+            "generation": route.generation,
+        }:
+            return worker
+    pytest.fail("courier did not bootstrap")
+
+
+def _stop_courier(root: Path, route: Route, worker: threading.Thread) -> None:
+    request_socket(
+        runtime.socket_path(root, route),
+        {"schema_version": 1, "operation": "shutdown", "generation": route.generation},
+        timeout=30.0,
+    )
+    worker.join(timeout=30.0)
+    assert not worker.is_alive()
+
+
+def test_courier_accept_prefers_daemon_ingress_over_configured_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured experimental queue never fires once a daemon ingress exists."""
+    with provider(tmp_path) as (ingress, calls, _):
+        courier = CodexCourier(
+            alias=ingress.route.alias,
+            generation=ingress.route.generation,
+            native_queue=(
+                Path("/bound/codex"),
+                {"CODEX_HOME": "/elsewhere"},
+                ingress.route.session_id,
+            ),
+        )
+        monkeypatch.setattr(
+            "cross_agent_chat.codex.queue_native_input",
+            lambda **kwargs: pytest.fail("queue must not run behind a daemon ingress"),
+        )
+        event = str(uuid4())
+        result = runtime.courier_accept(
+            ingress.route, courier, event, "through the owner", daemon_ingress=ingress
+        )
+        assert result["status"] == "TRANSPORT_ACCEPTED"
+        assert [c["method"] for c in calls].count("thread/queue/add") == 1
+
+
+def test_experimental_env_yields_to_exact_qualified_owning_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The experimental env cannot reselect a queue the running owner rejects."""
+    with provider(tmp_path) as (ingress, calls, _):
+        root = tmp_path / "state"
+        Registry(root).upsert(ingress.route)
+        monkeypatch.setenv(NATIVE_QUEUE_ENV_VAR, NATIVE_QUEUE_ENV_VALUE)
+        monkeypatch.setenv(NATIVE_QUEUE_BINARY_ENV_VAR, sys.executable)
+        monkeypatch.setattr(runtime, "_route_owner_current", lambda *_args: True)
+        monkeypatch.setattr(runtime, "_courier_owner_binary", lambda *_args: Path("/bound/codex"))
+        monkeypatch.setattr(
+            codex_daemon.subprocess,
+            "run",
+            _running_daemon_report("0.162.1", ingress.endpoint),
+        )
+        monkeypatch.setattr(
+            "cross_agent_chat.codex.queue_native_input",
+            lambda **kwargs: pytest.fail("queue must not run for a daemon-owned route"),
+        )
+        worker = _started_courier(root, ingress.route)
+        path = runtime.socket_path(root, ingress.route)
+        event = str(uuid4())
+        try:
+            response = request_socket(
+                path,
+                {
+                    "schema_version": 1,
+                    "operation": "accept",
+                    "generation": ingress.route.generation,
+                    "event_id": event,
+                    "message": "deliver through the owning daemon",
+                },
+                timeout=30.0,
+            )
+            assert response == {
+                "schema_version": 1,
+                "event_id": event,
+                "status": "TRANSPORT_ACCEPTED",
+                "to": ingress.route.alias,
+                "provider": "codex",
+            }
+            health = request_socket(
+                path,
+                {
+                    "schema_version": 1,
+                    "operation": "health",
+                    "generation": ingress.route.generation,
+                    "include_delivery_mode": True,
+                    "include_delivery_mechanism": True,
+                    "include_owning_daemon": True,
+                },
+                timeout=5.0,
+            )
+            assert health["delivery_mode"] == "codex_daemon_input"
+            assert health["delivery_mechanism"] == "owning_daemon"
+        finally:
+            _stop_courier(root, ingress.route, worker)
+        assert [c["method"] for c in calls].count("thread/queue/add") == 1
+
+
+@pytest.mark.parametrize("version", ["0.162.2", "0.162.1-alpha"])
+def test_experimental_env_keeps_queue_when_daemon_is_unqualified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    """An unqualified owner report never displaces the explicit queue selection."""
+    with provider(tmp_path) as (ingress, calls, _):
+        root = tmp_path / "state"
+        Registry(root).upsert(ingress.route)
+        monkeypatch.setenv(NATIVE_QUEUE_ENV_VAR, NATIVE_QUEUE_ENV_VALUE)
+        monkeypatch.setenv(NATIVE_QUEUE_BINARY_ENV_VAR, sys.executable)
+        monkeypatch.setattr(runtime, "_route_owner_current", lambda *_args: True)
+        monkeypatch.setattr(runtime, "_courier_owner_binary", lambda *_args: Path("/bound/codex"))
+        monkeypatch.setattr(
+            codex_daemon.subprocess,
+            "run",
+            _running_daemon_report(version, ingress.endpoint),
+        )
+        queued: list[dict[str, object]] = []
+        monkeypatch.setattr(
+            "cross_agent_chat.codex.queue_native_input",
+            lambda **kwargs: queued.append(kwargs),
+        )
+        worker = _started_courier(root, ingress.route)
+        path = runtime.socket_path(root, ingress.route)
+        event = str(uuid4())
+        try:
+            response = request_socket(
+                path,
+                {
+                    "schema_version": 1,
+                    "operation": "accept",
+                    "generation": ingress.route.generation,
+                    "event_id": event,
+                    "message": "through the explicit experimental queue",
+                },
+                timeout=30.0,
+            )
+            assert response == {
+                "schema_version": 1,
+                "event_id": event,
+                "status": "TRANSPORT_ACCEPTED",
+                "to": ingress.route.alias,
+                "provider": "codex",
+            }
+            health = request_socket(
+                path,
+                {
+                    "schema_version": 1,
+                    "operation": "health",
+                    "generation": ingress.route.generation,
+                    "include_delivery_mode": True,
+                    "include_delivery_mechanism": True,
+                    "include_owning_daemon": True,
+                },
+                timeout=5.0,
+            )
+            assert health["delivery_mode"] == "codex_experimental_queue"
+            assert health["delivery_mechanism"] == "direct_queue"
+        finally:
+            _stop_courier(root, ingress.route, worker)
+        assert len(queued) == 1
+        assert queued[0]["thread_id"] == ingress.route.session_id
+        assert queued[0]["event_id"] == event
+        assert calls == []
+
+
+def test_no_env_and_no_owning_daemon_stays_stop_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the experimental env or a qualified owner, custody stays local."""
+    with provider(tmp_path) as (ingress, _, _):
+        root = tmp_path / "state"
+        Registry(root).upsert(ingress.route)
+        monkeypatch.delenv(NATIVE_QUEUE_ENV_VAR, raising=False)
+        monkeypatch.setattr(runtime, "_route_owner_current", lambda *_args: True)
+        monkeypatch.setattr(runtime, "_courier_owner_binary", lambda *_args: None)
+        worker = _started_courier(root, ingress.route)
+        path = runtime.socket_path(root, ingress.route)
+        event = str(uuid4())
+        try:
+            response = request_socket(
+                path,
+                {
+                    "schema_version": 1,
+                    "operation": "accept",
+                    "generation": ingress.route.generation,
+                    "event_id": event,
+                    "message": "held for the stop boundary",
+                },
+                timeout=30.0,
+            )
+            assert response["status"] == "TRANSPORT_ACCEPTED"
+            health = request_socket(
+                path,
+                {
+                    "schema_version": 1,
+                    "operation": "health",
+                    "generation": ingress.route.generation,
+                    "include_delivery_mode": True,
+                    "include_delivery_mechanism": True,
+                    "include_owning_daemon": True,
+                },
+                timeout=5.0,
+            )
+            assert health["delivery_mode"] == "codex_stop_bound"
+            assert health["delivery_mechanism"] == "stop_bound"
+            peeked = request_socket(
+                path,
+                {
+                    "schema_version": 1,
+                    "operation": "peek",
+                    "generation": ingress.route.generation,
+                },
+                timeout=5.0,
+            )
+            assert peeked["messages"] == [
+                {"event_id": event, "message": "held for the stop boundary"}
+            ]
+        finally:
+            _stop_courier(root, ingress.route, worker)
+
+
+def test_uncertain_daemon_effect_never_falls_through_to_the_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-write malformed daemon reply stays UNKNOWN; no queue re-effect."""
+    with provider(
+        tmp_path,
+        reply=lambda request: {
+            "id": request["id"],
+            "result": {
+                "queuedSubmission": {
+                    "id": str(uuid4()),
+                    "clientUserMessageId": str(uuid4()),
+                    "input": request["params"]["input"],
+                }
+            },
+        },
+    ) as (ingress, calls, _):
+        root = tmp_path / "state"
+        Registry(root).upsert(ingress.route)
+        monkeypatch.setenv(NATIVE_QUEUE_ENV_VAR, NATIVE_QUEUE_ENV_VALUE)
+        monkeypatch.setenv(NATIVE_QUEUE_BINARY_ENV_VAR, sys.executable)
+        monkeypatch.setattr(runtime, "_route_owner_current", lambda *_args: True)
+        monkeypatch.setattr(runtime, "_courier_owner_binary", lambda *_args: Path("/bound/codex"))
+        monkeypatch.setattr(
+            codex_daemon.subprocess,
+            "run",
+            _running_daemon_report("0.162.1", ingress.endpoint),
+        )
+        monkeypatch.setattr(
+            "cross_agent_chat.codex.queue_native_input",
+            lambda **kwargs: pytest.fail("an uncertain daemon effect must not fall through"),
+        )
+        worker = _started_courier(root, ingress.route)
+        path = runtime.socket_path(root, ingress.route)
+        event = str(uuid4())
+        try:
+            response = request_socket(
+                path,
+                {
+                    "schema_version": 1,
+                    "operation": "accept",
+                    "generation": ingress.route.generation,
+                    "event_id": event,
+                    "message": "possible effect",
+                },
+                timeout=30.0,
+            )
+            assert response == {
+                "schema_version": 1,
+                "event_id": event,
+                "status": "UNKNOWN_DELIVERY",
+                "provider": "codex",
+            }
+        finally:
+            _stop_courier(root, ingress.route, worker)
+        assert [c["method"] for c in calls].count("thread/queue/add") == 1
