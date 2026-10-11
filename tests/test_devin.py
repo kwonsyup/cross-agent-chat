@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -18,6 +19,7 @@ from cross_agent_chat.core import (
     Registry,
     Route,
     session_key,
+    state_lock,
     valid_session_id,
 )
 from cross_agent_chat.devin import (
@@ -77,6 +79,253 @@ def test_duplicate_absent_devin_session_end_is_a_noop_but_pid_mismatch_fails(
     monkeypatch.setattr("sys.stdin", io.StringIO(_hook("SessionEnd", session_id=session_id)))
     with pytest.raises(ChatError, match="exact Devin session route is unavailable"):
         runtime.unregister_devin(123, str(state))
+
+
+def _devin_live_session(
+    state: Path,
+    workspace: Path,
+    session_id: str,
+    pid: int,
+) -> Route:
+    """Publish one Devin route with an issued capability and a running custom child."""
+    route = Route.create(
+        provider="devin",
+        session_id=session_id,
+        device="studio",
+        cwd=str(workspace),
+        pid=pid,
+    )
+    Registry(state).upsert(route)
+    DevinCapabilityStore(state).issue(
+        route, prompt_id=str(uuid4()), tool_name="chat_peers", arguments={}
+    )
+    children = DevinSubagentStore(state)
+    children.launch(session_id, "call_1", "swe-2")
+    children.launched(
+        session_id,
+        "call_1",
+        "Background subagent started with agent_id=child_worker",
+    )
+    return route
+
+
+def _session_end(monkeypatch: pytest.MonkeyPatch, session_id: str) -> Callable[[int, str], None]:
+    def end(pid: int, state: str) -> None:
+        monkeypatch.setattr("sys.stdin", io.StringIO(_hook("SessionEnd", session_id=session_id)))
+        runtime.unregister_devin(pid, state)
+
+    return end
+
+
+def test_rejected_devin_session_end_preserves_route_capability_and_custody(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A wrong-pid SessionEnd must refuse before touching the live session's state."""
+    state = tmp_path / "state"
+    session_id = str(uuid4())
+    route = _devin_live_session(state, tmp_path, session_id, pid=456)
+    marker = runtime.devin_tool_boundary_path(state, route)
+    marker.touch()
+    requests: list[tuple[Path, dict[str, object]]] = []
+
+    def request(path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        requests.append((path, payload))
+        return {}
+
+    monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
+    monkeypatch.setenv("DEVIN_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(runtime, "request_socket", request)
+
+    with pytest.raises(ChatError, match="exact Devin session route is unavailable"):
+        _session_end(monkeypatch, session_id)(457, str(state))
+
+    assert Registry(state).routes() == [route]
+    assert DevinSubagentStore(state).custody(session_id) == "hold"
+    assert len(DevinCapabilityStore(state).capabilities()) == 1
+    assert marker.exists()
+    assert requests == []
+
+
+def test_rejected_devin_session_end_wrong_cwd_preserves_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    other = tmp_path / "other"
+    workspace.mkdir()
+    other.mkdir()
+    session_id = str(uuid4())
+    route = _devin_live_session(state, workspace, session_id, pid=456)
+    monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
+    monkeypatch.setenv("DEVIN_PROJECT_DIR", str(other))
+
+    with pytest.raises(ChatError, match="exact Devin session route is unavailable"):
+        _session_end(monkeypatch, session_id)(route.pid, str(state))
+
+    assert Registry(state).routes() == [route]
+    assert DevinSubagentStore(state).custody(session_id) == "hold"
+    assert len(DevinCapabilityStore(state).capabilities()) == 1
+
+
+def test_rejected_devin_session_end_keeps_custom_child_hold_at_boundaries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """After a refused end, ordinary boundaries must still see the live hold."""
+    state = tmp_path / "state"
+    session_id = str(uuid4())
+    route = _devin_live_session(state, tmp_path, session_id, pid=456)
+    monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
+    monkeypatch.setenv("DEVIN_PROJECT_DIR", str(tmp_path))
+
+    with pytest.raises(ChatError, match="exact Devin session route is unavailable"):
+        _session_end(monkeypatch, session_id)(457, str(state))
+
+    # The mutate-then-raise ordering would have released this queued body to a
+    # boundary that can belong to the still-running custom child.
+    message = {"event_id": str(uuid4()), "message": "root only"}
+    monkeypatch.setattr(runtime, "_devin_route", lambda *_args, **_kwargs: route)
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_live_devin_keys", lambda _root: frozenset())
+    monkeypatch.setattr(runtime, "_devin_messages", lambda *_args: [message])
+    acknowledged: list[list[dict[str, str]]] = []
+    monkeypatch.setattr(
+        runtime, "_ack_devin", lambda _root, _route, value: acknowledged.append(value)
+    )
+    monkeypatch.setattr("sys.stdin", _tool_hook("PostToolUse", "exec", session_id=session_id))
+
+    runtime.devin_post_tool(route.pid, str(state))
+
+    assert capsys.readouterr().out == ""
+    assert acknowledged == []
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_hook("Stop", session_id=session_id)))
+    runtime.devin_stop(route.pid, str(state))
+
+    assert capsys.readouterr().out == "{}\n"
+    assert acknowledged == []
+    assert DevinSubagentStore(state).custody(session_id) == "hold"
+
+
+def test_stale_devin_session_end_waits_for_registration_and_spares_the_new_owner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The end validates inside the registration lock, after any newer owner."""
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_id = str(uuid4())
+    monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
+    monkeypatch.setenv("DEVIN_PROJECT_DIR", str(workspace))
+    monkeypatch.setattr("sys.stdin", io.StringIO(_hook("SessionEnd", session_id=session_id)))
+    # The ended original's route is still listed while its delayed hook waits.
+    _devin_live_session(state, workspace, session_id, pid=123)
+    entered = threading.Event()
+    real_route = runtime._devin_route
+
+    def observed(
+        root: Path, event_session_id: str, pid: int, *, require_cwd: bool = True
+    ) -> Route | None:
+        entered.set()
+        return real_route(root, event_session_id, pid, require_cwd=require_cwd)
+
+    monkeypatch.setattr(runtime, "_devin_route", observed)
+    outcomes: list[str] = []
+
+    def end() -> None:
+        try:
+            runtime.unregister_devin(123, str(state))
+        except ChatError as error:
+            outcomes.append(str(error))
+            return
+        outcomes.append("completed")
+
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        with state_lock(state, "register-" + session_key("devin", session_id)):
+            future = workers.submit(end)
+            # Queued behind the same lock the first-prompt registration uses:
+            # the end has not yet read the registry when the new owner lands.
+            assert not entered.wait(timeout=5.0)
+            new_route = _devin_live_session(state, workspace, session_id, pid=789)
+        future.result(timeout=10.0)
+
+    assert outcomes == ["exact Devin session route is unavailable"]
+    assert Registry(state).routes() == [new_route]
+    assert DevinSubagentStore(state).custody(session_id) == "hold"
+    # Revocation is session-scoped, so both the ended owner's and the new
+    # owner's outstanding capabilities must survive the stale end.
+    assert len(DevinCapabilityStore(state).capabilities()) == 2
+
+
+def test_valid_devin_session_end_retires_only_its_exact_route(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    workspace_a, workspace_b = tmp_path / "workspace-a", tmp_path / "workspace-b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    session_a, session_b = str(uuid4()), str(uuid4())
+    route_a = _devin_live_session(state, workspace_a, session_a, pid=456)
+    route_b = _devin_live_session(state, workspace_b, session_b, pid=789)
+    marker_a = runtime.devin_tool_boundary_path(state, route_a)
+    marker_b = runtime.devin_tool_boundary_path(state, route_b)
+    marker_a.touch()
+    marker_b.touch()
+    requests: list[tuple[Path, dict[str, object]]] = []
+
+    def request(path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        requests.append((path, payload))
+        return {"schema_version": 1, "status": "STOPPED"}
+
+    monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
+    monkeypatch.setattr(runtime, "request_socket", request)
+    monkeypatch.setenv("DEVIN_PROJECT_DIR", str(workspace_a))
+    _session_end(monkeypatch, session_a)(456, str(state))
+
+    assert Registry(state).routes() == [route_b]
+    assert not marker_a.exists()
+    assert marker_b.exists()
+    assert [item.session_id for item in DevinCapabilityStore(state).capabilities()] == [session_b]
+    assert DevinSubagentStore(state).custody(session_a) is None
+    assert DevinSubagentStore(state).custody(session_b) == "hold"
+    assert requests == [
+        (
+            runtime.socket_path(state, route_a),
+            {
+                "schema_version": 1,
+                "operation": "shutdown",
+                "generation": route_a.generation,
+            },
+        )
+    ]
+
+
+def test_absent_devin_session_end_stays_idempotent_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no current route at all, a repeated end still cleans leftovers."""
+    state = tmp_path / "state"
+    session_id = str(uuid4())
+    route = Route.create(
+        provider="devin",
+        session_id=session_id,
+        device="studio",
+        cwd=str(tmp_path),
+        pid=456,
+    )
+    DevinCapabilityStore(state).issue(
+        route, prompt_id=str(uuid4()), tool_name="chat_peers", arguments={}
+    )
+    DevinSubagentStore(state).launch(session_id, "call_1", "swe-2")
+    monkeypatch.setattr(runtime, "presence_is_enabled", lambda: True)
+    monkeypatch.setenv("DEVIN_PROJECT_DIR", str(tmp_path))
+    end = _session_end(monkeypatch, session_id)
+
+    end(999, str(state))
+    end(999, str(state))
+
+    assert DevinCapabilityStore(state).capabilities() == []
+    assert DevinSubagentStore(state).custody(session_id) is None
+    assert Registry(state).routes() == []
 
 
 def test_parse_native_stop_payload_without_invented_cwd() -> None:

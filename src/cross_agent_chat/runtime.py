@@ -1606,20 +1606,43 @@ def unregister_devin(pid: int, state_root_value: str | None) -> None:
         return
     event = parse_hook_input(sys.stdin.read(MAX_FRAME_BYTES + 1), expected_event="SessionEnd")
     root = state_root(state_root_value)
-    DevinCapabilityStore(root).revoke_session(event.session_id)
-    DevinSubagentStore(root).clear(event.session_id)
-    session_routes = [
-        item
-        for item in Registry(root).routes()
-        if item.provider == "devin" and item.session_id == event.session_id
-    ]
-    route = _devin_route(root, event.session_id, pid)
-    if route is None:
-        if not session_routes:
+    with (
+        _registration_sigterm_scope(),
+        state_lock(root, "register-" + session_key("devin", event.session_id)),
+    ):
+        # SessionEnd shares the per-session registration lock with the first
+        # trusted prompt, so validation and retirement are atomic against a
+        # new owner registering the same session: a delayed end that matched
+        # the previous generation cannot clear fresh state, and an end whose
+        # pid/cwd does not match the current route refuses before any
+        # capability or custody mutation.
+        session_routes = [
+            item
+            for item in Registry(root).routes()
+            if item.provider == "devin" and item.session_id == event.session_id
+        ]
+        route = _devin_route(root, event.session_id, pid)
+        if route is None and session_routes:
+            raise ChatError("exact Devin session route is unavailable")
+        if route is not None:
+            # The pinned generation retires first: while the route still
+            # resolves, an unlocked PostToolUse or Stop boundary would read
+            # cleared custody against the live route and could hand a held
+            # body to a running subagent.
+            Registry(root).remove(
+                route.provider, route.session_id, route.pid, generation=route.generation
+            )
+            devin_tool_boundary_path(root, route).unlink(missing_ok=True)
+        # A genuinely absent session still gets idempotent cleanup, decided
+        # here inside the lock where no live current route can exist.
+        DevinCapabilityStore(root).revoke_session(event.session_id)
+        DevinSubagentStore(root).clear(event.session_id)
+        if route is None:
             return
-        raise ChatError("exact Devin session route is unavailable")
-    Registry(root).remove(route.provider, route.session_id, route.pid, generation=route.generation)
-    devin_tool_boundary_path(root, route).unlink(missing_ok=True)
+    # The shutdown request runs outside the registration lock: the courier
+    # socket path already pins this exact route generation, so it cannot
+    # reach a later generation's courier, and the lock must not be held
+    # across provider socket work.
     with suppress(ChatError):
         request_socket(
             socket_path(root, route),
