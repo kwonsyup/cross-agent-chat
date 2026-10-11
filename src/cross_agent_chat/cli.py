@@ -45,6 +45,7 @@ from cross_agent_chat.runtime import (
     native_dispatch,
     native_register,
     native_startup,
+    owner_event_status,
     peers,
     presence_is_enabled,
     register,
@@ -879,6 +880,15 @@ def parser() -> argparse.ArgumentParser:
     peers_parser = commands.add_parser("peers", help="list exact available live sessions")
     peers_parser.add_argument("--local-only", action="store_true")
     peers_parser.add_argument("--json", action="store_true")
+    status_parser = commands.add_parser(
+        "status",
+        help=(
+            "read the recorded custody and current receiving observation for one event "
+            "(read-only: it never sends, wakes, acknowledges, or mutates anything)"
+        ),
+    )
+    status_parser.add_argument("event_id")
+    status_parser.add_argument("--json", action="store_true")
     resolve_parser = commands.add_parser(
         "resolve",
         help=(
@@ -1081,6 +1091,9 @@ def run(arguments: argparse.Namespace) -> int:
                 if doctor_installer is not None and doctor_installer._codex_native_queue_enabled()
                 else "stop-bound"
             ),
+            "codex_native_queue_basis": (
+                "experimental configuration setting, not an observed receiving mode"
+            ),
             "local_broker": "healthy" if broker_healthy else "unavailable",
             "remote_trust": "tailscale_acl",
             "next": _doctor_next(doctor_installer, healthy),
@@ -1099,12 +1112,51 @@ def run(arguments: argparse.Namespace) -> int:
         if retained:
             print("Delivery intent records remain available for owner inspection.")
     elif command == "peers":
-        peer_result = peers(state_root(), include_remote=not arguments.local_only)
         if arguments.json:
-            print(json.dumps(peer_result, sort_keys=True))
+            # The JSON contract stays exactly as it was: no extra request
+            # metadata, no extra fields.
+            print(
+                json.dumps(
+                    peers(state_root(), include_remote=not arguments.local_only),
+                    sort_keys=True,
+                )
+            )
         else:
+            peer_result = peers(
+                state_root(),
+                include_remote=not arguments.local_only,
+                include_delivery_mode=True,
+                include_delivery_mechanism=True,
+            )
             for peer_item in cast(list[dict[str, str]], peer_result["peers"]):
-                print(f"{peer_item['alias']}\t{peer_item['status']}")
+                # One alias can name several live Devin sessions, so the title
+                # (or the session's synthetic label), the observed receiving
+                # mode, and the negotiated current restriction keep every row
+                # distinguishable. All three stay display-only hints; selection
+                # still uses the exact JSON handle, never a label.
+                print(
+                    "\t".join(
+                        [
+                            peer_item["alias"],
+                            peer_item["status"],
+                            peer_item.get("title", "-"),
+                            peer_item.get("delivery_mode", "-"),
+                            peer_item.get("current_boundary", "-"),
+                        ]
+                    )
+                )
+    elif command == "status":
+        payload = owner_event_status(state_root(), arguments.event_id)
+        if arguments.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            for key, value in payload.items():
+                if isinstance(value, dict):
+                    observation = cast(dict[str, object], value)
+                    for nested_key, nested_value in observation.items():
+                        print(f"{nested_key}: {nested_value}")
+                else:
+                    print(f"{key}: {value}")
     elif command == "resolve":
         current = IntentStore(state_root()).resolve_by_owner(arguments.event_id)
         if current == "RESOLVED_BY_OWNER":

@@ -590,6 +590,14 @@ def test_event_status_reads_only_an_exact_source_owned_intent(
         "target_generation": target.generation,
         "timestamp": store.intents()[0].timestamp,
         "delivery_observation": "not_observed",
+        # The target route was never registered, so no live local receiver can
+        # answer for it; the observation stays honestly unknown and body-free.
+        "receiving_observation": {
+            "stage": "unknown",
+            "reason": "no_local_receiver",
+            "detail": "no live local receiver owns the recorded target generation; "
+            "a remote receiver's custody cannot be observed",
+        },
     }
     assert store.path.read_bytes() == before
     with pytest.raises(ChatError, match="event is unavailable"):
@@ -3570,13 +3578,20 @@ def test_a_late_result_replaces_the_owner_disposition(
 
 
 @pytest.mark.parametrize(
-    ("provider", "courier_mode", "expected"),
+    ("provider", "courier_mode", "courier_mechanism", "expected"),
     [
-        ("claude", None, "while_idle"),
-        ("devin", None, "next_turn"),
-        ("codex", "codex_experimental_queue", "while_idle"),
-        ("codex", "codex_stop_bound", "next_turn"),
-        ("codex", "something_new", "unknown"),
+        ("claude", None, None, "while_idle"),
+        ("devin", None, None, "next_turn"),
+        # The managed helper's while-idle mechanism stays qualified; an
+        # unqualified direct-queue experimental mode is exactly that --
+        # unqualified -- so accepted queue custody is "unknown", never the
+        # stronger "while_idle" the bare mode used to imply.
+        ("codex", "codex_experimental_queue", "native_helper", "while_idle"),
+        ("codex", "codex_experimental_queue", "direct_queue", "unknown"),
+        ("codex", "codex_experimental_queue", None, "unknown"),
+        ("codex", "codex_daemon_input", "owning_daemon", "while_idle"),
+        ("codex", "codex_stop_bound", "stop_bound", "next_turn"),
+        ("codex", "something_new", "something_new", "unknown"),
     ],
 )
 def test_reply_delivery_reports_how_an_answer_reaches_the_sender(
@@ -3584,6 +3599,7 @@ def test_reply_delivery_reports_how_an_answer_reaches_the_sender(
     monkeypatch: pytest.MonkeyPatch,
     provider: str,
     courier_mode: str | None,
+    courier_mechanism: str | None,
     expected: str,
 ) -> None:
     from cross_agent_chat import runtime
@@ -3592,13 +3608,17 @@ def test_reply_delivery_reports_how_an_answer_reaches_the_sender(
 
     def health(_path: Path, request: dict[str, object], timeout: float) -> dict[str, object]:
         assert request["include_delivery_mode"] is True
-        return {
+        assert request["include_delivery_mechanism"] is True
+        response: dict[str, object] = {
             "schema_version": 1,
             "status": "READY",
             "generation": source.generation,
             "alias": source.alias,
             "delivery_mode": courier_mode,
         }
+        if courier_mechanism is not None:
+            response["delivery_mechanism"] = courier_mechanism
+        return response
 
     monkeypatch.setattr(runtime, "request_socket", health)
 

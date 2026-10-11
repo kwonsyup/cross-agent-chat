@@ -3602,6 +3602,7 @@ def test_send_to_an_exact_handle_does_not_wait_for_a_full_loaded_roster(
             "include_delivery_mechanism": True,
             "include_owning_daemon": True,
             "include_devin_tool_boundary": True,
+            "include_current_boundary": True,
         }
     ]
     # Counterexample on the same fixture: the un-bound roster query still
@@ -3676,12 +3677,22 @@ def test_exact_token_send_falls_back_to_a_full_roster_on_an_old_broker(
         "include_delivery_mechanism": True,
         "include_owning_daemon": True,
     }
-    assert calls[:3] == [
+    assert calls[:4] == [
+        {
+            **negotiated,
+            "handle": handle,
+            "include_devin_tool_boundary": True,
+            "include_current_boundary": True,
+        },
         {**negotiated, "handle": handle, "include_devin_tool_boundary": True},
         {**negotiated, "handle": handle},
-        {**negotiated, "include_devin_tool_boundary": True},
+        {
+            **negotiated,
+            "include_devin_tool_boundary": True,
+            "include_current_boundary": True,
+        },
     ]
-    assert calls[3].get("operation") == "receive"
+    assert calls[4].get("operation") == "receive"
 
 
 def test_handle_bound_roster_query_is_empty_and_complete_for_an_unowned_handle(

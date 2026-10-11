@@ -707,6 +707,9 @@ def test_doctor_reports_the_selected_profile_queue_mode(
 
     assert json.loads(capsys.readouterr().out) == {
         "codex_native_queue": "experimental",
+        "codex_native_queue_basis": (
+            "experimental configuration setting, not an observed receiving mode"
+        ),
         "integration": "healthy",
         "local_broker": "healthy",
         "next": "start a fresh Claude Code or Codex session; "
@@ -823,6 +826,9 @@ def test_doctor_omits_the_terminal_diagnostic_without_the_marker(
 
     assert json.loads(capsys.readouterr().out) == {
         "codex_native_queue": "stop-bound",
+        "codex_native_queue_basis": (
+            "experimental configuration setting, not an observed receiving mode"
+        ),
         "integration": "healthy",
         "local_broker": "healthy",
         "next": "start a fresh Claude Code or Codex session; "
@@ -2320,16 +2326,21 @@ def test_doctor_json_reports_no_codex_hook_trust_verdict(
 
     # Hook trust is the provider's own state; doctor reports exactly the
     # released key set and cannot claim the hooks are trusted. (The optional
-    # "terminal" key is asserted separately.)
+    # "terminal" key is asserted separately.) The queue key's new basis field
+    # names it as a configuration setting, not an observed receiving mode.
     assert "codex_hooks" not in report
     assert set(report) == {
         "codex_native_queue",
+        "codex_native_queue_basis",
         "integration",
         "local_broker",
         "next",
         "remote_trust",
         "version",
     }
+    assert report["codex_native_queue_basis"] == (
+        "experimental configuration setting, not an observed receiving mode"
+    )
     assert report["integration"] == "healthy"
     assert report["next"] == (
         "start a fresh Claude Code or Codex session; "

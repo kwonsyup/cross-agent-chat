@@ -35,7 +35,7 @@ from types import FrameType
 from typing import BinaryIO, Final, Literal, TypedDict, cast
 from uuid import uuid4
 
-from cross_agent_chat import claude_runtime
+from cross_agent_chat import __version__, claude_runtime
 from cross_agent_chat.claude_runtime import (
     AGENTS_TIMEOUT_SECONDS,
     COURIER_ENV_KEYS,
@@ -86,12 +86,14 @@ from cross_agent_chat.core import (
 )
 from cross_agent_chat.devin import (
     DEVIN_CAPABILITY_FIELD,
+    DEVIN_CURRENT_BOUNDARIES,
     DEVIN_LARGE_HOOK_INPUT_MAX_BYTES,
     DEVIN_READ_SUBAGENT_TOOL,
     DEVIN_ROOT_ONLY_TOOLS,
     DEVIN_SUBAGENT_TOOL,
     DevinCapabilityStore,
     DevinCapabilityTool,
+    DevinCurrentBoundary,
     DevinHookEvent,
     DevinSubagentStore,
     build_post_tool_callback_payload,
@@ -674,6 +676,7 @@ class Target:
     delivery_mode: DeliveryMode | None = None
     delivery_mechanism: DeliveryMechanism | None = None
     title: str | None = None
+    current_boundary: DevinCurrentBoundary | None = None
 
     def public(
         self,
@@ -685,6 +688,7 @@ class Target:
         include_title: bool = True,
         include_owning_daemon: bool = False,
         include_devin_tool_boundary: bool = False,
+        include_current_boundary: bool = False,
     ) -> dict[str, str]:
         result = {
             "alias": self.alias,
@@ -708,6 +712,10 @@ class Target:
             result["delivery_mode"] = "unknown" if mode is None else mode
             if include_delivery_mechanism:
                 result["delivery_mechanism"] = "unknown" if mechanism is None else mechanism
+        # The negotiated content-free restriction is emitted only to a reader
+        # that asked for it; its absence stays "unobserved", never "held".
+        if include_current_boundary and self.current_boundary is not None:
+            result["current_boundary"] = self.current_boundary
         return result
 
 
@@ -1912,7 +1920,12 @@ def courier_accept(
         body = bounded_message(message)
         if route.provider == "codex":
             if daemon_ingress is not None:
-                return daemon_ingress.accept(identifier, body)
+                response = daemon_ingress.accept(identifier, body)
+                # Only a decided provider-boundary handoff counts as retired:
+                # rejected or unknown outcomes must not masquerade as one.
+                if response.get("status") == "TRANSPORT_ACCEPTED" and courier is not None:
+                    courier.retire(identifier)
+                return response
             if courier is None:
                 raise ChatError("Codex courier is unavailable")
             return courier.accept(identifier, body)
@@ -2089,6 +2102,8 @@ def courier_health(
     daemon_ingress: CodexDaemonIngress | None = None,
     include_devin_tool_boundary: bool = False,
     devin_tool_boundary_observed: bool = False,
+    include_current_boundary: bool = False,
+    devin_current_boundary: DevinCurrentBoundary | None = None,
 ) -> dict[str, object]:
     alias = route.alias
     if route.provider == "claude":
@@ -2128,9 +2143,29 @@ def courier_health(
             response["delivery_mode"] = "devin_tool_boundary"
         if include_delivery_mechanism:
             response["delivery_mechanism"] = "devin_tool_boundary"
+    if (
+        include_current_boundary
+        and route.provider == "devin"
+        and devin_current_boundary is not None
+    ):
+        response["current_boundary"] = devin_current_boundary
     if include_direct_delivery_mode:
         response["direct_delivery_mode"] = _delivery_mode(route, courier)
     return response
+
+
+def _devin_current_boundary(root: Path, route: Route) -> DevinCurrentBoundary:
+    """Read the session's current receive restriction, conservatively.
+
+    Lifecycle state that cannot be read is treated exactly like the
+    unobserved-launch hold: the report stays content-free and never releases
+    or advances a held body.
+    """
+
+    try:
+        return DevinSubagentStore(root).restriction(route.session_id)
+    except (ChatError, OSError):
+        return "next_prompt_unobserved_launch"
 
 
 def courier_server(
@@ -2223,6 +2258,10 @@ def courier_server(
                 daemon_ingress = discover_daemon_ingress(daemon_binary, dict(os.environ), route)
         except (ChatError, OSError):
             pass
+    # One opaque incarnation per courier process: a same-generation restart
+    # answers inspect with a different value, so a reader can tell the courier
+    # that holds pending memory now from the one that may have accepted it.
+    incarnation = str(uuid4())
     bound = path.lstat()
     # Many listers probe health at once while a delivery occupies the effect
     # lock; the backlog matches the broker listener so an ordinary burst is
@@ -2291,6 +2330,43 @@ def courier_server(
                     # The denying transition (shutdown) publishes in the
                     # opposite order for the same reason.
                     bootstrapped.set()
+                elif operation == "inspect":
+                    if not bootstrapped.is_set():
+                        emit_frame_safely(
+                            connection,
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "status": "UNAVAILABLE",
+                                "generation": route.generation,
+                            },
+                        )
+                    else:
+                        event_id = request.get("event_id")
+                        try:
+                            if not isinstance(event_id, str):
+                                raise ChatError("event id")
+                            identifier = valid_uuid(event_id, "event id")
+                        except ChatError:
+                            return
+                        # Read-only and body-free: inspect never enqueues,
+                        # wakes, acknowledges, or reorders anything, and the
+                        # answer carries only volatile custody state.
+                        observation = (
+                            courier.inspect(identifier)
+                            if courier is not None
+                            else {"event_state": "no_courier_queue"}
+                        )
+                        emit_frame_safely(
+                            connection,
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "status": "INSPECTED",
+                                "generation": route.generation,
+                                "courier_version": __version__,
+                                "courier_incarnation": incarnation,
+                                **observation,
+                            },
+                        )
                 elif operation == "health":
                     if not bootstrapped.is_set():
                         emit_frame_safely(
@@ -2322,6 +2398,15 @@ def courier_server(
                                 devin_tool_boundary_observed=(
                                     route.provider == "devin"
                                     and devin_tool_boundary_path(root, route).exists()
+                                ),
+                                include_current_boundary=(
+                                    request.get("include_current_boundary") is True
+                                ),
+                                devin_current_boundary=(
+                                    _devin_current_boundary(root, route)
+                                    if route.provider == "devin"
+                                    and request.get("include_current_boundary") is True
+                                    else None
                                 ),
                                 native_helper=(
                                     NativeHelperStore(root).helper_for_original(
@@ -2627,6 +2712,7 @@ def _local_target(
                 "include_delivery_mechanism": True,
                 "include_owning_daemon": True,
                 "include_devin_tool_boundary": True,
+                "include_current_boundary": True,
             },
             timeout=timeout,
         )
@@ -2636,12 +2722,14 @@ def _local_target(
     expected = {"schema_version", "status", "generation", "alias"}
     observed_mode = response.get("delivery_mode")
     observed_mechanism = response.get("delivery_mechanism")
+    observed_boundary = response.get("current_boundary")
     if (
         set(response)
         not in (
             expected,
             expected | {"delivery_mode"},
             expected | {"delivery_mode", "delivery_mechanism"},
+            expected | {"delivery_mode", "delivery_mechanism", "current_boundary"},
         )
         or response.get("schema_version") != SCHEMA_VERSION
         or response.get("status") != "READY"
@@ -2660,6 +2748,17 @@ def _local_target(
             }
         )
         or (observed_mechanism is not None and observed_mechanism not in DELIVERY_MECHANISMS)
+        # The current restriction rides the mechanism layer and is only
+        # meaningful on the Devin courier that publishes it; anything else is
+        # an invalid shape, not a partial truth the reader may keep.
+        or (
+            observed_boundary is not None
+            and (
+                observed_boundary not in DEVIN_CURRENT_BOUNDARIES
+                or route.provider != "devin"
+                or observed_mechanism is None
+            )
+        )
     ):
         return None
     if route.provider == "codex":
@@ -2689,6 +2788,12 @@ def _local_target(
                 cast(DeliveryMechanism, observed_mechanism)
                 if observed_mechanism is not None
                 else None
+            ),
+            # The reader shares the custody store's filesystem, so the local
+            # boundary is read straight from it: exact, current, and correct
+            # even when an older courier cannot answer the negotiated field.
+            current_boundary=(
+                _devin_current_boundary(root, route) if route.provider == "devin" else None
             ),
         )
     except ChatError:
@@ -2794,6 +2899,7 @@ class _ExternalDiscoveryOption(TypedDict, total=False):
 
 class _DeliveryDiscoveryOption(TypedDict, total=False):
     include_delivery_mechanism: bool
+    include_current_boundary: bool
 
 
 def _external_option(enabled: bool) -> _ExternalDiscoveryOption:
@@ -2809,6 +2915,7 @@ def _targets_from_tailnet(
     include_title: bool = False,
     include_owning_daemon: bool = False,
     include_devin_tool_boundary: bool = False,
+    include_current_boundary: bool = False,
     include_devin: bool = False,
     include_external: bool = False,
     node_id: str | None = None,
@@ -2834,6 +2941,7 @@ def _targets_from_tailnet(
             required
             | ({"delivery_mode"} if include_delivery_mode else set())
             | ({"delivery_mechanism"} if include_delivery_mechanism else set())
+            | ({"current_boundary"} if include_current_boundary else set())
             | ({"title"} if include_title else set())
         )
         if not isinstance(raw_item, dict) or not required <= set(raw_item) <= allowed:
@@ -2884,6 +2992,17 @@ def _targets_from_tailnet(
         title = item.get("title")
         if title is not None and (not include_title or not isinstance(title, str)):
             raise ChatError("Tailnet peer returned invalid discovery")
+        observed_boundary = item.get("current_boundary")
+        # The negotiated restriction is Devin-only: any other provider's row
+        # carrying it is malformed, and a reader that never asked for it must
+        # never receive it (an old courier simply omits the key, which the
+        # reader keeps as unobserved rather than dropping the peer).
+        if observed_boundary is not None and (
+            not include_current_boundary
+            or observed_boundary not in DEVIN_CURRENT_BOUNDARIES
+            or provider != "devin"
+        ):
+            raise ChatError("Tailnet peer returned invalid discovery")
         targets.append(
             Target(
                 alias=valid_name(cast(str, item["alias"]), "remote alias"),
@@ -2906,6 +3025,11 @@ def _targets_from_tailnet(
                     else None
                 ),
                 title=valid_name(title, "remote title") if isinstance(title, str) else None,
+                current_boundary=(
+                    cast(DevinCurrentBoundary, observed_boundary)
+                    if isinstance(observed_boundary, str)
+                    else None
+                ),
             )
         )
     return targets
@@ -2920,6 +3044,7 @@ def _remote_node_targets(
     include_title: bool = False,
     include_devin: bool = False,
     include_external: bool = False,
+    include_current_boundary: bool = False,
     handle: str | None = None,
     node_id: str | None = None,
 ) -> tuple[list[Target], bool]:
@@ -2963,15 +3088,25 @@ def _remote_node_targets(
         ]
         # A broker that predates the Devin tool-boundary flag refuses it, so
         # each negotiated shape is retried without it before the next shape.
+        # The newest boundary flag rides only on shapes that already carry the
+        # tool-boundary flag it layers onto: a broker that understands it
+        # necessarily understands the older layer, so no extra refusal probe
+        # is spent on unreachable combinations.
         tool_boundary_variants: list[tuple[dict[str, object], bool]] = []
         for shape, _ in mechanism_variants:
-            tool_boundary_variants.append(({**shape, "include_devin_tool_boundary": True}, True))
+            with_tool_boundary = {**shape, "include_devin_tool_boundary": True}
+            if include_current_boundary:
+                tool_boundary_variants.append(
+                    ({**with_tool_boundary, "include_current_boundary": True}, True)
+                )
+            tool_boundary_variants.append((with_tool_boundary, True))
             tool_boundary_variants.append((shape, True))
         variants = tool_boundary_variants + variants
     base: list[Target] | None = None
     mechanism_negotiated = False
     owning_negotiated = False
     tool_boundary_negotiated = False
+    boundary_negotiated = False
     external_negotiated = False
     capacity_refused = False
     for payload, mode_requested in variants:
@@ -3027,6 +3162,11 @@ def _remote_node_targets(
                     if "include_devin_tool_boundary" in payload
                     else {}
                 ),
+                **(
+                    {"include_current_boundary": True}
+                    if "include_current_boundary" in payload
+                    else {}
+                ),
                 **_external_option(include_external),
                 node_id=node_id,
             )
@@ -3034,6 +3174,7 @@ def _remote_node_targets(
             mechanism_negotiated = "include_delivery_mechanism" in payload
             owning_negotiated = "include_owning_daemon" in payload
             tool_boundary_negotiated = "include_devin_tool_boundary" in payload
+            boundary_negotiated = "include_current_boundary" in payload
             break
         except (ChatError, UnknownDeliveryError):
             continue
@@ -3058,6 +3199,8 @@ def _remote_node_targets(
             rich_payload["include_owning_daemon"] = True
         if tool_boundary_negotiated:
             rich_payload["include_devin_tool_boundary"] = True
+        if boundary_negotiated:
+            rich_payload["include_current_boundary"] = True
         if include_devin:
             rich_payload["include_devin"] = True
         if external_negotiated:
@@ -3077,6 +3220,7 @@ def _remote_node_targets(
             include_title=True,
             **({"include_owning_daemon": True} if owning_negotiated else {}),
             **({"include_devin_tool_boundary": True} if tool_boundary_negotiated else {}),
+            **({"include_current_boundary": True} if boundary_negotiated else {}),
             include_devin=include_devin,
             **_external_option(external_negotiated),
             node_id=node_id,
@@ -3103,6 +3247,7 @@ def _remote_discovery(
     include_title: bool = False,
     include_devin: bool = True,
     include_external: bool = False,
+    include_current_boundary: bool = False,
     identity: TailnetIdentity | None = None,
 ) -> tuple[list[Target], bool]:
     if identity is None:
@@ -3116,6 +3261,8 @@ def _remote_discovery(
     metadata: _DeliveryDiscoveryOption = (
         {"include_delivery_mechanism": True} if include_delivery_mechanism else {}
     )
+    if include_current_boundary:
+        metadata["include_current_boundary"] = True
     futures = [
         workers.submit(
             _remote_node_targets,
@@ -3430,6 +3577,38 @@ def _begin_delivery(
     return None
 
 
+def _receiving_qualification(
+    mode: str | None, mechanism: str | None
+) -> tuple[bool | Literal["unknown"], bool | Literal["unknown"], ReplyDelivery]:
+    """Derive parked-wake, active-turn-input and reply guidance from one basis.
+
+    Everything keys on the observed ``(mode, mechanism)`` pair the peer
+    affirmed -- never a provider version string -- so a mechanism lane A later
+    qualifies for a daemon version only has to make health report the new
+    pair, and the same derivation applies automatically. An unqualified
+    combination such as an experimental ``direct_queue`` stays ``unknown``:
+    queue acceptance says nothing about when the original session can act.
+    """
+    owning_daemon = mode == "codex_daemon_input" and mechanism == "owning_daemon"
+    tool_boundary = mode == "devin_tool_boundary" and mechanism == "devin_tool_boundary"
+    deferred = mode in {"codex_stop_bound", "devin_stop_or_prompt_bound"}
+    if owning_daemon:
+        return True, True, "while_idle"
+    if tool_boundary:
+        # The Devin tool hook can only inject after a tool call inside a turn
+        # that is already running; it never wakes a parked conversation.
+        return False, True, "next_turn"
+    if deferred:
+        return False, False, "next_turn"
+    if mode == "claude_native_cross_session" or (
+        mode == "codex_experimental_queue" and mechanism == "native_helper"
+    ):
+        # These mechanisms deliver while the destination is live and able to
+        # act, but their wake behavior is not separately qualified.
+        return "unknown", "unknown", "while_idle"
+    return "unknown", "unknown", "unknown"
+
+
 def destination_receiving(target: Target | None) -> dict[str, object]:
     """Describe observed routing, never receipt or unqualified wake/steer support.
 
@@ -3441,24 +3620,33 @@ def destination_receiving(target: Target | None) -> dict[str, object]:
     A Devin route reports active-turn input only as the negotiated
     ``devin_tool_boundary`` mode, which its receiver affirms after its loaded
     session ran the tool hook; the legacy Devin mode stays deferred. Neither
-    wakes an idle Devin conversation.
+    wakes an idle Devin conversation. When the receiver also negotiated its
+    content-free current restriction, ``current_boundary`` discloses it and a
+    hold narrows active-turn input to what the restriction actually permits.
     """
     mode = target.delivery_mode if target is not None else None
     mechanism = target.delivery_mechanism if target is not None else None
-    owning_daemon = mode == "codex_daemon_input" and mechanism == "owning_daemon"
-    tool_boundary = mode == "devin_tool_boundary" and mechanism == "devin_tool_boundary"
-    deferred = mode in {"codex_stop_bound", "devin_stop_or_prompt_bound"}
-    return {
+    parked_wake, qualified_input, _reply = _receiving_qualification(mode, mechanism)
+    active_turn_input: bool | Literal["unknown", "limited"] = qualified_input
+    boundary = target.current_boundary if target is not None else None
+    if boundary in {"next_prompt_custom_subagent", "next_prompt_unobserved_launch"}:
+        # The receiver's custody guard holds every queued body until the root's
+        # next prompt; a tool boundary cannot inject while it does.
+        active_turn_input = False
+    elif boundary == "root_tools_only":
+        # Only the documented root-only tools can deliver mid-turn; a child may
+        # be running, so the unqualified promise degrades rather than lies.
+        active_turn_input = "limited"
+    result: dict[str, object] = {
         "mode": mode or "unknown",
         "mechanism": mechanism or "unknown",
-        "parked_wake": True if owning_daemon else False if deferred or tool_boundary else "unknown",
-        "active_turn_input": True
-        if owning_daemon or tool_boundary
-        else False
-        if deferred
-        else "unknown",
+        "parked_wake": parked_wake,
+        "active_turn_input": active_turn_input,
         "delivery_observation": "not_observed",
     }
+    if boundary is not None:
+        result["current_boundary"] = boundary
+    return result
 
 
 def _existing_delivery(intent: Intent, target: Target) -> dict[str, object]:
@@ -3746,6 +3934,7 @@ def _send_remote_token_target(
         include_delivery_mode=True,
         include_delivery_mechanism=True,
         include_devin=True,
+        include_current_boundary=True,
         **_external_option(include_external),
         handle=token.handle,
         node_id=token.node_id,
@@ -4453,6 +4642,7 @@ def peers(
     include_title: bool = False,
     include_owning_daemon: bool = False,
     include_devin_tool_boundary: bool = False,
+    include_current_boundary: bool = False,
     include_devin: bool = True,
     include_external: bool = False,
     handle: str | None = None,
@@ -4479,6 +4669,11 @@ def peers(
                 include_delivery_mode=include_delivery_mode,
                 include_title=display_titles,
                 **({"include_delivery_mechanism": True} if include_delivery_mechanism else {}),
+                **(
+                    {"include_current_boundary": True}
+                    if not internal or include_current_boundary
+                    else {}
+                ),
                 identity=identity,
                 **_external_option(include_external),
             )
@@ -4522,6 +4717,7 @@ def peers(
             include_title=not internal or include_title,
             include_owning_daemon=not internal or include_owning_daemon,
             include_devin_tool_boundary=not internal or include_devin_tool_boundary,
+            include_current_boundary=not internal or include_current_boundary,
         )
         if internal:
             item["generation"] = target.generation
@@ -4635,9 +4831,12 @@ def reply_delivery(root: Path, source: SourceIdentity) -> ReplyDelivery:
         return "unknown"
     if source.provider == "claude":
         mode: str | None = "claude_native_cross_session"
+        mechanism: str | None = "claude_native"
     elif source.provider == "devin":
         mode = "devin_stop_or_prompt_bound"
+        mechanism = "devin_prompt_bound"
     else:
+        mechanism = None
         try:
             response = request_socket(
                 socket_path(root, source),
@@ -4646,6 +4845,7 @@ def reply_delivery(root: Path, source: SourceIdentity) -> ReplyDelivery:
                     "operation": "health",
                     "generation": source.generation,
                     "include_delivery_mode": True,
+                    "include_delivery_mechanism": True,
                     "include_owning_daemon": True,
                 },
                 timeout=REPLY_DELIVERY_TIMEOUT_SECONDS,
@@ -4653,18 +4853,18 @@ def reply_delivery(root: Path, source: SourceIdentity) -> ReplyDelivery:
         except (ChatError, OSError):
             return "unknown"
         raw = response.get("delivery_mode")
-        mode = (
-            raw
-            if response.get("status") == "READY"
-            and response.get("generation") == source.generation
-            and isinstance(raw, str)
-            else None
+        ready = (
+            response.get("status") == "READY" and response.get("generation") == source.generation
         )
-    if mode in {"claude_native_cross_session", "codex_experimental_queue", "codex_daemon_input"}:
-        return "while_idle"
-    if mode in {"codex_stop_bound", "devin_stop_or_prompt_bound", "devin_tool_boundary"}:
-        return "next_turn"
-    return "unknown"
+        mode = raw if ready and isinstance(raw, str) else None
+        raw_mechanism = response.get("delivery_mechanism")
+        if ready and isinstance(raw_mechanism, str) and raw_mechanism in DELIVERY_MECHANISMS:
+            mechanism = raw_mechanism
+    # The same (mode, mechanism) qualification that grades destination
+    # receiving grades this source's receive timing; an unqualified
+    # direct-queue experimental mode is unknown, never "while_idle".
+    _parked, _active, reply = _receiving_qualification(mode, mechanism)
+    return reply
 
 
 def native_helper_tools(root: Path, source: Route) -> tuple[str, ...]:
@@ -5049,6 +5249,154 @@ def native_dispatch(root: Path, helper: Route, event_id: str) -> dict[str, objec
     }
 
 
+# Inspect stays a read: it may add at most this much to a status call before
+# the send's own budgets apply, and it must never be able to stall delivery.
+INSPECT_TIMEOUT_SECONDS: Final = 1.0
+
+
+def _receiving_observation(root: Path, intent: Intent) -> dict[str, object]:
+    """Body-free view of where the recorded target generation's courier holds
+    this event. It only reads volatile courier state: nothing is sent, woken,
+    acknowledged, dequeued, or reordered, and an unreachable answer stays
+    ``unknown`` rather than guessing at custody."""
+
+    route = next(
+        (
+            item
+            for item in Registry(root).routes()
+            if session_key(item.provider, item.session_id) == intent.target_key
+            and item.generation == intent.target_generation
+        ),
+        None,
+    )
+    if route is None:
+        return {
+            "stage": "unknown",
+            "reason": "no_local_receiver",
+            "detail": (
+                "no live local receiver owns the recorded target generation; "
+                "a remote receiver's custody cannot be observed"
+            ),
+        }
+    try:
+        response = request_socket(
+            socket_path(root, route),
+            {
+                "schema_version": SCHEMA_VERSION,
+                "operation": "inspect",
+                "generation": route.generation,
+                "event_id": intent.event_id,
+            },
+            timeout=INSPECT_TIMEOUT_SECONDS,
+        )
+    except (ChatError, OSError):
+        return {
+            "stage": "unknown",
+            "reason": "courier_unavailable",
+            "detail": (
+                "the receiving courier cannot answer; volatile receiving state is "
+                "unobservable, for example after a receiver restart"
+            ),
+        }
+    expected = {
+        "schema_version",
+        "status",
+        "generation",
+        "courier_version",
+        "courier_incarnation",
+        "event_state",
+    }
+    state = response.get("event_state")
+    if (
+        set(response) not in (expected, expected | {"pending_count", "oldest_pending_age_seconds"})
+        or response.get("schema_version") != SCHEMA_VERSION
+        or response.get("status") != "INSPECTED"
+        or response.get("generation") != route.generation
+        or not isinstance(response.get("courier_version"), str)
+        or not isinstance(response.get("courier_incarnation"), str)
+        or state not in {"pending", "handed_off", "unseen", "no_courier_queue"}
+    ):
+        return {
+            "stage": "unknown",
+            "reason": "observation_invalid",
+            "detail": "the receiving courier's answer was not a valid inspect response",
+        }
+    pending_count = response.get("pending_count")
+    pending_age = response.get("oldest_pending_age_seconds")
+    if "pending_count" in response and (
+        not isinstance(pending_count, int)
+        or isinstance(pending_count, bool)
+        or pending_count < 0
+        or not (
+            pending_age is None
+            or (
+                isinstance(pending_age, (int, float))
+                and not isinstance(pending_age, bool)
+                and pending_age >= 0
+            )
+        )
+    ):
+        return {
+            "stage": "unknown",
+            "reason": "observation_invalid",
+            "detail": "the receiving courier's answer was not a valid inspect response",
+        }
+    observation: dict[str, object] = {
+        "courier_version": response["courier_version"],
+        "courier_incarnation": response["courier_incarnation"],
+    }
+    if state == "pending" and isinstance(pending_count, int):
+        observation["stage"] = "pending_in_courier"
+        observation["pending_count"] = pending_count
+        observation["oldest_pending_age_seconds"] = pending_age
+        observation["detail"] = (
+            "the receiving courier still holds the event; the provider boundary has not taken it"
+        )
+    elif state == "handed_off":
+        observation["stage"] = "handed_off"
+        if isinstance(pending_count, int):
+            observation["pending_count"] = pending_count
+            observation["oldest_pending_age_seconds"] = pending_age
+        observation["detail"] = (
+            "the receiving courier recorded handing the event to the provider "
+            "boundary; that is never evidence the original session consumed it"
+        )
+    elif state == "no_courier_queue" and intent.status == "TRANSPORT_ACCEPTED":
+        # A provider-native route (Claude, direct Devin) accepted the event at
+        # transport and holds no CAC queue; custody ended at the provider side.
+        observation["stage"] = "handed_off"
+        observation["detail"] = (
+            "provider-native delivery completed at transport acceptance; there "
+            "is no CAC-held queue to observe"
+        )
+    elif state == "unseen":
+        observation["stage"] = "unknown"
+        observation["reason"] = "no_courier_record"
+        observation["detail"] = (
+            "the live receiving courier holds no record of the event; a "
+            "same-generation courier restart forgets volatile custody"
+        )
+    else:
+        observation["stage"] = "unknown"
+        observation["reason"] = "unqualified_state"
+        observation["detail"] = "the receiving courier's state does not map to a custody stage"
+    return observation
+
+
+def _event_status_payload(root: Path, intent: Intent) -> dict[str, object]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": intent.event_id,
+        "status": intent.status,
+        "source_alias": intent.source_alias,
+        "target_handle": intent.target_key,
+        "target_generation": intent.target_generation,
+        "timestamp": intent.timestamp,
+        "delivery_observation": "not_observed",
+        "receiving_observation": _receiving_observation(root, intent),
+    }
+
+
 def event_status(root: Path, source: SourceIdentity, event_id: str) -> dict[str, object]:
     """Return body-free custody state for one exact authenticated source event."""
     if not _source_current(root, source):
@@ -5060,16 +5408,20 @@ def event_status(root: Path, source: SourceIdentity, event_id: str) -> dict[str,
     )
     if intent is None:
         raise ChatError("event is unavailable")
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "event_id": intent.event_id,
-        "status": intent.status,
-        "source_alias": intent.source_alias,
-        "target_handle": intent.target_key,
-        "target_generation": intent.target_generation,
-        "timestamp": intent.timestamp,
-        "delivery_observation": "not_observed",
-    }
+    return _event_status_payload(root, intent)
+
+
+def owner_event_status(root: Path, event_id: str) -> dict[str, object]:
+    """Body-free status for one owner-side event id, exactly as read-only as
+    ``event_status``: the owner already sees every recorded row, and this adds
+    only the same volatile receiving observation -- no durable write, no wake,
+    no acknowledgement."""
+
+    identifier = valid_uuid(event_id, "event id")
+    matches = [item for item in IntentStore(root).intents() if item.event_id == identifier]
+    if len(matches) != 1:
+        raise ChatError("event is unavailable")
+    return _event_status_payload(root, matches[0])
 
 
 def codex_stop(pid: int, state_root_value: str | None) -> None:
