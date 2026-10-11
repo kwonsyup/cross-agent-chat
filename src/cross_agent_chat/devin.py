@@ -7,6 +7,7 @@ is never retried here.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import math
@@ -14,6 +15,7 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -104,6 +106,104 @@ def devin_profile_root(home: Path | None = None) -> Path:
 
     base = Path.home() if home is None else home
     return (base / ".config" / "devin").resolve(strict=False)
+
+
+_PROC_PIDTBSDINFO: Final = 3
+_PROC_BSDINFO_SIZE: Final = 136
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessFacts:
+    ppid: int
+    start_seconds: int
+    start_microseconds: int
+
+
+def process_facts(pid: int) -> ProcessFacts | None:
+    """Return the parent and BSD birth time of one live same-uid process."""
+
+    if isinstance(pid, bool) or pid <= 0:
+        return None
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+    info = ctypes.create_string_buffer(_PROC_BSDINFO_SIZE)
+    if libproc.proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, info, len(info)) != _PROC_BSDINFO_SIZE:
+        return None
+    if int.from_bytes(info.raw[20:24], sys.byteorder) != os.getuid():
+        return None
+    return ProcessFacts(
+        ppid=int.from_bytes(info.raw[16:20], sys.byteorder),
+        start_seconds=int.from_bytes(info.raw[120:128], sys.byteorder),
+        start_microseconds=int.from_bytes(info.raw[128:136], sys.byteorder),
+    )
+
+
+def acp_host_path(root: Path, engine_pid: int, engine: ProcessFacts) -> Path:
+    """Private, content-free attestation that one live adapter owns this engine."""
+
+    return root / f"devin-acp-host-{engine_pid}-{engine.start_seconds}-{engine.start_microseconds}"
+
+
+def write_acp_host(root: Path, *, adapter_pid: int, engine_pid: int) -> Path:
+    """Publish that ``adapter_pid`` launched and owns the native engine ``engine_pid``."""
+
+    adapter = process_facts(adapter_pid)
+    engine = process_facts(engine_pid)
+    if adapter is None or engine is None or engine.ppid != adapter_pid:
+        raise ChatError("Devin ACP engine ownership is unavailable")
+    path = acp_host_path(root, engine_pid, engine)
+    atomic_json(
+        path,
+        {
+            "adapter_pid": adapter_pid,
+            "adapter_start": [adapter.start_seconds, adapter.start_microseconds],
+            "engine_pid": engine_pid,
+            "engine_start": [engine.start_seconds, engine.start_microseconds],
+        },
+    )
+    return path
+
+
+def acp_host_observed(root: Path, route: Route) -> bool:
+    """Whether a live CAC ACP adapter is the launching parent of this Devin route.
+
+    True only when the route's exact engine process is alive, its private
+    attestation names that same birth, and the attested adapter is alive with
+    its recorded birth and is still the engine's parent. Anything else,
+    including an unreadable or foreign record, is False.
+    """
+
+    if route.provider != "devin":
+        return False
+    engine = process_facts(route.pid)
+    if engine is None:
+        return False
+    path = acp_host_path(root, route.pid, engine)
+    try:
+        require_private_file(path)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ChatError):
+        return False
+    if not isinstance(raw, dict) or set(raw) != {
+        "adapter_pid",
+        "adapter_start",
+        "engine_pid",
+        "engine_start",
+    }:
+        return False
+    adapter_pid = raw["adapter_pid"]
+    if (
+        not isinstance(adapter_pid, int)
+        or isinstance(adapter_pid, bool)
+        or raw["engine_pid"] != route.pid
+        or raw["engine_start"] != [engine.start_seconds, engine.start_microseconds]
+        or engine.ppid != adapter_pid
+    ):
+        return False
+    adapter = process_facts(adapter_pid)
+    return adapter is not None and raw["adapter_start"] == [
+        adapter.start_seconds,
+        adapter.start_microseconds,
+    ]
 
 
 def capability_arguments_digest(arguments: dict[str, object]) -> str:
