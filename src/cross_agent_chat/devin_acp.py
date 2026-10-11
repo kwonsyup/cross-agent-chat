@@ -55,6 +55,8 @@ class _Session:
     host_prompts: set[int] = field(default_factory=set)
     cac_prompt: int | None = None
     claiming: bool = False
+    submitted: bool = False
+    cancel_pending: Frame | None = None
     queued: deque[Frame] = field(default_factory=deque)
 
     def busy(self) -> bool:
@@ -202,11 +204,16 @@ class Mediator:
         with self._lock:
             session = self._sessions.get(session_id)
             queued = list(session.queued) if session is not None else []
+            forward = True
             if session is not None:
                 session.queued.clear()
-            forward = (
-                session is None or session.cac_prompt is not None or bool(session.host_prompts)
-            )
+                if session.claiming or (session.cac_prompt is not None and not session.submitted):
+                    # A peer prompt is being taken or written right now; the
+                    # cancel must follow it to the engine, not overtake it.
+                    session.cancel_pending = frame
+                    forward = bool(session.host_prompts)
+                else:
+                    forward = session.cac_prompt is not None or bool(session.host_prompts)
         for prompt in queued:
             # The human stopped a prompt that never reached the engine.
             self._to_host(
@@ -284,6 +291,8 @@ class Mediator:
         session.host_prompts.discard(internal)
         if session.cac_prompt == internal:
             session.cac_prompt = None
+            session.submitted = False
+            session.cancel_pending = None
         return self._due(sid, session)
 
     def _due(self, session_id: str, session: _Session) -> list[Frame]:
@@ -325,11 +334,13 @@ class Mediator:
                     continue
                 session.claiming = False
                 if taken is None:
+                    session.cancel_pending = None
                     release = self._due(sid, session)
                 else:
                     message_id = str(uuid4())
                     internal = self._allocate(_Pending("cac", None, "session/prompt", sid))
                     session.cac_prompt = internal
+                    session.submitted = False
                     release = []
             if taken is None:
                 self._release(release)
@@ -343,7 +354,15 @@ class Mediator:
                 self._diagnostic(f"event {event_id} may not have reached the engine")
                 self._stopped.set()
                 return
+            with self._lock:
+                current = self._sessions.get(sid)
+                cancel = None
+                if current is not None and current.cac_prompt == internal:
+                    current.submitted = True
+                    cancel, current.cancel_pending = current.cancel_pending, None
             self._diagnostic(f"submitted event {event_id} to its idle session")
+            if cancel is not None:
+                self._to_engine(cancel)
 
     def _submit(self, sid: str, internal: int, message_id: str, text: str) -> None:
         self._to_host(

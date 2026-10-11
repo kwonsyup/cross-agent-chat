@@ -409,3 +409,38 @@ def test_registry_cli_dispatches_and_reports(
     assert '"registered": true' in capsys.readouterr().out
     assert cli.main(["devin-acp-registry", "remove", "--registry", str(registry)]) == 0
     assert not registry.exists()
+
+
+def test_cancel_during_take_follows_the_peer_prompt_instead_of_overtaking_it(
+    wired: Wired,
+) -> None:
+    w = wired
+    _new_session(w, "sess-alpha1")
+    _human_turn(w, "sess-alpha1", 2)
+    entered, release = threading.Event(), threading.Event()
+    original = w.inbox.take
+
+    def slow_take(session_id: str) -> tuple[str, str] | None:
+        entered.set()
+        release.wait(5)
+        return original(session_id)
+
+    w.inbox.pending["sess-alpha1"] = [(EVENT, "peer task")]
+    w.inbox.take = slow_take  # type: ignore[method-assign]
+    threading.Thread(target=w.mediator.deliver_once, daemon=True).start()
+    assert entered.wait(5)
+    cancel: Frame = {
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": "sess-alpha1"},
+    }
+    w.host.send(cancel)
+    # Nothing is running yet, so nothing reaches the engine before the prompt.
+    assert w.engine.quiet()
+    release.set()
+    w.host.recv()  # echo of the peer message
+    prompt = w.engine.recv()
+    assert prompt["method"] == "session/prompt"
+    assert w.engine.recv() == cancel
+    w.engine.send(_end(prompt, "cancelled"))
+    assert w.host.quiet()
