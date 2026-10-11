@@ -541,3 +541,46 @@ def test_waiting_prompts_are_bounded_with_an_explicit_refusal(wired: Wired) -> N
     refusal = w.host.recv()
     assert refusal["id"] == 99 and "error" in refusal
     assert w.engine.quiet()
+
+
+def test_a_closing_session_refuses_new_prompts(wired: Wired) -> None:
+    w = wired
+    _new_session(w, "sess-alpha1")
+    w.host.send(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/close",
+            "params": {"sessionId": "sess-alpha1"},
+        }
+    )
+    close = w.engine.recv()
+    w.host.send(_prompt("sess-alpha1", 4))
+    refusal = w.host.recv()
+    assert refusal["id"] == 4 and "error" in refusal
+    assert w.engine.quiet()
+    w.engine.send({"jsonrpc": "2.0", "id": close["id"], "result": {}})
+    assert w.host.recv() == {"jsonrpc": "2.0", "id": 3, "result": {}}
+
+
+def test_close_drains_accepted_frames_and_refuses_later_ones(wired: Wired) -> None:
+    w = wired
+    _new_session(w, "sess-alpha1")
+    w.host.send(_prompt("sess-alpha1", 2))
+    prompt = w.engine.recv()
+    w.mediator.close()
+    assert w.mediator.drain(5)
+    # A peer prompt acknowledged after close is reported, never queued behind the end.
+    w.inbox.pending["sess-alpha1"] = [(EVENT, "late")]
+    w.engine.send(_end(prompt))
+    w.host.recv()
+    w.mediator.deliver_once()
+    assert w.inbox.asked == [] and w.engine.quiet()
+
+
+def test_a_stalled_engine_bounds_queued_input(
+    wired: Wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(devin_acp, "ENGINE_QUEUE_MAX_BYTES", 0)
+    wired.host.send({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {}})
+    assert wired.mediator.stopped().wait(5)

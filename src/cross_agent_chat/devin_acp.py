@@ -48,6 +48,7 @@ ACP_FRAME_MAX_BYTES: Final = 64 * 1024 * 1024
 DELIVERY_POLL_SECONDS: Final = 1.0
 ENGINE_EXIT_GRACE_SECONDS: Final = 5.0
 MAX_QUEUED_PROMPTS: Final = 4
+ENGINE_QUEUE_MAX_BYTES: Final = 4 * ACP_FRAME_MAX_BYTES
 REGISTRY_AGENT_ID: Final = "cross-agent-chat-devin"
 DEFAULT_REGISTRY: Final = Path("~/.windsurf/acp/registry.json")
 PLATFORMS: Final = ("darwin-aarch64", "darwin-x86_64")
@@ -109,9 +110,9 @@ class Mediator:
     such as permission prompts pass through unchanged; their replies come back
     from the host with the engine's own id.
 
-    Every frame bound for the engine is decided and enqueued under one lock and
-    written by one writer thread, so the engine receives prompts, cancels and
-    closes in exactly the order they were decided.
+    Prompts, cancels and closes are decided and enqueued under one lock, and
+    one writer thread writes every engine-bound frame in queue order, so the
+    engine receives them in exactly the order they were decided.
     """
 
     def __init__(
@@ -139,6 +140,10 @@ class Mediator:
         self._lock = threading.Lock()
         self._host_write = threading.Lock()
         self._engine_queue: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
+        self._queue_lock = threading.Lock()
+        self._queued_bytes = 0
+        self._input_closed = False
+        self._writer: threading.Thread | None = None
         self._next_id = 0
         self._pending: dict[int, _Pending] = {}
         self._sessions: dict[str, _Session] = {}
@@ -147,18 +152,38 @@ class Mediator:
     # -- lifecycle ---------------------------------------------------------
 
     def start(self, *, deliver: bool = True) -> None:
-        loops = [self.host_loop, self.engine_loop, self.writer_loop]
+        self._writer = threading.Thread(target=self.writer_loop, daemon=True)
+        loops = [self.host_loop, self.engine_loop]
         if deliver:
             loops.append(self.delivery_loop)
+        self._writer.start()
         for loop in loops:
             threading.Thread(target=loop, daemon=True).start()
 
     def stopped(self) -> threading.Event:
         return self._stopped
 
+    def drain(self, timeout: float) -> bool:
+        """Wait until every accepted engine-bound frame was written; True if done."""
+
+        if self._writer is None:
+            return True
+        self._writer.join(timeout)
+        return not self._writer.is_alive()
+
+    def close(self) -> None:
+        """Accept no further engine-bound frames; already accepted ones still drain."""
+
+        self._stop()
+
     def _stop(self) -> None:
+        with self._queue_lock:
+            if not self._input_closed:
+                # Frames accepted before this point are still written in order;
+                # nothing is accepted after it.
+                self._input_closed = True
+                self._engine_queue.put(None)
         self._stopped.set()
-        self._engine_queue.put(None)
 
     # -- framing -----------------------------------------------------------
 
@@ -183,19 +208,35 @@ class Mediator:
             self._host_out.write(data)
             self._host_out.flush()
 
-    def _to_engine(self, frame: Frame | bytes) -> None:
-        """Enqueue one engine-bound frame; callers decide order under ``_lock``."""
+    def _to_engine(self, frame: Frame | bytes) -> bool:
+        """Accept one engine-bound frame for in-order writing; False if refused."""
 
-        self._engine_queue.put(self._encode(frame))
+        data = self._encode(frame)
+        with self._queue_lock:
+            if self._input_closed:
+                return False
+            if self._queued_bytes + len(data) > ENGINE_QUEUE_MAX_BYTES:
+                self._diagnostic("the engine is not reading its input; closing")
+                self._input_closed = True
+                self._engine_queue.put(None)
+                self._stopped.set()
+                return False
+            self._queued_bytes += len(data)
+            self._engine_queue.put(data)
+        return True
 
     def writer_loop(self) -> None:
         try:
             while (data := self._engine_queue.get()) is not None:
                 self._engine_in.write(data)
                 self._engine_in.flush()
+                with self._queue_lock:
+                    self._queued_bytes -= len(data)
         except OSError:
             self._diagnostic("the engine stopped accepting input")
         finally:
+            with self._queue_lock:
+                self._input_closed = True
             self._stopped.set()
 
     def _allocate(self, pending: _Pending) -> int:
@@ -259,7 +300,13 @@ class Mediator:
             session = self._sessions.get(session_id) if session_id is not None else None
             if method == "session/prompt" and session_id is not None:
                 session = self._track(session_id)
-                if session.cac_prompt is not None or session.claiming or session.queued:
+                if session.closing:
+                    refusal = {
+                        "jsonrpc": "2.0",
+                        "id": frame["id"],
+                        "error": {"code": -32000, "message": "the session is closing"},
+                    }
+                elif session.cac_prompt is not None or session.claiming or session.queued:
                     if len(session.queued) < MAX_QUEUED_PROMPTS:
                         session.queued.append(frame)
                     else:
@@ -409,7 +456,7 @@ class Mediator:
             return session is not None and not session.closing and not self._stopped.is_set()
 
     def deliver_once(self) -> None:
-        if self._inbox is None:
+        if self._inbox is None or self._stopped.is_set():
             return
         with self._lock:
             idle = [sid for sid, session in self._sessions.items() if not session.busy()]
@@ -456,7 +503,7 @@ class Mediator:
                 if taken is not None:
                     internal = self._allocate(_Pending("cac", None, "session/prompt", sid))
                     session.cac_prompt = internal
-                    self._to_engine(
+                    submitted = self._to_engine(
                         {
                             "jsonrpc": "2.0",
                             "id": internal,
@@ -468,7 +515,14 @@ class Mediator:
                             },
                         }
                     )
-                    if session.cancel_claim:
+                    if not submitted:
+                        # Acknowledged but the engine input already closed:
+                        # report the uncertain event, never retry it.
+                        self._pending.pop(internal, None)
+                        session.cac_prompt = None
+                        self._diagnostic(f"event {taken[0]} was acknowledged but not submitted")
+                        taken = None
+                    elif session.cancel_claim:
                         self._to_engine(
                             {
                                 "jsonrpc": "2.0",
@@ -578,7 +632,14 @@ def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[s
             )
 
     def attest(sessions: frozenset[str]) -> None:
-        write_acp_host(root, adapter_pid=os.getpid(), engine_pid=engine.pid, sessions=sessions)
+        try:
+            write_acp_host(root, adapter_pid=os.getpid(), engine_pid=engine.pid, sessions=sessions)
+        except (ChatError, OSError):
+            # Never leave an older, broader attestation readable.
+            if attestation is not None:
+                with suppress(OSError):
+                    attestation.unlink()
+            raise
 
     mediator = Mediator(
         host_in=sys.stdin.buffer,
@@ -594,9 +655,14 @@ def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[s
     try:
         mediator.stopped().wait()
     finally:
+        mediator.close()
         if attestation is not None:
             with suppress(OSError):
                 attestation.unlink()
+        if not mediator.drain(ENGINE_EXIT_GRACE_SECONDS):
+            # The engine stopped reading; ending it unblocks the writer.
+            engine.terminate()
+            mediator.drain(ENGINE_EXIT_GRACE_SECONDS)
         with suppress(OSError):
             engine.stdin.close()
         try:
