@@ -605,7 +605,13 @@ def test_the_handle_probe_falls_back_to_the_legacy_roster(
         "include_delivery_mechanism": True,
         "include_owning_daemon": True,
     }
-    assert calls[:4] == [
+    acp = {
+        "include_devin_tool_boundary": True,
+        "include_devin_acp_host": True,
+    }
+    assert calls[:6] == [
+        {**negotiated, "handle": handle, **acp, "include_current_boundary": True},
+        {**negotiated, "handle": handle, **acp},
         {
             **negotiated,
             "handle": handle,
@@ -614,13 +620,9 @@ def test_the_handle_probe_falls_back_to_the_legacy_roster(
         },
         {**negotiated, "handle": handle, "include_devin_tool_boundary": True},
         {**negotiated, "handle": handle},
-        {
-            **negotiated,
-            "include_devin_tool_boundary": True,
-            "include_current_boundary": True,
-        },
+        {**negotiated, **acp, "include_current_boundary": True},
     ]
-    assert calls[4].get("operation") == "receive"
+    assert calls[6].get("operation") == "receive"
 
 
 def test_a_seeded_recipients_file_has_no_routing_influence(
@@ -1026,13 +1028,19 @@ def test_wire_request_and_response_key_sets_are_unchanged(
     }
     tool_boundary = negotiated | {"include_devin_tool_boundary"}
     boundary = tool_boundary | {"include_current_boundary"}
+    acp_host = tool_boundary | {"include_devin_acp_host"}
+    acp_boundary = boundary | {"include_devin_acp_host"}
     assert all(
         set(payload)
         in (
+            {"schema_version", "operation", "handle", "include_devin"} | acp_boundary,
+            {"schema_version", "operation", "handle", "include_devin"} | acp_host,
             {"schema_version", "operation", "handle", "include_devin"} | boundary,
             {"schema_version", "operation", "handle", "include_devin"} | tool_boundary,
             {"schema_version", "operation", "handle", "include_devin"} | negotiated,
             {"schema_version", "operation", "handle", "include_devin"},
+            {"schema_version", "operation", "include_devin"} | acp_boundary,
+            {"schema_version", "operation", "include_devin"} | acp_host,
             {"schema_version", "operation", "include_devin"} | boundary,
             {"schema_version", "operation", "include_devin"} | tool_boundary,
             {"schema_version", "operation", "include_devin"} | negotiated,
