@@ -439,7 +439,12 @@ def test_one_observed_basis_grades_receiving_and_reply_identically() -> None:
     assert runtime._receiving_qualification("codex_experimental_queue", "native_helper") == (
         "unknown",
         "unknown",
-        "while_idle",
+        "unknown",
+    )
+    assert runtime._receiving_qualification("claude_native_cross_session", "claude_native") == (
+        "unknown",
+        "unknown",
+        "unknown",
     )
     assert runtime._receiving_qualification("codex_daemon_input", "owning_daemon") == (
         True,

@@ -37,7 +37,7 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 | Module | Responsibility |
 |---|---|
 | `__init__.py` | Runtime `__version__`, kept consistent with package and release metadata. |
-| `cli.py` | Argument parsing, public commands (`setup`, `doctor`, `peers`, `resolve`, `uninstall`), owner-managed `external enroll/configure-scope/configure-callback/rotate/revoke`, one-shot `external-call`, stdio `external-mcp`, hidden provider hook/service entrypoints (`_`-prefixed), and MCP tool dispatch. |
+| `cli.py` | Argument parsing, public commands (`setup`, `doctor`, `peers`, `status`, `resolve`, `uninstall`), owner-managed `external enroll/configure-scope/configure-callback/rotate/revoke`, one-shot `external-call`, stdio `external-mcp`, hidden provider hook/service entrypoints (`_`-prefixed), and MCP tool dispatch. |
 | `mcp_server.py` | The stdio MCP surface itself: bounded frame reading, JSON-RPC batch handling, strict initialize lifecycle, request-ID validation, ping, and `chat_send` argument normalization. |
 | `recipient.py` | Versioned opaque recipient endpoint tokens (`cac2.`): minting and strict parsing. A remote token pins session key + route generation to a stable Tailnet node; a local token pins them to the issuing state root. |
 | `core.py` | Route identity, content-free intent records, validation, private atomic persistence, state locks, and the private per-generation owner image anchor sidecar (`owner-<generation>.json`). This is where durable product state is defined. |
@@ -49,7 +49,7 @@ install/setup/uninstall                 (install.sh → cli.py _install-staged
 | `remote.py` / `transport.py` | Strict parsing and serialization of the trusted Tailnet envelope (`remote` parses inbound, `transport` builds outbound). |
 | `claude_runtime.py` | Claude Code discovery, constrained helper couriers, the exact argument-supply delivery gate, transient body file, receipt classification. |
 | `codex.py` | Codex CLI process-memory courier and Stop-bound handoff, stdio app-server metadata and experimental queue operations. |
-| `codex_daemon.py` | Owning-daemon ingress for `codex-tui` 0.160.1 originals: a private owner-only Unix WebSocket admitted by route-owner PID with exact profile, thread, cwd, and originator checks; `thread/queue/add` wakes a parked original and `turn/steer` with a pinned `expectedTurnId` inputs the expected active turn. CAC starts no daemon, resumes no thread, changes no permission, and never retries an uncertain effect; missing or unqualified routes stay Stop-bound. |
+| `codex_daemon.py` | Owning-daemon ingress for `codex-tui` 0.160.1, 0.162.0, and 0.162.1 originals: a private owner-only Unix WebSocket admitted by route-owner PID with exact profile, thread, cwd, and originator checks; `thread/queue/add` wakes a parked original and `turn/steer` with a pinned `expectedTurnId` inputs the expected active turn. CAC starts no daemon, resumes no thread, changes no permission, and never retries an uncertain effect; missing or unqualified routes stay Stop-bound. |
 | `native_helper.py` | Shared provider hook recipes/defaults and the private, body-free binding between original Codex conversations and managed native helpers. |
 | `devin.py` | Devin lifecycle-hook parsing, the filesystem-backed single-use capability store, and the content-free subagent lifecycle record that holds Stop/PostToolUse delivery to root-only boundaries (built-in profiles) or to the next prompt (custom profiles, unobserved launches) while a subagent may run (`atomic_json` + `state_lock`). |
 | `install.py` | Provider selection (`resolve_providers`), selected-root resolution, read-only `SetupPlan`, config payload preparation, whole-file backups, guarded transactions/rollback, LaunchAgent lifecycle, schema-5 install metadata, uninstall/restore. Largest file; most of its size is the ownership/rollback matrix. |
@@ -117,7 +117,14 @@ alone proves that an active recipient consumed an envelope.
   receipt. Only `codex_daemon_input`/`owning_daemon` routes claim parked wake
   and active-turn input; Stop/prompt-bound modes report `false` for both and
   everything else is `unknown`. `reply_delivery` stays the sender's own
-  return path; `TRANSPORT_ACCEPTED` is custody, and
+  return path, derived from the same qualification: generic Claude/helper
+  labels leave wake, input, and reply timing unknown for the current host.
+  Historical context-specific qualifications do not qualify alpha hosts.
+  Status follows the exact original/helper binding; optional remote recipient
+  tokens pin one Tailnet node and must match the recorded target generation.
+  Inspection reads existing body-free courier state and never authorizes,
+  sends, acknowledges, or infers original consumption.
+  `TRANSPORT_ACCEPTED` is custody, and
   `chat_peers.sender` identifies the authenticated session by alias and
   exact handle.
 - **Durable effects:** `core.py` intent store — event IDs, digests, statuses;
@@ -193,3 +200,20 @@ attestation or per-Bot isolation.
 Fixtures monkeypatch module attributes by name; renaming a module or moving a
 function can silently change what a guard intercepts. Check `conftest.py` and
 the matching `test_*` imports before reorganizing.
+
+## Local Devin idle receiving
+
+Devin CLI 3000.11.3 and the Desktop-bundled CLI 3000.10.48 expose lifecycle
+hooks and `devin acp`. Their supported interfaces do not establish an
+external attachment to the already-running local original's owned session.
+Hooks run at prompts or active-turn boundaries, so they do not wake an idle
+original. `--resume` in another process and the Cloud message API do not
+prove this outcome. [Issue #38](https://github.com/kwonsyup/cross-agent-chat/issues/38)
+remains open.
+
+A supported owning-host input channel could let CAC submit ACP
+`session/prompt` to the existing original, with owner/session checks and no
+fallback after an uncertain effect. Alternatively, a host can create its
+original through ACP and retain that input channel from launch; that is an
+explicit ACP-host lifecycle, not ordinary local CLI/Desktop compatibility.
+CAC currently implements neither alternative.

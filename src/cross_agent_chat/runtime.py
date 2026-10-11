@@ -3630,12 +3630,10 @@ def _receiving_qualification(
         return False, True, "next_turn"
     if deferred:
         return False, False, "next_turn"
-    if mode == "claude_native_cross_session" or (
-        mode == "codex_experimental_queue" and mechanism == "native_helper"
-    ):
-        # These mechanisms deliver while the destination is live and able to
-        # act, but their wake behavior is not separately qualified.
-        return "unknown", "unknown", "while_idle"
+    # Generic Claude/helper labels do not attest the current host's wake
+    # behavior or the helper-to-original boundary. Historical qualification
+    # for one context cannot turn an unknown current wake into an idle reply
+    # promise. Delivery still uses the same native path.
     return "unknown", "unknown", "unknown"
 
 
@@ -3645,7 +3643,7 @@ def destination_receiving(target: Target | None) -> dict[str, object]:
     A Stop/prompt boundary cannot wake a parked original or inject into its active
     turn. Queue and native mechanisms need host-specific proof for those stronger
     promises; a health response alone does not provide that proof. The owning
-    daemon 0.160.1 path is separately qualified for parked queue wake and
+    daemon's admitted versions are separately qualified for parked queue wake and
     expected-active-turn steer; qualification still is not an event receipt.
     A Devin route reports active-turn input only as the negotiated
     ``devin_tool_boundary`` mode, which its receiver affirms after its loaded
@@ -4849,8 +4847,10 @@ REPLY_DELIVERY_TIMEOUT_SECONDS: Final = 1.0
 def reply_delivery(root: Path, source: SourceIdentity) -> ReplyDelivery:
     """Say how an answer sent to this authenticated source session reaches it.
 
-    Claude and a queued Codex route receive a new message while idle. A Stop-bound
-    Codex route is handed a queued message only at its next turn boundary: the end
+    A qualified owning-daemon route receives a new message while idle. Generic
+    Claude, Native helper, and experimental queue labels leave current host
+    qualification unknown. A Stop-bound Codex route is handed a queued message
+    only at its next turn boundary: the end
     of the current turn if it has already arrived, otherwise the user's next prompt.
     A Devin route also receives it at the next tool boundary of an active turn, but
     an idle Devin conversation waits for the user's next prompt. An unreachable,

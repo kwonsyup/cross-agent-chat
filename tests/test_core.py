@@ -3580,13 +3580,12 @@ def test_a_late_result_replaces_the_owner_disposition(
 @pytest.mark.parametrize(
     ("provider", "courier_mode", "courier_mechanism", "expected"),
     [
-        ("claude", None, None, "while_idle"),
+        ("claude", None, None, "unknown"),
         ("devin", None, None, "next_turn"),
-        # The managed helper's while-idle mechanism stays qualified; an
-        # unqualified direct-queue experimental mode is exactly that --
-        # unqualified -- so accepted queue custody is "unknown", never the
-        # stronger "while_idle" the bare mode used to imply.
-        ("codex", "codex_experimental_queue", "native_helper", "while_idle"),
+        # Mechanism names do not qualify the current host or helper-to-original
+        # boundary. In particular, an alpha Native host must not inherit an
+        # older Intel build's qualification from its generic helper label.
+        ("codex", "codex_experimental_queue", "native_helper", "unknown"),
         ("codex", "codex_experimental_queue", "direct_queue", "unknown"),
         ("codex", "codex_experimental_queue", None, "unknown"),
         ("codex", "codex_daemon_input", "owning_daemon", "while_idle"),
