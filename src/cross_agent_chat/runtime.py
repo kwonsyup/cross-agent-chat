@@ -2216,7 +2216,14 @@ def courier_server(
         else None
     )
     daemon_ingress = None
-    if provider == "codex" and native_queue is None and not helper_lineage:
+    # An exact, qualified, currently-owning daemon wins over the explicit
+    # experimental queue for the same route: a separate stdio app-server
+    # cannot queue into a thread a running 0.162.x owner already owns, so
+    # selecting it would be a guaranteed pre-effect refusal. Without a
+    # qualified owner the explicit env behavior is unchanged. Helper
+    # lineage keeps its queue mechanism; an uncertain daemon effect never
+    # falls through to the queue (courier_accept's ordering decides once).
+    if provider == "codex" and not helper_lineage:
         try:
             daemon_binary = _courier_owner_binary(root, route)
             if daemon_binary is not None:
