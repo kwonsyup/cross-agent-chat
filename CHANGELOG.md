@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Qualify Codex CLI 0.162.0 and 0.162.1 owning-daemon input alongside 0.160.1, preserving exact owner/profile/thread checks and no replay after uncertain effects. Other versions remain Stop-bound. When the explicit experimental direct-queue flag is set and an exact qualified owning daemon passes every check for the same route, the daemon is selected instead of the queue — the spawned stdio app-server cannot enqueue into a thread a running 0.162.x owner already owns (the observed pre-effect refusal). Unqualified or absent daemons keep the explicit queue behavior unchanged. Existing couriers retain their loaded code and accepted in-memory queues across installation; do not restart them to activate this change.
+- Qualify Codex CLI 0.162.0 and 0.162.1 owning-daemon input alongside 0.160.1, preserving exact owner/profile/thread checks and no replay after uncertain effects. Other versions remain Stop-bound. When the explicit experimental direct-queue flag is set and an exact qualified owning daemon passes every check for the same route, the daemon is selected instead of the queue. Codex 0.162.x's own CLI refuses to queue through a separately spawned app-server while a local daemon runs, and the owner path adds owner-PID verification and exact active-turn input. This removes the route's dependence on the embedded-server queue implicated in repeated pre-effect refusals; the provider's exact reason for those refusals was not reproduced. Unqualified or absent daemons keep the explicit queue behavior unchanged. Existing couriers retain their loaded code and accepted in-memory queues across installation; do not restart them to activate this change.
 
 ## 0.5.3 - 2026-10-08
 

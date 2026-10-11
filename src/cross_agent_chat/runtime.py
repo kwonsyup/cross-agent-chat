@@ -2240,10 +2240,10 @@ def courier_server(
     )
     daemon_ingress = None
     # An exact, qualified, currently-owning daemon wins over the explicit
-    # experimental queue for the same route: a separate stdio app-server
-    # cannot queue into a thread a running 0.162.x owner already owns, so
-    # selecting it would be a guaranteed pre-effect refusal. Without a
-    # qualified owner the explicit env behavior is unchanged. Helper
+    # experimental queue for the same route. Codex 0.162.x itself refuses to
+    # queue through an embedded app-server while a local daemon runs, and the
+    # owner path adds owner-PID verification and exact active-turn steer.
+    # Without a qualified owner the explicit env behavior is unchanged. Helper
     # lineage keeps its queue mechanism; an uncertain daemon effect never
     # falls through to the queue (courier_accept's ordering decides once).
     if provider == "codex" and not helper_lineage:
