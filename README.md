@@ -272,7 +272,10 @@ unknown. A helper handoff is not helper-to-original delivery; handed off never
 means read. For a remote receiver, `chat_status` accepts an optional `recipient`
 handle (CLI: `--recipient`) whose session and generation must match the event.
 CAC checks only that handle's authenticated Tailnet node; it never fans out or
-replays. Without the remote handle, run `status EVENT_ID` on the receiving Mac.
+replays. Without a matching remote handle, check the intended original through its
+normal provider transcript or next natural turn. Incoming remote events have
+no sender-local intent record on the receiving Mac, so its owner `status`
+command may report unavailable; that does not prove non-delivery.
 Old couriers, unavailable helpers, and forgotten observations stay unknown. A missing peer warrants one read-only relist, not a
 replay; persistent absence may need the provider's normal registration event
 (resume the Claude conversation, or prompt the original Devin workspace), not

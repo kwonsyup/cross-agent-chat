@@ -5289,15 +5289,9 @@ ReceivingObserver = Literal["original_courier", "native_helper"]
 _COURIER_EVENT_STATES: Final = frozenset({"pending", "handed_off", "unseen", "no_courier_queue"})
 # The failure tokens a remote inspect answer may carry; the requester maps each
 # to its own prose, so a peer can never inject body text into a status read.
-_REMOTE_INSPECT_REASONS: Final = frozenset(
-    {
-        "no_local_receiver",
-        "original_unavailable",
-        "helper_binding_ambiguous",
-        "helper_unavailable",
-        "courier_unavailable",
-        "observation_invalid",
-    }
+_RECEIVER_CHECK_ACTION: Final = (
+    "check the intended original through its normal provider transcript or "
+    "next natural turn on the receiving Mac; do not replay this event"
 )
 _REMOTE_INSPECT_DETAILS: Final = {
     "original_unavailable": (
@@ -5307,30 +5301,26 @@ _REMOTE_INSPECT_DETAILS: Final = {
     ),
     "no_local_receiver": (
         "the recipient node found no live receiver owning the recorded target "
-        "generation; run `cross-agent-chat status` on the receiving Mac for the "
-        "current local observation"
+        f"generation; {_RECEIVER_CHECK_ACTION}"
     ),
     "helper_binding_ambiguous": (
         "the recipient node could not resolve the recorded target's native "
-        "helper binding unambiguously; run `cross-agent-chat status` on the "
-        "receiving Mac"
+        f"helper binding unambiguously; {_RECEIVER_CHECK_ACTION}"
     ),
     "helper_unavailable": (
         "the event was addressed to the recorded target's registered native "
-        "helper, which is not live on the receiving Mac; run "
-        "`cross-agent-chat status` there"
+        f"helper, which is not live; {_RECEIVER_CHECK_ACTION}"
     ),
     "courier_unavailable": (
         "the receiving courier on the recipient node did not answer inspect; it "
-        "may predate this observation or have restarted; run `cross-agent-chat "
-        "status` on the receiving Mac"
+        f"may predate this observation or have restarted; {_RECEIVER_CHECK_ACTION}"
     ),
     "observation_invalid": (
         "the receiving courier on the recipient node returned an answer that "
-        "was not a valid inspect response; run `cross-agent-chat status` on the "
-        "receiving Mac"
+        f"was not a valid inspect response; {_RECEIVER_CHECK_ACTION}"
     ),
 }
+_REMOTE_INSPECT_REASONS: Final = frozenset(_REMOTE_INSPECT_DETAILS)
 _REMOTE_INSPECT_REASON_NAMES: Final = {
     "original_unavailable": "remote_original_unavailable",
     "no_local_receiver": "remote_no_receiver",
@@ -5558,10 +5548,10 @@ def _receiving_observation(
     if failure == "no_local_receiver":
         return _receiving_unknown(
             "no_local_receiver",
-            "no live local receiver owns the recorded target generation; run "
-            "`cross-agent-chat status` on the receiving Mac, or ask again with "
-            "that receiver's exact remote handle (status --recipient or the "
-            "chat_status recipient argument)",
+            "no live local receiver owns the recorded target generation; inspect "
+            "with that receiver's exact matching remote handle (status --recipient "
+            "or the chat_status recipient argument), or "
+            f"{_RECEIVER_CHECK_ACTION}",
         )
     if failure == "helper_binding_ambiguous":
         return _receiving_unknown(
@@ -5626,15 +5616,14 @@ def _remote_receiving_observation(intent: Intent, recipient: str) -> dict[str, o
         return _receiving_unknown(
             "remote_unavailable",
             "Tailscale is unavailable, so the recipient node cannot be resolved; "
-            "run `cross-agent-chat status` on the receiving Mac",
+            f"{_RECEIVER_CHECK_ACTION}",
         )
     address = identity.peers.get(token.node_id)
     if address is None:
         return _receiving_unknown(
             "remote_node_unavailable",
             "the node that presented the recorded recipient is not currently "
-            "online on the tailnet; run `cross-agent-chat status` on the "
-            "receiving Mac",
+            f"online on the tailnet; {_RECEIVER_CHECK_ACTION}",
         )
     try:
         response = request_tailnet(
@@ -5652,8 +5641,8 @@ def _remote_receiving_observation(intent: Intent, recipient: str) -> dict[str, o
         return _receiving_unknown(
             "remote_broker_unavailable",
             "the recipient node's broker did not answer one bounded inspect; it "
-            "may be offline, at capacity, or older than this operation; run "
-            "`cross-agent-chat status` on the receiving Mac",
+            "may be offline, at capacity, or older than this operation; "
+            f"{_RECEIVER_CHECK_ACTION}",
         )
     base = {"schema_version", "status", "event_id", "observer"}
     observed = base | {"event_state", "courier_version", "courier_incarnation"}
@@ -5686,8 +5675,8 @@ def _remote_receiving_observation(intent: Intent, recipient: str) -> dict[str, o
     ):
         return _receiving_unknown(
             "remote_observation_invalid",
-            "the recipient node's answer was not a valid inspect response; run "
-            "`cross-agent-chat status` on the receiving Mac",
+            "the recipient node's answer was not a valid inspect response; "
+            f"{_RECEIVER_CHECK_ACTION}",
         )
     if observer == "none":
         reason = cast(str, response["reason"])
