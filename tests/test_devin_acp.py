@@ -684,3 +684,57 @@ def test_desktop_clears_running_state_when_acknowledged_prompt_cannot_be_submitt
     assert _host_status(w.host.recv()) == "working"
     assert _host_status(w.host.recv()) == "idle"
     assert w.engine.quiet()  # A display update is never evidence of engine admission.
+
+
+def test_failed_peer_admission_settles_queued_human_without_phantom_activity(wired: Wired) -> None:
+    w = wired
+    _desktop_initialize(w)
+    _new_session(w, "sess-alpha1")
+    entered, release = threading.Event(), threading.Event()
+
+    def claimed_then_closed(
+        session_id: str, still_open: Callable[[], bool]
+    ) -> tuple[str, str] | None:
+        assert session_id == "sess-alpha1" and still_open()
+        entered.set()
+        assert release.wait(5)
+        w.mediator.close()
+        return EVENT, "already acknowledged"
+
+    w.inbox.take = claimed_then_closed  # type: ignore[method-assign]
+    worker = threading.Thread(target=w.mediator.deliver_once, daemon=True)
+    worker.start()
+    assert entered.wait(5)
+    w.host.send(_prompt("sess-alpha1", "waiting-human"))
+    assert w.engine.quiet()  # The human prompt has queued behind the active claim.
+    release.set()
+    frames = [w.host.recv() for _ in range(3)]
+    assert [_host_status(frame) for frame in frames if "method" in frame] == ["working", "idle"]
+    assert {
+        "jsonrpc": "2.0",
+        "id": "waiting-human",
+        "result": {"stopReason": "cancelled"},
+    } in frames
+    assert w.engine.quiet()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert w.mediator._sessions["sess-alpha1"].host_prompts == set()
+
+
+@pytest.mark.parametrize("method", ["session/prompt", "session/list"])
+def test_closed_engine_refuses_new_host_requests_without_pending_activity(
+    wired: Wired, method: str
+) -> None:
+    w = wired
+    _new_session(w, "sess-alpha1")
+    w.mediator.close()
+    request = _prompt("sess-alpha1", "late-host")
+    request["method"] = method
+    w.host.send(request)
+    response = w.host.recv()
+    assert response["id"] == "late-host"
+    error = cast(dict[str, object], response["error"])
+    assert error["message"] == "the engine input is closed; nothing submitted"
+    assert w.mediator._pending == {}
+    assert w.mediator._sessions["sess-alpha1"].host_prompts == set()
+    assert w.engine.quiet()

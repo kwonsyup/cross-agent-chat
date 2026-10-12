@@ -716,3 +716,20 @@ def test_sigterm_during_initialization_still_reaps_the_owned_engine(tmp_path: Pa
         _assert_dead(pid)
     finally:
         _finish(proc, pid)
+
+
+def test_termination_during_eof_cleanup_cannot_bypass_engine_reaping(tmp_path: Path) -> None:
+    proc = _adapter_process(tmp_path, _stubborn_engine(tmp_path))
+    pid = _engine_pid(tmp_path / "engine.pid")
+    try:
+        assert proc.stdin is not None
+        proc.stdin.close()
+        time.sleep(0.5)  # EOF has entered teardown with a drained writer/live engine.
+        proc.terminate()
+        time.sleep(0.2)
+        if proc.poll() is None:
+            proc.terminate()  # Repeated termination must not unwind escalation either.
+        assert proc.wait(timeout=30) == 1
+        _assert_dead(pid)
+    finally:
+        _finish(proc, pid)

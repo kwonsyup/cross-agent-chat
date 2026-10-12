@@ -427,8 +427,11 @@ class Mediator:
                         }
                 else:
                     internal = self._allocate(_Pending("host", frame["id"], method, session_id))
-                    session.host_prompts.add(internal)
-                    self._to_engine({**frame, "id": internal})
+                    if self._to_engine({**frame, "id": internal}):
+                        session.host_prompts.add(internal)
+                    else:
+                        self._pending.pop(internal, None)
+                        refusal = self._admission_refusal(frame["id"])
             else:
                 internal = self._allocate(_Pending("host", frame["id"], method, session_id))
                 remapped = {**frame, "id": internal}
@@ -439,8 +442,9 @@ class Mediator:
                         # the close follows whatever that claim submits.
                         session.deferred.append(remapped)
                         remapped = {}
-                if remapped:
-                    self._to_engine(remapped)
+                if remapped and not self._to_engine(remapped):
+                    self._pending.pop(internal, None)
+                    refusal = self._admission_refusal(frame["id"])
         if refusal is not None:
             self._to_host(refusal)
 
@@ -575,15 +579,27 @@ class Mediator:
             },
         }
 
-    def _due(self, session_id: str, session: _Session) -> None:
-        """Submit the oldest waiting host prompt once the session is free."""
+    @staticmethod
+    def _admission_refusal(request_id: object) -> Frame:
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32000, "message": "the engine input is closed; nothing submitted"},
+        }
 
-        if session.busy() or not session.queued:
-            return
-        frame = session.queued.popleft()
-        internal = self._allocate(_Pending("host", frame["id"], "session/prompt", session_id))
-        session.host_prompts.add(internal)
-        self._to_engine({**frame, "id": internal})
+    def _due(self, session_id: str, session: _Session) -> None:
+        """Promote waiting prompts only when engine admission succeeds."""
+
+        while not session.busy() and session.queued:
+            frame = session.queued.popleft()
+            internal = self._allocate(_Pending("host", frame["id"], "session/prompt", session_id))
+            if self._to_engine({**frame, "id": internal}):
+                session.host_prompts.add(internal)
+            else:
+                self._pending.pop(internal, None)
+                # This waiting request never reached the engine. Settle every
+                # such request without manufacturing an active human turn.
+                self._to_host(_cancelled(frame["id"]))
 
     # -- CAC delivery ------------------------------------------------------
 
@@ -856,7 +872,7 @@ def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[s
 
     # Cover initialization too: a host may terminate before sessions or the
     # mediator exist, but the owned engine must still leave through finally.
-    signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(143))
+    previous_term = signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(143))
     try:
         engine = subprocess.Popen(
             [str(binary), "acp", *args],
@@ -904,20 +920,34 @@ def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[s
         # is the teardown in the finally clause.
         mediator.stopped().wait()
     finally:
-        if mediator is not None:
-            mediator.close()
-            # Stop publication first so no renewal can fire afterwards, then
-            # remove the record serialized with any publish already in flight.
-            # A wedged publisher cannot stall teardown: the lease bounds what
-            # an unsynchronized removal can leave behind.
-            if not mediator.invalidate_sessions(remove_attestation, ENGINE_EXIT_GRACE_SECONDS):
-                remove_attestation()
-        else:
-            remove_attestation()
-        # Whatever happened above, the owned child leaves with this process.
-        code = (
-            _stop_owned_engine(mediator, engine, diagnostic=diagnostic) if engine is not None else 1
-        )
+        # A second termination/interrupt must not unwind kill/reap already in
+        # progress. These handlers are local to this adapter's teardown only.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        previous_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            try:
+                if mediator is not None:
+                    mediator.close()
+                    # Stop publication first so no renewal can fire afterwards, then
+                    # remove the record serialized with any publish already in flight.
+                    # A wedged publisher cannot stall teardown: the lease bounds what
+                    # an unsynchronized removal can leave behind.
+                    if not mediator.invalidate_sessions(
+                        remove_attestation, ENGINE_EXIT_GRACE_SECONDS
+                    ):
+                        remove_attestation()
+                else:
+                    remove_attestation()
+            finally:
+                # Whatever happened above, the owned child leaves with this process.
+                code = (
+                    _stop_owned_engine(mediator, engine, diagnostic=diagnostic)
+                    if engine is not None
+                    else 1
+                )
+        finally:
+            signal.signal(signal.SIGTERM, previous_term)
+            signal.signal(signal.SIGINT, previous_int)
     return code
 
 
