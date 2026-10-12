@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 
+from cross_agent_chat import __version__
 from cross_agent_chat.codex import (
     CodexCourier,
     deliver_at_stop,
@@ -376,7 +377,7 @@ with open(os.environ["TEST_TRACE"], "a", buffering=1) as trace:
             "id": 0,
             "method": "initialize",
             "params": {
-                "clientInfo": {"name": "cross-agent-chat", "version": "0.5.5"},
+                "clientInfo": {"name": "cross-agent-chat", "version": __version__},
                 "capabilities": {"experimentalApi": True},
             },
         }
@@ -518,6 +519,17 @@ def test_queue_is_idempotent_for_exact_repeats_and_rejects_conflicts() -> None:
     courier.accept(str(uuid4()), "two")
     with pytest.raises(ChatError, match="full"):
         courier.accept(str(uuid4()), "three")
+
+
+def test_devin_queue_full_names_its_provider_without_admitting_the_message() -> None:
+    courier = CodexCourier(
+        alias="devin@studio:api:sess-alpha1", generation=str(uuid4()), capacity=1, provider="devin"
+    )
+    first, refused = str(uuid4()), str(uuid4())
+    courier.accept(first, "accepted")
+    with pytest.raises(ChatError, match=r"^Devin courier queue is full$"):
+        courier.accept(refused, "refused")
+    assert courier.peek() == [{"event_id": first, "message": "accepted"}]
 
 
 def test_native_queue_hides_body_only_for_helper_lineage(monkeypatch: pytest.MonkeyPatch) -> None:

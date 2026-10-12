@@ -96,6 +96,7 @@ from cross_agent_chat.devin import (
     DevinCurrentBoundary,
     DevinHookEvent,
     DevinSubagentStore,
+    acp_host_observed,
     build_post_tool_callback_payload,
     build_pretool_callback,
     build_stop_callback_payload,
@@ -224,6 +225,7 @@ DeliveryMode = Literal[
     "codex_daemon_input",
     "devin_stop_or_prompt_bound",
     "devin_tool_boundary",
+    "devin_acp_hosted",
 ]
 DeliveryMechanism = Literal[
     "claude_native",
@@ -233,12 +235,14 @@ DeliveryMechanism = Literal[
     "stop_bound",
     "devin_prompt_bound",
     "devin_tool_boundary",
+    "devin_acp_host",
 ]
 DELIVERY_MECHANISMS: Final = frozenset(
     {
         "claude_native",
         "devin_prompt_bound",
         "devin_tool_boundary",
+        "devin_acp_host",
         "direct_queue",
         "native_helper",
         "stop_bound",
@@ -688,6 +692,7 @@ class Target:
         include_title: bool = True,
         include_owning_daemon: bool = False,
         include_devin_tool_boundary: bool = False,
+        include_devin_acp_host: bool = False,
         include_current_boundary: bool = False,
     ) -> dict[str, str]:
         result = {
@@ -706,6 +711,14 @@ class Target:
         mode, mechanism = self.delivery_mode, self.delivery_mechanism
         if mode == "codex_daemon_input" and not include_owning_daemon:
             mode, mechanism = "codex_stop_bound", "stop_bound"
+        if mode == "devin_acp_hosted" and not include_devin_acp_host:
+            # Fall back to the strongest older layer this route has evidence
+            # for: the tool boundary only when its hook was observed.
+            mode, mechanism = (
+                ("devin_tool_boundary", "devin_tool_boundary")
+                if mechanism == "devin_tool_boundary"
+                else ("devin_stop_or_prompt_bound", "devin_prompt_bound")
+            )
         if mode == "devin_tool_boundary" and not include_devin_tool_boundary:
             mode, mechanism = "devin_stop_or_prompt_bound", "devin_prompt_bound"
         if include_delivery_mode:
@@ -2011,7 +2024,8 @@ FORWARDABLE_PRE_EFFECT_REASONS: Final = frozenset(
         COURIER_BUSY_PRE_EFFECT_REASON,
         COURIER_STOPPED_PRE_EFFECT_REASON,
         "Codex courier is unavailable",
-        "Codex courier queue is full",
+        "Codex courier queue is full",  # Older receivers used this for every provider.
+        "Devin courier queue is full",
         "Codex native queue is unavailable",
         "Codex native queue response exceeds the bounded limit",
         "Codex native queue profile changed",
@@ -2125,6 +2139,8 @@ def courier_health(
     daemon_ingress: CodexDaemonIngress | None = None,
     include_devin_tool_boundary: bool = False,
     devin_tool_boundary_observed: bool = False,
+    include_devin_acp_host: bool = False,
+    devin_acp_host_observed: bool = False,
     include_current_boundary: bool = False,
     devin_current_boundary: DevinCurrentBoundary | None = None,
 ) -> dict[str, object]:
@@ -2166,6 +2182,16 @@ def courier_health(
             response["delivery_mode"] = "devin_tool_boundary"
         if include_delivery_mechanism:
             response["delivery_mechanism"] = "devin_tool_boundary"
+    if route.provider == "devin" and include_devin_acp_host and devin_acp_host_observed:
+        # Affirmed only while a live CAC ACP adapter relays this exact
+        # session; an older reader never sends the flag. The mechanism keeps
+        # the tool-boundary evidence, which alone qualifies active-turn input.
+        if include_delivery_mode:
+            response["delivery_mode"] = "devin_acp_hosted"
+        if include_delivery_mechanism:
+            response["delivery_mechanism"] = (
+                "devin_tool_boundary" if devin_tool_boundary_observed else "devin_acp_host"
+            )
     if (
         include_current_boundary
         and route.provider == "devin"
@@ -2428,6 +2454,12 @@ def courier_server(
                                 devin_tool_boundary_observed=(
                                     route.provider == "devin"
                                     and devin_tool_boundary_path(root, route).exists()
+                                ),
+                                include_devin_acp_host=(
+                                    request.get("include_devin_acp_host") is True
+                                ),
+                                devin_acp_host_observed=(
+                                    route.provider == "devin" and acp_host_observed(root, route)
                                 ),
                                 include_current_boundary=(
                                     request.get("include_current_boundary") is True
@@ -2742,6 +2774,7 @@ def _local_target(
                 "include_delivery_mechanism": True,
                 "include_owning_daemon": True,
                 "include_devin_tool_boundary": True,
+                "include_devin_acp_host": True,
                 "include_current_boundary": True,
             },
             timeout=timeout,
@@ -2775,6 +2808,7 @@ def _local_target(
                 "codex_daemon_input",
                 "devin_stop_or_prompt_bound",
                 "devin_tool_boundary",
+                "devin_acp_hosted",
             }
         )
         or (observed_mechanism is not None and observed_mechanism not in DELIVERY_MECHANISMS)
@@ -2945,6 +2979,7 @@ def _targets_from_tailnet(
     include_title: bool = False,
     include_owning_daemon: bool = False,
     include_devin_tool_boundary: bool = False,
+    include_devin_acp_host: bool = False,
     include_current_boundary: bool = False,
     include_devin: bool = False,
     include_external: bool = False,
@@ -3007,6 +3042,7 @@ def _targets_from_tailnet(
                     }
                     | ({"codex_daemon_input"} if include_owning_daemon else set())
                     | ({"devin_tool_boundary"} if include_devin_tool_boundary else set())
+                    | ({"devin_acp_hosted"} if include_devin_acp_host else set())
                 )
             )
         ):
@@ -3017,6 +3053,7 @@ def _targets_from_tailnet(
             not isinstance(observed_mechanism, str)
             or observed_mechanism not in DELIVERY_MECHANISMS | {"unknown"}
             or (observed_mechanism == "devin_tool_boundary" and not include_devin_tool_boundary)
+            or (observed_mechanism == "devin_acp_host" and not include_devin_acp_host)
         ):
             raise ChatError("Tailnet peer returned invalid discovery")
         title = item.get("title")
@@ -3121,10 +3158,17 @@ def _remote_node_targets(
         # The newest boundary flag rides only on shapes that already carry the
         # tool-boundary flag it layers onto: a broker that understands it
         # necessarily understands the older layer, so no extra refusal probe
-        # is spent on unreachable combinations.
+        # is spent on unreachable combinations. The ACP-host flag layers the
+        # same way on top of the tool-boundary shapes.
         tool_boundary_variants: list[tuple[dict[str, object], bool]] = []
         for shape, _ in mechanism_variants:
             with_tool_boundary = {**shape, "include_devin_tool_boundary": True}
+            with_acp_host = {**with_tool_boundary, "include_devin_acp_host": True}
+            if include_current_boundary:
+                tool_boundary_variants.append(
+                    ({**with_acp_host, "include_current_boundary": True}, True)
+                )
+            tool_boundary_variants.append((with_acp_host, True))
             if include_current_boundary:
                 tool_boundary_variants.append(
                     ({**with_tool_boundary, "include_current_boundary": True}, True)
@@ -3136,6 +3180,7 @@ def _remote_node_targets(
     mechanism_negotiated = False
     owning_negotiated = False
     tool_boundary_negotiated = False
+    acp_host_negotiated = False
     boundary_negotiated = False
     external_negotiated = False
     capacity_refused = False
@@ -3192,6 +3237,7 @@ def _remote_node_targets(
                     if "include_devin_tool_boundary" in payload
                     else {}
                 ),
+                **({"include_devin_acp_host": True} if "include_devin_acp_host" in payload else {}),
                 **(
                     {"include_current_boundary": True}
                     if "include_current_boundary" in payload
@@ -3204,6 +3250,7 @@ def _remote_node_targets(
             mechanism_negotiated = "include_delivery_mechanism" in payload
             owning_negotiated = "include_owning_daemon" in payload
             tool_boundary_negotiated = "include_devin_tool_boundary" in payload
+            acp_host_negotiated = "include_devin_acp_host" in payload
             boundary_negotiated = "include_current_boundary" in payload
             break
         except (ChatError, UnknownDeliveryError):
@@ -3229,6 +3276,8 @@ def _remote_node_targets(
             rich_payload["include_owning_daemon"] = True
         if tool_boundary_negotiated:
             rich_payload["include_devin_tool_boundary"] = True
+        if acp_host_negotiated:
+            rich_payload["include_devin_acp_host"] = True
         if boundary_negotiated:
             rich_payload["include_current_boundary"] = True
         if include_devin:
@@ -3250,6 +3299,7 @@ def _remote_node_targets(
             include_title=True,
             **({"include_owning_daemon": True} if owning_negotiated else {}),
             **({"include_devin_tool_boundary": True} if tool_boundary_negotiated else {}),
+            **({"include_devin_acp_host": True} if acp_host_negotiated else {}),
             **({"include_current_boundary": True} if boundary_negotiated else {}),
             include_devin=include_devin,
             **_external_option(external_negotiated),
@@ -3620,10 +3670,19 @@ def _receiving_qualification(
     queue acceptance says nothing about when the original session can act.
     """
     owning_daemon = mode == "codex_daemon_input" and mechanism == "owning_daemon"
+    acp_hosted = mode == "devin_acp_hosted" and mechanism in {
+        "devin_acp_host",
+        "devin_tool_boundary",
+    }
     tool_boundary = mode == "devin_tool_boundary" and mechanism == "devin_tool_boundary"
     deferred = mode in {"codex_stop_bound", "devin_stop_or_prompt_bound"}
     if owning_daemon:
         return True, True, "while_idle"
+    if acp_hosted:
+        # The live CAC adapter submits a queued CAC message as a native
+        # prompt while the engine idles. Active-turn input additionally needs
+        # the session's observed root tool-boundary hook.
+        return True, mechanism == "devin_tool_boundary", "while_idle"
     if tool_boundary:
         # The Devin tool hook can only inject after a tool call inside a turn
         # that is already running; it never wakes a parked conversation.
@@ -3648,7 +3707,11 @@ def destination_receiving(target: Target | None) -> dict[str, object]:
     A Devin route reports active-turn input only as the negotiated
     ``devin_tool_boundary`` mode, which its receiver affirms after its loaded
     session ran the tool hook; the legacy Devin mode stays deferred. Neither
-    wakes an idle Devin conversation. When the receiver also negotiated its
+    wakes an idle Devin conversation. A Devin route whose exact engine is
+    owned by a live CAC ACP adapter reports ``devin_acp_hosted`` instead: the
+    adapter submits a queued message as a native prompt while the engine
+    idles, so parked wake and a while-idle reply are additionally qualified.
+    When the receiver also negotiated its
     content-free current restriction, ``current_boundary`` discloses it and a
     hold narrows active-turn input to what the restriction actually permits.
     """
@@ -3957,7 +4020,7 @@ def _send_remote_token_target(
         raise ChatError("local Tailscale node identity is unavailable")
     # The token asks only the node that verifiably presented its handle; an
     # unrelated node is never fanned out to and cannot hold the send hostage.
-    attested, _node_complete = _remote_node_targets(
+    attested, node_complete = _remote_node_targets(
         address,
         min(time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS, deadline),
         include_delivery_mode=True,
@@ -3974,10 +4037,13 @@ def _send_remote_token_target(
         if target.session_key == token.handle and target.generation == token.generation
     ]
     if len(claimants) != 1:
+        reason = (
+            "recipient is unavailable or changed"
+            if node_complete
+            else "the selected recipient could not be verified"
+        )
         raise ChatError(
-            "recipient is unavailable or changed; "
-            + ("external recipients require an external-aware broker; " if include_external else "")
-            + "call chat_peers and choose the recipient again"
+            f"{reason}; nothing was delivered; call chat_peers and choose the recipient again"
         )
     return _send_remote_target(
         root,
@@ -4671,6 +4737,7 @@ def peers(
     include_title: bool = False,
     include_owning_daemon: bool = False,
     include_devin_tool_boundary: bool = False,
+    include_devin_acp_host: bool = False,
     include_current_boundary: bool = False,
     include_devin: bool = True,
     include_external: bool = False,
@@ -4746,6 +4813,7 @@ def peers(
             include_title=not internal or include_title,
             include_owning_daemon=not internal or include_owning_daemon,
             include_devin_tool_boundary=not internal or include_devin_tool_boundary,
+            include_devin_acp_host=not internal or include_devin_acp_host,
             include_current_boundary=not internal or include_current_boundary,
         )
         if internal:
@@ -4853,7 +4921,9 @@ def reply_delivery(root: Path, source: SourceIdentity) -> ReplyDelivery:
     only at its next turn boundary: the end
     of the current turn if it has already arrived, otherwise the user's next prompt.
     A Devin route also receives it at the next tool boundary of an active turn, but
-    an idle Devin conversation waits for the user's next prompt. An unreachable,
+    an idle Devin conversation waits for the user's next prompt -- unless a live
+    CAC ACP adapter owns the exact engine, in which case the adapter submits a
+    queued reply as a native prompt while it idles. An unreachable,
     busy, or unrecognized courier reports unknown.
     Callers ask before sending: a slow or failing check must never turn an accepted
     send into an apparent failure that invites a resend.
@@ -4864,8 +4934,12 @@ def reply_delivery(root: Path, source: SourceIdentity) -> ReplyDelivery:
         mode: str | None = "claude_native_cross_session"
         mechanism: str | None = "claude_native"
     elif source.provider == "devin":
-        mode = "devin_stop_or_prompt_bound"
-        mechanism = "devin_prompt_bound"
+        if acp_host_observed(root, source):
+            mode = "devin_acp_hosted"
+            mechanism = "devin_acp_host"
+        else:
+            mode = "devin_stop_or_prompt_bound"
+            mechanism = "devin_prompt_bound"
     else:
         mechanism = None
         try:

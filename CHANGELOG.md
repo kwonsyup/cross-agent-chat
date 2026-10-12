@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.5.6 - 2026-10-11
+
+- New Devin receiving mode for conversations started in Devin Desktop through
+  a CAC ACP agent entry (`cross-agent-chat devin-acp-registry add`). The
+  `cross-agent-chat devin-acp` agent command launches the native `devin acp`
+  with the user's own login, model, permissions and hooks, and when a root
+  session is idle it acknowledges one queued CAC message for that exact route
+  and submits it as a native prompt, echoed in the conversation. Host prompts
+  that arrive meanwhile wait for the peer turn's real completion (at most four
+  wait); direct host cancellation cancels the peer turn, and closing the session
+  answers every waiting prompt. Every engine-bound frame is written in the
+  order it was decided, so a cancel never overtakes a prompt. Host request ids
+  are remapped so peer prompts and permission replies never cross. Message
+  bodies are not stored; nothing is retried.
+- Peers negotiate the new `devin_acp_hosted` / `devin_acp_host` mode with
+  `include_devin_acp_host`, reported only while a live adapter is the attested
+  parent of the route's engine and relays that exact session. It qualifies
+  parked wake and a `while_idle` reply; active-turn input additionally needs the
+  session's observed tool-boundary hook (mechanism `devin_tool_boundary`
+  instead of `devin_acp_host`). Older readers keep seeing the tool-boundary or
+  legacy Devin mode they have evidence for. A Devin sender in this mode reports `reply_delivery: while_idle`.
+- Bound every engine-shutdown wait with termination/kill/reap escalation and
+  an interruptible ordered pipe writer; startup failures also reap the owned
+  child. Current session membership renews every 10 seconds under its existing
+  lock and expires after 45 seconds if filesystem invalidation fails.
+- For the Desktop v1 host, project existing peer-turn activity through its
+  supported session metadata, including completion and failed submission;
+  a promoted human turn is not cleared by the previous peer completion.
+- Report a retained unused Devin sender grant that expires during approval as
+  an explicit pre-effect tool refusal, preserving the 120-second expiry guard.
+  Missing/already-consumed grants retain uncertainty; an absent event ID is
+  never permission to replay an earlier invocation.
+- Qualified 11 Oct 2026 (Apple silicon): Devin Desktop branded app 3.10.48
+  (editor core 1.126.0; bundled CLI 3000.10.48) hosting CLI 3000.11.3 completed useful idle round trips with a Codex CLI 0.162.1
+  owning-daemon original and a Claude Code 2.1.296 original, both receiving
+  ends idle. Peer turns show Working / In progress and direct Cancel with an
+  empty composer; clicking Cancel returned native `stopReason: cancelled`.
+  Already admitted tool effects are not undone. Ordinary native permission
+  approval and denial were exercised; denial caused no alternate route.
+  Already-running ordinary Devin CLI and built-in Desktop originals
+  still have no supported idle inlet; #38 stays open.
+- Exact remote refusals distinguish unavailable/changed identity from an
+  incomplete verification and explicitly report that nothing was delivered.
+  Native targets no longer get an unsupported external-broker hint. Full
+  courier queues identify their actual provider; older broker wording remains
+  a recognized pre-effect refusal.
+- Host restart restores receiving only after registration for new tasks;
+  volatile pending bodies do not survive courier exit. Earlier accepted or
+  unknown events must not be replayed.
+
 ## 0.5.5 - 2026-10-11
 
 - Keep receiving and reply timing on the same qualification basis. Generic

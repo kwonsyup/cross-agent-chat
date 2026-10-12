@@ -365,8 +365,9 @@ def test_a_stale_token_is_replaced_only_by_a_fresh_listing(
     assert deliveries == [OWNER]
 
 
+@pytest.mark.parametrize("include_external", [False, True])
 def test_the_selected_node_not_claiming_refuses_before_any_effect(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, include_external: bool
 ) -> None:
     """The token's node answers but no longer presents the handle: refuse."""
     handle = session_key("claude", str(uuid4()))
@@ -392,8 +393,14 @@ def test_the_selected_node_not_claiming_refuses_before_any_effect(
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
-        send(tmp_path, source, remote_token(OWNER_NODE, handle, str(uuid4())), "hello")
+    with pytest.raises(ChatError, match="unavailable or changed; nothing was delivered"):
+        send(
+            tmp_path,
+            source,
+            remote_token(OWNER_NODE, handle, str(uuid4())),
+            "hello",
+            include_external=include_external,
+        )
 
     assert not (tmp_path / "intents.json").exists()
     # Only the selected node was asked; there is no unrelated-node fallback.
@@ -598,7 +605,13 @@ def test_the_handle_probe_falls_back_to_the_legacy_roster(
         "include_delivery_mechanism": True,
         "include_owning_daemon": True,
     }
-    assert calls[:4] == [
+    acp = {
+        "include_devin_tool_boundary": True,
+        "include_devin_acp_host": True,
+    }
+    assert calls[:6] == [
+        {**negotiated, "handle": handle, **acp, "include_current_boundary": True},
+        {**negotiated, "handle": handle, **acp},
         {
             **negotiated,
             "handle": handle,
@@ -607,13 +620,9 @@ def test_the_handle_probe_falls_back_to_the_legacy_roster(
         },
         {**negotiated, "handle": handle, "include_devin_tool_boundary": True},
         {**negotiated, "handle": handle},
-        {
-            **negotiated,
-            "include_devin_tool_boundary": True,
-            "include_current_boundary": True,
-        },
+        {**negotiated, **acp, "include_current_boundary": True},
     ]
-    assert calls[4].get("operation") == "receive"
+    assert calls[6].get("operation") == "receive"
 
 
 def test_a_seeded_recipients_file_has_no_routing_influence(
@@ -1019,13 +1028,19 @@ def test_wire_request_and_response_key_sets_are_unchanged(
     }
     tool_boundary = negotiated | {"include_devin_tool_boundary"}
     boundary = tool_boundary | {"include_current_boundary"}
+    acp_host = tool_boundary | {"include_devin_acp_host"}
+    acp_boundary = boundary | {"include_devin_acp_host"}
     assert all(
         set(payload)
         in (
+            {"schema_version", "operation", "handle", "include_devin"} | acp_boundary,
+            {"schema_version", "operation", "handle", "include_devin"} | acp_host,
             {"schema_version", "operation", "handle", "include_devin"} | boundary,
             {"schema_version", "operation", "handle", "include_devin"} | tool_boundary,
             {"schema_version", "operation", "handle", "include_devin"} | negotiated,
             {"schema_version", "operation", "handle", "include_devin"},
+            {"schema_version", "operation", "include_devin"} | acp_boundary,
+            {"schema_version", "operation", "include_devin"} | acp_host,
             {"schema_version", "operation", "include_devin"} | boundary,
             {"schema_version", "operation", "include_devin"} | tool_boundary,
             {"schema_version", "operation", "include_devin"} | negotiated,

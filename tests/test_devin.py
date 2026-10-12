@@ -1749,3 +1749,43 @@ def test_devin_post_tool_callback_preserves_exact_source_at_the_core_limit(
         build_post_tool_callback_payload(event_id, "x" * (MAX_MESSAGE_BYTES + 1))
     with pytest.raises(ChatError, match="event id is invalid"):
         build_post_tool_callback_payload("bad", "x")
+
+
+@pytest.mark.parametrize("previously_consumed", [False, True])
+def test_delayed_send_approval_distinguishes_unused_expiry_from_possible_prior_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, previously_consumed: bool
+) -> None:
+    from cross_agent_chat import cli
+    from cross_agent_chat.core import Route
+
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="devin", session_id="sess-approval1", device="fixture", cwd=str(tmp_path), pid=123
+    )
+    clock = [100.0]
+    monkeypatch.setattr("cross_agent_chat.devin.time.time", lambda: clock[0])
+    arguments: dict[str, object] = {"to": "fixture-peer", "message": "new fixture request"}
+    store = DevinCapabilityStore(root)
+    token = store.issue(route, prompt_id=str(uuid4()), tool_name="chat_send", arguments=arguments)
+    if previously_consumed:
+        store.consume(token, tool_name="chat_send", arguments=arguments)
+    clock[0] += DEVIN_CAPABILITY_TTL_SECONDS + 1
+    monkeypatch.setattr(
+        cli, "send", lambda *_args, **_kwargs: pytest.fail("expired auth reached send")
+    )
+    request: dict[str, object] = {
+        "name": "chat_send",
+        "arguments": {**arguments, DEVIN_CAPABILITY_FIELD: token},
+    }
+    if previously_consumed:
+        with pytest.raises(ChatError, match="unavailable") as caught:
+            cli._mcp_call_tool("devin", root, request)
+        assert "nothing was delivered" not in str(caught.value)
+    else:
+        result = cli._mcp_call_tool("devin", root, request)
+        assert result["isError"] is True
+        content = cast(list[dict[str, object]], result["content"])
+        assert "expired before use" in str(content[0]["text"])
+        assert "nothing was delivered" in str(content[0]["text"])
+        # The expiry guard remains real; extending/removing it cannot satisfy this test.
+        assert len(store.capabilities()) == 1
