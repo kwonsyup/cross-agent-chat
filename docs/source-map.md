@@ -224,7 +224,11 @@ busy/Stop for peer turns. The current mediator projects its existing prompt
 lifecycle through that Desktop v1 consumer's notification-level
 `cognition.ai/session` metadata, allowing direct `session/cancel` without a
 synthetic human prompt. Other client names or protocol versions receive no
-Desktop status projection; no unnegotiated v2 `state_update` is sent.
+Desktop status projection; no unnegotiated v2 `state_update` is sent. The
+current live Desktop qualification observed Working / In progress and direct
+Cancel with an empty composer, followed by native `stopReason: cancelled`;
+already admitted tool effects can still complete. The branded app was 3.10.48,
+editor core 1.126.0, bundled CLI 3000.10.48, and hosted CLI 3000.11.3.
 
 The adapter renews the private current nonclosing-session membership every
 10 seconds. Process birth and parentage checks remain load-bearing; a 45-second

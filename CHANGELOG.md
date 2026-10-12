@@ -9,7 +9,7 @@
   session is idle it acknowledges one queued CAC message for that exact route
   and submits it as a native prompt, echoed in the conversation. Host prompts
   that arrive meanwhile wait for the peer turn's real completion (at most four
-  wait); Stop on such a prompt cancels the peer turn, and closing the session
+  wait); direct host cancellation cancels the peer turn, and closing the session
   answers every waiting prompt. Every engine-bound frame is written in the
   order it was decided, so a cancel never overtakes a prompt. Host request ids
   are remapped so peer prompts and permission replies never cross. Message
@@ -32,11 +32,14 @@
   an explicit pre-effect tool refusal, preserving the 120-second expiry guard.
   Missing/already-consumed grants retain uncertainty; an absent event ID is
   never permission to replay an earlier invocation.
-- Qualified 11 Oct 2026 (Apple silicon): Devin Desktop 3.10.48
-  (bundled CLI 3000.10.48) hosting CLI 3000.11.3 completed useful idle round trips with a Codex CLI 0.162.1
+- Qualified 11 Oct 2026 (Apple silicon): Devin Desktop branded app 3.10.48
+  (editor core 1.126.0; bundled CLI 3000.10.48) hosting CLI 3000.11.3 completed useful idle round trips with a Codex CLI 0.162.1
   owning-daemon original and a Claude Code 2.1.296 original, both receiving
-  ends idle. Desktop does not show a peer-started turn as busy or offer Stop
-  for it. Already-running ordinary Devin CLI and built-in Desktop originals
+  ends idle. Peer turns show Working / In progress and direct Cancel with an
+  empty composer; clicking Cancel returned native `stopReason: cancelled`.
+  Already admitted tool effects are not undone. Ordinary native permission
+  approval and denial were exercised; denial caused no alternate route.
+  Already-running ordinary Devin CLI and built-in Desktop originals
   still have no supported idle inlet; #38 stays open.
 - Exact remote refusals distinguish unavailable/changed identity from an
   incomplete verification and explicitly report that nothing was delivered.
