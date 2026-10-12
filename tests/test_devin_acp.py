@@ -585,3 +585,102 @@ def test_a_stalled_engine_bounds_queued_input(
     monkeypatch.setattr(devin_acp, "ENGINE_QUEUE_MAX_BYTES", 0)
     wired.host.send({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {}})
     assert wired.mediator.stopped().wait(5)
+
+
+def _desktop_initialize(w: Wired, *, name: str = "windsurf", version: int = 1) -> None:
+    w.host.send(
+        {
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize",
+            "params": {"protocolVersion": version, "clientInfo": {"name": name}},
+        }
+    )
+    request = w.engine.recv()
+    w.engine.send({"jsonrpc": "2.0", "id": request["id"], "result": {"protocolVersion": version}})
+    assert w.host.recv()["id"] == "init"
+
+
+def _host_status(frame: Frame) -> object:
+    params = cast(dict[str, object], frame["params"])
+    meta = cast(dict[str, object], params.get("_meta", {}))
+    return cast(dict[str, object], meta.get("cognition.ai/session", {})).get(
+        "cognition.ai/statusEnum"
+    )
+
+
+def test_desktop_peer_turn_exposes_running_state_and_direct_cancel(wired: Wired) -> None:
+    w = wired
+    _desktop_initialize(w)
+    _new_session(w, "sess-alpha1")
+    w.inbox.pending["sess-alpha1"] = [(EVENT, "new harmless task")]
+    echo, prompt = _deliver(w)
+    assert _host_status(echo) == "working"
+    cancel: Frame = {
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": "sess-alpha1"},
+    }
+    w.host.send(cancel)
+    assert w.engine.recv() == cancel  # No human prompt needed to expose or forward Stop.
+    w.engine.send(_end(prompt, "cancelled"))
+    finished = w.host.recv()
+    assert _host_status(finished) == "idle"
+    assert (
+        cast(dict[str, object], cast(dict[str, object], finished["params"])["update"])[
+            "sessionUpdate"
+        ]
+        == "session_info_update"
+    )
+    assert w.host.quiet() and w.engine.quiet()
+
+
+def test_peer_completion_does_not_clear_a_promoted_human_turn(wired: Wired) -> None:
+    w = wired
+    _desktop_initialize(w)
+    _new_session(w, "sess-alpha1")
+    w.inbox.pending["sess-alpha1"] = [(EVENT, "new harmless task")]
+    _echo, peer = _deliver(w)
+    w.host.send(_prompt("sess-alpha1", 3, "human follow-up"))
+    assert w.engine.quiet()
+    w.engine.send(_end(peer))
+    human = w.engine.recv()
+    assert human["method"] == "session/prompt"
+    assert w.host.quiet()  # No idle update while the native human turn owns activity.
+    w.engine.send(_end(human))
+    assert w.host.recv() == {"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "end_turn"}}
+
+
+@pytest.mark.parametrize(("name", "version"), [("other-client", 1), ("windsurf", 2)])
+def test_desktop_v1_metadata_is_not_advertised_to_other_clients_or_versions(
+    wired: Wired, name: str, version: int
+) -> None:
+    w = wired
+    _desktop_initialize(w, name=name, version=version)
+    _new_session(w, "sess-alpha1")
+    w.inbox.pending["sess-alpha1"] = [(EVENT, "new harmless task")]
+    echo, peer = _deliver(w)
+    assert _host_status(echo) is None
+    w.engine.send(_end(peer))
+    assert w.host.quiet()
+
+
+def test_desktop_clears_running_state_when_acknowledged_prompt_cannot_be_submitted(
+    wired: Wired,
+) -> None:
+    w = wired
+    _desktop_initialize(w)
+    _new_session(w, "sess-alpha1")
+
+    def acknowledged_before_close(
+        session_id: str, still_open: Callable[[], bool]
+    ) -> tuple[str, str] | None:
+        assert session_id == "sess-alpha1" and still_open()
+        w.mediator.close()
+        return EVENT, "already acknowledged"
+
+    w.inbox.take = acknowledged_before_close  # type: ignore[method-assign]
+    w.mediator.deliver_once()
+    assert _host_status(w.host.recv()) == "working"
+    assert _host_status(w.host.recv()) == "idle"
+    assert w.engine.quiet()  # A display update is never evidence of engine admission.

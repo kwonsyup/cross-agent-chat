@@ -21,6 +21,13 @@
   session's observed tool-boundary hook (mechanism `devin_tool_boundary`
   instead of `devin_acp_host`). Older readers keep seeing the tool-boundary or
   legacy Devin mode they have evidence for. A Devin sender in this mode reports `reply_delivery: while_idle`.
+- Bound every engine-shutdown wait with termination/kill/reap escalation and
+  an interruptible ordered pipe writer; startup failures also reap the owned
+  child. Current session membership renews every 10 seconds under its existing
+  lock and expires after 45 seconds if filesystem invalidation fails.
+- For the Desktop v1 host, project existing peer-turn activity through its
+  supported session metadata, including completion and failed submission;
+  a promoted human turn is not cleared by the previous peer completion.
 - Qualified 11 Oct 2026 (Apple silicon): Devin Desktop 3.10.48
   (bundled CLI 3000.10.48) hosting CLI 3000.11.3 completed useful idle round trips with a Codex CLI 0.162.1
   owning-daemon original and a Claude Code 2.1.296 original, both receiving

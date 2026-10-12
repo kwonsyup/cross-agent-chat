@@ -219,6 +219,16 @@ channel from launch. `devin_acp.py` implements that explicit lifecycle for
 Devin Desktop's local ACP registry: conversations started with the
 "Devin + Cross Agent Chat" agent receive while idle. This does not attach to
 an already-running ordinary CLI or built-in Desktop original, so #38 stays
-open for those. Desktop 3.10.48 (bundled CLI 3000.10.48; ACP v1) renders a peer-started turn but does
-not show it as busy or offer Stop for it; ACP v2's `state_update` is not
-honored in a v1 session.
+open for those. The earlier Desktop 3.10.48 qualification did not expose
+busy/Stop for peer turns. The current mediator projects its existing prompt
+lifecycle through that Desktop v1 consumer's notification-level
+`cognition.ai/session` metadata, allowing direct `session/cancel` without a
+synthetic human prompt. Other client names or protocol versions receive no
+Desktop status projection; no unnegotiated v2 `state_update` is sent.
+
+The adapter renews the private current nonclosing-session membership every
+10 seconds. Process birth and parentage checks remain load-bearing; a 45-second
+freshness lease limits stale qualification if both rewrite and unlink fail.
+Shutdown serializes invalidation where possible, bounds lock/drain/terminate/
+kill/reap waits, and aborts a nonblocking writer on escalation before closing
+its input. A surviving pipe reader cannot retain the writer indefinitely.

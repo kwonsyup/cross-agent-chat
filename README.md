@@ -124,6 +124,13 @@ tasks; they do not settle an earlier accepted or unknown event. Inspect the
 original conversation and retained custody evidence without replaying it.
 `cross-agent-chat devin-acp-registry remove` removes only that entry.
 
+Hosted receiving uses a private attestation renewed every 10 seconds for the
+current open sessions. If renewal and removal both fail, its 45-second lease
+expires and peers stop claiming hosted wake. Shutdown drains admitted frames,
+then bounds termination and kill/reap waits; it confirms writer exit before
+closing engine input. The configured teardown wait budget is about 29 seconds;
+accepted or uncertain effects remain non-replayable after shutdown.
+
 `destination_receiving` in a send result describes the destination's observed
 route mode and mechanism — which of these capabilities apply — never a
 receipt. `reply_delivery` describes the sender's own return path, and

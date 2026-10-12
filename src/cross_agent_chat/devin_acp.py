@@ -158,6 +158,8 @@ class Mediator:
         self._abort_writes = threading.Event()
         self._writer: threading.Thread | None = None
         self._next_id = 0
+        self._host_name: str | None = None
+        self._protocol_version: int | None = None
         self._pending: dict[int, _Pending] = {}
         self._sessions: dict[str, _Session] = {}
         self._stopped = threading.Event()
@@ -399,6 +401,12 @@ class Mediator:
             return
         refusal: Frame | None = None
         with self._lock:
+            if method == "initialize":
+                params = frame.get("params")
+                info = params.get("clientInfo") if isinstance(params, dict) else None
+                name = info.get("name") if isinstance(info, dict) else None
+                self._host_name = name if isinstance(name, str) else None
+                self._protocol_version = None
             session = self._sessions.get(session_id) if session_id is not None else None
             if method == "session/prompt" and session_id is not None:
                 session = self._track(session_id)
@@ -506,6 +514,12 @@ class Mediator:
 
         result = frame.get("result")
         sid = pending.session_id
+        if pending.method == "initialize":
+            version = result.get("protocolVersion") if isinstance(result, dict) else None
+            self._protocol_version = (
+                version if isinstance(version, int) and not isinstance(version, bool) else None
+            )
+            return []
         if pending.method == "session/new" and isinstance(result, dict):
             created = cast(dict[str, object], result).get("sessionId")
             if isinstance(created, str):
@@ -534,7 +548,32 @@ class Mediator:
         if session.cac_prompt == internal:
             session.cac_prompt = None
         self._due(sid, session)
+        if pending.owner == "cac" and not session.busy() and self._desktop_v1():
+            # Publish under the session lock: a later peer claim/host admission
+            # cannot emit working first and then be cleared by this completion.
+            self._to_host(self._desktop_status(sid, "idle"))
         return []
+
+    def _desktop_v1(self) -> bool:
+        """Use only the installed Desktop v1 consumer's session metadata extension."""
+
+        return self._protocol_version == 1 and self._host_name in {
+            "windsurf",
+            "windsurf-next",
+            "windsurf-insiders",
+        }
+
+    @staticmethod
+    def _desktop_status(session_id: str, status: str) -> Frame:
+        return {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {"sessionUpdate": "session_info_update"},
+                "_meta": {"cognition.ai/session": {"cognition.ai/statusEnum": status}},
+            },
+        }
 
     def _due(self, session_id: str, session: _Session) -> None:
         """Submit the oldest waiting host prompt once the session is free."""
@@ -584,6 +623,17 @@ class Mediator:
                         "method": "session/update",
                         "params": {
                             "sessionId": sid,
+                            **(
+                                {
+                                    "_meta": {
+                                        "cognition.ai/session": {
+                                            "cognition.ai/statusEnum": "working"
+                                        }
+                                    }
+                                }
+                                if self._desktop_v1()
+                                else {}
+                            ),
                             "update": {
                                 "sessionUpdate": "user_message_chunk",
                                 "content": {"type": "text", "text": text},
@@ -595,6 +645,7 @@ class Mediator:
                         },
                     }
                 )
+            not_submitted = False
             with self._lock:
                 session = self._sessions.get(sid)
                 if session is None:
@@ -624,6 +675,7 @@ class Mediator:
                         session.cac_prompt = None
                         self._diagnostic(f"event {taken[0]} was acknowledged but not submitted")
                         taken = None
+                        not_submitted = True
                     elif session.cancel_claim:
                         self._to_engine(
                             {
@@ -637,6 +689,8 @@ class Mediator:
                     self._to_engine(deferred)
                 session.deferred.clear()
                 self._due(sid, session)
+                if not_submitted and not session.busy() and self._desktop_v1():
+                    self._to_host(self._desktop_status(sid, "idle"))
             if taken is not None:
                 self._diagnostic(f"submitted event {taken[0]} to its idle session")
 
@@ -787,16 +841,11 @@ def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[s
 
     binary = _engine_binary(devin)
     args = engine_args[1:] if engine_args[:1] == ["--"] else engine_args
-    engine = subprocess.Popen(
-        [str(binary), "acp", *args],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-    )
-    assert engine.stdin is not None and engine.stdout is not None
 
     def diagnostic(text: str) -> None:
         print(f"cross-agent-chat devin-acp: {text}", file=sys.stderr, flush=True)
 
+    engine: subprocess.Popen[bytes] | None = None
     mediator: Mediator | None = None
     attestation: Path | None = None
 
@@ -805,7 +854,16 @@ def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[s
             with suppress(OSError):
                 attestation.unlink()
 
+    # Cover initialization too: a host may terminate before sessions or the
+    # mediator exist, but the owned engine must still leave through finally.
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(143))
     try:
+        engine = subprocess.Popen(
+            [str(binary), "acp", *args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        assert engine.stdin is not None and engine.stdout is not None
         root = state_root(state_root_value)
         inbox: Inbox | None = None
         if presence_is_enabled():
@@ -821,6 +879,7 @@ def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[s
                 )
 
         def attest(sessions: frozenset[str]) -> None:
+            assert engine is not None
             if attestation is not None:
                 _republish_attestation(
                     root,
@@ -840,8 +899,6 @@ def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[s
             on_sessions=attest if attestation is not None else None,
             renew_seconds=ACP_HOST_RENEW_SECONDS,
         )
-        # The host ends an agent with SIGTERM; exit through the cleanup below.
-        signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(143))
         mediator.start()
         # Intentionally unbounded while the host stays open; the bounded part
         # is the teardown in the finally clause.
@@ -858,7 +915,9 @@ def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[s
         else:
             remove_attestation()
         # Whatever happened above, the owned child leaves with this process.
-        code = _stop_owned_engine(mediator, engine, diagnostic=diagnostic)
+        code = (
+            _stop_owned_engine(mediator, engine, diagnostic=diagnostic) if engine is not None else 1
+        )
     return code
 
 

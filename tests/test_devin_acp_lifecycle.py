@@ -682,3 +682,37 @@ def test_live_adapter_lifecycle_is_bounded(tmp_path: Path) -> None:
         if proc.poll() is None:
             proc.kill()
         proc.wait()
+
+
+def test_sigterm_during_initialization_still_reaps_the_owned_engine(tmp_path: Path) -> None:
+    bindir = _fake_engine(tmp_path, _stubborn_engine(tmp_path))
+    marker = tmp_path / "initializing"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(SOURCE)
+    env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
+    driver = (
+        "import pathlib,time\n"
+        "from cross_agent_chat import runtime,devin_acp\n"
+        "def hold_setup(value):\n"
+        f"    pathlib.Path({str(marker)!r}).touch()\n"
+        "    time.sleep(3600)\n"
+        "runtime.state_root=hold_setup\n"
+        "devin_acp.run(state_root_value=None,"
+        f"devin=pathlib.Path({str(bindir / 'devin')!r}),engine_args=[])\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", driver],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        cwd=tmp_path,
+    )
+    pid = _engine_pid(tmp_path / "engine.pid")
+    try:
+        assert _until(marker.exists)
+        proc.terminate()
+        assert proc.wait(timeout=30) == 143
+        _assert_dead(pid)
+    finally:
+        _finish(proc, pid)
