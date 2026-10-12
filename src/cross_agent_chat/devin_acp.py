@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import select
 import shutil
 import signal
 import subprocess
@@ -47,6 +48,15 @@ from cross_agent_chat.devin import (
 ACP_FRAME_MAX_BYTES: Final = 64 * 1024 * 1024
 DELIVERY_POLL_SECONDS: Final = 1.0
 ENGINE_EXIT_GRACE_SECONDS: Final = 5.0
+# SIGKILL always ends the owned child; a shorter bound covers its reap and the
+# writer's broken-pipe wakeup so no shutdown path can wait without a bound.
+ENGINE_KILL_GRACE_SECONDS: Final = 2.0
+# Well inside the ACP_HOST_TTL_SECONDS lease the reader enforces, so an idle
+# adapter's attestation stays fresh without model or host activity.
+ACP_HOST_RENEW_SECONDS: Final = 10.0
+# The writer polls pipe readiness in bounded slices so shutdown can always end
+# it even when a stalled write can never complete.
+ENGINE_WRITE_POLL_SECONDS: Final = 0.25
 MAX_QUEUED_PROMPTS: Final = 4
 ENGINE_QUEUE_MAX_BYTES: Final = 4 * ACP_FRAME_MAX_BYTES
 REGISTRY_AGENT_ID: Final = "cross-agent-chat-devin"
@@ -126,6 +136,7 @@ class Mediator:
         poll_seconds: float = DELIVERY_POLL_SECONDS,
         diagnostic: Callable[[str], None] | None = None,
         on_sessions: Callable[[frozenset[str]], None] | None = None,
+        renew_seconds: float | None = None,
     ) -> None:
         self._host_in = host_in
         self._host_out = host_out
@@ -137,12 +148,14 @@ class Mediator:
             lambda text: print(f"cross-agent-chat devin-acp: {text}", file=sys.stderr, flush=True)
         )
         self._on_sessions = on_sessions
+        self._renew_seconds = renew_seconds
         self._lock = threading.Lock()
         self._host_write = threading.Lock()
         self._engine_queue: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
         self._queue_lock = threading.Lock()
         self._queued_bytes = 0
         self._input_closed = False
+        self._abort_writes = threading.Event()
         self._writer: threading.Thread | None = None
         self._next_id = 0
         self._pending: dict[int, _Pending] = {}
@@ -156,6 +169,8 @@ class Mediator:
         loops = [self.host_loop, self.engine_loop]
         if deliver:
             loops.append(self.delivery_loop)
+        if self._on_sessions is not None and self._renew_seconds is not None:
+            loops.append(self.renewal_loop)
         self._writer.start()
         for loop in loops:
             threading.Thread(target=loop, daemon=True).start()
@@ -171,10 +186,41 @@ class Mediator:
         self._writer.join(timeout)
         return not self._writer.is_alive()
 
+    def writer_done(self) -> bool:
+        """Whether the engine writer is gone, so buffered stdin may be closed."""
+
+        writer = self._writer
+        return writer is None or not writer.is_alive()
+
+    def invalidate_sessions(self, action: Callable[[], None], timeout: float) -> bool:
+        """Run ``action`` serialized with every session publication.
+
+        A publication can hold this lock while it writes to the filesystem, so
+        waiting must be bounded: False means the caller should fall back to an
+        unsynchronized invalidation, which the record's own lease still bounds.
+        """
+
+        if not self._lock.acquire(timeout=timeout):
+            return False
+        try:
+            action()
+        finally:
+            self._lock.release()
+        return True
+
     def close(self) -> None:
         """Accept no further engine-bound frames; already accepted ones still drain."""
 
         self._stop()
+
+    def abort_writes(self) -> None:
+        """End a writer stalled on a pipe that can never drain.
+
+        Accepted frames still drain during the shutdown grace window; this is
+        only raised once teardown has decided the engine cannot receive more.
+        """
+
+        self._abort_writes.set()
 
     def _stop(self) -> None:
         with self._queue_lock:
@@ -219,17 +265,44 @@ class Mediator:
                 self._diagnostic("the engine is not reading its input; closing")
                 self._input_closed = True
                 self._engine_queue.put(None)
+                self._abort_writes.set()
                 self._stopped.set()
                 return False
             self._queued_bytes += len(data)
             self._engine_queue.put(data)
         return True
 
+    def _write_engine(self, descriptor: int, data: bytes) -> None:
+        """Write one accepted frame fully on the non-blocking descriptor.
+
+        A stalled write keeps retrying in bounded polls, so accepted frames
+        still drain during the shutdown grace window; once abort_writes is
+        raised the writer ends instead of hanging on a read end that may be
+        held by a surviving descendant.
+        """
+
+        view = memoryview(data)
+        while view:
+            try:
+                written = os.write(descriptor, view)
+            except BlockingIOError:
+                if self._abort_writes.is_set():
+                    raise OSError("the engine stopped accepting input") from None
+                select.select([], [descriptor], [], ENGINE_WRITE_POLL_SECONDS)
+            else:
+                if not written:
+                    raise OSError("the engine stopped accepting input")
+                view = view[written:]
+
     def writer_loop(self) -> None:
         try:
+            descriptor = self._engine_in.fileno()
+            # Only this loop writes to the engine, so raw writes on the
+            # descriptor keep exactly the queue's order; a wedged pipe must
+            # never be allowed to block past a bounded poll.
+            os.set_blocking(descriptor, False)
             while (data := self._engine_queue.get()) is not None:
-                self._engine_in.write(data)
-                self._engine_in.flush()
+                self._write_engine(descriptor, data)
                 with self._queue_lock:
                     self._queued_bytes -= len(data)
         except OSError:
@@ -251,12 +324,41 @@ class Mediator:
             self._publish_sessions()
         return session
 
+    def _membership(self) -> frozenset[str]:
+        """Current nonclosing sessions; callers hold ``self._lock``."""
+
+        return frozenset(
+            session_id for session_id, session in self._sessions.items() if not session.closing
+        )
+
     def _publish_sessions(self) -> None:
-        if self._on_sessions is not None:
-            try:
-                self._on_sessions(frozenset(self._sessions))
-            except (ChatError, OSError) as error:
-                self._diagnostic(f"session attestation failed: {error}")
+        """Publish current nonclosing membership; callers hold ``self._lock``.
+
+        Once the mediator stopped, no publish may run: a heartbeat that fires
+        after the final invalidation would otherwise resurrect the record.
+        """
+
+        if self._on_sessions is None or self._stopped.is_set():
+            return
+        try:
+            self._on_sessions(self._membership())
+        except (ChatError, OSError) as error:
+            self._diagnostic(f"session attestation failed: {error}")
+
+    def renewal_loop(self) -> None:
+        """Refresh the freshness lease until shutdown, independent of activity.
+
+        The snapshot and publication happen under ``self._lock``, the same
+        lock every membership change uses, so a renewal is always serialized
+        with a session closing and can never resurrect one.
+        """
+
+        interval = self._renew_seconds
+        if interval is None:
+            return
+        while not self._stopped.wait(interval):
+            with self._lock:
+                self._publish_sessions()
 
     # -- host -> engine ----------------------------------------------------
 
@@ -605,6 +707,81 @@ def _engine_binary(requested: Path | None) -> Path:
     return resolved
 
 
+def _republish_attestation(
+    root: Path,
+    attestation: Path,
+    *,
+    adapter_pid: int,
+    engine_pid: int,
+    sessions: frozenset[str],
+) -> None:
+    """Rewrite the lease; on failure never leave an older record readable.
+
+    If the rewrite fails and the unlink also fails, the record's own lease is
+    the backstop: readers refuse it once ``renewed_at`` ages past the TTL.
+    """
+
+    try:
+        write_acp_host(root, adapter_pid=adapter_pid, engine_pid=engine_pid, sessions=sessions)
+    except (ChatError, OSError):
+        with suppress(OSError):
+            attestation.unlink()
+        raise
+
+
+def _stop_owned_engine(
+    mediator: Mediator | None,
+    engine: subprocess.Popen[bytes],
+    *,
+    diagnostic: Callable[[str], None],
+) -> int:
+    """Drain, terminate, then kill and reap the owned engine, all bounded.
+
+    Accepted frames keep their order while they drain; once admission stopped,
+    a full pipe means the engine no longer reads, so ending it is what lets the
+    writer finish or fail. The buffered stdin is closed only after the writer
+    is confirmed gone, so close can never wait on the writer's stream lock.
+    """
+
+    if mediator is not None:
+        mediator.close()
+        if not mediator.drain(ENGINE_EXIT_GRACE_SECONDS):
+            # The engine stopped reading; ending it unblocks the writer.
+            engine.terminate()
+            if not mediator.drain(ENGINE_EXIT_GRACE_SECONDS):
+                # A surviving descendant can keep the pipe's read end open
+                # past the child's SIGKILL, so the writer is aborted directly
+                # rather than relying on the write to fail.
+                mediator.abort_writes()
+                engine.kill()
+                mediator.drain(ENGINE_KILL_GRACE_SECONDS)
+    if engine.stdin is not None:
+        if mediator is not None and not mediator.writer_done():
+            # The writer exits on a bounded poll even when a live descendant
+            # still holds the pipe's read end, so this is defensive only: never
+            # close the descriptor out from under an active writer.
+            diagnostic("the engine writer never exited; leaving engine stdin open")
+        else:
+            with suppress(OSError):
+                engine.stdin.close()
+    code: int | None = None
+    try:
+        code = engine.wait(timeout=ENGINE_EXIT_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        engine.terminate()
+    if code is None:
+        try:
+            code = engine.wait(timeout=ENGINE_EXIT_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            engine.kill()
+    if code is None:
+        try:
+            code = engine.wait(timeout=ENGINE_KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            diagnostic("the owned engine could not be reaped after SIGKILL")
+    return code if code is not None and code >= 0 else 1
+
+
 def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[str]) -> int:
     from cross_agent_chat.runtime import presence_is_enabled, state_root
 
@@ -616,61 +793,73 @@ def run(*, state_root_value: str | None, devin: Path | None, engine_args: list[s
         stdout=subprocess.PIPE,
     )
     assert engine.stdin is not None and engine.stdout is not None
-    root = state_root(state_root_value)
+
+    def diagnostic(text: str) -> None:
+        print(f"cross-agent-chat devin-acp: {text}", file=sys.stderr, flush=True)
+
+    mediator: Mediator | None = None
     attestation: Path | None = None
-    inbox: Inbox | None = None
-    if presence_is_enabled():
-        try:
-            prune_acp_hosts(root)
-            attestation = write_acp_host(root, adapter_pid=os.getpid(), engine_pid=engine.pid)
-            inbox = CourierInbox(root, engine.pid)
-        except (ChatError, OSError) as error:
-            print(
-                f"cross-agent-chat devin-acp: idle receiving is unavailable: {error}",
-                file=sys.stderr,
-                flush=True,
-            )
 
-    def attest(sessions: frozenset[str]) -> None:
-        try:
-            write_acp_host(root, adapter_pid=os.getpid(), engine_pid=engine.pid, sessions=sessions)
-        except (ChatError, OSError):
-            # Never leave an older, broader attestation readable.
-            if attestation is not None:
-                with suppress(OSError):
-                    attestation.unlink()
-            raise
-
-    mediator = Mediator(
-        host_in=sys.stdin.buffer,
-        host_out=sys.stdout.buffer,
-        engine_in=engine.stdin,
-        engine_out=engine.stdout,
-        inbox=inbox,
-        on_sessions=attest if attestation is not None else None,
-    )
-    # The host ends an agent with SIGTERM; exit through the cleanup below.
-    signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(143))
-    mediator.start()
-    try:
-        mediator.stopped().wait()
-    finally:
-        mediator.close()
+    def remove_attestation() -> None:
         if attestation is not None:
             with suppress(OSError):
                 attestation.unlink()
-        if not mediator.drain(ENGINE_EXIT_GRACE_SECONDS):
-            # The engine stopped reading; ending it unblocks the writer.
-            engine.terminate()
-            mediator.drain(ENGINE_EXIT_GRACE_SECONDS)
-        with suppress(OSError):
-            engine.stdin.close()
-        try:
-            code = engine.wait(ENGINE_EXIT_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            engine.terminate()
-            code = engine.wait()
-    return code if code >= 0 else 1
+
+    try:
+        root = state_root(state_root_value)
+        inbox: Inbox | None = None
+        if presence_is_enabled():
+            try:
+                prune_acp_hosts(root)
+                attestation = write_acp_host(root, adapter_pid=os.getpid(), engine_pid=engine.pid)
+                inbox = CourierInbox(root, engine.pid)
+            except (ChatError, OSError) as error:
+                print(
+                    f"cross-agent-chat devin-acp: idle receiving is unavailable: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        def attest(sessions: frozenset[str]) -> None:
+            if attestation is not None:
+                _republish_attestation(
+                    root,
+                    attestation,
+                    adapter_pid=os.getpid(),
+                    engine_pid=engine.pid,
+                    sessions=sessions,
+                )
+
+        mediator = Mediator(
+            host_in=sys.stdin.buffer,
+            host_out=sys.stdout.buffer,
+            engine_in=engine.stdin,
+            engine_out=engine.stdout,
+            inbox=inbox,
+            diagnostic=diagnostic,
+            on_sessions=attest if attestation is not None else None,
+            renew_seconds=ACP_HOST_RENEW_SECONDS,
+        )
+        # The host ends an agent with SIGTERM; exit through the cleanup below.
+        signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(143))
+        mediator.start()
+        # Intentionally unbounded while the host stays open; the bounded part
+        # is the teardown in the finally clause.
+        mediator.stopped().wait()
+    finally:
+        if mediator is not None:
+            mediator.close()
+            # Stop publication first so no renewal can fire afterwards, then
+            # remove the record serialized with any publish already in flight.
+            # A wedged publisher cannot stall teardown: the lease bounds what
+            # an unsynchronized removal can leave behind.
+            if not mediator.invalidate_sessions(remove_attestation, ENGINE_EXIT_GRACE_SECONDS):
+                remove_attestation()
+        else:
+            remove_attestation()
+        # Whatever happened above, the owned child leaves with this process.
+        code = _stop_owned_engine(mediator, engine, diagnostic=diagnostic)
+    return code
 
 
 # -- Local ACP registry entry ---------------------------------------------

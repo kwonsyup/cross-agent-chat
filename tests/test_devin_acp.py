@@ -367,6 +367,7 @@ def test_host_attestation_names_only_the_live_owned_engine(tmp_path: Path) -> No
             "adapter_start",
             "engine_pid",
             "engine_start",
+            "renewed_at",
             "sessions",
         }
         path.write_text(json.dumps({**record, "adapter_pid": os.getppid()}))

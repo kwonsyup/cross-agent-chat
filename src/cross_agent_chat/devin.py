@@ -138,6 +138,11 @@ def process_facts(pid: int) -> ProcessFacts | None:
     )
 
 
+# The adapter refreshes its attestation well inside this lease; a record
+# that can be neither rewritten nor removed stops qualifying on its own.
+ACP_HOST_TTL_SECONDS: Final = 45.0
+
+
 def acp_host_path(root: Path, engine_pid: int, engine: ProcessFacts) -> Path:
     """Private, content-free attestation that one live adapter owns this engine."""
 
@@ -179,6 +184,7 @@ def write_acp_host(
             "adapter_start": [adapter.start_seconds, adapter.start_microseconds],
             "engine_pid": engine_pid,
             "engine_start": [engine.start_seconds, engine.start_microseconds],
+            "renewed_at": time.time(),
             "sessions": sorted(sessions),
         },
     )
@@ -190,8 +196,9 @@ def acp_host_observed(root: Path, route: Route) -> bool:
 
     True only when the route's engine process is alive, its private
     attestation names that same birth and lists the route's session as one the
-    adapter relays, and the attested adapter is alive with its recorded birth
-    and is still the engine's parent. Anything else, including an unreadable
+    adapter relays, the record was refreshed inside its freshness lease, and
+    the attested adapter is alive with its recorded birth and is still the
+    engine's parent. Anything else, including an unreadable, stale, malformed
     or foreign record, is False.
     """
 
@@ -211,11 +218,13 @@ def acp_host_observed(root: Path, route: Route) -> bool:
         "adapter_start",
         "engine_pid",
         "engine_start",
+        "renewed_at",
         "sessions",
     }:
         return False
     adapter_pid = raw["adapter_pid"]
     sessions = raw["sessions"]
+    renewed_at = raw["renewed_at"]
     if (
         not isinstance(adapter_pid, int)
         or isinstance(adapter_pid, bool)
@@ -224,6 +233,14 @@ def acp_host_observed(root: Path, route: Route) -> bool:
         or raw["engine_pid"] != route.pid
         or raw["engine_start"] != [engine.start_seconds, engine.start_microseconds]
         or engine.ppid != adapter_pid
+    ):
+        return False
+    # Interval comparisons refuse NaN, infinities and arbitrarily huge JSON
+    # integers without ever converting the value to a float.
+    if (
+        not isinstance(renewed_at, (int, float))
+        or isinstance(renewed_at, bool)
+        or not time.time() - ACP_HOST_TTL_SECONDS <= renewed_at <= time.time()
     ):
         return False
     adapter = process_facts(adapter_pid)
