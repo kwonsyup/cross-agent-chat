@@ -21,14 +21,20 @@
   session's observed tool-boundary hook (mechanism `devin_tool_boundary`
   instead of `devin_acp_host`). Older readers keep seeing the tool-boundary or
   legacy Devin mode they have evidence for. A Devin sender in this mode reports `reply_delivery: while_idle`.
-- Qualified 11 Oct 2026 (Apple silicon): Devin Desktop 3.10.48 hosting Devin
-  CLI 3000.11.3 completed useful idle round trips with a Codex CLI 0.162.1
+- Qualified 11 Oct 2026 (Apple silicon): Devin Desktop 3.10.48
+  (bundled CLI 3000.10.48) hosting CLI 3000.11.3 completed useful idle round trips with a Codex CLI 0.162.1
   owning-daemon original and a Claude Code 2.1.296 original, both receiving
   ends idle. Desktop does not show a peer-started turn as busy or offer Stop
   for it. Already-running ordinary Devin CLI and built-in Desktop originals
   still have no supported idle inlet; #38 stays open.
-- Clarify that an exact remote recipient refused before any effect reports
-  that nothing was delivered.
+- Exact remote refusals distinguish unavailable/changed identity from an
+  incomplete verification and explicitly report that nothing was delivered.
+  Native targets no longer get an unsupported external-broker hint. Full
+  courier queues identify their actual provider; older broker wording remains
+  a recognized pre-effect refusal.
+- Host restart restores receiving only after registration for new tasks;
+  volatile pending bodies do not survive courier exit. Earlier accepted or
+  unknown events must not be replayed.
 
 ## 0.5.5 - 2026-10-11
 

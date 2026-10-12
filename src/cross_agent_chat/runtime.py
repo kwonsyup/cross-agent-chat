@@ -2024,7 +2024,8 @@ FORWARDABLE_PRE_EFFECT_REASONS: Final = frozenset(
         COURIER_BUSY_PRE_EFFECT_REASON,
         COURIER_STOPPED_PRE_EFFECT_REASON,
         "Codex courier is unavailable",
-        "Codex courier queue is full",
+        "Codex courier queue is full",  # Older receivers used this for every provider.
+        "Devin courier queue is full",
         "Codex native queue is unavailable",
         "Codex native queue response exceeds the bounded limit",
         "Codex native queue profile changed",
@@ -4019,7 +4020,7 @@ def _send_remote_token_target(
         raise ChatError("local Tailscale node identity is unavailable")
     # The token asks only the node that verifiably presented its handle; an
     # unrelated node is never fanned out to and cannot hold the send hostage.
-    attested, _node_complete = _remote_node_targets(
+    attested, node_complete = _remote_node_targets(
         address,
         min(time.monotonic() + REMOTE_DISCOVERY_TIMEOUT_SECONDS, deadline),
         include_delivery_mode=True,
@@ -4036,10 +4037,13 @@ def _send_remote_token_target(
         if target.session_key == token.handle and target.generation == token.generation
     ]
     if len(claimants) != 1:
+        reason = (
+            "recipient is unavailable or changed"
+            if node_complete
+            else "the selected recipient could not be verified"
+        )
         raise ChatError(
-            "recipient is unavailable or changed; nothing was delivered; "
-            + ("external recipients require an external-aware broker; " if include_external else "")
-            + "call chat_peers and choose the recipient again"
+            f"{reason}; nothing was delivered; call chat_peers and choose the recipient again"
         )
     return _send_remote_target(
         root,

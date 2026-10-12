@@ -3887,3 +3887,95 @@ def test_exact_token_send_refuses_when_the_handle_moved_to_another_node(
         send(tmp_path, source, remote_token("nOwner", handle, generation), "hello")
 
     assert contacted == ["100.64.0.11"]
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_native_revalidation_refusal_does_not_invent_an_external_broker_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, complete: bool
+) -> None:
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="fixture",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(source)
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSelf", peers={"nOwner": "100.64.0.11"}),
+    )
+    monkeypatch.setattr(runtime, "_remote_node_targets", lambda *_args, **_kwargs: ([], complete))
+    monkeypatch.setattr(
+        runtime,
+        "_send_remote_target",
+        lambda *_args, **_kwargs: pytest.fail("unverified identity reached the effect boundary"),
+    )
+    with pytest.raises(ChatError) as caught:
+        send(
+            tmp_path,
+            source,
+            remote_token("nOwner", "f" * 64, str(uuid4())),
+            "new harmless task",
+            include_external=True,
+        )
+    message = str(caught.value)
+    assert "external-aware" not in message
+    assert "nothing was delivered" in message
+    assert ("could not be verified" in message) is (not complete)
+    assert ("unavailable or changed" in message) is complete
+    assert IntentStore(tmp_path).intents() == []
+
+
+@pytest.mark.parametrize("reason", ["Codex courier queue is full", "Devin courier queue is full"])
+def test_remote_queue_full_preserves_old_and_current_provider_wording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    target = Route.create(
+        provider="devin",
+        session_id="sess-alpha1",
+        device="target",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(tmp_path).upsert(target)
+    public_target = Target(
+        alias=target.alias,
+        provider=target.provider,
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=session_key(target.provider, target.session_id),
+        remote=False,
+        session_id=target.session_id,
+        cwd=target.cwd,
+        pid=target.pid,
+    )
+    event_id = str(uuid4())
+    envelope = remote_envelope(
+        event_id=event_id,
+        source_alias="codex@source:api:source-a1",
+        source_generation=str(uuid4()),
+        target_alias=target.alias,
+        generation=target.generation,
+        message="new harmless task",
+    )
+    monkeypatch.setattr(runtime, "local_targets", lambda _root, *, handle=None: [public_target])
+    monkeypatch.setattr(
+        runtime,
+        "request_tailnet",
+        lambda _address, payload, **_: (
+            {key: value for key, value in payload.items() if key != "operation"}
+            | {"status": "AUTHORIZED"}
+        ),
+    )
+    response = {
+        "schema_version": 1,
+        "event_id": event_id,
+        "status": "PRE_EFFECT_REJECTED",
+        "provider": "devin",
+        "error": reason,
+    }
+    monkeypatch.setattr(runtime, "request_socket", lambda *_args, **_kwargs: response)
+    assert receive_remote(tmp_path, envelope, "100.64.0.11") == response

@@ -432,7 +432,7 @@ class CodexCourier:
                             "provider": "codex",
                         }
                     elif len(self._pending) >= self.capacity:
-                        raise ChatError("Codex courier queue is full")
+                        raise ChatError(f"{self.provider.title()} courier queue is full")
                     else:
                         self._pending[identifier] = (body, time.monotonic())
                         self._retired.pop(identifier, None)
@@ -494,7 +494,7 @@ class CodexCourier:
                         "Codex courier event conflicts with a pending message"
                     )
             elif len(self._pending) >= self.capacity:
-                raise ChatError("Codex courier queue is full")
+                raise ChatError(f"{self.provider.title()} courier queue is full")
             else:
                 self._pending[identifier] = (body, time.monotonic())
                 self._retired.pop(identifier, None)

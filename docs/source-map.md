@@ -115,9 +115,11 @@ alone proves that an active recipient consumed an envelope.
 - **Receiving contract:** send results carry `destination_receiving` —
   route `mode`, `mechanism`, `parked_wake`, `active_turn_input`, and
   `delivery_observation` — describing destination capability, never a
-  receipt. Only `codex_daemon_input`/`owning_daemon` routes claim parked wake
-  and active-turn input; Stop/prompt-bound modes report `false` for both and
-  everything else is `unknown`. `reply_delivery` stays the sender's own
+  receipt. Qualified `codex_daemon_input`/`owning_daemon` routes claim parked
+  wake and active-turn input. `devin_acp_hosted` routes claim parked wake while
+  the exact engine/session attestation is live; active input also needs the
+  observed root tool boundary. Stop/prompt-bound modes report `false` for both
+  and unqualified mechanisms remain `unknown`. `reply_delivery` stays the sender's own
   return path, derived from the same qualification: generic Claude/helper
   labels leave wake, input, and reply timing unknown for the current host.
   Historical context-specific qualifications do not qualify alpha hosts.
@@ -217,6 +219,6 @@ channel from launch. `devin_acp.py` implements that explicit lifecycle for
 Devin Desktop's local ACP registry: conversations started with the
 "Devin + Cross Agent Chat" agent receive while idle. This does not attach to
 an already-running ordinary CLI or built-in Desktop original, so #38 stays
-open for those. Desktop 3.10.48 (ACP v1) renders a peer-started turn but does
+open for those. Desktop 3.10.48 (bundled CLI 3000.10.48; ACP v1) renders a peer-started turn but does
 not show it as busy or offer Stop for it; ACP v2's `state_update` is not
 honored in a v1 session.
