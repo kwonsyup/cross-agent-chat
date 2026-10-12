@@ -18,6 +18,7 @@ from cross_agent_chat.core import (
     valid_name,
     valid_uuid,
 )
+from cross_agent_chat.devin import DevinCapabilityExpiredError
 from cross_agent_chat.external import (
     ExternalEndpointStore,
     endpoint_effect_lock,
@@ -393,12 +394,20 @@ def _mcp_call_tool(
     devin_source = None
     if provider == "devin" and name in MCP_PUBLIC_TOOLS:
         assert root is not None
-        devin_source = authenticate_devin_capability(
-            root,
-            parent_pid=os.getppid(),
-            tool_name=name,
-            arguments=typed_arguments,
-        )
+        try:
+            devin_source = authenticate_devin_capability(
+                root,
+                parent_pid=os.getppid(),
+                tool_name=name,
+                arguments=typed_arguments,
+            )
+        except DevinCapabilityExpiredError as error:
+            if name != "chat_send":
+                raise
+            # This retained unused grant proves refusal before send dispatch.
+            # Return a tool result so native clients do not mistake it for a
+            # broken MCP connection and reconnect/replay a credential.
+            return _mcp_tool_error(error)
         typed_arguments = {
             key: value for key, value in typed_arguments.items() if key != "_cac_capability"
         }

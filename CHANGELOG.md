@@ -28,6 +28,10 @@
 - For the Desktop v1 host, project existing peer-turn activity through its
   supported session metadata, including completion and failed submission;
   a promoted human turn is not cleared by the previous peer completion.
+- Report a retained unused Devin sender grant that expires during approval as
+  an explicit pre-effect tool refusal, preserving the 120-second expiry guard.
+  Missing/already-consumed grants retain uncertainty; an absent event ID is
+  never permission to replay an earlier invocation.
 - Qualified 11 Oct 2026 (Apple silicon): Devin Desktop 3.10.48
   (bundled CLI 3000.10.48) hosting CLI 3000.11.3 completed useful idle round trips with a Codex CLI 0.162.1
   owning-daemon original and a Claude Code 2.1.296 original, both receiving

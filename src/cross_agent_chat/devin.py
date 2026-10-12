@@ -37,6 +37,11 @@ from cross_agent_chat.core import (
     valid_uuid,
 )
 
+
+class DevinCapabilityExpiredError(ChatError):
+    """An issuer record still proves this grant expired without being consumed."""
+
+
 DevinHookName = Literal[
     "PreToolUse",
     "PostToolUse",
@@ -390,9 +395,21 @@ class DevinCapabilityStore:
             raise ChatError("Devin sender capability is invalid")
         token_digest = hashlib.sha256(token.encode("ascii")).hexdigest()
         with state_lock(self.root, "devin-capabilities"):
-            existing = self._fresh(self.capabilities())
+            records = self.capabilities()
+            existing = self._fresh(records)
             matches = [item for item in existing if item.token_digest == token_digest]
             if len(matches) != 1:
+                unused = [item for item in records if item.token_digest == token_digest]
+                if (
+                    len(unused) == 1
+                    and time.time() - unused[0].issued_at > DEVIN_CAPABILITY_TTL_SECONDS
+                ):
+                    raise DevinCapabilityExpiredError(
+                        "Devin sender capability is unavailable: expired before use; "
+                        "nothing was delivered"
+                    )
+                # A missing record may already have been consumed by an earlier
+                # invocation. It cannot settle that invocation's possible effect.
                 raise ChatError("Devin sender capability is unavailable")
             capability = matches[0]
             retained = [item for item in existing if item != capability]
