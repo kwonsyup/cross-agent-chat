@@ -898,10 +898,54 @@ def request_tailnet(
     return cast(dict[str, object], raw)
 
 
+def _hook_json_record() -> str:
+    """Read one bounded JSON object without requiring the provider to close stdin.
+
+    Native app-server hooks can keep the pipe open until the hook exits. JSON
+    object framing therefore owns completion; EOF is not a completion signal
+    that the hook may require. JSON decoding and event validation remain below.
+    """
+    characters: list[str] = []
+    depth = 0
+    quoted = False
+    escaped = False
+    started = False
+    size = 0
+    while True:
+        character = sys.stdin.read(1)
+        if not character:
+            break
+        size += len(character.encode())
+        if size > MAX_FRAME_BYTES:
+            raise ChatError("hook input exceeds the bounded limit")
+        characters.append(character)
+        if not started:
+            if character.isspace():
+                continue
+            if character != "{":
+                raise ChatError("hook input is not a JSON object")
+            started = True
+            depth = 1
+        elif quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+        elif character == '"':
+            quoted = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                break
+    return "".join(characters)
+
+
 def hook_input(expected_event: str) -> dict[str, object]:
-    text = sys.stdin.read(MAX_FRAME_BYTES + 1)
-    if len(text.encode()) > MAX_FRAME_BYTES:
-        raise ChatError("hook input exceeds the bounded limit")
+    text = _hook_json_record()
     try:
         raw = json.loads(text)
     except json.JSONDecodeError as error:
