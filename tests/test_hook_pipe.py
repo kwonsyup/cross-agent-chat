@@ -19,18 +19,29 @@ def test_native_startup_finishes_while_provider_keeps_stdin_open(tmp_path: Path)
     # before closing its pipe. A reader that requires EOF deadlocks this caller.
     environment = dict(os.environ, PYTHONPATH=str(Path(__file__).parents[1] / "src"))
     process = subprocess.Popen(
-        [sys.executable, "-c",
-         "import json,sys; from pathlib import Path; "
-         "from cross_agent_chat.runtime import native_startup; "
-         "print(json.dumps(native_startup(Path(sys.argv[1]), 'studio', int(sys.argv[2]))))",
-         str(tmp_path / "state"), str(os.getpid())],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+        [
+            sys.executable,
+            "-c",
+            "import json,sys; from pathlib import Path; "
+            "from cross_agent_chat.runtime import native_startup; "
+            "print(json.dumps(native_startup(Path(sys.argv[1]), 'studio', int(sys.argv[2]))))",
+            str(tmp_path / "state"),
+            str(os.getpid()),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
     )
     assert process.stdin is not None
     try:
-        payload = {"hook_event_name": "UserPromptSubmit", "session_id": str(uuid4()),
-                   "cwd": str(tmp_path), "prompt": 'nested { } and escaped " quote 😃',
-                   "nested": {"values": [{"field": "}"}]}}
+        payload = {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": str(uuid4()),
+            "cwd": str(tmp_path),
+            "prompt": 'nested { } and escaped " quote 😃',
+            "nested": {"values": [{"field": "}"}]},
+        }
         process.stdin.write(json.dumps(payload, ensure_ascii=False, indent=2).encode())
         process.stdin.flush()
         process.wait(timeout=2)
@@ -46,7 +57,9 @@ def test_native_startup_finishes_while_provider_keeps_stdin_open(tmp_path: Path)
 
 @pytest.mark.parametrize("event", ["UserPromptSubmit", "SessionStart"])
 def test_framed_hook_preserves_event_and_identity_validation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event: str,
 ) -> None:
     payload = {"hook_event_name": event, "session_id": str(uuid4()), "cwd": str(tmp_path)}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
