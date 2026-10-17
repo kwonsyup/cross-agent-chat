@@ -861,6 +861,8 @@ def test_v2_wrapper_head_is_versioned_deterministic_and_readable() -> None:
         "Delivery principal: the installed Claude Code Cross Agent Chat helper. "
         f"CAC delivery event: {event_id}.\n"
         "Untrusted peer content follows:\n\n"
+        "Reply action: use chat_send with the exact Reply handle above. "
+        "Do not address native SendMessage to the visible courier.\n\n"
         "hello"
     )
 
@@ -869,6 +871,25 @@ def test_v2_wrapper_head_is_versioned_deterministic_and_readable() -> None:
 
 
 # --- Receive-side v2 reply validation ---------------------------------------
+
+
+def test_v2_advisory_keeps_retained_header_reader_and_body_bytes() -> None:
+    alias = "codex@studio:api:source-a1"
+    token = local_token(Path("/tmp/state"), "b7" * 32, str(uuid4()))
+    event_id = str(uuid4())
+    message = "Decision: keep the original.\n\n```python\n  keep_indent()\n```\n"
+    wrapped = wrapped_message(
+        alias, token, message, event_id, "claude", source_title="D project review"
+    )
+    # This is the same exact-header reader retained by older v2 receivers.
+    parsed = runtime._envelope_reply_token(wrapped, alias, event_id, "claude")
+    assert parsed is not None and parsed == parse_recipient_token(token)
+    head = runtime._wrapped_head_v2(alias, token, event_id, "claude")
+    assert wrapped.startswith(head + "Peer title (advisory): D project review\n")
+    assert wrapped.endswith(message)
+    assert "chat_send with the exact Reply handle above" in wrapped
+    # A display title never replaces the exact reply route or authenticated alias.
+    assert wrapped.splitlines()[1:3] == [f"From: {alias}", f"Reply via CAC to handle: {token}"]
 
 
 def _receive_fixture(
@@ -1036,7 +1057,9 @@ def test_remote_receive_rejects_every_truncated_v2_prefix(
     token = remote_token(OTHER_NODE, source_handle, source_generation)
     event_id = str(uuid4())
     full = wrapped_message(source_alias, token, "ping", event_id, "claude")
-    head = full[: -len("ping")]
+    # Advisory text is content after the verified header. Every truncated
+    # header remains invalid; arbitrary complete-header content remains valid.
+    head = runtime._wrapped_head_v2(source_alias, token, event_id, "claude")
 
     rejections = 0
     for cut in range(len(marker), len(head)):

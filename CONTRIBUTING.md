@@ -84,6 +84,43 @@ native surfaces relied on, run the affected contained adapter contracts, then
 note the verified versions in the release notes (see
 [CHANGELOG.md](CHANGELOG.md)).
 
+### Qualifying a Codex update
+
+Measure the actual owner with `codex app-server daemon version`; `codex
+--version` measures the invoking CLI. Native App's embedded binary and helper
+route require their own qualification. Keep the exact version allowlist until
+both protocol checks and real original-session use pass.
+
+Generate the official experimental schema with each bound binary:
+
+```sh
+/path/to/baseline/codex app-server generate-json-schema --experimental --out /tmp/cac-baseline
+/path/to/candidate/codex app-server generate-json-schema --experimental --out /tmp/cac-candidate
+```
+
+Compare `v1/Initialize{Params,Response}.json` and
+`v2/{ThreadRead,ThreadTurnsList,ThreadQueueAdd,TurnSteer}{Params,Response}.json`,
+including their referenced types. Check the fields consumed by
+`codex_daemon.py`: profile, original thread/cwd/originator, direct-input
+eligibility, active turn, expected turn, input and event identity, and exact
+acceptance receipts. A schema match alone does not qualify runtime behavior.
+Run `pytest -q tests/test_codex_daemon.py` and the affected transport tests.
+
+Use a disposable ordinary TUI original on the candidate's existing daemon.
+Verify its route PID is that daemon and its originator is `codex-tui`, then
+exercise a useful request and independently checked answer while idle and a
+distinct request during an active turn. Preserve unknown events without
+replay. In 0.163.0, arbitrary `-c` overrides (including a reasoning-effort
+override) select an embedded server instead of reusing the daemon; do not
+change the owner check to accommodate that different route. Use the provider's
+normal session settings when testing the daemon path. Unset inherited Native
+originator metadata when launching a terminal original from a Native tool.
+
+After transactional installation, repeat discovery, request, original use and
+answer on the shipped, newly loaded code. Record source, installed files,
+loaded process evidence and recipient use separately. Retained productive
+sessions keep their loaded code until their normal lifecycle permits adoption.
+
 ## Reporting issues
 
 Include, redacted: `cross-agent-chat --version`, provider and harness, macOS

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,7 +16,9 @@ from cross_agent_chat.transport import remote_envelope
 def _remote_delivery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    accept_response: object,
+    accept_response: (
+        dict[str, object] | BaseException | Callable[[Route, dict[str, object]], dict[str, object]]
+    ),
 ) -> dict[str, object]:
     target = Route.create(
         provider="claude",
@@ -49,7 +52,9 @@ def _remote_delivery(
         message="controlled message",
     )
 
-    def authorize(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+    def authorize(
+        _address: str, payload: dict[str, object], **_kwargs: object
+    ) -> dict[str, object]:
         return {
             **{key: value for key, value in payload.items() if key != "operation"},
             "status": "AUTHORIZED",
@@ -67,7 +72,7 @@ def _remote_delivery(
             raise accept_response
         if callable(accept_response):
             return accept_response(target, payload)
-        return accept_response  # type: ignore[return-value]
+        return accept_response
 
     monkeypatch.setattr(runtime, "request_tailnet", authorize)
     monkeypatch.setattr(runtime, "request_socket", socket)

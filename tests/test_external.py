@@ -145,7 +145,8 @@ def test_external_send_reaches_real_native_courier_once_and_preserves_old_intent
         assert len(messages) == 1 and messages[0]["event_id"] == event
         body = messages[0]["message"]
         assert body.startswith("Cross Agent Chat transport envelope v2\nFrom: " + endpoint.alias)
-        assert body.endswith("Untrusted peer content follows:\n\nindependent new fixture work")
+        assert body.endswith("\n\nindependent new fixture work")
+        assert "Reply action: use chat_send with the exact Reply handle above." in body
         reply = parse_recipient_token(body.split("\n")[2].removeprefix("Reply via CAC to handle: "))
         assert (
             reply is not None

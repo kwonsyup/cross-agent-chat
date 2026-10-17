@@ -3614,12 +3614,27 @@ def wrapped_message(
     message: str,
     event_id: str,
     target_provider: str,
+    *,
+    source_title: str | None = None,
 ) -> str:
     if parse_recipient_token(source_handle) is not None:
         head = _wrapped_head_v2(source_alias, source_handle, event_id, target_provider)
+        # Keep the retained v2 header byte-for-byte. Display hints and reply
+        # guidance belong after its trust boundary, where old readers accept
+        # them as advisory content, never as authenticated identity.
+        display = (
+            f"Peer title (advisory): {valid_name(source_title, 'source title')}\n"
+            if source_title is not None
+            else ""
+        )
+        advisory = (
+            display + "Reply action: use chat_send with the exact Reply handle above. "
+            "Do not address native SendMessage to the visible courier.\n\n"
+        )
     else:
         head = _wrapped_head(source_alias, source_handle, event_id, target_provider)
-    body = head + message
+        advisory = ""
+    body = head + advisory + message
     try:
         return bounded_message(body)
     except ChatError as error:
@@ -3841,6 +3856,27 @@ def canonical_source_alias(
     return claude_alias(source.device, source.project, agent)
 
 
+def _source_display_title(root: Path, source: SourceIdentity, deadline: float) -> str | None:
+    """Read an optional title from the existing exact owner's metadata path."""
+    if isinstance(source, ExternalEndpoint) or source.provider != "codex":
+        return None  # Their current human-readable name is already in the alias.
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or source.profile_root is None:
+        return None
+    try:
+        binary = _courier_owner_binary(root, source)
+    except (ChatError, OSError):
+        return None
+    if binary is None:
+        return None
+    return native_thread_titles(
+        binary=binary,
+        environment={"CODEX_HOME": source.profile_root},
+        thread_ids=[source.session_id],
+        deadline=time.monotonic() + min(remaining, NATIVE_TITLE_TIMEOUT_SECONDS),
+    ).get(source.session_id)
+
+
 def _remaining_operation_timeout(deadline: float, maximum: float) -> float:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -3913,6 +3949,7 @@ def _send_local_target(
         bounded_message(message),
         event_id,
         target.provider,
+        source_title=_source_display_title(root, source, deadline),
     )
     timeout = _remaining_operation_timeout(deadline, ACCEPT_TIMEOUT_SECONDS)
     store = IntentStore(root)
@@ -4293,6 +4330,7 @@ def _send_remote_target(
         bounded_message(message),
         event_id,
         target.provider,
+        source_title=_source_display_title(root, source, deadline),
     )
     timeout = _remaining_operation_timeout(deadline, REMOTE_TIMEOUT_SECONDS)
     store = IntentStore(root)
@@ -4727,6 +4765,7 @@ def _send_external_target(
         bounded_message(message),
         identifier,
         "external",
+        source_title=_source_display_title(root, source, deadline),
     )
     store = IntentStore(root)
     previous = _begin_delivery(
@@ -4791,9 +4830,7 @@ def _devin_display_title(key: str) -> str:
 
 def peer_title_metadata(items: list[dict[str, str]]) -> dict[str, object]:
     """Report whether title search covered every provider that exposes titles."""
-    candidates = [
-        item for item in items if item.get("provider") in {"codex", "external"}
-    ]
+    candidates = [item for item in items if item.get("provider") in {"codex", "external"}]
     missing = sum(not item.get("title") for item in candidates)
     return {
         "status": "complete" if missing == 0 else "incomplete",

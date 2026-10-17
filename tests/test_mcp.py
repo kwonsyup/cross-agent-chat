@@ -4,6 +4,7 @@ import io
 import json
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 import pytest
@@ -295,7 +296,10 @@ def test_instructions_describe_reply_delivery_as_the_sender_return_path() -> Non
 
 
 def _discovered_target(
-    alias: str, handle_char: str, title: str | None = None, provider: str = "claude"
+    alias: str,
+    handle_char: str,
+    title: str | None = None,
+    provider: Literal["claude", "codex", "devin", "external"] = "claude",
 ) -> Target:
     return Target(
         alias=alias,
@@ -404,7 +408,9 @@ def test_chat_peers_zero_match_reports_incomplete_title_enrichment(
         _discovered_target("codex@imac:kwonsyup:662c7d4d031e", "a", provider="codex"),
     ]
     _stub_peer_discovery(monkeypatch, targets)
-    monkeypatch.setattr("sys.stdin", _feed([*_handshake(), _chat_peers_call(1, {"query": "missing"})]))
+    monkeypatch.setattr(
+        "sys.stdin", _feed([*_handshake(), _chat_peers_call(1, {"query": "missing"})])
+    )
 
     mcp("claude", "studio", str(root))
 
@@ -431,7 +437,9 @@ def test_chat_peers_zero_match_with_complete_title_data_is_a_real_nonmatch(
         ),
     ]
     _stub_peer_discovery(monkeypatch, targets)
-    monkeypatch.setattr("sys.stdin", _feed([*_handshake(), _chat_peers_call(1, {"query": "missing"})]))
+    monkeypatch.setattr(
+        "sys.stdin", _feed([*_handshake(), _chat_peers_call(1, {"query": "missing"})])
+    )
 
     mcp("claude", "studio", str(root))
 
