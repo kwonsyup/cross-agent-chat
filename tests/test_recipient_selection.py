@@ -27,6 +27,7 @@ import pytest
 from cross_agent_chat import runtime
 from cross_agent_chat.core import (
     ChatError,
+    IntentStore,
     Registry,
     Route,
     session_key,
@@ -616,6 +617,33 @@ def test_local_token_send_delivers_to_the_exact_local_route(
     assert reply is not None and reply.scope == "local"
     assert reply.handle == session_key("codex", source.session_id)
     assert reply.generation == source.generation
+
+
+def test_local_decided_refusal_exposes_no_effect_and_original_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target, source = _route(tmp_path), _source(tmp_path)
+    healthy = cast(Callable[..., dict[str, object]], _courier([target, source]))
+
+    def socket(path: Path, payload: dict[str, object], **kwargs: object) -> dict[str, object]:
+        if payload["operation"] == "accept":
+            return {
+                "schema_version": 1,
+                "event_id": payload["event_id"],
+                "status": "PRE_EFFECT_REJECTED",
+                "provider": "claude",
+                "error": "Claude target changed during discovery",
+            }
+        return healthy(path, payload, **kwargs)
+
+    monkeypatch.setattr(runtime, "request_socket", socket)
+    token = local_token(tmp_path, session_key("claude", target.session_id), target.generation)
+    with pytest.raises(ChatError, match="nothing was delivered") as refused:
+        send(tmp_path, source, token, "One distinct request")
+    (intent,) = IntentStore(tmp_path).intents()
+    assert intent.status == "PRE_EFFECT_REJECTED"
+    assert intent.event_id in str(refused.value)
+    assert "Claude target changed during discovery" in str(refused.value)
 
 
 def test_local_send_wires_exact_original_title_into_advisory(

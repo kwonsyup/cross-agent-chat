@@ -4023,7 +4023,7 @@ def _send_local_target(
     if rejection is not None:
         store.mark(event_id, "PRE_EFFECT_REJECTED")
         # Local courier errors originate in a same-uid process, not a remote peer.
-        raise ChatError(rejection)
+        raise ChatError(f"{rejection}; nothing was delivered; event {event_id}")
     diagnostic = unknown_delivery_diagnostic(response, event_id, target.provider)
     if diagnostic is not None:
         store.mark(event_id, "UNKNOWN_DELIVERY")
@@ -4074,7 +4074,8 @@ def _send_local_token_target(
     ]
     if len(matches) != 1:
         raise ChatError(
-            "recipient is unavailable or changed; call chat_peers and choose the recipient again"
+            "recipient is unavailable or changed; nothing was delivered; "
+            "call chat_peers and choose the recipient again"
         )
     return _send_local_target(
         root,
