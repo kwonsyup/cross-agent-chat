@@ -733,11 +733,13 @@ def _external_call_tool(
             rows = cast(list[dict[str, str]], result["peers"])
             rows = [row for row in rows if row["handle"] in source.allowed_recipients]
             result["peers"] = rows
-            if exact_query is not None:
-                # Search completeness and counts must describe only this
-                # endpoint's authorized recipient scope.
-                result["title_metadata"] = peer_title_metadata(rows)
         if exact_query is not None:
+            # Search completeness and counts must describe only this
+            # endpoint's authorized recipient scope. Owner-wide endpoints use
+            # the complete listing; selected endpoints use the rows above.
+            result["title_metadata"] = peer_title_metadata(
+                cast(list[dict[str, str]], result["peers"])
+            )
             rows = cast(list[dict[str, str]], result["peers"])
             filtered = [
                 row

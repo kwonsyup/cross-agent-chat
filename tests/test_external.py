@@ -1090,6 +1090,43 @@ def test_external_meta_is_ignored_and_scoped_count_stays_private(
     }
 
 
+def test_external_owner_peers_filtered_zero_reports_missing_title_enrichment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    _endpoint, credential = _enroll(root)
+    monkeypatch.setattr(
+        cli,
+        "peers",
+        lambda *_a, **_k: {
+            "schema_version": 1,
+            "peers": [
+                {
+                    "alias": "codex@fixture:session",
+                    "handle": "selected",
+                    "provider": "codex",
+                }
+            ],
+            "remote_discovery": "complete",
+        },
+    )
+
+    result = _result(
+        cli._external_call_tool(
+            root,
+            credential,
+            {"name": "chat_peers", "arguments": {"query": "missing"}},
+        )
+    )
+
+    assert result["filter"] == {"query": "missing", "matched": 0, "of": 1}
+    assert result["title_metadata"] == {
+        "status": "incomplete",
+        "applicable": 1,
+        "missing": 1,
+    }
+
+
 def test_outer_post_spawn_oserror_stays_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
