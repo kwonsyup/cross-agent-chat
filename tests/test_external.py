@@ -1025,8 +1025,16 @@ def test_external_meta_is_ignored_and_scoped_count_stays_private(
         lambda *_a, **_k: {
             "schema_version": 1,
             "peers": [
-                {"alias": "codex@fixture:owned", "handle": permitted},
-                {"alias": "codex@fixture:private", "handle": "different"},
+                {
+                    "alias": "codex@fixture:owned",
+                    "handle": permitted,
+                    "provider": "codex",
+                },
+                {
+                    "alias": "codex@fixture:private",
+                    "handle": "different",
+                    "provider": "codex",
+                },
             ],
             "remote_discovery": "complete",
         },
@@ -1043,6 +1051,12 @@ def test_external_meta_is_ignored_and_scoped_count_stays_private(
         )
     )
     assert result["filter"] == {"query": "owned", "matched": 1, "of": 1}
+    # The hidden row must not affect scoped title completeness metadata.
+    assert result["title_metadata"] == {
+        "status": "incomplete",
+        "applicable": 1,
+        "missing": 1,
+    }
     credential_path = root / "credential"
     credential_path.write_text(credential)
     credential_path.chmod(0o600)

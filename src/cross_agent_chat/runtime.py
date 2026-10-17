@@ -4771,6 +4771,19 @@ def _devin_display_title(key: str) -> str:
     return f"session {key[:CODEX_ALIAS_DIGEST_LENGTH]}"
 
 
+def peer_title_metadata(items: list[dict[str, str]]) -> dict[str, object]:
+    """Report whether title search covered every provider that exposes titles."""
+    candidates = [
+        item for item in items if item.get("provider") in {"codex", "external"}
+    ]
+    missing = sum(not item.get("title") for item in candidates)
+    return {
+        "status": "complete" if missing == 0 else "incomplete",
+        "applicable": len(candidates),
+        "missing": missing,
+    }
+
+
 def peers(
     root: Path,
     *,
@@ -4876,6 +4889,7 @@ def peers(
             item["identity_assurance"] = "owner_enrolled_endpoint"
         items.append(item)
     total = len(items)
+    title_metadata = peer_title_metadata(items) if not internal else None
     if wanted is not None:
         # The full listing is produced first and only then narrowed, so a
         # query never changes what discovery probed.
@@ -4890,6 +4904,10 @@ def peers(
     }
     if query is not None:
         result["filter"] = {"query": query, "matched": len(items), "of": total}
+        if title_metadata is not None:
+            # Keep search completeness independent of the filtered result: a
+            # missing title can explain a zero match even when that row is hidden.
+            result["title_metadata"] = title_metadata
     if not internal:
         result["remote_discovery"] = remote_discovery
         if include_external and external_discovery == "unavailable":

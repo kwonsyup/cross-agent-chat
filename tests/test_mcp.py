@@ -294,10 +294,12 @@ def test_instructions_describe_reply_delivery_as_the_sender_return_path() -> Non
     )
 
 
-def _discovered_target(alias: str, handle_char: str, title: str | None = None) -> Target:
+def _discovered_target(
+    alias: str, handle_char: str, title: str | None = None, provider: str = "claude"
+) -> Target:
     return Target(
         alias=alias,
-        provider="claude",
+        provider=provider,
         device="imac",
         project="proj",
         generation=str(uuid4()),
@@ -340,8 +342,11 @@ def test_chat_peers_query_filters_alias_and_title_and_reports_scope(
     root = tmp_path / "state"
     targets = [
         _discovered_target("claude@imac:Projects:W_Kluro_2Oct1PM", "a"),
-        _discovered_target("codex@imac:kwonsyup:662c7d4d031e", "b", title="E_Kluro_2Oct1PM"),
+        _discovered_target(
+            "codex@imac:kwonsyup:662c7d4d031e", "b", title="E_Kluro_2Oct1PM", provider="codex"
+        ),
         _discovered_target("claude@imac:Projects:W_Other", "c"),
+        _discovered_target("codex@imac:kwonsyup:missing", "d", provider="codex"),
     ]
     _stub_peer_discovery(monkeypatch, targets)
     requests = [
@@ -349,6 +354,7 @@ def test_chat_peers_query_filters_alias_and_title_and_reports_scope(
         _chat_peers_call(1, {}),
         _chat_peers_call(2, {"query": "kluro"}),
         _chat_peers_call(3, {"query": "e_kluro"}),
+        _chat_peers_call(4, {"query": "no-such-peer"}),
     ]
     monkeypatch.setattr("sys.stdin", _feed(requests))
 
@@ -360,10 +366,10 @@ def test_chat_peers_query_filters_alias_and_title_and_reports_scope(
     assert set(unfiltered) == {"schema_version", "peers", "remote_discovery", "sender"}
     unfiltered_peers = unfiltered["peers"]
     assert isinstance(unfiltered_peers, list)
-    assert len(unfiltered_peers) == 3
+    assert len(unfiltered_peers) == 4
 
     by_alias = _tool_result_payload(responses[2])
-    assert by_alias["filter"] == {"query": "kluro", "matched": 2, "of": 3}
+    assert by_alias["filter"] == {"query": "kluro", "matched": 2, "of": 4}
     by_alias_peers = by_alias["peers"]
     assert isinstance(by_alias_peers, list)
     assert {peer["alias"] for peer in by_alias_peers} == {
@@ -374,10 +380,69 @@ def test_chat_peers_query_filters_alias_and_title_and_reports_scope(
     assert all(isinstance(peer["handle"], str) for peer in by_alias_peers)
 
     by_title = _tool_result_payload(responses[3])
-    assert by_title["filter"] == {"query": "e_kluro", "matched": 1, "of": 3}
+    assert by_title["filter"] == {"query": "e_kluro", "matched": 1, "of": 4}
     by_title_peers = by_title["peers"]
     assert isinstance(by_title_peers, list)
     assert [peer["alias"] for peer in by_title_peers] == ["codex@imac:kwonsyup:662c7d4d031e"]
+
+    no_match = _tool_result_payload(responses[4])
+    assert no_match["filter"] == {"query": "no-such-peer", "matched": 0, "of": 4}
+    # A filtered zero is inconclusive when optional Codex title enrichment
+    # omitted a row; report the gap even though that row was filtered away.
+    assert no_match["title_metadata"] == {
+        "status": "incomplete",
+        "applicable": 2,
+        "missing": 1,
+    }
+
+
+def test_chat_peers_zero_match_reports_incomplete_title_enrichment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    targets = [
+        _discovered_target("codex@imac:kwonsyup:662c7d4d031e", "a", provider="codex"),
+    ]
+    _stub_peer_discovery(monkeypatch, targets)
+    monkeypatch.setattr("sys.stdin", _feed([*_handshake(), _chat_peers_call(1, {"query": "missing"})]))
+
+    mcp("claude", "studio", str(root))
+
+    response = json.loads(capsys.readouterr().out.splitlines()[-1])
+    result = _tool_result_payload(response)
+    assert result["filter"] == {"query": "missing", "matched": 0, "of": 1}
+    assert result["title_metadata"] == {
+        "status": "incomplete",
+        "applicable": 1,
+        "missing": 1,
+    }
+
+
+def test_chat_peers_zero_match_with_complete_title_data_is_a_real_nonmatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    targets = [
+        _discovered_target(
+            "codex@imac:kwonsyup:662c7d4d031e",
+            "a",
+            title="Known project",
+            provider="codex",
+        ),
+    ]
+    _stub_peer_discovery(monkeypatch, targets)
+    monkeypatch.setattr("sys.stdin", _feed([*_handshake(), _chat_peers_call(1, {"query": "missing"})]))
+
+    mcp("claude", "studio", str(root))
+
+    response = json.loads(capsys.readouterr().out.splitlines()[-1])
+    result = _tool_result_payload(response)
+    assert result["filter"] == {"query": "missing", "matched": 0, "of": 1}
+    assert result["title_metadata"] == {
+        "status": "complete",
+        "applicable": 1,
+        "missing": 0,
+    }
 
 
 def test_chat_peers_rejects_malformed_query_arguments(
