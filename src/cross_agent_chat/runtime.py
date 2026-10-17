@@ -42,6 +42,7 @@ from cross_agent_chat.claude_runtime import (
     DISCOVERY_TIMEOUT_SECONDS,
     SEND_TIMEOUT_SECONDS,
     ClaudeAgentsPreflightTimeout,
+    ClaudeSendMessageRefused,
     ClaudeSendMessageUnknownDelivery,
     claude_alias,
     claude_binary,
@@ -2042,12 +2043,17 @@ def courier_accept(
             "provider": route.provider,
         }
     except ChatError as error:
+        safe_error = (
+            "Claude SendMessage was refused before delivery"
+            if isinstance(error, ClaudeSendMessageRefused)
+            else str(error)
+        )
         return {
             "schema_version": SCHEMA_VERSION,
             "event_id": event_id,
             "status": "PRE_EFFECT_REJECTED",
             "provider": route.provider,
-            "error": str(error),
+            "error": safe_error,
         }
 
 
@@ -2064,6 +2070,7 @@ FORWARDABLE_PRE_EFFECT_REASONS: Final = frozenset(
         "Claude target reference is invalid",
         "Claude SendMessage courier setup failed",
         "Claude courier finished without a SendMessage call",
+        "Claude SendMessage was refused before delivery",
         "session courier is still bootstrapping",
         COURIER_BUSY_PRE_EFFECT_REASON,
         COURIER_STOPPED_PRE_EFFECT_REASON,
@@ -2076,6 +2083,12 @@ FORWARDABLE_PRE_EFFECT_REASONS: Final = frozenset(
         "Codex native queue preflight failed",
         "Codex native queue rejected the message before acceptance",
         "Devin inbox is unavailable",
+        "remote target changed before transport acceptance",
+        "remote target route is incomplete",
+        "remote envelope is not authorized",
+        "native helper is unavailable",
+        "session courier is unavailable before delivery",
+        "Tailnet peer is unavailable before delivery",
         "message is invalid",
         "message must not be empty",
         "message exceeds the 16 KiB limit",
@@ -4585,13 +4598,18 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         }
     except UnknownDeliveryError:
         raise
-    except ChatError:
+    except ChatError as error:
+        reason = str(error)
         return {
             "schema_version": SCHEMA_VERSION,
             "event_id": event_id,
             "status": "PRE_EFFECT_REJECTED",
             "provider": target_provider,
-            "error": "remote destination rejected before provider effect",
+            "error": (
+                reason
+                if reason in FORWARDABLE_PRE_EFFECT_REASONS
+                else "remote destination rejected before provider effect"
+            ),
         }
 
 
