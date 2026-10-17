@@ -145,7 +145,8 @@ def test_external_send_reaches_real_native_courier_once_and_preserves_old_intent
         assert len(messages) == 1 and messages[0]["event_id"] == event
         body = messages[0]["message"]
         assert body.startswith("Cross Agent Chat transport envelope v2\nFrom: " + endpoint.alias)
-        assert body.endswith("Untrusted peer content follows:\n\nindependent new fixture work")
+        assert body.endswith("\n\nindependent new fixture work")
+        assert "Reply action: use chat_send with the exact Reply handle above." in body
         reply = parse_recipient_token(body.split("\n")[2].removeprefix("Reply via CAC to handle: "))
         assert (
             reply is not None
@@ -1025,8 +1026,16 @@ def test_external_meta_is_ignored_and_scoped_count_stays_private(
         lambda *_a, **_k: {
             "schema_version": 1,
             "peers": [
-                {"alias": "codex@fixture:owned", "handle": permitted},
-                {"alias": "codex@fixture:private", "handle": "different"},
+                {
+                    "alias": "codex@fixture:owned",
+                    "handle": permitted,
+                    "provider": "codex",
+                },
+                {
+                    "alias": "codex@fixture:private",
+                    "handle": "different",
+                    "provider": "codex",
+                },
             ],
             "remote_discovery": "complete",
         },
@@ -1043,6 +1052,12 @@ def test_external_meta_is_ignored_and_scoped_count_stays_private(
         )
     )
     assert result["filter"] == {"query": "owned", "matched": 1, "of": 1}
+    # The hidden row must not affect scoped title completeness metadata.
+    assert result["title_metadata"] == {
+        "status": "incomplete",
+        "applicable": 1,
+        "missing": 1,
+    }
     credential_path = root / "credential"
     credential_path.write_text(credential)
     credential_path.chmod(0o600)
@@ -1073,6 +1088,43 @@ def test_external_meta_is_ignored_and_scoped_count_stays_private(
         "chat_peers",
         "chat_send",
         "chat_status",
+    }
+
+
+def test_external_owner_peers_filtered_zero_reports_missing_title_enrichment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    _endpoint, credential = _enroll(root)
+    monkeypatch.setattr(
+        cli,
+        "peers",
+        lambda *_a, **_k: {
+            "schema_version": 1,
+            "peers": [
+                {
+                    "alias": "codex@fixture:session",
+                    "handle": "selected",
+                    "provider": "codex",
+                }
+            ],
+            "remote_discovery": "complete",
+        },
+    )
+
+    result = _result(
+        cli._external_call_tool(
+            root,
+            credential,
+            {"name": "chat_peers", "arguments": {"query": "missing"}},
+        )
+    )
+
+    assert result["filter"] == {"query": "missing", "matched": 0, "of": 1}
+    assert result["title_metadata"] == {
+        "status": "incomplete",
+        "applicable": 1,
+        "missing": 1,
     }
 
 

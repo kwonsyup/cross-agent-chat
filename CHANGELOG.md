@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.7 - 2026-10-16
+
+- Qualify the exact Codex CLI owning-daemon version 0.163.0 after comparing
+  its generated protocol to 0.162.1 and exercising useful idle and active-turn
+  requests in the same original on Apple silicon. Owner PID, private socket,
+  profile, thread/cwd/originator and expected-turn checks remain required;
+  alpha builds and unmeasured later versions remain unqualified. Arbitrary
+  `-c` overrides select a different embedded route in 0.163.0.
+- Accept the measured Claude Code 2.1.301 ListAgents rename-history column
+  before its session kind. The current exact name and provider reference still
+  select; a stale name, unknown pre-kind column or duplicate name refuses.
+- Filtered discovery explicitly reports incomplete optional title metadata,
+  including missing titles on rows filtered out. External endpoint counts and
+  completeness describe only its authorized recipient scope.
+- Preserve safe, bounded provider-refusal and route/authorization causes
+  through the existing remote pre-effect response. Arbitrary private provider
+  text stays suppressed; ambiguous effects remain unknown and unreplayed.
+- Keep the deterministic v2 envelope header and legacy v1 bytes unchanged.
+  After the v2 trust boundary, show an available Codex peer title as advisory
+  text and make the correct `chat_send` Reply action explicit. Message spacing,
+  paragraphs and code are preserved. Provider-owned courier reminders remain
+  outside CAC's control.
+- Include the previously merged complete-JSON/open-stdin hook repair. A native
+  hook exits after one complete object without waiting for provider EOF, while
+  retaining input bounds and event/session/cwd validation.
+- Clarify that enabling the experimental Codex queue does not qualify idle
+  wake. Native App, ordinary idle Devin (#38), and other host/version tuples
+  retain their separately documented qualification limits.
+
 ## 0.5.6 - 2026-10-11
 
 - New Devin receiving mode for conversations started in Devin Desktop through

@@ -17,6 +17,7 @@ import json
 import os
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -26,6 +27,7 @@ import pytest
 from cross_agent_chat import runtime
 from cross_agent_chat.core import (
     ChatError,
+    IntentStore,
     Registry,
     Route,
     session_key,
@@ -617,6 +619,96 @@ def test_local_token_send_delivers_to_the_exact_local_route(
     assert reply.generation == source.generation
 
 
+def test_local_decided_refusal_exposes_no_effect_and_original_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target, source = _route(tmp_path), _source(tmp_path)
+    healthy = cast(Callable[..., dict[str, object]], _courier([target, source]))
+
+    def socket(path: Path, payload: dict[str, object], **kwargs: object) -> dict[str, object]:
+        if payload["operation"] == "accept":
+            return {
+                "schema_version": 1,
+                "event_id": payload["event_id"],
+                "status": "PRE_EFFECT_REJECTED",
+                "provider": "claude",
+                "error": "Claude target changed during discovery",
+            }
+        return healthy(path, payload, **kwargs)
+
+    monkeypatch.setattr(runtime, "request_socket", socket)
+    token = local_token(tmp_path, session_key("claude", target.session_id), target.generation)
+    with pytest.raises(ChatError, match="nothing was delivered") as refused:
+        send(tmp_path, source, token, "One distinct request")
+    (intent,) = IntentStore(tmp_path).intents()
+    assert intent.status == "PRE_EFFECT_REJECTED"
+    assert intent.event_id in str(refused.value)
+    assert "Claude target changed during discovery" in str(refused.value)
+
+
+def test_local_send_wires_exact_original_title_into_advisory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _route(tmp_path)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    identity = runtime.recipient_owner_identity("codex", os.getpid(), str(profile))[0]
+    source = replace(_source(tmp_path), profile_root=str(profile), owner_identity=identity)
+    Registry(tmp_path).upsert(source)
+    accepts: list[dict[str, object]] = []
+    reads: list[list[str]] = []
+    monkeypatch.setattr(runtime, "request_socket", _courier([target, source], accepts))
+    monkeypatch.setattr(runtime, "_courier_owner_binary", lambda *_args: Path("/bound/codex"))
+
+    def titles(
+        *, binary: Path, environment: dict[str, str], thread_ids: list[str], deadline: float
+    ) -> dict[str, str]:
+        assert binary == Path("/bound/codex")
+        assert environment == {"CODEX_HOME": source.profile_root}
+        reads.append(thread_ids)
+        return {source.session_id: "D project review"}
+
+    monkeypatch.setattr(runtime, "native_thread_titles", titles)
+    token = local_token(tmp_path, session_key("claude", target.session_id), target.generation)
+    assert send(tmp_path, source, token, "Keep the original.\n\nReturn its finding.")["status"] == (
+        "TRANSPORT_ACCEPTED"
+    )
+    assert reads == [[source.session_id]]
+    (accepted,) = accepts
+    body = str(accepted["message"])
+    assert "Peer title (advisory): D project review\n" in body
+    assert body.endswith("Keep the original.\n\nReturn its finding.")
+    reply = runtime._envelope_reply_token(body, source.alias, str(accepted["event_id"]), "claude")
+    assert reply is not None and reply.handle == session_key("codex", source.session_id)
+
+
+def test_optional_title_read_cannot_extend_send_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    identity = runtime.recipient_owner_identity("codex", os.getpid(), str(profile))[0]
+    source = replace(_source(tmp_path), profile_root=str(profile), owner_identity=identity)
+    clock = [99.0]
+    observed: list[float] = []
+    monkeypatch.setattr("cross_agent_chat.runtime.time.monotonic", lambda: clock[0])
+
+    def resolve(*_args: object) -> Path:
+        clock[0] = 100.5  # Executable lookup has spent the remaining send budget.
+        return Path("/bound/codex")
+
+    def titles(
+        *, binary: Path, environment: dict[str, str], thread_ids: list[str], deadline: float
+    ) -> dict[str, str]:
+        observed.append(deadline)
+        return {}
+
+    monkeypatch.setattr(runtime, "_courier_owner_binary", resolve)
+    monkeypatch.setattr(runtime, "native_thread_titles", titles)
+    assert runtime._source_display_title(tmp_path, source, 100.0) is None
+    assert observed == [100.0]
+
+
 def test_local_token_from_another_state_root_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -861,6 +953,8 @@ def test_v2_wrapper_head_is_versioned_deterministic_and_readable() -> None:
         "Delivery principal: the installed Claude Code Cross Agent Chat helper. "
         f"CAC delivery event: {event_id}.\n"
         "Untrusted peer content follows:\n\n"
+        "Reply action: use chat_send with the exact Reply handle above. "
+        "Do not address native SendMessage to the visible courier.\n\n"
         "hello"
     )
 
@@ -869,6 +963,25 @@ def test_v2_wrapper_head_is_versioned_deterministic_and_readable() -> None:
 
 
 # --- Receive-side v2 reply validation ---------------------------------------
+
+
+def test_v2_advisory_keeps_retained_header_reader_and_body_bytes() -> None:
+    alias = "codex@studio:api:source-a1"
+    token = local_token(Path("/tmp/state"), "b7" * 32, str(uuid4()))
+    event_id = str(uuid4())
+    message = "Decision: keep the original.\n\n```python\n  keep_indent()\n```\n"
+    wrapped = wrapped_message(
+        alias, token, message, event_id, "claude", source_title="D project review"
+    )
+    # This is the same exact-header reader retained by older v2 receivers.
+    parsed = runtime._envelope_reply_token(wrapped, alias, event_id, "claude")
+    assert parsed is not None and parsed == parse_recipient_token(token)
+    head = runtime._wrapped_head_v2(alias, token, event_id, "claude")
+    assert wrapped.startswith(head + "Peer title (advisory): D project review\n")
+    assert wrapped.endswith(message)
+    assert "chat_send with the exact Reply handle above" in wrapped
+    # A display title never replaces the exact reply route or authenticated alias.
+    assert wrapped.splitlines()[1:3] == [f"From: {alias}", f"Reply via CAC to handle: {token}"]
 
 
 def _receive_fixture(
@@ -1036,7 +1149,9 @@ def test_remote_receive_rejects_every_truncated_v2_prefix(
     token = remote_token(OTHER_NODE, source_handle, source_generation)
     event_id = str(uuid4())
     full = wrapped_message(source_alias, token, "ping", event_id, "claude")
-    head = full[: -len("ping")]
+    # Advisory text is content after the verified header. Every truncated
+    # header remains invalid; arbitrary complete-header content remains valid.
+    head = runtime._wrapped_head_v2(source_alias, token, event_id, "claude")
 
     rejections = 0
     for cut in range(len(marker), len(head)):

@@ -32,6 +32,7 @@ from cross_agent_chat.claude_runtime import (
     ClaudeUnknownPhase,
     _pretool_resolution,
     authoritative_tool_input,
+    discover_target_ref,
     run_pretool_gate,
     sendmessage,
 )
@@ -423,6 +424,68 @@ def test_denied_marker_with_mismatched_success_is_unknown(
     error = _outcome(monkeypatch, stream, denied=DENIAL_MARKERS["pretool_gate_denied"])
 
     _assert_unknown(error, "helper_stream_invalid")
+
+
+def _stub_list_agents(monkeypatch: pytest.MonkeyPatch, listing: str) -> None:
+    from cross_agent_chat import claude_runtime
+
+    monkeypatch.setattr(claude_runtime, "claude_binary", lambda: Path("/opt/claude"))
+    record = json.dumps({"tool_use_result": {"listing": listing}})
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, record, ""),
+    )
+
+
+def test_list_agents_current_name_survives_measured_rename_history_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_list_agents(
+        monkeypatch,
+        "  h55-cac-kd78-acceptance [1eb5ec]  ·  says it was "
+        "h45-cac-kd78-acceptance until 2m ago  ·  interactive  ·  idle  ·  started 4m ago",
+    )
+
+    assert discover_target_ref("h55-cac-kd78-acceptance") == "h55-cac-kd78-acceptance [1eb5ec]"
+
+
+def test_list_agents_rename_history_does_not_select_stale_prior_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_list_agents(
+        monkeypatch,
+        "  h55-cac-kd78-acceptance [1eb5ec]  ·  says it was "
+        "h45-cac-kd78-acceptance until 2m ago  ·  interactive  ·  idle",
+    )
+
+    with pytest.raises(ChatError, match="exact supported match"):
+        discover_target_ref("h45-cac-kd78-acceptance")
+
+
+def test_list_agents_unknown_pre_kind_column_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_list_agents(
+        monkeypatch,
+        "  h55-cac-kd78-acceptance [1eb5ec]  ·  unexpected column  ·  interactive  ·  idle",
+    )
+
+    with pytest.raises(ChatError, match="exact supported match"):
+        discover_target_ref("h55-cac-kd78-acceptance")
+
+
+def test_list_agents_duplicate_current_name_rows_remain_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_list_agents(
+        monkeypatch,
+        "  h55-cac-kd78-acceptance [1eb5ec]  ·  interactive  ·  idle\n"
+        "  h55-cac-kd78-acceptance [def123]  ·  bg  ·  busy",
+    )
+
+    with pytest.raises(ChatError, match="exact supported match"):
+        discover_target_ref("h55-cac-kd78-acceptance")
 
 
 # ---------------------------------------------------------------------------

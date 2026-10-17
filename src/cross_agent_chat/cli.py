@@ -47,6 +47,7 @@ from cross_agent_chat.runtime import (
     native_register,
     native_startup,
     owner_event_status,
+    peer_title_metadata,
     peers,
     presence_is_enabled,
     register,
@@ -730,8 +731,15 @@ def _external_call_tool(
         result = peers(root, include_delivery_mode=True, include_external=True)
         if source.allowed_recipients is not None:
             rows = cast(list[dict[str, str]], result["peers"])
-            result["peers"] = [row for row in rows if row["handle"] in source.allowed_recipients]
+            rows = [row for row in rows if row["handle"] in source.allowed_recipients]
+            result["peers"] = rows
         if exact_query is not None:
+            # Search completeness and counts must describe only this
+            # endpoint's authorized recipient scope. Owner-wide endpoints use
+            # the complete listing; selected endpoints use the rows above.
+            result["title_metadata"] = peer_title_metadata(
+                cast(list[dict[str, str]], result["peers"])
+            )
             rows = cast(list[dict[str, str]], result["peers"])
             filtered = [
                 row

@@ -24,16 +24,16 @@ secrets those files hold (see [setup and data handling](SECURITY.md)).
 Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
 limits the set.
 
-Install v0.5.6 with:
+Install v0.5.7 with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.6/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.7/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
-This builds the released `v0.5.6` tag and installs the command at
+This builds the released `v0.5.7` tag and installs the command at
 `~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
 Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
 not found in your shell, use the full path the installer reports. Run it on
@@ -90,13 +90,17 @@ harness and mode:
 | Coding surface on macOS | Parked/idle wake | Active-turn input | Deferred behavior | Qualification |
 |---|---|---|---|---|
 | Claude Code | Qualified idle wake and new-turn input | Between tool calls; a running tool is not interrupted | — | Supported desktop-launched contexts; a session inside a remote SSH shell registered but could not receive |
-| Codex CLI 0.160.1 / 0.162.0 / 0.162.1 (owning app-server daemon) | Queued input wakes the parked original | Direct input reaches the expected active turn | — | Only a `codex-tui` 0.160.1, 0.162.0, or 0.162.1 conversation already owned by its own daemon, verified by route PID, profile, thread, cwd, and originator over a private owner-only socket; CAC starts no daemon and uses no UI relay |
+| Codex CLI 0.160.1 / 0.162.0 / 0.162.1 / 0.163.0 (owning app-server daemon) | Queued input wakes the parked original | Direct input reaches the expected active turn | — | Only a `codex-tui` 0.160.1, 0.162.0, 0.162.1, or 0.163.0 conversation already owned by its own daemon, verified by route PID, profile, thread, cwd, and originator over a private owner-only socket; CAC starts no daemon and uses no UI relay |
 | Codex CLI `--no-daemon` or any unqualified version (older or newer) | No | No | Stop-bound: the current turn's end or the next prompt | Default when no owning daemon is present |
 | Codex Native App (managed helper) | Qualified on the listed host | Qualified on the listed host | — | Intel macOS, Codex 0.159.2 in Native app 26.928.21956, trusted hooks available; does not qualify every host version |
 | Codex CLI experimental native queue | Unknown: provider queue acceptance alone does not qualify wake | Unknown | May wait behind the current turn or until resume | Only under explicit `setup --enable-experimental-codex-native-queue`; not active by default. A qualified owning daemon on the same route takes precedence over this queue |
 | Local Devin CLI/App | No — [#38](https://github.com/kwonsyup/cross-agent-chat/issues/38) open | Between the root conversation's tool calls; a running tool is not interrupted. While a built-in subagent (`subagent_general`, `subagent_explore`) is running, only after the root's own subagent or question tool calls; while a custom profile (which may nest) runs or a launch outcome was not observed, the message waits for the next prompt. A child counts as running until Devin reports it finished to the root (`read_subagent` or a foreground return); one known only through Devin's completion notification keeps that session restricted until it ends | An idle conversation receives at its next prompt | Reported as active-turn input only when the receiving Mac runs 0.5.3 or later and that session has already run its tool hook; otherwise reported conservatively. A 0.5.4 or later receiver also reports its current subagent restriction as `current_boundary`, and `active_turn_input` is then `false` (held until the next prompt) or `limited` (root-only tools). Qualified 8 Oct 2026 with Devin CLI 3000.11.3 and the Desktop-bundled CLI 3000.10.48 (Apple silicon) receiving from Codex CLI 0.162.0 and Claude Code 2.1.294 across Macs; the Desktop app window itself was not exercised |
 | New Devin conversation in Devin Desktop through the "Devin + Cross Agent Chat" ACP agent | Yes: an idle root conversation is woken with the peer message as a native prompt | Same root tool-boundary rules as local Devin | A message that arrives during a turn waits for that turn to finish (or its tool boundary) | Qualified 11 Oct 2026 on Apple silicon with Devin Desktop branded app 3.10.48 (editor core 1.126.0; bundled CLI 3000.10.48), hosting CLI 3000.11.3 (`devin acp`): idle round trips with a Codex CLI 0.162.1 owning-daemon original and a Claude Code 2.1.296 original, both receiving ends idle, plus a Devin CLI original. Desktop shows the peer task, tool calls, native permission prompts and the answer in the same conversation. Peer-started turns show **Working / In progress** and a direct **Cancel** button with an empty composer; direct cancellation returned native `stopReason: cancelled`. Cancel does not undo already admitted tool effects. Only conversations started with this agent; not existing Devin Local, CLI, or Desktop originals (#38) |
 | Grokbot 0.66.0 (external endpoint) | One author-reported idle webhook return | Unqualified | — | One owner-enrolled Bot; does not certify another Bot, fresh-user setup, or M2 |
+
+For Codex 0.163.0, arbitrary command-line `-c` configuration overrides use an
+embedded server and therefore do not qualify for the owning-daemon row. The
+actual route PID must match the daemon; a version string alone is insufficient.
 
 ### Devin idle receiving through Devin Desktop
 
@@ -276,6 +280,14 @@ show a descriptive title; a Devin row's is a stable opaque session label, not
 a provider title or selector. An exact handle or uniquely matching full alias
 always selects.
 
+A filtered peer query reports `title_metadata` completeness for the discovered
+Codex and enrolled endpoint rows. Zero matches with incomplete metadata does
+not establish that an original is absent. Use its exact known handle or full
+alias; title and project text remain display hints. A message may include an
+advisory peer title after the retained v2 header and an explicit `chat_send`
+reply action. The provider may still display its own courier reminder; use
+the CAC Reply route rather than the visible helper address.
+
 `chat_send` reports `TRANSPORT_ACCEPTED` (custody, not a read receipt — do
 not re-send), a pre-delivery refusal (nothing was handed over; correcting
 that refused attempt is safe only if no earlier attempt of the same work was
@@ -338,8 +350,10 @@ Cross-Mac sessions connect over Tailscale: the broker listens on the Mac's
 Tailnet address, TCP port `47071`, and your Tailscale ACL decides which Macs
 may reach it; local broker health is `127.0.0.1:47072`.
 `setup --enable-experimental-codex-native-queue` and
-`--disable-experimental-codex-native-queue` toggle idle reception for new
-sessions in the current Codex profile.
+`--disable-experimental-codex-native-queue` enable or disable the experimental
+queue for new sessions in the current Codex profile. Queue acceptance does
+not establish idle wake or active-turn input; inspect the session's reported
+mode and the qualification table above.
 
 </details>
 

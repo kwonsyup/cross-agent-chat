@@ -68,8 +68,9 @@ CLAUDE_CONTEXT_ENV_KEYS: Final = (
 BOUND_CLAUDE_BINARY_ENV: Final = "CROSS_AGENT_CHAT_CLAUDE_BINARY"
 TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z")
 # One ListAgents row: two leading spaces, the printable `name [ref]` address,
-# then `  ·  `-separated columns whose first is the kind (`interactive` or
-# `bg`) followed by free-form status/detail columns the provider may extend.
+# then an optional measured rename-history column, followed by the kind
+# (`interactive` or `bg`) and free-form status/detail columns the provider may
+# extend. The rename-history text never supplies the current target name.
 # The `name [ref]` text is the only documented cross-session SendMessage
 # address -- the embedded tool description in Claude Code 2.1.278 says "the
 # name IS the address; there is no separate address syntax", and `claude
@@ -78,6 +79,7 @@ TARGET_REF_RE: Final = re.compile(r"(?P<name>.+) \[(?P<token>[A-Za-z0-9]{6})\]\Z
 # hash(kind, session id) token, so it stays bound to exact session identity.
 LISTING_ROW_RE: Final = re.compile(
     r"^  (?P<name>.+?) \[(?P<token>[A-Za-z0-9]{6})\]  ·  "
+    r"(?:says it was [^\r\n]+ until \d+[smhd] ago  ·  )?"
     r"(?:interactive|bg)(?:  ·  [^\r\n]+)*$"
 )
 # The provider schema declares `summary` an optional one-line UI preview of at
