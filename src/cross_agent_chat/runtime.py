@@ -3873,7 +3873,7 @@ def _source_display_title(root: Path, source: SourceIdentity, deadline: float) -
         binary=binary,
         environment={"CODEX_HOME": source.profile_root},
         thread_ids=[source.session_id],
-        deadline=time.monotonic() + min(remaining, NATIVE_TITLE_TIMEOUT_SECONDS),
+        deadline=min(deadline, time.monotonic() + NATIVE_TITLE_TIMEOUT_SECONDS),
     ).get(source.session_id)
 
 

@@ -17,6 +17,7 @@ import json
 import os
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -615,6 +616,69 @@ def test_local_token_send_delivers_to_the_exact_local_route(
     assert reply is not None and reply.scope == "local"
     assert reply.handle == session_key("codex", source.session_id)
     assert reply.generation == source.generation
+
+
+def test_local_send_wires_exact_original_title_into_advisory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _route(tmp_path)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    identity = runtime.recipient_owner_identity("codex", os.getpid(), str(profile))[0]
+    source = replace(_source(tmp_path), profile_root=str(profile), owner_identity=identity)
+    Registry(tmp_path).upsert(source)
+    accepts: list[dict[str, object]] = []
+    reads: list[list[str]] = []
+    monkeypatch.setattr(runtime, "request_socket", _courier([target, source], accepts))
+    monkeypatch.setattr(runtime, "_courier_owner_binary", lambda *_args: Path("/bound/codex"))
+
+    def titles(
+        *, binary: Path, environment: dict[str, str], thread_ids: list[str], deadline: float
+    ) -> dict[str, str]:
+        assert binary == Path("/bound/codex")
+        assert environment == {"CODEX_HOME": source.profile_root}
+        reads.append(thread_ids)
+        return {source.session_id: "D project review"}
+
+    monkeypatch.setattr(runtime, "native_thread_titles", titles)
+    token = local_token(tmp_path, session_key("claude", target.session_id), target.generation)
+    assert send(tmp_path, source, token, "Keep the original.\n\nReturn its finding.")["status"] == (
+        "TRANSPORT_ACCEPTED"
+    )
+    assert reads == [[source.session_id]]
+    (accepted,) = accepts
+    body = str(accepted["message"])
+    assert "Peer title (advisory): D project review\n" in body
+    assert body.endswith("Keep the original.\n\nReturn its finding.")
+    reply = runtime._envelope_reply_token(body, source.alias, str(accepted["event_id"]), "claude")
+    assert reply is not None and reply.handle == session_key("codex", source.session_id)
+
+
+def test_optional_title_read_cannot_extend_send_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    identity = runtime.recipient_owner_identity("codex", os.getpid(), str(profile))[0]
+    source = replace(_source(tmp_path), profile_root=str(profile), owner_identity=identity)
+    clock = [99.0]
+    observed: list[float] = []
+    monkeypatch.setattr("cross_agent_chat.runtime.time.monotonic", lambda: clock[0])
+
+    def resolve(*_args: object) -> Path:
+        clock[0] = 100.5  # Executable lookup has spent the remaining send budget.
+        return Path("/bound/codex")
+
+    def titles(
+        *, binary: Path, environment: dict[str, str], thread_ids: list[str], deadline: float
+    ) -> dict[str, str]:
+        observed.append(deadline)
+        return {}
+
+    monkeypatch.setattr(runtime, "_courier_owner_binary", resolve)
+    monkeypatch.setattr(runtime, "native_thread_titles", titles)
+    assert runtime._source_display_title(tmp_path, source, 100.0) is None
+    assert observed == [100.0]
 
 
 def test_local_token_from_another_state_root_is_refused(
