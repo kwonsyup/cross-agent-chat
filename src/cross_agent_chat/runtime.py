@@ -5979,7 +5979,19 @@ def owner_event_status(
     return _event_status_payload(root, matches[0], recipient=recipient)
 
 
+CODEX_STOP_DEADLINE_SECONDS: Final = 2.0
+CODEX_STOP_FINISH_MARGIN_SECONDS: Final = 0.05
+
+
 def codex_stop(pid: int, state_root_value: str | None) -> None:
+    deadline = time.monotonic() + CODEX_STOP_DEADLINE_SECONDS
+
+    def request_before_deadline(path: Path, payload: dict[str, object]) -> dict[str, object] | None:
+        timeout = deadline - time.monotonic() - CODEX_STOP_FINISH_MARGIN_SECONDS
+        if timeout <= 0:
+            return None
+        return request_socket(path, payload, timeout=timeout)
+
     if not presence_is_enabled():
         return
     raw = hook_input("Stop")
@@ -6005,7 +6017,7 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
         print("{}", flush=True)
         return
     try:
-        health = request_socket(
+        health = request_before_deadline(
             socket_path(root, route),
             {
                 "schema_version": SCHEMA_VERSION,
@@ -6016,6 +6028,9 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
             },
         )
     except ChatError:
+        print("{}", flush=True)
+        return
+    if health is None:
         print("{}", flush=True)
         return
     base_health = {
@@ -6038,10 +6053,17 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
     if direct_mode != "codex_stop_bound":
         print("{}", flush=True)
         return
-    peek = request_socket(
-        socket_path(root, route),
-        {"schema_version": 1, "operation": "peek", "generation": route.generation},
-    )
+    try:
+        peek = request_before_deadline(
+            socket_path(root, route),
+            {"schema_version": 1, "operation": "peek", "generation": route.generation},
+        )
+    except ChatError:
+        print("{}", flush=True)
+        return
+    if peek is None:
+        print("{}", flush=True)
+        return
     raw_messages = peek.get("messages")
     if not isinstance(raw_messages, list) or not raw_messages:
         print("{}", flush=True)
@@ -6057,7 +6079,7 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
         messages.append({"event_id": valid_uuid(event_id, "event id"), "message": message})
 
     try:
-        acknowledged = request_socket(
+        acknowledged = request_before_deadline(
             socket_path(root, route),
             {
                 "schema_version": 1,
@@ -6066,7 +6088,14 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
                 "event_ids": [item["event_id"] for item in messages],
             },
         )
+    except UnknownDeliveryError:
+        print("acknowledgement outcome unknown; not retried", file=sys.stderr, flush=True)
+        print("{}", flush=True)
+        return
     except ChatError:
+        print("{}", flush=True)
+        return
+    if acknowledged is None:
         print("{}", flush=True)
         return
     if acknowledged != {
