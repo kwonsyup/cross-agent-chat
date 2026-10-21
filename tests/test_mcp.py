@@ -4,15 +4,16 @@ import io
 import json
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NoReturn
 from uuid import uuid4
 
 import pytest
 
-from cross_agent_chat import cli
+from cross_agent_chat import cli, runtime
 from cross_agent_chat.cli import mcp
-from cross_agent_chat.core import ChatError, IntentStore, Registry, Route
+from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, UnknownDeliveryError
 from cross_agent_chat.mcp_server import normalize_send_arguments
+from cross_agent_chat.recipient import local_token
 from cross_agent_chat.runtime import Target
 
 
@@ -599,6 +600,102 @@ def test_chat_send_resolves_a_unique_exact_alias(
     # The human-readable recipient is surfaced alongside the effect result.
     assert result["to"] == "claude@imac:Projects:W_Kluro_2Oct1PM"
     assert result["status"] == "TRANSPORT_ACCEPTED"
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_chat_send_malformed_recipient_exposes_decided_no_effect_on_the_wire(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    provider: Literal["claude", "codex"],
+) -> None:
+    root = tmp_path / "state"
+    source = Route.create(
+        provider=provider, session_id=str(uuid4()), device="studio", cwd=str(tmp_path), pid=1
+    )
+    monkeypatch.setattr(cli, "authenticate_mcp_sender", lambda *_args: source)
+    monkeypatch.setattr(cli, "reply_delivery", lambda *_args: "unknown")
+
+    def unexpected(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("malformed MCP recipient reached intent admission or provider I/O")
+
+    for name in ("_begin_delivery", "request_socket", "request_tailnet"):
+        monkeypatch.setattr(runtime, name, unexpected)
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "chat_send",
+            "arguments": {"to": "cac2.not-base64!", "message": "independent fixture request"},
+            "_meta": {"threadId": source.session_id},
+        },
+    }
+    monkeypatch.setattr("sys.stdin", _feed([*_handshake(), request]))
+
+    mcp(provider, "studio", str(root))
+
+    response: object = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "isError": True,
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "recipient token is invalid; nothing was delivered; "
+                        "call chat_peers and choose a fresh exact recipient handle"
+                    ),
+                }
+            ],
+        },
+    }
+    store = IntentStore(root)
+    assert store.intents() == []
+    assert not store.path.exists()
+
+
+def test_chat_send_preserves_downstream_unknown_on_the_wire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="claude", session_id=str(uuid4()), device="studio", cwd=str(tmp_path), pid=1
+    )
+    recipient = local_token(root, "f" * 64, str(uuid4()))
+    monkeypatch.setattr(cli, "authenticate_mcp_sender", lambda *_args: source)
+    monkeypatch.setattr(cli, "reply_delivery", lambda *_args: "unknown")
+
+    def downstream(*_args: object, **_kwargs: object) -> NoReturn:
+        raise UnknownDeliveryError("provider receipt unavailable; do not replay")
+
+    monkeypatch.setattr(runtime, "_send_local_token_target", downstream)
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "chat_send",
+            "arguments": {"to": recipient, "message": "independent fixture request"},
+        },
+    }
+    monkeypatch.setattr("sys.stdin", _feed([*_handshake(), request]))
+
+    mcp("claude", "studio", str(root))
+
+    response: object = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "isError": True,
+            "content": [
+                {"type": "text", "text": "provider receipt unavailable; do not replay"}
+            ],
+        },
+    }
 
 
 def test_chat_send_refuses_an_ambiguous_alias_before_effect(

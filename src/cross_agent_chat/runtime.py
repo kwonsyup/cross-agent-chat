@@ -4160,6 +4160,17 @@ def _send_remote_token_target(
     )
 
 
+def _parse_send_recipient(value: str) -> RecipientToken | None:
+    """Decide malformed-token refusal only before sender discovery or effects."""
+    try:
+        return parse_recipient_token(value)
+    except ChatError as error:
+        raise ChatError(
+            "recipient token is invalid; nothing was delivered; "
+            "call chat_peers and choose a fresh exact recipient handle"
+        ) from error
+
+
 def send_local(
     root: Path,
     source: SourceIdentity,
@@ -4170,7 +4181,7 @@ def send_local(
     source_lock_fd: int | None = None,
 ) -> dict[str, object]:
     deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
-    token = parse_recipient_token(target_query)
+    token = _parse_send_recipient(target_query)
     if token is not None:
         if token.scope != "local":
             raise ChatError("recipient token selects a remote device, not a local session")
@@ -4210,7 +4221,7 @@ def send(
     include_external: bool = False,
 ) -> dict[str, object]:
     deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
-    token = parse_recipient_token(target_query)
+    token = _parse_send_recipient(target_query)
     if token is not None:
         if token.scope == "local":
             return _send_local_token_target(

@@ -19,7 +19,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import Literal, NoReturn, cast
 from uuid import uuid4
 
 import pytest
@@ -30,6 +30,7 @@ from cross_agent_chat.core import (
     IntentStore,
     Registry,
     Route,
+    UnknownDeliveryError,
     session_key,
 )
 from cross_agent_chat.recipient import (
@@ -269,6 +270,96 @@ def test_non_token_values_are_not_parsed_as_tokens() -> None:
     assert parse_recipient_token("claude@studio:api:api-a1") is None
     assert parse_recipient_token("f" * 64) is None
     assert parse_recipient_token("cac1.legacy") is None
+
+
+@pytest.mark.parametrize("sender", [send, send_local], ids=["send", "send_local"])
+@pytest.mark.parametrize(
+    "recipient",
+    [
+        "cac2.not-base64!",
+        _encode_token({"v": 2, "s": "remote", "h": "f" * 64, "n": OWNER_NODE}),
+    ],
+    ids=["invalid-encoding", "missing-generation"],
+)
+def test_malformed_recipient_refuses_before_intent_or_provider_without_settling_old_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sender: Callable[[Path, Route, str, str], dict[str, object]],
+    recipient: str,
+) -> None:
+    source, target = _source(tmp_path), _route(tmp_path)
+    store = IntentStore(tmp_path)
+    old_event = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    store.mark(old_event, "UNKNOWN_DELIVERY")
+    before = store.path.read_bytes()
+
+    def unexpected(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("malformed recipient reached discovery, intent admission or provider I/O")
+
+    for name in (
+        "_local_discovery",
+        "_remote_discovery",
+        "_begin_delivery",
+        "request_socket",
+        "request_tailnet",
+    ):
+        monkeypatch.setattr(runtime, name, unexpected)
+
+    with pytest.raises(ChatError) as refused:
+        sender(tmp_path, source, recipient, "new independent fixture request")
+
+    assert type(refused.value) is ChatError
+    assert str(refused.value) == (
+        "recipient token is invalid; nothing was delivered; "
+        "call chat_peers and choose a fresh exact recipient handle"
+    )
+    assert recipient not in str(refused.value)
+    assert store.path.read_bytes() == before
+    assert [(item.event_id, item.status) for item in store.intents()] == [
+        (old_event, "UNKNOWN_DELIVERY")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("sender", "scope"),
+    [(send, "local"), (send_local, "local"), (send, "remote")],
+    ids=["send-local", "send_local", "send-remote"],
+)
+def test_sender_does_not_reclassify_downstream_unknown_after_valid_recipient_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sender: Callable[[Path, Route, str, str], dict[str, object]],
+    scope: Literal["local", "remote"],
+) -> None:
+    source, target = _source(tmp_path), _route(tmp_path)
+    handle = session_key(target.provider, target.session_id)
+    recipient = (
+        local_token(tmp_path, handle, target.generation)
+        if scope == "local"
+        else remote_token(OWNER_NODE, handle, target.generation)
+    )
+    expected = parse_recipient_token(recipient)
+    assert expected is not None
+    unknown = UnknownDeliveryError("provider effect may have happened; do not replay")
+    selected: list[RecipientToken] = []
+
+    def downstream(
+        _root: Path,
+        _source: runtime.SourceIdentity,
+        token: RecipientToken,
+        _message: str,
+        **_kwargs: object,
+    ) -> NoReturn:
+        selected.append(token)
+        raise unknown
+
+    monkeypatch.setattr(runtime, f"_send_{scope}_token_target", downstream)
+    with pytest.raises(UnknownDeliveryError) as refused:
+        sender(tmp_path, source, recipient, "independent fixture request")
+
+    assert selected == [expected]
+    assert refused.value is unknown
+    assert "nothing was delivered" not in str(refused.value)
 
 
 # --- Public listing --------------------------------------------------------
