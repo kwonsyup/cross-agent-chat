@@ -49,6 +49,7 @@ from cross_agent_chat.runtime import (
     wrapped_message,
 )
 from cross_agent_chat.tailnet import TailnetIdentity
+from cross_agent_chat.tailnet_broker import handle_broker_request
 from cross_agent_chat.transport import remote_envelope
 
 OWNER = "100.64.0.11"
@@ -113,7 +114,10 @@ def _remote_wire(
     def wire(address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         calls.append((address, dict(payload)))
         if payload.get("operation") == "peers":
-            return {"schema_version": 1, "peers": rosters.get(address, [])}
+            response: dict[str, object] = {"schema_version": 1, "peers": rosters.get(address, [])}
+            if payload.get("include_local_discovery") is True:
+                response["local_discovery"] = "complete"
+            return response
         if payload.get("operation") == "receive":
             return _accepted(json.loads(str(payload["envelope"])))
         raise ChatError("unexpected wire operation")
@@ -987,8 +991,170 @@ def test_local_discovery_health_miss_cannot_hide_duplicate_alias(
     filtered = peers(tmp_path, include_remote=False, query="absent label")
     assert filtered["peers"] == []
     assert filtered["local_discovery"] == "incomplete"
-    internal = peers(tmp_path, include_remote=False, internal=True)
-    assert set(internal) == {"schema_version", "peers"}
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        peers(tmp_path, include_remote=False, internal=True)
+    internal = peers(tmp_path, include_remote=False, internal=True, include_local_discovery=True)
+    assert set(internal) == {"schema_version", "peers", "local_discovery"}
+    assert internal["local_discovery"] == "incomplete"
+
+
+def test_broker_partial_local_roster_cannot_make_a_remote_alias_unique(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A responding broker must carry its own missed-twin coverage to the sender."""
+    requester, broker = tmp_path / "requester", tmp_path / "broker"
+    requester.mkdir()
+    broker.mkdir()
+    source = _source(requester)
+    first, second = _route(broker, provider="devin"), _route(broker, provider="devin")
+    assert first.alias == second.alias
+    routes = {route.generation: route for route in (source, first, second)}
+    missing: set[str] = set()
+    selected: list[str] = []
+    monkeypatch.setattr(Route, "process_is_live", lambda _route: True)
+    monkeypatch.setattr(runtime, "_with_codex_titles", lambda _root, rows, _deadline: rows)
+    monkeypatch.setattr(
+        runtime, "tailnet_identity", lambda: _identity(peers={OWNER_NODE: OWNER})
+    )
+
+    def health(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        assert payload["operation"] == "health"
+        route = routes[str(payload["generation"])]
+        if route.generation in missing:
+            raise ChatError("fixture live courier health timed out")
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+        }
+
+    def wire(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        assert payload["operation"] == "peers"
+        return handle_broker_request(broker, payload, "100.64.0.10")
+
+    def select(
+        _root: Path,
+        _source: runtime.SourceIdentity,
+        target: Target,
+        _message: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        selected.append(target.session_key)
+        return {"status": "DRY_RUN_SELECTION_ONLY"}
+
+    monkeypatch.setattr(runtime, "request_socket", health)
+    monkeypatch.setattr(runtime, "request_tailnet", wire)
+    monkeypatch.setattr(runtime, "_send_remote_target", select)
+    complete = peers(requester, query=first.alias)
+    assert complete["remote_discovery"] == "complete"
+    assert len(cast(list[object], complete["peers"])) == 2
+    with pytest.raises(ChatError, match="ambiguous"):
+        send(requester, source, first.alias, "fixture only")
+
+    missing.add(second.generation)
+    partial = peers(requester, query=first.alias)
+    assert partial["remote_discovery"] == "incomplete"
+    (healthy,) = cast(list[dict[str, str]], partial["peers"])
+    with pytest.raises(ChatError, match="remote peer discovery is incomplete"):
+        send(requester, source, first.alias, "fixture only")
+    assert selected == []
+    # An old caller cannot understand the new marker: the new broker must
+    # refuse its unscoped partial response, not emit a legacy-valid singleton.
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        handle_broker_request(
+            broker,
+            {"schema_version": 1, "operation": "peers", "include_devin": True},
+            "100.64.0.10",
+        )
+    assert send(requester, source, healthy["handle"], "fixture only")["status"] == (
+        "DRY_RUN_SELECTION_ONLY"
+    )
+    missing_token = remote_token(
+        OWNER_NODE, session_key(second.provider, second.session_id), second.generation
+    )
+    with pytest.raises(ChatError, match="nothing was delivered"):
+        send(requester, source, missing_token, "fixture only")
+    assert selected == [session_key(first.provider, first.session_id)]
+    assert IntentStore(requester).intents() == []
+
+
+@pytest.mark.parametrize("reject_unknown_flag", [False, True])
+def test_legacy_node_without_coverage_keeps_rows_but_cannot_justify_alias_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reject_unknown_flag: bool
+) -> None:
+    source = _source(tmp_path)
+    handle, generation = _remote_selection()
+    row = _peer(REMOTE_ALIAS, "studio", handle, generation)
+    selected: list[str] = []
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([], True))
+    monkeypatch.setattr(runtime, "_with_codex_titles", lambda _root, rows, _deadline: rows)
+    monkeypatch.setattr(
+        runtime, "tailnet_identity", lambda: _identity(peers={OWNER_NODE: OWNER})
+    )
+
+    def legacy(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        assert payload["operation"] == "peers"
+        if reject_unknown_flag and "include_local_discovery" in payload:
+            raise ChatError("legacy broker rejected unknown field")
+        return {"schema_version": 1, "peers": [row]}
+
+    def select(
+        _root: Path,
+        _source: runtime.SourceIdentity,
+        target: Target,
+        _message: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        selected.append(target.session_key)
+        return {"status": "DRY_RUN_SELECTION_ONLY"}
+
+    monkeypatch.setattr(runtime, "request_tailnet", legacy)
+    monkeypatch.setattr(runtime, "_send_remote_target", select)
+    listing = peers(tmp_path, query=REMOTE_ALIAS)
+    assert listing["remote_discovery"] == "incomplete"
+    (healthy,) = cast(list[dict[str, str]], listing["peers"])
+    with pytest.raises(ChatError, match="remote peer discovery is incomplete"):
+        send(tmp_path, source, REMOTE_ALIAS, "fixture only")
+    assert selected == []
+    assert send(tmp_path, source, healthy["handle"], "fixture only")["status"] == (
+        "DRY_RUN_SELECTION_ONLY"
+    )
+    assert selected == [handle]
+    assert IntentStore(tmp_path).intents() == []
+
+
+def test_remote_alias_refuses_when_title_pass_reveals_another_same_alias_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    handle, generation = _remote_selection()
+    first = _peer(REMOTE_ALIAS, "studio", handle, generation)
+    second = _peer(REMOTE_ALIAS, "studio", "b" * 64, str(uuid4()))
+    probes: list[dict[str, object]] = []
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([], True))
+    monkeypatch.setattr(
+        runtime, "tailnet_identity", lambda: _identity(peers={OWNER_NODE: OWNER})
+    )
+
+    def wire(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        assert payload["operation"] == "peers"
+        probes.append(payload)
+        return {
+            "schema_version": 1,
+            "peers": [first, second] if payload.get("include_title") is True else [first],
+            "local_discovery": "complete",
+        }
+
+    def unexpected(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("a newer duplicate was hidden by the earlier singleton")
+
+    monkeypatch.setattr(runtime, "request_tailnet", wire)
+    monkeypatch.setattr(runtime, "_send_remote_target", unexpected)
+    with pytest.raises(ChatError, match="remote peer discovery is incomplete"):
+        send(tmp_path, source, REMOTE_ALIAS, "fixture only")
+    assert len(probes) == 2 and probes[-1]["include_title"] is True
+    assert IntentStore(tmp_path).intents() == []
 
 
 def test_local_discovery_incomplete_cannot_establish_unique_title(
@@ -1151,7 +1317,10 @@ def test_alias_send_refuses_when_the_generation_changed_after_selection(
     def wire(address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         calls.append((address, dict(payload)))
         if payload.get("operation") == "peers":
-            return {"schema_version": 1, "peers": next(rosters_seen)}
+            response: dict[str, object] = {"schema_version": 1, "peers": next(rosters_seen)}
+            if payload.get("include_local_discovery") is True:
+                response["local_discovery"] = "complete"
+            return response
         if payload.get("operation") == "receive":
             pytest.fail("receive ran after a stale generation")
         raise ChatError("unexpected wire operation")

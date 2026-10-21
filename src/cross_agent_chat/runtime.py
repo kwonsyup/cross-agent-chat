@@ -2928,12 +2928,15 @@ def _local_target_before_deadline(root: Path, route: Route, deadline: float) -> 
     return _local_target(root, route, timeout=min(HEALTH_TIMEOUT_SECONDS, remaining))
 
 
-def _local_discovery(root: Path, *, handle: str | None = None) -> tuple[list[Target], bool]:
+def _local_discovery(
+    root: Path, *, handle: str | None = None, include_devin: bool = True
+) -> tuple[list[Target], bool]:
     """Retain healthy rows and whether every eligible local route attested."""
     routes = [
         route
         for route in Registry(root).routes()
         if (handle is None or session_key(route.provider, route.session_id) == handle)
+        and (include_devin or route.provider != "devin")
         and route.process_is_live()
         and route.cwd_is_available()
         and not NativeHelperStore(root).is_helper_lineage(route)
@@ -3026,6 +3029,10 @@ class _ExternalDiscoveryOption(TypedDict, total=False):
     include_external: bool
 
 
+class _LocalDiscoveryOption(TypedDict, total=False):
+    include_devin: bool
+
+
 class _DeliveryDiscoveryOption(TypedDict, total=False):
     include_delivery_mechanism: bool
     include_current_boundary: bool
@@ -3048,11 +3055,20 @@ def _targets_from_tailnet(
     include_current_boundary: bool = False,
     include_devin: bool = False,
     include_external: bool = False,
+    include_local_discovery: bool = False,
     node_id: str | None = None,
 ) -> list[Target]:
-    if not isinstance(raw, dict) or set(raw) != {"schema_version", "peers"}:
+    response_fields = {"schema_version", "peers"}
+    if not isinstance(raw, dict) or not response_fields <= set(raw) <= (
+        response_fields | ({"local_discovery"} if include_local_discovery else set())
+    ):
         raise ChatError("Tailnet peer returned invalid discovery")
     response = cast(dict[object, object], raw)
+    coverage = response.get("local_discovery")
+    if "local_discovery" in response and (
+        not isinstance(coverage, str) or coverage not in {"complete", "incomplete"}
+    ):
+        raise ChatError("Tailnet peer returned invalid discovery")
     items = response.get("peers")
     if response.get("schema_version") != SCHEMA_VERSION or not isinstance(items, list):
         raise ChatError("Tailnet peer returned invalid discovery")
@@ -3241,7 +3257,14 @@ def _remote_node_targets(
             tool_boundary_variants.append((with_tool_boundary, True))
             tool_boundary_variants.append((shape, True))
         variants = tool_boundary_variants + variants
+    # Only unscoped discovery needs to prove name uniqueness. Exact tokens
+    # retain the existing scoped attestation shapes, including legacy brokers.
+    if handle is None:
+        first, mode_requested = variants[0]
+        variants.insert(0, ({**first, "include_local_discovery": True}, mode_requested))
     base: list[Target] | None = None
+    base_complete = False
+    coverage_negotiated = False
     mechanism_negotiated = False
     owning_negotiated = False
     tool_boundary_negotiated = False
@@ -3309,8 +3332,11 @@ def _remote_node_targets(
                     else {}
                 ),
                 **_external_option(include_external),
+                include_local_discovery="include_local_discovery" in payload,
                 node_id=node_id,
             )
+            coverage_negotiated = "include_local_discovery" in payload
+            base_complete = coverage_negotiated and raw.get("local_discovery") == "complete"
             external_negotiated = "include_external" in payload
             mechanism_negotiated = "include_delivery_mechanism" in payload
             owning_negotiated = "include_owning_daemon" in payload
@@ -3328,7 +3354,7 @@ def _remote_node_targets(
     # Return validated identities even when optional title work cannot finish.
     # Leave time for the outer discovery collector to receive the retained result.
     if not include_title or remaining <= 1.0:
-        return base, True
+        return base, base_complete
     try:
         rich_payload: dict[str, object] = {
             **legacy,
@@ -3351,6 +3377,8 @@ def _remote_node_targets(
             rich_payload["include_external"] = True
         if handle is not None:
             rich_payload["handle"] = handle
+        if coverage_negotiated:
+            rich_payload["include_local_discovery"] = True
         raw = request_tailnet(
             address,
             rich_payload,
@@ -3368,10 +3396,14 @@ def _remote_node_targets(
             **({"include_current_boundary": True} if boundary_negotiated else {}),
             include_devin=include_devin,
             **_external_option(external_negotiated),
+            include_local_discovery=coverage_negotiated,
             node_id=node_id,
         )
+        # Optional enrichment cannot upgrade an unqualified base roster or
+        # hide a newer partial observation from this same node.
+        base_complete = base_complete and raw.get("local_discovery") == "complete"
     except (ChatError, UnknownDeliveryError):
-        return base, True
+        return base, base_complete
     if not include_delivery_mode:
         enriched = [replace(target, delivery_mode=None) for target in enriched]
     base_authority = {target.session_key: replace(target, title=None) for target in base}
@@ -3381,8 +3413,10 @@ def _remote_node_targets(
         and len(rich_authority) == len(enriched)
         and rich_authority == base_authority
     ):
-        return enriched, True
-    return base, True
+        return enriched, base_complete
+    # Retain the original identities, but a contradictory newer roster cannot
+    # establish that the earlier name match is still unique.
+    return base, False
 
 
 def _remote_discovery(
@@ -4892,10 +4926,12 @@ def peers(
     include_current_boundary: bool = False,
     include_devin: bool = True,
     include_external: bool = False,
+    include_local_discovery: bool = False,
     handle: str | None = None,
     query: str | None = None,
 ) -> dict[str, object]:
     display_titles = not internal or include_title
+    local_scope: _LocalDiscoveryOption = {} if include_devin else {"include_devin": False}
     wanted = (
         None
         if query is None
@@ -4910,11 +4946,12 @@ def peers(
     if include_remote:
         identity = tailnet_identity()
         with ThreadPoolExecutor(max_workers=2) as workers:
-            local = workers.submit(_local_discovery, root, handle=handle)
+            local = workers.submit(_local_discovery, root, handle=handle, **local_scope)
             remote = workers.submit(
                 _remote_discovery,
                 include_delivery_mode=include_delivery_mode,
                 include_title=display_titles,
+                include_devin=include_devin,
                 **({"include_delivery_mechanism": True} if include_delivery_mechanism else {}),
                 **(
                     {"include_current_boundary": True}
@@ -4933,7 +4970,7 @@ def peers(
             targets = [target for target in targets if not target.remote]
         remote_discovery = "complete" if remote_complete else "incomplete"
     else:
-        targets, local_complete = _local_discovery(root, handle=handle)
+        targets, local_complete = _local_discovery(root, handle=handle, **local_scope)
         remote_discovery = "not_requested"
     external_discovery = "not_requested"
     if include_external:
@@ -4944,6 +4981,7 @@ def peers(
             # An optional extension cannot take down native discovery. The
             # authenticated external sender still refuses the corrupt state.
             external_discovery = "unavailable"
+            local_complete = False
     if not include_devin:
         targets = [target for target in targets if target.provider != "devin"]
     handles = [target.session_key for target in targets]
@@ -5003,8 +5041,13 @@ def peers(
             # Keep search completeness independent of the filtered result: a
             # missing title can explain a zero match even when that row is hidden.
             result["title_metadata"] = title_metadata
-    if not internal:
+    if internal and handle is None and not include_local_discovery and not local_complete:
+        # Old readers validate a closed response and would interpret a valid
+        # partial roster as complete. Refuse rather than hiding a namesake.
+        raise ChatError("local peer discovery is incomplete; use an exact recipient handle")
+    if not internal or include_local_discovery:
         result["local_discovery"] = "complete" if local_complete else "incomplete"
+    if not internal:
         result["remote_discovery"] = remote_discovery
         if include_external and external_discovery == "unavailable":
             result["external_discovery"] = external_discovery

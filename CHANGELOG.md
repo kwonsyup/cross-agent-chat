@@ -6,6 +6,11 @@
   `local_discovery`, and refuse alias/title selection until uniqueness can be
   established. A fresh exact handle still checks only its bound endpoint;
   unavailable or stale endpoints refuse.
+- Carry each responding node's local coverage through negotiated remote
+  discovery. Legacy responses without coverage retain healthy rows but cannot
+  prove name uniqueness. A new broker refuses an unnegotiated partial roster;
+  complete legacy responses and exact-token attestation keep their existing
+  shapes. Requested external endpoints count toward the same coverage.
 - Keep a qualified `no_courier_queue` observation unknown when the sender's
   outcome is `UNKNOWN_DELIVERY` or the observer is a Native helper. No queue
   does not prove provider custody or original-session use. Inspect the original

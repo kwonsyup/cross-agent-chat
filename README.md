@@ -287,6 +287,11 @@ the CAC Reply route rather than the visible helper address.
 cannot establish a unique alias or title. The agent can use a fresh exact
 handle from its own `chat_peers` result or the received Reply route; an
 unavailable or stale endpoint still refuses.
+Remote name selection also requires each node's negotiated coverage. A legacy
+node's rows remain useful, but missing coverage cannot establish uniqueness;
+use the available exact handle. Requested external endpoints are part of that
+coverage. A new broker refuses an unnegotiated partial roster rather than
+letting an old reader infer uniqueness.
 
 `chat_send` reports `TRANSPORT_ACCEPTED` (custody, not a read receipt — do
 not re-send), a pre-delivery refusal (nothing was handed over; correcting

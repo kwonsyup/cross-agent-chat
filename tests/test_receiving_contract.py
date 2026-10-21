@@ -288,7 +288,10 @@ def test_title_dispatch_refuses_a_hidden_remote_duplicate_when_title_enrichment_
         probes.append(payload)
         if payload.get("include_title"):
             raise runtime.UnknownDeliveryError("optional title response timed out")
-        return {"schema_version": 1, "peers": [row]}
+        response: dict[str, object] = {"schema_version": 1, "peers": [row]}
+        if payload.get("include_local_discovery") is True:
+            response["local_discovery"] = "complete"
+        return response
 
     monkeypatch.setattr(runtime, "request_tailnet", wire)
     monkeypatch.setattr(
@@ -932,7 +935,7 @@ def test_new_reader_negotiates_devin_tool_boundaries_and_stays_conservative_with
         include_devin=True,
     )
 
-    assert complete is True
+    assert complete is False  # Legacy coverage cannot establish alias uniqueness.
     assert "include_devin_tool_boundary" in requests[0]
     assert runtime.destination_receiving(target)["active_turn_input"] is active
 
@@ -1011,7 +1014,7 @@ def test_new_reader_negotiates_current_boundary_and_stays_conservative_with_old_
         include_current_boundary=True,
     )
 
-    assert complete is True
+    assert complete is False  # Legacy coverage cannot establish alias uniqueness.
     assert requests[0]["include_current_boundary"] is True
     if broker_knows_flag:
         assert target.current_boundary == "next_prompt_custom_subagent"
@@ -1019,7 +1022,7 @@ def test_new_reader_negotiates_current_boundary_and_stays_conservative_with_old_
     else:
         assert target.current_boundary is None
         assert "current_boundary" not in runtime.destination_receiving(target)
-        assert len(requests) == 2
+        assert len(requests) == 3
 
 
 def test_devin_tool_hook_records_that_its_loaded_session_runs_the_hook(

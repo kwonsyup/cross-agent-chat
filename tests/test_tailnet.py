@@ -7,10 +7,12 @@ import select
 import socket
 import threading
 import time
+from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 from unittest import mock
 from uuid import uuid4
 
@@ -196,6 +198,158 @@ def test_legacy_broker_peer_request_filters_new_devin_routes(
     assert calls == [False]
 
 
+def test_legacy_roster_coverage_does_not_probe_an_unrequested_devin_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    routes = [
+        Route.create(
+            provider=provider,
+            session_id=str(uuid4()),
+            device="remote",
+            cwd=str(tmp_path),
+            pid=os.getpid(),
+        )
+        for provider in ("codex", "devin")
+    ]
+    for route in routes:
+        Registry(tmp_path).upsert(route)
+    by_generation = {route.generation: route for route in routes}
+    probes: list[str] = []
+    monkeypatch.setattr(Route, "process_is_live", lambda _route: True)
+
+    def health(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        route = by_generation[str(payload["generation"])]
+        probes.append(route.provider)
+        if route.provider == "devin":
+            raise ChatError("fixture unobserved Devin courier")
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+        }
+
+    monkeypatch.setattr(runtime, "request_socket", health)
+    legacy = {"schema_version": 1, "operation": "peers"}
+    response = handle_broker_request(tmp_path, legacy, "100.64.0.10")
+    assert set(response) == {"schema_version", "peers"}
+    targets = runtime._targets_from_tailnet("100.64.0.2", response)
+    assert [target.provider for target in targets] == ["codex"]
+    assert probes == ["codex"]
+    requested = handle_broker_request(
+        tmp_path,
+        {**legacy, "include_devin": True, "include_local_discovery": True},
+        "100.64.0.10",
+    )
+    assert requested["local_discovery"] == "incomplete"
+    assert "devin" in probes
+
+
+def test_broker_coverage_includes_only_the_requested_external_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route = Route.create(
+        provider="codex", session_id=str(uuid4()), device="remote", cwd=str(tmp_path), pid=1
+    )
+    handle = session_key(route.provider, route.session_id)
+    target = Target(
+        alias=route.alias,
+        provider=route.provider,
+        device=route.device,
+        project=route.project,
+        generation=route.generation,
+        session_key=handle,
+        remote=False,
+    )
+    external_calls: list[str | None] = []
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([target], True))
+    monkeypatch.setattr(runtime, "_with_codex_titles", lambda _root, rows, _deadline: rows)
+
+    def unavailable(_root: Path, *, handle: str | None = None) -> list[Target]:
+        external_calls.append(handle)
+        raise ChatError("fixture external extension unavailable")
+
+    monkeypatch.setattr(runtime, "external_targets", unavailable)
+    legacy = {"schema_version": 1, "operation": "peers"}
+    response = handle_broker_request(tmp_path, legacy, "100.64.0.10")
+    assert set(response) == {"schema_version", "peers"}
+    assert len(runtime._targets_from_tailnet("100.64.0.2", response)) == 1
+    complete = handle_broker_request(
+        tmp_path, {**legacy, "include_local_discovery": True}, "100.64.0.10"
+    )
+    assert complete["local_discovery"] == "complete"
+    assert external_calls == []
+
+    partial = handle_broker_request(
+        tmp_path,
+        {**legacy, "include_local_discovery": True, "include_external": True},
+        "100.64.0.10",
+    )
+    assert partial["local_discovery"] == "incomplete"
+    targets = runtime._targets_from_tailnet(
+        "100.64.0.2", partial, include_local_discovery=True, include_external=True
+    )
+    assert len(targets) == 1
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        handle_broker_request(tmp_path, {**legacy, "include_external": True}, "100.64.0.10")
+    # Scope-filtered exact identity remains usable without certifying names
+    # across the unavailable optional extension.
+    scoped = handle_broker_request(
+        tmp_path, {**legacy, "handle": handle, "include_external": True}, "100.64.0.10"
+    )
+    assert set(scoped) == {"schema_version", "peers"}
+    assert runtime._targets_from_tailnet("100.64.0.2", scoped)[0].session_key == handle
+    assert external_calls == [None, None, handle]
+
+
+def test_node_coverage_field_is_closed_and_negotiated() -> None:
+    raw = {"schema_version": 1, "peers": [], "local_discovery": "incomplete"}
+    with pytest.raises(ChatError, match="invalid discovery"):
+        runtime._targets_from_tailnet("100.64.0.2", raw)
+    assert runtime._targets_from_tailnet("100.64.0.2", raw, include_local_discovery=True) == []
+    for invalid in (True, False, "unknown", None):
+        with pytest.raises(ChatError, match="invalid discovery"):
+            runtime._targets_from_tailnet(
+                "100.64.0.2", {**raw, "local_discovery": invalid}, include_local_discovery=True
+            )
+
+
+@pytest.mark.parametrize("base_coverage", ["complete", "incomplete"])
+@pytest.mark.parametrize("rich_coverage", ["complete", "incomplete"])
+def test_optional_title_work_cannot_upgrade_or_discard_node_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    base_coverage: Literal["complete", "incomplete"],
+    rich_coverage: Literal["complete", "incomplete"],
+) -> None:
+    row = _remote_peer()
+    calls: list[dict[str, object]] = []
+
+    def wire(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        calls.append(payload)
+        assert payload["include_local_discovery"] is True
+        rich = payload.get("include_title") is True
+        return {
+            "schema_version": 1,
+            "peers": [{**row, "title": "Fixture title"} if rich else row],
+            "local_discovery": rich_coverage if rich else base_coverage,
+        }
+
+    monkeypatch.setattr(runtime, "request_tailnet", wire)
+    targets, complete = runtime._remote_node_targets("100.64.0.2", include_title=True)
+    assert complete is (base_coverage == rich_coverage == "complete")
+    assert len(targets) == 1 and targets[0].title == "Fixture title"
+    assert len(calls) == 2
+
+
+def _complete_roster(
+    payload: dict[str, object], rows: Sequence[Mapping[str, object]]
+) -> dict[str, object]:
+    response: dict[str, object] = {"schema_version": 1, "peers": [dict(row) for row in rows]}
+    if payload.get("include_local_discovery") is True:
+        response["local_discovery"] = "complete"
+    return response
+
+
 def test_new_devin_discovery_falls_back_to_legacy_broker_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -228,9 +382,15 @@ def test_new_devin_discovery_falls_back_to_legacy_broker_request(
         include_devin=True,
     )
 
-    assert complete is True
+    assert complete is False
     assert [target.provider for target in targets] == ["codex"]
     assert calls == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_devin": True,
+            "include_local_discovery": True,
+        },
         {"schema_version": 1, "operation": "peers", "include_devin": True},
         {"schema_version": 1, "operation": "peers"},
     ]
@@ -277,7 +437,7 @@ def test_negotiated_devin_roster_preserves_delivery_mode_and_title(
                 {key: value for key, value in codex_peer.items() if key != "title"},
             ]
         )
-        return {"schema_version": 1, "peers": items}
+        return _complete_roster(payload, items)
 
     monkeypatch.setattr(runtime, "request_tailnet", new_broker)
 
@@ -301,12 +461,14 @@ def test_negotiated_devin_roster_preserves_delivery_mode_and_title(
         {
             "schema_version": 1,
             "operation": "peers",
+            "include_local_discovery": True,
             "include_delivery_mode": True,
             "include_devin": True,
         },
         {
             "schema_version": 1,
             "operation": "peers",
+            "include_local_discovery": True,
             "include_delivery_mode": True,
             "include_title": True,
             "include_devin": True,
@@ -349,7 +511,7 @@ def test_remote_node_targets_base_then_rich_success_preserves_identity_and_title
 
     def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         calls.append((payload, timeout))
-        return {"schema_version": 1, "peers": [base if len(calls) == 1 else rich]}
+        return _complete_roster(payload, [base if len(calls) == 1 else rich])
 
     monkeypatch.setattr(time, "monotonic", clock.monotonic)
     monkeypatch.setattr(runtime, "request_tailnet", request)
@@ -360,10 +522,16 @@ def test_remote_node_targets_base_then_rich_success_preserves_identity_and_title
 
     assert complete is True
     assert [payload for payload, _ in calls] == [
-        {"schema_version": 1, "operation": "peers", "include_delivery_mode": True},
         {
             "schema_version": 1,
             "operation": "peers",
+            "include_local_discovery": True,
+            "include_delivery_mode": True,
+        },
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_local_discovery": True,
             "include_delivery_mode": True,
             "include_title": True,
         },
@@ -387,7 +555,7 @@ def test_remote_node_targets_slow_rich_timeout_retains_valid_base(
     def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         calls.append(timeout)
         if len(calls) == 1:
-            return {"schema_version": 1, "peers": [base]}
+            return _complete_roster(_payload, [base])
         clock.now += timeout
         raise ChatError("rich request timed out")
 
@@ -414,7 +582,7 @@ def test_remote_node_targets_mode_base_prompt_failure_falls_back_to_legacy(
 
     def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         calls.append(payload)
-        if len(calls) == 1:
+        if "include_delivery_mode" in payload:
             raise ChatError("old server")
         return {"schema_version": 1, "peers": [base]}
 
@@ -423,9 +591,15 @@ def test_remote_node_targets_mode_base_prompt_failure_falls_back_to_legacy(
         "100.64.0.1", deadline=time.monotonic() + 22.0, include_delivery_mode=True
     )
 
-    assert complete is True
+    assert complete is False
     assert targets[0].alias == base["alias"]
     assert calls == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
+            "include_local_discovery": True,
+        },
         {"schema_version": 1, "operation": "peers", "include_delivery_mode": True},
         {"schema_version": 1, "operation": "peers"},
     ]
@@ -440,7 +614,7 @@ def test_remote_node_targets_title_only_uses_rich_wire_but_hides_mode_publicly(
 
     def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         calls.append(payload)
-        return {"schema_version": 1, "peers": [base if len(calls) == 1 else rich]}
+        return _complete_roster(payload, [base if len(calls) == 1 else rich])
 
     monkeypatch.setattr(runtime, "request_tailnet", request)
     targets, complete = runtime._remote_node_targets(
@@ -449,10 +623,11 @@ def test_remote_node_targets_title_only_uses_rich_wire_but_hides_mode_publicly(
 
     assert complete is True
     assert calls == [
-        {"schema_version": 1, "operation": "peers"},
+        {"schema_version": 1, "operation": "peers", "include_local_discovery": True},
         {
             "schema_version": 1,
             "operation": "peers",
+            "include_local_discovery": True,
             "include_delivery_mode": True,
             "include_title": True,
         },
@@ -469,7 +644,7 @@ def test_remote_node_targets_without_title_uses_one_base_query(
 
     def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         calls.append(payload)
-        return {"schema_version": 1, "peers": [base]}
+        return _complete_roster(payload, [base])
 
     monkeypatch.setattr(runtime, "request_tailnet", request)
     targets, complete = runtime._remote_node_targets(
@@ -478,7 +653,14 @@ def test_remote_node_targets_without_title_uses_one_base_query(
 
     assert complete is True
     assert len(targets) == 1
-    assert calls == [{"schema_version": 1, "operation": "peers", "include_delivery_mode": True}]
+    assert calls == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_local_discovery": True,
+            "include_delivery_mode": True,
+        }
+    ]
 
 
 def test_remote_node_targets_little_remaining_budget_skips_optional_rich_query(
@@ -490,7 +672,7 @@ def test_remote_node_targets_little_remaining_budget_skips_optional_rich_query(
 
     def request(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         calls.append(payload)
-        return {"schema_version": 1, "peers": [base]}
+        return _complete_roster(payload, [base])
 
     monkeypatch.setattr(time, "monotonic", clock.monotonic)
     monkeypatch.setattr(runtime, "request_tailnet", request)
@@ -500,7 +682,7 @@ def test_remote_node_targets_little_remaining_budget_skips_optional_rich_query(
 
     assert complete is True
     assert len(targets) == 1
-    assert calls == [{"schema_version": 1, "operation": "peers"}]
+    assert calls == [{"schema_version": 1, "operation": "peers", "include_local_discovery": True}]
 
 
 def test_remote_node_targets_no_base_response_is_incomplete(
@@ -520,6 +702,12 @@ def test_remote_node_targets_no_base_response_is_incomplete(
     assert targets == []
     assert complete is False
     assert calls == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
+            "include_local_discovery": True,
+        },
         {"schema_version": 1, "operation": "peers", "include_delivery_mode": True},
         {"schema_version": 1, "operation": "peers"},
     ]
@@ -554,7 +742,7 @@ def test_remote_node_targets_rich_identity_drift_retains_base(
     def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         nonlocal calls
         calls += 1
-        return {"schema_version": 1, "peers": [base if calls == 1 else rich]}
+        return _complete_roster(_payload, [base if calls == 1 else rich])
 
     monkeypatch.setattr(runtime, "request_tailnet", request)
     targets, complete = runtime._remote_node_targets(
@@ -564,7 +752,7 @@ def test_remote_node_targets_rich_identity_drift_retains_base(
         include_title=True,
     )
 
-    assert complete is True
+    assert complete is False  # Conflicting snapshots cannot establish name uniqueness.
     assert targets[0].alias == base["alias"]
     assert targets[0].generation == base["generation"]
     assert targets[0].delivery_mode == "codex_stop_bound"
@@ -586,6 +774,7 @@ def test_remote_node_targets_rich_address_drift_retains_base(
         include_delivery_mode: bool = False,
         include_title: bool = False,
         include_devin: bool = False,
+        include_local_discovery: bool = False,
         node_id: str | None = None,
     ) -> list[Target]:
         nonlocal calls
@@ -596,6 +785,7 @@ def test_remote_node_targets_rich_address_drift_retains_base(
             include_delivery_mode=include_delivery_mode,
             include_title=include_title,
             include_devin=include_devin,
+            include_local_discovery=include_local_discovery,
             node_id=node_id,
         )
         if calls == 2:
@@ -603,7 +793,7 @@ def test_remote_node_targets_rich_address_drift_retains_base(
         return targets
 
     def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
-        return {"schema_version": 1, "peers": [base if calls == 0 else rich]}
+        return _complete_roster(_payload, [base if calls == 0 else rich])
 
     monkeypatch.setattr(runtime, "_targets_from_tailnet", parse)
     monkeypatch.setattr(runtime, "request_tailnet", request)
@@ -611,7 +801,7 @@ def test_remote_node_targets_rich_address_drift_retains_base(
         "100.64.0.1", deadline=time.monotonic() + 22.0, include_title=True
     )
 
-    assert complete is True
+    assert complete is False  # Conflicting snapshots cannot establish name uniqueness.
     assert targets[0].tailnet_address == "100.64.0.1"
     assert targets[0].title is None
 
@@ -625,7 +815,7 @@ def test_remote_node_targets_malformed_rich_response_retains_base(
     def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         nonlocal calls
         calls += 1
-        return {"schema_version": 1, "peers": [base]} if calls == 1 else {"schema_version": 1}
+        return _complete_roster(_payload, [base]) if calls == 1 else {"schema_version": 1}
 
     monkeypatch.setattr(runtime, "request_tailnet", request)
     targets, complete = runtime._remote_node_targets(
@@ -649,7 +839,7 @@ def test_remote_node_targets_malformed_rich_metadata_retains_base(
     def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         nonlocal calls
         calls += 1
-        return {"schema_version": 1, "peers": [base if calls == 1 else rich]}
+        return _complete_roster(_payload, [base if calls == 1 else rich])
 
     monkeypatch.setattr(runtime, "request_tailnet", request)
     targets, complete = runtime._remote_node_targets(
@@ -671,21 +861,14 @@ def test_remote_node_targets_duplicate_rich_response_retains_base(
     def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         nonlocal calls
         calls += 1
-        return (
-            {"schema_version": 1, "peers": [base]}
-            if calls == 1
-            else {
-                "schema_version": 1,
-                "peers": [rich, rich],
-            }
-        )
+        return _complete_roster(_payload, [base] if calls == 1 else [rich, rich])
 
     monkeypatch.setattr(runtime, "request_tailnet", request)
     targets, complete = runtime._remote_node_targets(
         "100.64.0.1", deadline=time.monotonic() + 22.0, include_title=True
     )
 
-    assert complete is True
+    assert complete is False  # Conflicting snapshots cannot establish name uniqueness.
     assert len(targets) == 1
     assert targets[0].title is None
 
@@ -699,21 +882,14 @@ def test_remote_node_targets_missing_rich_peer_snapshot_retains_base(
     def request(_address: str, _payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         nonlocal calls
         calls += 1
-        return (
-            {"schema_version": 1, "peers": [base]}
-            if calls == 1
-            else {
-                "schema_version": 1,
-                "peers": [],
-            }
-        )
+        return _complete_roster(_payload, [base] if calls == 1 else [])
 
     monkeypatch.setattr(runtime, "request_tailnet", request)
     targets, complete = runtime._remote_node_targets(
         "100.64.0.1", deadline=time.monotonic() + 22.0, include_title=True
     )
 
-    assert complete is True
+    assert complete is False  # Conflicting snapshots cannot establish name uniqueness.
     assert len(targets) == 1
     assert targets[0].alias == base["alias"]
     assert targets[0].title is None
@@ -726,7 +902,7 @@ def test_new_remote_title_negotiation_returns_title(monkeypatch: pytest.MonkeyPa
 
     def request(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
         calls.append(payload)
-        return {"schema_version": 1, "peers": [base if len(calls) == 1 else peer]}
+        return _complete_roster(payload, [base if len(calls) == 1 else peer])
 
     monkeypatch.setattr(runtime, "request_tailnet", request)
     targets, complete = runtime._remote_node_targets(
@@ -739,11 +915,13 @@ def test_new_remote_title_negotiation_returns_title(monkeypatch: pytest.MonkeyPa
         {
             "schema_version": 1,
             "operation": "peers",
+            "include_local_discovery": True,
             "include_delivery_mode": True,
         },
         {
             "schema_version": 1,
             "operation": "peers",
+            "include_local_discovery": True,
             "include_delivery_mode": True,
             "include_title": True,
         },
@@ -765,9 +943,15 @@ def test_new_remote_title_negotiation_retries_legacy_peer(monkeypatch: pytest.Mo
         "100.64.0.1", include_delivery_mode=True, include_title=True
     )
 
-    assert complete is True
+    assert complete is False
     assert targets[0].title is None
     assert calls == [
+        {
+            "schema_version": 1,
+            "operation": "peers",
+            "include_delivery_mode": True,
+            "include_local_discovery": True,
+        },
         {
             "schema_version": 1,
             "operation": "peers",
@@ -801,18 +985,20 @@ def test_new_remote_title_negotiation_preserves_mode_from_an_older_mode_peer(
         "100.64.0.1", include_delivery_mode=True, include_title=True
     )
 
-    assert complete is True
+    assert complete is False
     assert targets[0].delivery_mode == "codex_stop_bound"
     assert targets[0].title is None
     assert calls == [
         {
             "schema_version": 1,
             "operation": "peers",
+            "include_local_discovery": True,
             "include_delivery_mode": True,
         },
         {
             "schema_version": 1,
             "operation": "peers",
+            "include_local_discovery": True,
             "include_delivery_mode": True,
             "include_title": True,
         },
@@ -3007,6 +3193,7 @@ def test_remote_node_targets_retries_capacity_then_returns_targets(
         if len(calls) < 3:
             return dict(BROKER_CAPACITY_REFUSAL)
         return {
+            "local_discovery": "complete",
             "schema_version": 1,
             "peers": [
                 {
@@ -3698,7 +3885,7 @@ def test_exact_token_send_falls_back_to_a_full_roster_on_an_old_broker(
     assert calls[6].get("operation") == "receive"
 
 
-def test_handle_bound_roster_query_is_empty_and_complete_for_an_unowned_handle(
+def test_handle_bound_roster_query_is_empty_for_an_unowned_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     route = Route.create(
@@ -3726,7 +3913,7 @@ def test_handle_bound_roster_query_is_empty_and_complete_for_an_unowned_handle(
     monkeypatch.setattr(runtime, "request_tailnet", lambda *_a, **_k: answer)
     targets, complete = runtime._remote_node_targets("100.64.0.10", handle="f" * 64)
     assert targets == []
-    assert complete is True
+    assert complete is False  # No node-wide coverage was negotiated.
 
 
 def test_handle_bound_roster_query_still_drops_a_route_that_fails_validation(
