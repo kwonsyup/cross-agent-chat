@@ -822,7 +822,9 @@ def test_remote_refusal_event_is_visible_on_mcp_and_readable_without_settling_un
             f"remote envelope is not authorized; nothing was delivered; event {identifier}"
         )
     elif fault == "unknown":
-        error = f"remote delivery state is unknown for event {identifier}; do not retry automatically"
+        error = (
+            f"remote delivery state is unknown for event {identifier}; do not retry automatically"
+        )
     else:
         error = "remote delivery state is unknown"
     assert raw_send == {
