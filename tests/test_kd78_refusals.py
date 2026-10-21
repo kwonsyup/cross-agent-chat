@@ -76,7 +76,9 @@ def _remote_delivery(
 
     monkeypatch.setattr(runtime, "request_tailnet", authorize)
     monkeypatch.setattr(runtime, "request_socket", socket)
-    monkeypatch.setattr(runtime, "_local_discovery", lambda *_args, **_kwargs: ([runtime_target], True))
+    monkeypatch.setattr(
+        runtime, "_local_discovery", lambda *_args, **_kwargs: ([runtime_target], True)
+    )
     return runtime.receive_remote(tmp_path, envelope, "100.64.0.11")
 
 

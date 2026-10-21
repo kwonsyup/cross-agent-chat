@@ -3961,7 +3961,9 @@ def test_remote_queue_full_preserves_old_and_current_provider_wording(
         generation=target.generation,
         message="new harmless task",
     )
-    monkeypatch.setattr(runtime, "_local_discovery", lambda _root, *, handle=None: ([public_target], True))
+    monkeypatch.setattr(
+        runtime, "_local_discovery", lambda _root, *, handle=None: ([public_target], True)
+    )
     monkeypatch.setattr(
         runtime,
         "request_tailnet",

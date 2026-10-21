@@ -1160,7 +1160,9 @@ def _receive_fixture(
         cwd=target.cwd,
         pid=target.pid,
     )
-    monkeypatch.setattr(runtime, "_local_discovery", lambda *_args, **_kwargs: ([public_target], True))
+    monkeypatch.setattr(
+        runtime, "_local_discovery", lambda *_args, **_kwargs: ([public_target], True)
+    )
     monkeypatch.setattr(
         runtime,
         "request_tailnet",

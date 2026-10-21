@@ -314,7 +314,9 @@ def _discovered_target(
 
 
 def _stub_peer_discovery(monkeypatch: pytest.MonkeyPatch, targets: list[Target]) -> None:
-    monkeypatch.setattr("cross_agent_chat.runtime._local_discovery", lambda *_args, **_kwargs: (targets, True))
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime._local_discovery", lambda *_args, **_kwargs: (targets, True)
+    )
     monkeypatch.setattr("cross_agent_chat.runtime.tailnet_identity", lambda: None)
     monkeypatch.setattr(
         "cross_agent_chat.runtime._with_codex_titles",
@@ -537,7 +539,9 @@ def test_chat_peers_rejects_a_malformed_query_before_any_discovery(
 
 def _stub_alias_send(monkeypatch: pytest.MonkeyPatch, targets: list[Target]) -> list[Target]:
     resolved: list[Target] = []
-    monkeypatch.setattr("cross_agent_chat.runtime._local_discovery", lambda *_args, **_kwargs: (targets, True))
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime._local_discovery", lambda *_args, **_kwargs: (targets, True)
+    )
     monkeypatch.setattr("cross_agent_chat.runtime._remote_discovery", lambda **_kwargs: ([], True))
 
     def fake_local_send(
