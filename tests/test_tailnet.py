@@ -2661,9 +2661,9 @@ def test_remote_pre_effect_rejection_is_safe_and_does_not_block_fresh_send(
         **_: object,
     ) -> dict[str, object]:
         if payload.get("operation") == "peers":
-            return {
-                "schema_version": 1,
-                "peers": [
+            return _complete_roster(
+                payload,
+                [
                     {
                         "alias": target_alias,
                         "provider": "claude",
@@ -2674,7 +2674,7 @@ def test_remote_pre_effect_rejection_is_safe_and_does_not_block_fresh_send(
                         "session_key": "a" * 64,
                     }
                 ],
-            }
+            )
         envelope = json.loads(str(payload["envelope"]))
         return {
             "schema_version": 1,
@@ -2701,11 +2701,12 @@ def test_remote_pre_effect_rejection_is_safe_and_does_not_block_fresh_send(
     with pytest.raises(ChatError, match="remote target rejected") as caught:
         send(tmp_path, source, target_alias, "hello")
 
+    intent = IntentStore(tmp_path).intents()[0]
     assert str(caught.value) == (
         "remote target rejected the message before provider effect: "
-        "remote destination rejected before provider effect; nothing was delivered"
+        "remote destination rejected before provider effect; nothing was delivered; "
+        f"event {intent.event_id}"
     )
-    intent = IntentStore(tmp_path).intents()[0]
     assert intent.status == "PRE_EFFECT_REJECTED"
     assert IntentStore(tmp_path).begin_identity(
         source_key=session_key(source.provider, source.session_id),
@@ -2834,10 +2835,10 @@ def test_remote_send_surfaces_allowlisted_courier_reason(
     def request(address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         if payload.get("operation") == "peers":
             if address != receiver_address:
-                return {"schema_version": 1, "peers": []}
-            return {
-                "schema_version": 1,
-                "peers": [
+                return _complete_roster(payload, [])
+            return _complete_roster(
+                payload,
+                [
                     {
                         "alias": target.alias,
                         "provider": "codex",
@@ -2848,7 +2849,7 @@ def test_remote_send_surfaces_allowlisted_courier_reason(
                         "session_key": session_key(target.provider, target.session_id),
                     }
                 ],
-            }
+            )
         if "envelope" in payload:
             return receive_remote(receiver_root, str(payload["envelope"]), sender_address)
         return {key: value for key, value in payload.items() if key != "operation"} | {
@@ -2883,11 +2884,12 @@ def test_remote_send_surfaces_allowlisted_courier_reason(
     with pytest.raises(ChatError, match="session courier is still bootstrapping") as caught:
         send(sender_root, source, target.alias, "hello")
 
+    intent = IntentStore(sender_root).intents()[0]
     assert str(caught.value) == (
         "remote target rejected the message before provider effect: "
-        "session courier is still bootstrapping; nothing was delivered"
+        f"session courier is still bootstrapping; nothing was delivered; event {intent.event_id}"
     )
-    assert IntentStore(sender_root).intents()[0].status == "PRE_EFFECT_REJECTED"
+    assert intent.status == "PRE_EFFECT_REJECTED"
 
 
 def test_remote_receive_probes_only_the_addressed_generation(

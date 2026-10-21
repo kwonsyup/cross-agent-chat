@@ -4468,7 +4468,7 @@ def _send_remote_target(
         store.mark(event_id, "PRE_EFFECT_REJECTED")
         raise ChatError(
             "remote target rejected the message before provider effect: "
-            f"{rejection}; nothing was delivered"
+            f"{rejection}; nothing was delivered; event {event_id}"
         )
     diagnostic = unknown_delivery_diagnostic(response, event_id, target.provider)
     if diagnostic is not None:
@@ -4603,9 +4603,43 @@ def receive_remote(root: Path, text: str, source_address: str) -> dict[str, obje
         # The sender's own broker authorized this exact envelope. A v2 reply
         # token inside it must bind to that same authenticated source before
         # the provider is touched; a malformed head is refused, not ignored.
-        source_token = _envelope_reply_token(message, source_alias, event_id, target_provider)
+        try:
+            source_token = _envelope_reply_token(message, source_alias, event_id, target_provider)
+        except UnknownDeliveryError:
+            raise
+        except ChatError:
+            # This call only parses the deterministic v2 head. Keep malformed
+            # token/header bytes private and name the proven pre-provider guard.
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "event_id": event_id,
+                "status": "PRE_EFFECT_REJECTED",
+                "provider": target_provider,
+                "error": "reply token is invalid",
+            }
         if source_token is not None:
-            _verify_remote_reply_token(source_token, source_generation, source_address)
+            try:
+                _verify_remote_reply_token(source_token, source_generation, source_address)
+            except UnknownDeliveryError:
+                raise
+            except ChatError as error:
+                reason = str(error)
+                if reason not in {
+                    "reply token scope is invalid",
+                    "reply token does not match the envelope generation",
+                    "reply token does not match the authenticated sender",
+                }:
+                    raise
+                # These fixed strings are raised by the binding predicates in
+                # the verifier above, before any provider call. Other failures
+                # retain the existing generic sanitizer below.
+                return {
+                    "schema_version": SCHEMA_VERSION,
+                    "event_id": event_id,
+                    "status": "PRE_EFFECT_REJECTED",
+                    "provider": target_provider,
+                    "error": reason,
+                }
         if target.provider == "external":
             return _accept_external(
                 root,

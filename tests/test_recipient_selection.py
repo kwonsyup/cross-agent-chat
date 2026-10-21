@@ -1609,6 +1609,7 @@ def test_remote_receive_rejects_malformed_v2_heads(
         envelope, _a, _g, _b = _v2_envelope(target, head_override=head)
         response = receive_remote(tmp_path, envelope, OWNER)
         assert response["status"] == "PRE_EFFECT_REJECTED"
+        assert response["error"] == "reply token is invalid"
     assert accepts == []
 
 
@@ -1629,6 +1630,7 @@ def test_remote_receive_rejects_a_local_scoped_reply_token(
     )
     response = receive_remote(tmp_path, envelope, OWNER)
     assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["error"] == "reply token scope is invalid"
     assert accepts == []
 
 
@@ -1648,6 +1650,7 @@ def test_remote_receive_rejects_a_reply_token_generation_mismatch(
     )
     response = receive_remote(tmp_path, envelope, OWNER)
     assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["error"] == "reply token does not match the envelope generation"
     assert accepts == []
 
 
@@ -1664,6 +1667,7 @@ def test_remote_receive_rejects_a_reply_token_from_the_wrong_address(
     envelope, _sa, _sg, _body = _v2_envelope(target)
     response = receive_remote(tmp_path, envelope, OWNER)
     assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["error"] == "reply token does not match the authenticated sender"
     assert accepts == []
 
 
@@ -1680,6 +1684,7 @@ def test_remote_receive_rejects_a_reply_token_for_an_absent_node(
     envelope, _sa, _sg, _body = _v2_envelope(target)
     response = receive_remote(tmp_path, envelope, OWNER)
     assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["error"] == "reply token does not match the authenticated sender"
     assert accepts == []
 
 
@@ -1691,6 +1696,49 @@ def test_remote_receive_rejects_a_reply_token_when_tailscale_is_unavailable(
     envelope, _sa, _sg, _body = _v2_envelope(target)
     response = receive_remote(tmp_path, envelope, OWNER)
     assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["error"] == "reply token does not match the authenticated sender"
+    assert accepts == []
+
+
+@pytest.mark.parametrize("boundary", ["_envelope_reply_token", "_verify_remote_reply_token"])
+def test_remote_receive_never_reclassifies_an_unknown_reply_check_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    accepts: list[dict[str, object]] = []
+    target = _receive_fixture(
+        tmp_path, monkeypatch, identity=_identity(peers={OTHER_NODE: OWNER}), accepts=accepts
+    )
+    envelope, _alias, _generation, _body = _v2_envelope(target)
+    unknown = UnknownDeliveryError("fixture reply-check outcome remains unknown")
+
+    def unresolved(*_args: object, **_kwargs: object) -> NoReturn:
+        raise unknown
+
+    monkeypatch.setattr(runtime, boundary, unresolved)
+    with pytest.raises(UnknownDeliveryError) as caught:
+        receive_remote(tmp_path, envelope, OWNER)
+    assert caught.value is unknown
+    assert accepts == []
+
+
+def test_remote_receive_keeps_an_unrecognized_reply_verifier_failure_generic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    accepts: list[dict[str, object]] = []
+    target = _receive_fixture(
+        tmp_path, monkeypatch, identity=_identity(peers={OTHER_NODE: OWNER}), accepts=accepts
+    )
+    envelope, _alias, _generation, _body = _v2_envelope(target)
+
+    def failed(*_args: object, **_kwargs: object) -> NoReturn:
+        raise ChatError("fixture-private read failure")
+
+    monkeypatch.setattr(runtime, "_verify_remote_reply_token", failed)
+    response = receive_remote(tmp_path, envelope, OWNER)
+    assert set(response) == {"schema_version", "event_id", "status", "provider", "error"}
+    assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["error"] == "remote destination rejected before provider effect"
+    assert "fixture-private" not in str(response)
     assert accepts == []
 
 

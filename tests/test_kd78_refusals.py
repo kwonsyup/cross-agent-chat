@@ -126,8 +126,16 @@ def test_remote_consumer_preserves_unknown_delivery(
         )
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "fixture-secret arbitrary provider payload",
+        "reply token is invalid",
+        "reply token does not match the authenticated sender",
+    ],
+)
 def test_remote_consumer_suppresses_unrecognized_secret_reason(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str
 ) -> None:
     response = _remote_delivery(
         tmp_path,
@@ -137,12 +145,13 @@ def test_remote_consumer_suppresses_unrecognized_secret_reason(
             "event_id": payload["event_id"],
             "status": "PRE_EFFECT_REJECTED",
             "provider": "claude",
-            "error": "fixture-secret arbitrary provider payload",
+            "error": reason,
         },
     )
 
     assert response["status"] == "PRE_EFFECT_REJECTED"
     assert response["error"] == "remote destination rejected before provider effect"
+    assert reason not in str(response)
     assert "fixture-secret" not in str(response)
 
 

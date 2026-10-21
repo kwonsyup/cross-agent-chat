@@ -18,6 +18,10 @@
 - Share one 2-second deadline across Codex Stop health/peek/ACK IPC. This does
   not bound interpreter or filesystem startup. An unknown ACK outcome ends
   without retrying or emitting a continuation.
+- Include the recorded event ID after a validated remote no-effect refusal
+  so sender custody can be inspected with `chat_status`. Forward fixed v2
+  reply-binding guard causes without exposing private header or provider text;
+  other errors and unknown outcomes retain their existing classification.
 
 ## 0.5.7 - 2026-10-16
 
