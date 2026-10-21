@@ -3528,7 +3528,11 @@ def test_broker_receive_preserves_proven_rejection_and_post_write_uncertainty(
                 "event_id": event_id,
                 "status": "PRE_EFFECT_REJECTED",
                 "provider": "codex",
-                "error": "remote destination rejected before provider effect",
+                "error": (
+                    runtime.REMOTE_SOURCE_AUTHORIZATION_FAILURE
+                    if stage == "authorize_pre"
+                    else runtime.REMOTE_COURIER_ADMISSION_FAILURE
+                ),
             }
         ]
         assert effects == []
