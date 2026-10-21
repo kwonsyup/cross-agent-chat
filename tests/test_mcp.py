@@ -4,16 +4,25 @@ import io
 import json
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NoReturn, cast
 from uuid import uuid4
 
 import pytest
 
-from cross_agent_chat import cli
+from cross_agent_chat import cli, runtime
 from cross_agent_chat.cli import mcp
-from cross_agent_chat.core import ChatError, IntentStore, Registry, Route
+from cross_agent_chat.core import (
+    ChatError,
+    IntentStore,
+    Registry,
+    Route,
+    UnknownDeliveryError,
+    session_key,
+)
 from cross_agent_chat.mcp_server import normalize_send_arguments
+from cross_agent_chat.recipient import local_token, remote_token
 from cross_agent_chat.runtime import Target
+from cross_agent_chat.tailnet import TailnetIdentity
 
 
 def _handshake(*, identifier: int = 0) -> list[dict[str, object]]:
@@ -314,7 +323,9 @@ def _discovered_target(
 
 
 def _stub_peer_discovery(monkeypatch: pytest.MonkeyPatch, targets: list[Target]) -> None:
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda *_args, **_kwargs: targets)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime._local_discovery", lambda *_args, **_kwargs: (targets, True)
+    )
     monkeypatch.setattr("cross_agent_chat.runtime.tailnet_identity", lambda: None)
     monkeypatch.setattr(
         "cross_agent_chat.runtime._with_codex_titles",
@@ -366,8 +377,15 @@ def test_chat_peers_query_filters_alias_and_title_and_reports_scope(
 
     responses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     unfiltered = _tool_result_payload(responses[1])
-    # The no-argument response keeps its exact prior shape: no filter key.
-    assert set(unfiltered) == {"schema_version", "peers", "remote_discovery", "sender"}
+    # The no-argument response reports coverage without adding a filter key.
+    assert set(unfiltered) == {
+        "schema_version",
+        "peers",
+        "local_discovery",
+        "remote_discovery",
+        "sender",
+    }
+    assert unfiltered["local_discovery"] == "complete"
     unfiltered_peers = unfiltered["peers"]
     assert isinstance(unfiltered_peers, list)
     assert len(unfiltered_peers) == 4
@@ -494,15 +512,15 @@ def test_chat_peers_rejects_a_malformed_query_before_any_discovery(
     root = tmp_path / "state"
     probed: list[str] = []
 
-    def recorded_local(*_args: object, **_kwargs: object) -> list[Target]:
+    def recorded_local(*_args: object, **_kwargs: object) -> tuple[list[Target], bool]:
         probed.append("local")
-        return []
+        return [], True
 
     def recorded_identity() -> None:
         probed.append("tailnet")
         return None
 
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", recorded_local)
+    monkeypatch.setattr("cross_agent_chat.runtime._local_discovery", recorded_local)
     monkeypatch.setattr("cross_agent_chat.runtime.tailnet_identity", recorded_identity)
     monkeypatch.setattr(
         "sys.stdin",
@@ -537,7 +555,9 @@ def test_chat_peers_rejects_a_malformed_query_before_any_discovery(
 
 def _stub_alias_send(monkeypatch: pytest.MonkeyPatch, targets: list[Target]) -> list[Target]:
     resolved: list[Target] = []
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda *_args, **_kwargs: targets)
+    monkeypatch.setattr(
+        "cross_agent_chat.runtime._local_discovery", lambda *_args, **_kwargs: (targets, True)
+    )
     monkeypatch.setattr("cross_agent_chat.runtime._remote_discovery", lambda **_kwargs: ([], True))
 
     def fake_local_send(
@@ -595,6 +615,237 @@ def test_chat_send_resolves_a_unique_exact_alias(
     # The human-readable recipient is surfaced alongside the effect result.
     assert result["to"] == "claude@imac:Projects:W_Kluro_2Oct1PM"
     assert result["status"] == "TRANSPORT_ACCEPTED"
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_chat_send_malformed_recipient_exposes_decided_no_effect_on_the_wire(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    provider: Literal["claude", "codex"],
+) -> None:
+    root = tmp_path / "state"
+    source = Route.create(
+        provider=provider, session_id=str(uuid4()), device="studio", cwd=str(tmp_path), pid=1
+    )
+    monkeypatch.setattr(cli, "authenticate_mcp_sender", lambda *_args: source)
+    monkeypatch.setattr(cli, "reply_delivery", lambda *_args: "unknown")
+
+    def unexpected(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("malformed MCP recipient reached intent admission or provider I/O")
+
+    for name in ("_begin_delivery", "request_socket", "request_tailnet"):
+        monkeypatch.setattr(runtime, name, unexpected)
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "chat_send",
+            "arguments": {"to": "cac2.not-base64!", "message": "independent fixture request"},
+            "_meta": {"threadId": source.session_id},
+        },
+    }
+    monkeypatch.setattr("sys.stdin", _feed([*_handshake(), request]))
+
+    mcp(provider, "studio", str(root))
+
+    response: object = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "isError": True,
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "recipient token is invalid; nothing was delivered; "
+                        "call chat_peers and choose a fresh exact recipient handle"
+                    ),
+                }
+            ],
+        },
+    }
+    store = IntentStore(root)
+    assert store.intents() == []
+    assert not store.path.exists()
+
+
+def test_chat_send_preserves_downstream_unknown_on_the_wire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="claude", session_id=str(uuid4()), device="studio", cwd=str(tmp_path), pid=1
+    )
+    recipient = local_token(root, "f" * 64, str(uuid4()))
+    monkeypatch.setattr(cli, "authenticate_mcp_sender", lambda *_args: source)
+    monkeypatch.setattr(cli, "reply_delivery", lambda *_args: "unknown")
+
+    def downstream(*_args: object, **_kwargs: object) -> NoReturn:
+        raise UnknownDeliveryError("provider receipt unavailable; do not replay")
+
+    monkeypatch.setattr(runtime, "_send_local_token_target", downstream)
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "chat_send",
+            "arguments": {"to": recipient, "message": "independent fixture request"},
+        },
+    }
+    monkeypatch.setattr("sys.stdin", _feed([*_handshake(), request]))
+
+    mcp("claude", "studio", str(root))
+
+    response: object = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "isError": True,
+            "content": [{"type": "text", "text": "provider receipt unavailable; do not replay"}],
+        },
+    }
+
+
+@pytest.mark.parametrize("fault", ["none", "event_id", "provider", "extra", "unknown"])
+def test_remote_refusal_event_is_visible_on_mcp_and_readable_without_settling_unknowns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fault: Literal["none", "event_id", "provider", "extra", "unknown"],
+) -> None:
+    sender, receiver = tmp_path / "sender", tmp_path / "receiver"
+    source = Route.create(
+        provider="codex", session_id=str(uuid4()), device="source", cwd=str(tmp_path), pid=1
+    )
+    target = Route.create(
+        provider="codex", session_id=str(uuid4()), device="target", cwd=str(tmp_path), pid=2
+    )
+    Registry(sender).upsert(source)
+    Registry(receiver).upsert(target)
+    target_key = session_key(target.provider, target.session_id)
+    remote = Target(
+        alias=target.alias,
+        provider=target.provider,
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=target_key,
+        remote=True,
+        tailnet_address="100.64.0.2",
+        tailnet_node_id="nTarget",
+    )
+    local = Target(
+        alias=target.alias,
+        provider=target.provider,
+        device=target.device,
+        project=target.project,
+        generation=target.generation,
+        session_key=target_key,
+        remote=False,
+        session_id=target.session_id,
+        pid=target.pid,
+        cwd=target.cwd,
+    )
+    event = uuid4()
+    identifier = str(event)
+    monkeypatch.setattr(runtime, "uuid4", lambda: event)
+    monkeypatch.setattr(cli, "authenticate_mcp_sender", lambda *_args: source)
+    monkeypatch.setattr(cli, "reply_delivery", lambda *_args: "unknown")
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_remote_node_targets", lambda *_a, **_k: ([remote], True))
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([local], True))
+    monkeypatch.setattr(
+        runtime,
+        "tailnet_identity",
+        lambda: TailnetIdentity(self_node_id="nSource", peers={"nTarget": "100.64.0.2"}),
+    )
+    frames: list[dict[str, object]] = []
+
+    def wire(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        if payload["operation"] == "authorize":
+            return {"schema_version": 1, "status": "DENIED"}
+        assert payload["operation"] == "receive"
+        if fault == "unknown":
+            raise UnknownDeliveryError("fixture remote receipt missing")
+        response = runtime.receive_remote(receiver, str(payload["envelope"]), "100.64.0.1")
+        assert set(response) == {"schema_version", "event_id", "status", "provider", "error"}
+        assert response["error"] == "remote envelope is not authorized"
+        frames.append(dict(response))
+        if fault == "event_id":
+            response["event_id"] = str(uuid4())
+        elif fault == "provider":
+            response["provider"] = "claude"
+        elif fault == "extra":
+            response["phase"] = "unnegotiated"
+        return response
+
+    def unexpected(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("provider socket reached after authorization refusal")
+
+    monkeypatch.setattr(runtime, "request_tailnet", wire)
+    monkeypatch.setattr(runtime, "request_socket", unexpected)
+    requests = [
+        *_handshake(),
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "chat_send",
+                "arguments": {
+                    "to": remote_token("nTarget", target_key, target.generation),
+                    "message": "independent fixture task",
+                },
+                "_meta": {"threadId": source.session_id},
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "chat_status",
+                "arguments": {"event_id": identifier},
+                "_meta": {"threadId": source.session_id},
+            },
+        },
+    ]
+    monkeypatch.setattr("sys.stdin", _feed(requests))
+
+    mcp("codex", "source", str(sender))
+
+    lines = capsys.readouterr().out.splitlines()
+    raw_send: object = json.loads(lines[1])
+    if fault == "none":
+        error = (
+            "remote target rejected the message before provider effect: "
+            f"remote envelope is not authorized; nothing was delivered; event {identifier}"
+        )
+    elif fault == "unknown":
+        error = (
+            f"remote delivery state is unknown for event {identifier}; do not retry automatically"
+        )
+    else:
+        error = "remote delivery state is unknown"
+    assert raw_send == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"isError": True, "content": [{"type": "text", "text": error}]},
+    }
+    raw_status: object = json.loads(lines[2])
+    assert isinstance(raw_status, dict)
+    status = _tool_result_payload(cast(dict[str, object], raw_status))
+    expected_status = "PRE_EFFECT_REJECTED" if fault == "none" else "UNKNOWN_DELIVERY"
+    assert status["event_id"] == identifier and status["status"] == expected_status
+    (intent,) = IntentStore(sender).intents()
+    assert intent.event_id == identifier and intent.status == expected_status
+    assert IntentStore(receiver).intents() == []
+    assert len(frames) == (0 if fault == "unknown" else 1)
 
 
 def test_chat_send_refuses_an_ambiguous_alias_before_effect(

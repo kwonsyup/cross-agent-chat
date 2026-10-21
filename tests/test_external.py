@@ -957,13 +957,17 @@ def test_remote_titles_use_only_the_negotiated_external_capability(
                 row["delivery_mode"] = "unknown"
             if payload.get("include_title"):
                 row["title"] = "qualified display title"
-        return {"schema_version": 1, "peers": rows}
+        response: dict[str, object] = {"schema_version": 1, "peers": rows}
+        if modern and payload.get("include_local_discovery") is True:
+            response["local_discovery"] = "complete"
+        return response
 
     monkeypatch.setattr(runtime, "request_tailnet", discovery)
     targets, complete = runtime._remote_node_targets(
         "100.64.0.2", include_external=True, include_title=True, node_id="nSelected"
     )
-    assert complete and len(targets) == 1 and targets[0].title == "qualified display title"
+    assert complete is modern
+    assert len(targets) == 1 and targets[0].title == "qualified display title"
     rich = [request for request in calls if request.get("include_title")]
     assert len(rich) == 1 and ("include_external" in rich[0]) is modern
 

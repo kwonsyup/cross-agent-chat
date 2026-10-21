@@ -54,7 +54,7 @@ def test_non_exact_recipient_refuses_before_any_send(
         cwd=str(tmp_path),
         pid=os.getpid(),
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [local])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _: ([local], True))
     monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([remote], True))
     monkeypatch.setattr(
         runtime,
@@ -111,7 +111,7 @@ def test_exact_alias_selects_the_shorter_twin_while_a_fuzzy_form_refuses(
         pid=os.getpid(),
     )
     root = tmp_path / "state"
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [plain, twin])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _: ([plain, twin], True))
     monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
     chosen: list[runtime.Target] = []
 
@@ -253,8 +253,8 @@ def test_exact_local_token_does_not_wait_for_remote_discovery(
     state_root = tmp_path / "state"
     monkeypatch.setattr(
         runtime,
-        "local_targets",
-        lambda _root, *, handle=None: [target] if handle == target.session_key else [],
+        "_local_discovery",
+        lambda _root, *, handle=None: ([target] if handle == target.session_key else [], True),
     )
     monkeypatch.setattr(
         runtime,
@@ -286,7 +286,7 @@ def test_recipient_refuses_incomplete_remote_discovery_before_intent(
         cwd=str(tmp_path),
         pid=os.getpid(),
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [target])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _: ([target], True))
     monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], False))
 
     with pytest.raises(ChatError, match="discovery is incomplete"):
@@ -315,7 +315,7 @@ def test_remote_token_send_probes_only_the_pinned_node(
         cwd=str(tmp_path),
         pid=os.getpid(),
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _: ([], True))
     monkeypatch.setattr(
         runtime,
         "_remote_discovery",
@@ -375,7 +375,7 @@ def test_exact_alias_local_target_sends_after_complete_global_resolution(
         pid=os.getpid(),
     )
     expected = {"status": "TRANSPORT_ACCEPTED", "to": target.alias}
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [target])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _: ([target], True))
     monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
     monkeypatch.setattr(runtime, "_send_local_target", lambda *args, **kwargs: expected)
 

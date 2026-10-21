@@ -256,7 +256,7 @@ def test_new_reader_negotiates_acp_host_and_stays_conservative_with_old_brokers(
         include_devin=True,
     )
 
-    assert complete is True
+    assert complete is False  # Legacy coverage cannot establish alias uniqueness.
     assert requests[0]["include_devin_acp_host"] is True
     receiving = runtime.destination_receiving(target)
     if broker_knows_flag:
@@ -264,8 +264,8 @@ def test_new_reader_negotiates_acp_host_and_stays_conservative_with_old_brokers(
         assert receiving["mode"] == "devin_acp_hosted"
     else:
         # Fell back to the tool-boundary shape this broker still understands.
-        assert len(requests) == 2
-        assert "include_devin_acp_host" not in requests[1]
+        assert len(requests) == 3
+        assert "include_devin_acp_host" not in requests[2]
         assert receiving["mode"] == "devin_tool_boundary"
         assert receiving["parked_wake"] is False
         assert receiving["active_turn_input"] is True
@@ -300,7 +300,7 @@ def test_broker_listing_emits_only_the_layer_the_remote_reader_negotiated(
 ) -> None:
     """The broker path is internal: its output must honor the remote reader's
     own flag, or an old reader's closed set drops the whole route."""
-    monkeypatch.setattr(runtime, "local_targets", lambda *_a, **_k: [_acp_target()])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([_acp_target()], True))
 
     def row(*, tool_boundary: bool, acp_host: bool = False) -> dict[str, object]:
         listing = runtime.peers(

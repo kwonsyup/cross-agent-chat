@@ -3,7 +3,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import sys
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -11,7 +13,7 @@ from uuid import uuid4
 
 import pytest
 
-from cross_agent_chat import __version__
+from cross_agent_chat import __version__, runtime
 from cross_agent_chat.codex import (
     CodexCourier,
     deliver_at_stop,
@@ -64,6 +66,236 @@ def test_stop_without_registered_route_is_silent_noop(
     codex_stop(os.getpid(), str(tmp_path / "state"))
 
     assert capsys.readouterr().out == "{}\n"
+
+
+def test_stop_shares_one_deadline_across_health_peek_and_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+            )
+        ),
+    )
+    now = [100.0]
+    monkeypatch.setattr("cross_agent_chat.runtime.time.monotonic", lambda: now[0])
+    event_id = str(uuid4())
+    calls: list[tuple[str, float]] = []
+
+    def request(_path: Path, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        operation = str(payload["operation"])
+        calls.append((operation, timeout))
+        if operation == "health":
+            now[0] += 0.8
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "generation": route.generation,
+                "alias": route.alias,
+                "delivery_mode": "codex_stop_bound",
+            }
+        if operation == "peek":
+            now[0] += 0.8
+            return {"messages": [{"event_id": event_id, "message": "hello"}]}
+        return {"schema_version": 1, "status": "ACKNOWLEDGED", "event_ids": [event_id]}
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+
+    codex_stop(os.getpid(), str(root))
+
+    assert [operation for operation, _ in calls] == ["health", "peek", "ack"]
+    assert calls[0][1] < 2.0
+    assert calls[1][1] < calls[0][1] - 0.79
+    assert 0 < calls[2][1] < calls[1][1] - 0.79
+    assert json.loads(capsys.readouterr().out)["decision"] == "block"
+
+
+def test_stop_does_not_ack_without_remaining_budget_and_reports_unknown_ack_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+            )
+        ),
+    )
+    now = [200.0]
+    monkeypatch.setattr("cross_agent_chat.runtime.time.monotonic", lambda: now[0])
+    event_id = str(uuid4())
+    calls: list[str] = []
+
+    def request(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        operation = str(payload["operation"])
+        calls.append(operation)
+        if operation == "health":
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "generation": route.generation,
+                "alias": route.alias,
+                "delivery_mode": "codex_stop_bound",
+            }
+        if operation == "peek":
+            return {"messages": [{"event_id": event_id, "message": "hello"}]}
+        raise UnknownDeliveryError("delivery state is unknown")
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+    codex_stop(os.getpid(), str(root))
+    assert calls == ["health", "peek", "ack"]
+    captured = capsys.readouterr()
+    assert captured.out == "{}\n"
+    assert captured.err == "acknowledgement outcome unknown; not retried\n"
+
+    calls.clear()
+    now[0] = 300.0
+    original_request = request
+
+    def exhausted_before_ack(
+        path: Path, payload: dict[str, object], **kwargs: object
+    ) -> dict[str, object]:
+        if payload["operation"] == "peek":
+            response = original_request(path, payload, **kwargs)
+            now[0] += 2.0
+            return response
+        return original_request(path, payload, **kwargs)
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", exhausted_before_ack)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+            )
+        ),
+    )
+    codex_stop(os.getpid(), str(root))
+    assert calls == ["health", "peek"]
+    assert capsys.readouterr().out == "{}\n"
+
+
+def test_stop_deadline_bounds_slow_real_unix_socket_exchanges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+            )
+        ),
+    )
+    event_id = str(uuid4())
+    path = runtime.socket_path(root, route)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    path.chmod(0o600)
+    listener.listen(3)
+    listener.settimeout(2.5)
+    ready = threading.Event()
+    operations: list[str] = []
+    failures: list[BaseException] = []
+
+    def serve_slowly() -> None:
+        try:
+            ready.set()
+            for delay in (0.45, 0.45, 2.0):
+                connection, _ = listener.accept()
+                with connection:
+                    frame = bytearray()
+                    while b"\n" not in frame:
+                        chunk = connection.recv(4096)
+                        if not chunk:
+                            raise AssertionError("request ended before its JSON frame")
+                        frame.extend(chunk)
+                    request = json.loads(frame.decode().split("\n", 1)[0])
+                    operation = request["operation"]
+                    operations.append(operation)
+                    time.sleep(delay)
+                    if operation == "health":
+                        response = {
+                            "schema_version": 1,
+                            "status": "READY",
+                            "generation": route.generation,
+                            "alias": route.alias,
+                            "delivery_mode": "codex_stop_bound",
+                        }
+                    elif operation == "peek":
+                        response = {
+                            "schema_version": 1,
+                            "status": "PEEKED",
+                            "generation": route.generation,
+                            "messages": [{"event_id": event_id, "message": "hello"}],
+                        }
+                    else:
+                        response = {
+                            "schema_version": 1,
+                            "status": "ACKNOWLEDGED",
+                            "event_ids": [event_id],
+                        }
+                    try:
+                        connection.sendall(json.dumps(response).encode() + b"\n")
+                    except OSError:
+                        # The final ACK intentionally completes after the hook's
+                        # total deadline, so the client may already have closed.
+                        if operation != "ack":
+                            raise
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            listener.close()
+
+    server = threading.Thread(target=serve_slowly, daemon=True)
+    server.start()
+    assert ready.wait(timeout=1)
+    started = time.monotonic()
+
+    codex_stop(os.getpid(), str(root))
+
+    elapsed = time.monotonic() - started
+    captured = capsys.readouterr()
+    assert operations == ["health", "peek", "ack"], (elapsed, operations, captured)
+    server.join(timeout=1.5)
+    path.unlink(missing_ok=True)
+    assert not server.is_alive()
+    assert failures == []
+    assert operations == ["health", "peek", "ack"]
+    assert elapsed < 2.3
+    assert captured.out == "{}\n"
+    assert captured.err == "acknowledgement outcome unknown; not retried\n"
 
 
 def test_stop_skips_legacy_experimental_native_queue_without_peeking(

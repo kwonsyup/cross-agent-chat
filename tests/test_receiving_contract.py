@@ -13,7 +13,7 @@ import pytest
 
 from cross_agent_chat import runtime
 from cross_agent_chat.codex import CodexCourier
-from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, session_key
+from cross_agent_chat.core import ChatError, IntentStatus, IntentStore, Registry, Route, session_key
 from cross_agent_chat.devin import DevinCurrentBoundary
 from cross_agent_chat.native_helper import NativeDispatchStore, NativeHelperStore
 from cross_agent_chat.recipient import local_token, remote_token
@@ -201,7 +201,7 @@ def test_exact_title_selects_one_original_and_duplicate_title_refuses_before_eff
         )
 
     rows = [target(first)]
-    monkeypatch.setattr(runtime, "local_targets", lambda *_a, **_k: rows)
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: (rows, True))
     monkeypatch.setattr(runtime, "_with_codex_titles", lambda _root, targets, _deadline: targets)
     monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
     selected: list[runtime.Target] = []
@@ -288,7 +288,10 @@ def test_title_dispatch_refuses_a_hidden_remote_duplicate_when_title_enrichment_
         probes.append(payload)
         if payload.get("include_title"):
             raise runtime.UnknownDeliveryError("optional title response timed out")
-        return {"schema_version": 1, "peers": [row]}
+        response: dict[str, object] = {"schema_version": 1, "peers": [row]}
+        if payload.get("include_local_discovery") is True:
+            response["local_discovery"] = "complete"
+        return response
 
     monkeypatch.setattr(runtime, "request_tailnet", wire)
     monkeypatch.setattr(
@@ -296,7 +299,7 @@ def test_title_dispatch_refuses_a_hidden_remote_duplicate_when_title_enrichment_
         "tailnet_identity",
         lambda: TailnetIdentity(self_node_id="nLocal", peers={"nRemote": "100.64.0.2"}),
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda *_a, **_k: [local])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([local], True))
     monkeypatch.setattr(runtime, "_with_codex_titles", lambda _r, rows, _d: rows)
 
     def capture(
@@ -345,8 +348,8 @@ def test_title_metadata_failure_preserves_exact_alias_selection(
     effects: list[runtime.Target] = []
     monkeypatch.setattr(
         runtime,
-        "local_targets",
-        lambda *_a, **_k: [selected] + ([] if unknown_is_remote else [unknown]),
+        "_local_discovery",
+        lambda *_a, **_k: ([selected] + ([] if unknown_is_remote else [unknown]), True),
     )
     monkeypatch.setattr(
         runtime, "_remote_discovery", lambda **_: ([unknown] if unknown_is_remote else [], True)
@@ -932,7 +935,7 @@ def test_new_reader_negotiates_devin_tool_boundaries_and_stays_conservative_with
         include_devin=True,
     )
 
-    assert complete is True
+    assert complete is False  # Legacy coverage cannot establish alias uniqueness.
     assert "include_devin_tool_boundary" in requests[0]
     assert runtime.destination_receiving(target)["active_turn_input"] is active
 
@@ -1011,7 +1014,7 @@ def test_new_reader_negotiates_current_boundary_and_stays_conservative_with_old_
         include_current_boundary=True,
     )
 
-    assert complete is True
+    assert complete is False  # Legacy coverage cannot establish alias uniqueness.
     assert requests[0]["include_current_boundary"] is True
     if broker_knows_flag:
         assert target.current_boundary == "next_prompt_custom_subagent"
@@ -1019,7 +1022,7 @@ def test_new_reader_negotiates_current_boundary_and_stays_conservative_with_old_
     else:
         assert target.current_boundary is None
         assert "current_boundary" not in runtime.destination_receiving(target)
-        assert len(requests) == 2
+        assert len(requests) == 3
 
 
 def test_devin_tool_hook_records_that_its_loaded_session_runs_the_hook(
@@ -1790,4 +1793,133 @@ def test_status_bound_helper_with_stale_original_cannot_claim_a_current_receivin
     assert observation["stage"] == "unknown"
     assert observation["reason"] == "original_unavailable"
     assert calls == []
+    assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("status", ["TRANSPORT_ACCEPTED", "UNKNOWN_DELIVERY"])
+def test_status_no_courier_queue_preserves_the_sender_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remote: bool, status: IntentStatus
+) -> None:
+    """The same qualified receiver answer must not turn an unknown send into handoff."""
+    root, receiver_root = tmp_path / "sender", tmp_path / "receiver"
+    source = _route(root, tmp_path)
+    target = _route(receiver_root if remote else root, tmp_path)
+    store, event_id = _accepted_intent(root, source, target)
+    store.mark(event_id, status)
+    before = store.path.read_bytes()
+    requests: list[dict[str, object]] = []
+
+    def socket(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        requests.append(payload)
+        assert payload == {
+            "schema_version": 1,
+            "operation": "inspect",
+            "generation": target.generation,
+            "event_id": event_id,
+        }
+        return _inspect_answer(target.generation, "no_courier_queue")
+
+    monkeypatch.setattr(runtime, "request_socket", socket)
+    recipient: str | None = None
+    if remote:
+        recipient = remote_token(
+            "nTarget", session_key(target.provider, target.session_id), target.generation
+        )
+        monkeypatch.setattr(
+            runtime,
+            "tailnet_identity",
+            lambda: TailnetIdentity(self_node_id="nSender", peers={"nTarget": "100.64.0.2"}),
+        )
+
+        def wire(address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
+            assert address == "100.64.0.2"
+            assert payload["operation"] == "inspect"
+            return handle_broker_request(receiver_root, payload, "100.64.0.1")
+
+        monkeypatch.setattr(runtime, "request_tailnet", wire)
+
+    payload = runtime.owner_event_status(root, event_id, recipient=recipient)
+    observation = cast(dict[str, object], payload["receiving_observation"])
+    assert payload["status"] == status
+    assert payload["delivery_observation"] == "not_observed"
+    assert observation["observer"] == "original_courier"
+    assert observation["courier_version"] == "0.5.4"
+    if status == "TRANSPORT_ACCEPTED":
+        assert observation["stage"] == "handed_off"
+    else:
+        assert observation["stage"] == "unknown"
+        assert observation["reason"] == "no_courier_queue"
+        detail = cast(str, observation["detail"])
+        assert "no CAC-held queue to observe" in detail
+        assert "does not establish whether the provider took custody" in detail
+        assert "normal provider transcript" in detail
+        assert "next natural turn" in detail
+        assert "do not replay this event" in detail
+    assert len(requests) == 1
+    assert store.path.read_bytes() == before
+    assert "message" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("status", ["TRANSPORT_ACCEPTED", "UNKNOWN_DELIVERY"])
+def test_status_no_helper_queue_never_establishes_original_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: IntentStatus
+) -> None:
+    root = tmp_path / "state"
+    source = _route(root, tmp_path)
+    original, helper = _bound_helper_pair(root, tmp_path)
+    store, event_id = _accepted_intent(root, source, original)
+    store.mark(event_id, status)
+    before = store.path.read_bytes()
+    monkeypatch.setattr(runtime, "_route_current", lambda *_args: True)
+
+    def socket(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        assert payload["operation"] == "inspect"
+        assert payload["generation"] == helper.generation
+        return _inspect_answer(helper.generation, "no_courier_queue")
+
+    monkeypatch.setattr(runtime, "request_socket", socket)
+    payload = runtime.owner_event_status(root, event_id)
+    observation = cast(dict[str, object], payload["receiving_observation"])
+    assert payload["status"] == status
+    assert observation["observer"] == "native_helper"
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == "no_courier_queue"
+    assert "the bound native helper's courier" in cast(str, observation["detail"])
+    assert "do not replay this event" in cast(str, observation["detail"])
+    assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("mode", ["schema_version", "generation", "event_state", "timeout"])
+def test_status_no_queue_does_not_bypass_inspect_qualification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    root = tmp_path / "state"
+    source, target = _route(root, tmp_path), _route(root, tmp_path)
+    store, event_id = _accepted_intent(root, source, target)
+    store.mark(event_id, "UNKNOWN_DELIVERY")
+    before = store.path.read_bytes()
+    response = _inspect_answer(target.generation, "no_courier_queue")
+    if mode == "schema_version":
+        response[mode] = 0
+    elif mode == "generation":
+        response[mode] = str(uuid4())
+    elif mode == "event_state":
+        response[mode] = "unsupported_state"
+
+    def socket(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
+        assert payload["operation"] == "inspect"
+        if mode == "timeout":
+            raise OSError("inspect timed out")
+        return response
+
+    monkeypatch.setattr(runtime, "request_socket", socket)
+    payload = runtime.owner_event_status(root, event_id)
+    observation = cast(dict[str, object], payload["receiving_observation"])
+    assert payload["status"] == "UNKNOWN_DELIVERY"
+    assert observation["stage"] == "unknown"
+    assert observation["reason"] == (
+        "courier_unavailable" if mode == "timeout" else "observation_invalid"
+    )
+    assert "courier_version" not in observation
     assert store.path.read_bytes() == before

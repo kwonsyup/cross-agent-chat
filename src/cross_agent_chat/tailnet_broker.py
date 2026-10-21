@@ -113,6 +113,7 @@ class _ExternalDiscoveryOption(TypedDict, total=False):
     include_devin_tool_boundary: bool
     include_devin_acp_host: bool
     include_current_boundary: bool
+    include_local_discovery: bool
 
 
 def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[str, object]:
@@ -142,6 +143,7 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
             "include_title",
             "include_devin",
             "include_external",
+            "include_local_discovery",
         }
         optional = set(request) - {"schema_version", "operation"}
         handle = request.get("handle")
@@ -181,6 +183,8 @@ def handle_broker_request(root: Path, raw: object, peer_address: str) -> dict[st
             extra["include_devin_acp_host"] = True
         if "include_current_boundary" in optional:
             extra["include_current_boundary"] = True
+        if "include_local_discovery" in optional:
+            extra["include_local_discovery"] = True
         return peers(
             root,
             include_remote=False,

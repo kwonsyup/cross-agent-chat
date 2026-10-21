@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.8 - 2026-10-20
+
+- Preserve healthy peers when local discovery is incomplete, report
+  `local_discovery`, and refuse alias/title selection until uniqueness can be
+  established. A fresh exact handle still checks only its bound endpoint;
+  unavailable or stale endpoints refuse.
+- Carry each responding node's local coverage through negotiated remote
+  discovery. Legacy responses without coverage retain healthy rows but cannot
+  prove name uniqueness. A new broker refuses an unnegotiated partial roster;
+  complete legacy responses and exact-token attestation keep their existing
+  shapes. Requested external endpoints count toward the same coverage.
+- Keep a qualified `no_courier_queue` observation unknown when the sender's
+  outcome is `UNKNOWN_DELIVERY` or the observer is a Native helper. No queue
+  does not prove provider custody or original-session use. Inspect the original
+  through its normal transcript or next natural turn; do not replay the event.
+- Share one 2-second deadline across Codex Stop health/peek/ACK IPC. This does
+  not bound interpreter or filesystem startup. An unknown ACK outcome ends
+  without retrying or emitting a continuation.
+- Include the recorded event ID after a validated remote no-effect refusal
+  so sender custody can be inspected with `chat_status`. Forward fixed v2
+  reply-binding guard causes without exposing private header or provider text;
+  other errors and unknown outcomes retain their existing classification.
+
 ## 0.5.7 - 2026-10-16
 
 - Qualify the exact Codex CLI owning-daemon version 0.163.0 after comparing

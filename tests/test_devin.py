@@ -1237,7 +1237,7 @@ def test_devin_originates_local_send_with_exact_source_alias(
         cwd=target.cwd,
         pid=target.pid,
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda _root: [target_view])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _root: ([target_view], True))
     monkeypatch.setattr(
         runtime,
         "request_socket",
@@ -1284,7 +1284,7 @@ def test_devin_originates_remote_send_with_exact_source_alias_and_intent(
         tailnet_address="100.64.0.2",
         tailnet_node_id="nOwner",
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda _root: [])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _root: ([], True))
     monkeypatch.setattr(
         runtime,
         "tailnet_identity",

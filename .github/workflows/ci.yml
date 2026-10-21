@@ -26,16 +26,16 @@ jobs:
       - name: Smoke built wheel in a fresh environment
         run: |
           python -m venv "$RUNNER_TEMP/wheel-smoke"
-          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install --upgrade pip 'setuptools==83.0.0'
           "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install dist/*.whl
-          test "$("$RUNNER_TEMP/wheel-smoke/bin/cross-agent-chat" --version)" = "cross-agent-chat 0.5.7"
+          test "$("$RUNNER_TEMP/wheel-smoke/bin/cross-agent-chat" --version)" = "cross-agent-chat 0.5.8"
           mkdir -p "$RUNNER_TEMP/doctor-home"
           set +e
           HOME="$RUNNER_TEMP/doctor-home" "$RUNNER_TEMP/wheel-smoke/bin/cross-agent-chat" doctor --json > "$RUNNER_TEMP/doctor.json"
           status=$?
           set -e
           test "$status" -eq 1
-          python -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value == {"codex_native_queue":"stop-bound","integration":"needs setup","local_broker":"unavailable","next":"cross-agent-chat setup","remote_trust":"tailscale_acl","version":"0.5.7"}' "$RUNNER_TEMP/doctor.json"
+          python -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value == {"codex_native_queue":"stop-bound","integration":"needs setup","local_broker":"unavailable","next":"cross-agent-chat setup","remote_trust":"tailscale_acl","version":"0.5.8"}' "$RUNNER_TEMP/doctor.json"
       - name: Inspect wheel and sdist contents
         run: |
           python - <<'PY'
@@ -61,3 +61,28 @@ jobs:
           assert any(name.endswith("/SECURITY.md") for name in sdist_names)
           assert any(name.endswith("/CHANGELOG.md") for name in sdist_names)
           PY
+      - name: Audit installed wheel runtime dependencies
+        id: runtime_audit
+        shell: bash
+        run: |
+          audit_dir="$RUNNER_TEMP/cac-runtime-audit"
+          tool_env="$RUNNER_TEMP/cac-audit-tool"
+          wheel_python="$RUNNER_TEMP/wheel-smoke/bin/python"
+          mkdir -p "$audit_dir"
+          printf 'commit=%s\nrun_id=%s\nrun_attempt=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$audit_dir/receipt.txt"
+          uname -sm >> "$audit_dir/receipt.txt"
+          python --version >> "$audit_dir/receipt.txt"
+          shasum -a 256 dist/*.whl >> "$audit_dir/receipt.txt"
+          "$wheel_python" -m pip freeze --all --exclude cross-agent-chat | tee "$audit_dir/runtime-requirements.txt"
+          printf '%s\n' 'Scope: fresh wheel environment runtime dependencies plus bootstrap packages; unpublished root excluded. Dev/build and auditor environments are not covered.' > "$audit_dir/scope.txt"
+          python -m venv "$tool_env"
+          "$tool_env/bin/python" -m pip --isolated install --index-url https://pypi.org/simple 'pip-audit==2.10.1' 2>&1 | tee "$audit_dir/tool-install.log"
+          "$tool_env/bin/pip-audit" --version | tee "$audit_dir/tool-version.txt"
+          "$tool_env/bin/pip-audit" --requirement "$audit_dir/runtime-requirements.txt" --no-deps --disable-pip --strict --vulnerability-service pypi --format json --output "$audit_dir/audit.json" 2>&1 | tee "$audit_dir/audit.log"
+      - name: Retain runtime audit diagnostics
+        if: ${{ always() && steps.runtime_audit.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runtime-dependency-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cac-runtime-audit/
+          if-no-files-found: error
