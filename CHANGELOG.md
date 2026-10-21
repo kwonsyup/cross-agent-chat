@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Preserve healthy peers when local discovery is incomplete, report
+  `local_discovery`, and refuse alias/title selection until uniqueness can be
+  established. A fresh exact handle still checks only its bound endpoint;
+  unavailable or stale endpoints refuse.
+- Keep a qualified `no_courier_queue` observation unknown when the sender's
+  outcome is `UNKNOWN_DELIVERY` or the observer is a Native helper. No queue
+  does not prove provider custody or original-session use. Inspect the original
+  through its normal transcript or next natural turn; do not replay the event.
+- Share one 2-second deadline across Codex Stop health/peek/ACK IPC. This does
+  not bound interpreter or filesystem startup. An unknown ACK outcome ends
+  without retrying or emitting a continuation.
+
 ## 0.5.7 - 2026-10-16
 
 - Qualify the exact Codex CLI owning-daemon version 0.163.0 after comparing
