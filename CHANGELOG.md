@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.8 - 2026-10-20
 
 - Preserve healthy peers when local discovery is incomplete, report
   `local_discovery`, and refuse alias/title selection until uniqueness can be

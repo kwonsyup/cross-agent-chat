@@ -24,16 +24,16 @@ secrets those files hold (see [setup and data handling](SECURITY.md)).
 Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
 limits the set.
 
-Install v0.5.7 with:
+Install v0.5.8 with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.7/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.8/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
-This builds the released `v0.5.7` tag and installs the command at
+This builds the released `v0.5.8` tag and installs the command at
 `~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
 Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
 not found in your shell, use the full path the installer reports. Run it on
@@ -282,7 +282,7 @@ advisory peer title after the retained v2 header and an explicit `chat_send`
 reply action. The provider may still display its own courier reminder; use
 the CAC Reply route rather than the visible helper address.
 
-**Unreleased candidate:** `chat_peers` also reports `local_discovery` as
+**In v0.5.8:** `chat_peers` also reports `local_discovery` as
 `complete` or `incomplete`. A missed health probe preserves healthy rows but
 cannot establish a unique alias or title. The agent can use a fresh exact
 handle from its own `chat_peers` result or the received Reply route; an
@@ -329,7 +329,7 @@ normal provider transcript or next natural turn. Incoming remote events have
 no sender-local intent record on the receiving Mac, so its owner `status`
 command may report unavailable; that does not prove non-delivery.
 
-**Unreleased candidate:** a qualified `no_courier_queue` answer leaves
+**In v0.5.8:** a qualified `no_courier_queue` answer leaves
 `UNKNOWN_DELIVERY` unknown and does not establish helper-to-original
 forwarding. Check the intended original through its normal provider transcript
 or next natural turn; do not replay the event.
