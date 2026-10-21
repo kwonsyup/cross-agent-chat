@@ -699,9 +699,7 @@ def test_chat_send_preserves_downstream_unknown_on_the_wire(
         "id": 1,
         "result": {
             "isError": True,
-            "content": [
-                {"type": "text", "text": "provider receipt unavailable; do not replay"}
-            ],
+            "content": [{"type": "text", "text": "provider receipt unavailable; do not replay"}],
         },
     }
 

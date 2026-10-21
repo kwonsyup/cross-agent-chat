@@ -972,9 +972,10 @@ def test_local_discovery_health_miss_cannot_hide_duplicate_alias(
     )
     assert probes == [first.generation]
     # Scoped endpoint discovery also keeps an exact healthy native token usable.
-    assert send(tmp_path, first, healthy["handle"], "fixture only", include_external=True)[
-        "status"
-    ] == "DRY_RUN_SELECTION_ONLY"
+    assert (
+        send(tmp_path, first, healthy["handle"], "fixture only", include_external=True)["status"]
+        == "DRY_RUN_SELECTION_ONLY"
+    )
     missing_token = local_token(
         tmp_path, session_key("devin", second.session_id), second.generation
     )
@@ -1013,9 +1014,7 @@ def test_broker_partial_local_roster_cannot_make_a_remote_alias_unique(
     selected: list[str] = []
     monkeypatch.setattr(Route, "process_is_live", lambda _route: True)
     monkeypatch.setattr(runtime, "_with_codex_titles", lambda _root, rows, _deadline: rows)
-    monkeypatch.setattr(
-        runtime, "tailnet_identity", lambda: _identity(peers={OWNER_NODE: OWNER})
-    )
+    monkeypatch.setattr(runtime, "tailnet_identity", lambda: _identity(peers={OWNER_NODE: OWNER}))
 
     def health(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
         assert payload["operation"] == "health"
@@ -1089,9 +1088,7 @@ def test_legacy_node_without_coverage_keeps_rows_but_cannot_justify_alias_select
     selected: list[str] = []
     monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([], True))
     monkeypatch.setattr(runtime, "_with_codex_titles", lambda _root, rows, _deadline: rows)
-    monkeypatch.setattr(
-        runtime, "tailnet_identity", lambda: _identity(peers={OWNER_NODE: OWNER})
-    )
+    monkeypatch.setattr(runtime, "tailnet_identity", lambda: _identity(peers={OWNER_NODE: OWNER}))
 
     def legacy(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
         assert payload["operation"] == "peers"
@@ -1133,9 +1130,7 @@ def test_remote_alias_refuses_when_title_pass_reveals_another_same_alias_identit
     second = _peer(REMOTE_ALIAS, "studio", "b" * 64, str(uuid4()))
     probes: list[dict[str, object]] = []
     monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([], True))
-    monkeypatch.setattr(
-        runtime, "tailnet_identity", lambda: _identity(peers={OWNER_NODE: OWNER})
-    )
+    monkeypatch.setattr(runtime, "tailnet_identity", lambda: _identity(peers={OWNER_NODE: OWNER}))
 
     def wire(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
         assert payload["operation"] == "peers"
