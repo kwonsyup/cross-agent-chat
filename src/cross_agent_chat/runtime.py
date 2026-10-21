@@ -5739,6 +5739,16 @@ def _receiving_state_observation(
             "provider-native delivery completed at transport acceptance; there "
             "is no CAC-held queue to observe"
         )
+    elif state == "no_courier_queue":
+        # A qualified answer with no queue cannot settle an uncertain send or
+        # establish forwarding from a helper to the original session.
+        observation["stage"] = "unknown"
+        observation["reason"] = "no_courier_queue"
+        observation["detail"] = (
+            f"{holder} has no CAC-held queue to observe; this does not establish "
+            "whether the provider took custody or the original session consumed "
+            f"the event; {_RECEIVER_CHECK_ACTION}"
+        )
     elif state == "unseen":
         observation["stage"] = "unknown"
         observation["reason"] = "no_courier_record"
