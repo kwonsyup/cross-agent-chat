@@ -7,7 +7,7 @@ import select
 import socket
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import replace
@@ -348,6 +348,22 @@ def _complete_roster(
     if payload.get("include_local_discovery") is True:
         response["local_discovery"] = "complete"
     return response
+
+
+def _healthy_source_courier(source: Route) -> Callable[..., dict[str, object]]:
+    """Qualify the registered sender through the real local discovery path."""
+
+    def health(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        assert payload["operation"] == "health"
+        assert payload["generation"] == source.generation
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": source.generation,
+            "alias": source.alias,
+        }
+
+    return health
 
 
 def test_new_devin_discovery_falls_back_to_legacy_broker_request(
@@ -2141,11 +2157,15 @@ def test_remote_targets_are_discovered_without_peer_configuration(
 
     def request(address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         assert address == "100.64.0.11"
-        assert payload == {"schema_version": 1, "operation": "peers"}
-        assert 0 < timeout <= REMOTE_DISCOVERY_TIMEOUT_SECONDS
-        return {
+        assert payload == {
             "schema_version": 1,
-            "peers": [
+            "operation": "peers",
+            "include_local_discovery": True,
+        }
+        assert 0 < timeout <= REMOTE_DISCOVERY_TIMEOUT_SECONDS
+        return _complete_roster(
+            payload,
+            [
                 {
                     "alias": "claude@studio:api:api-a1",
                     "provider": "claude",
@@ -2156,7 +2176,7 @@ def test_remote_targets_are_discovered_without_peer_configuration(
                     "session_key": "a" * 64,
                 }
             ],
-        }
+        )
 
     monkeypatch.setattr("cross_agent_chat.runtime.tailnet_identity", identity)
     monkeypatch.setattr(
@@ -2191,9 +2211,9 @@ def test_remote_send_uses_tailnet_broker_without_ssh_configuration(
         assert actual_address == address
         assert port == 47071
         if payload.get("operation") == "peers":
-            return {
-                "schema_version": 1,
-                "peers": [
+            return _complete_roster(
+                payload,
+                [
                     {
                         "alias": target_alias,
                         "provider": "claude",
@@ -2204,7 +2224,7 @@ def test_remote_send_uses_tailnet_broker_without_ssh_configuration(
                         "session_key": "a" * 64,
                     }
                 ],
-            }
+            )
         assert timeout > 90
         envelope = json.loads(str(payload["envelope"]))
         return {
@@ -2225,6 +2245,7 @@ def test_remote_send_uses_tailnet_broker_without_ssh_configuration(
         pid=os.getpid(),
     )
     Registry(tmp_path).upsert(source)
+    monkeypatch.setattr(runtime, "request_socket", _healthy_source_courier(source))
 
     result = send(tmp_path, source, target_alias, "hello")
 
@@ -2430,9 +2451,9 @@ def test_alias_send_still_waits_on_silent_unrelated_peer(
             if address == silent:
                 release.wait(timeout)
                 raise ChatError("silent neighbor never answered")
-            return {
-                "schema_version": 1,
-                "peers": [
+            return _complete_roster(
+                payload,
+                [
                     {
                         "alias": target_alias,
                         "provider": "claude",
@@ -2443,7 +2464,7 @@ def test_alias_send_still_waits_on_silent_unrelated_peer(
                         "session_key": "a" * 64,
                     }
                 ],
-            }
+            )
         envelope = json.loads(str(payload["envelope"]))
         return {
             "schema_version": 1,
@@ -2467,6 +2488,7 @@ def test_alias_send_still_waits_on_silent_unrelated_peer(
         pid=os.getpid(),
     )
     Registry(tmp_path).upsert(source)
+    monkeypatch.setattr(runtime, "request_socket", _healthy_source_courier(source))
 
     started = time.monotonic()
     try:
@@ -2522,7 +2544,9 @@ def test_exact_token_send_is_refused_when_attested_generation_is_stale(
     )
     Registry(tmp_path).upsert(source)
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
+    with pytest.raises(
+        ChatError, match="selected recipient could not be verified; nothing was delivered"
+    ):
         send(tmp_path, source, remote_token("nOwner", handle, stale), "hello")
 
     assert contacted == ["peers"]
@@ -2538,9 +2562,9 @@ def test_remote_claude_diagnostic_is_body_free_and_marks_one_unknown(
 
     def request(_address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         if payload.get("operation") == "peers":
-            return {
-                "schema_version": 1,
-                "peers": [
+            return _complete_roster(
+                payload,
+                [
                     {
                         "alias": target_alias,
                         "provider": "claude",
@@ -2551,7 +2575,7 @@ def test_remote_claude_diagnostic_is_body_free_and_marks_one_unknown(
                         "session_key": "a" * 64,
                     }
                 ],
-            }
+            )
         envelope = json.loads(str(payload["envelope"]))
         return {
             "schema_version": 1,
@@ -2574,6 +2598,7 @@ def test_remote_claude_diagnostic_is_body_free_and_marks_one_unknown(
         pid=os.getpid(),
     )
     Registry(tmp_path).upsert(source)
+    monkeypatch.setattr(runtime, "request_socket", _healthy_source_courier(source))
 
     with pytest.raises(UnknownDeliveryError, match="claude_helper_timeout") as error:
         send(tmp_path, source, target_alias, "private message body")
@@ -2697,6 +2722,7 @@ def test_remote_pre_effect_rejection_is_safe_and_does_not_block_fresh_send(
         pid=os.getpid(),
     )
     Registry(tmp_path).upsert(source)
+    monkeypatch.setattr(runtime, "request_socket", _healthy_source_courier(source))
 
     with pytest.raises(ChatError, match="remote target rejected") as caught:
         send(tmp_path, source, target_alias, "hello")
@@ -2865,10 +2891,13 @@ def test_remote_send_surfaces_allowlisted_courier_reason(
                 "provider": "codex",
                 "error": "session courier is still bootstrapping",
             }
+        assert payload["operation"] == "health"
+        assert payload["generation"] in {source.generation, target.generation}
         return {
             "schema_version": 1,
             "status": "READY",
-            "generation": payload.get("generation"),
+            "generation": payload["generation"],
+            "alias": source.alias if payload["generation"] == source.generation else target.alias,
         }
 
     monkeypatch.setattr(
@@ -3300,9 +3329,9 @@ def test_wrapped_message_limit_rejects_before_intent_creation(
     )
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_tailnet",
-        lambda *_args, **_kwargs: {
-            "schema_version": 1,
-            "peers": [
+        lambda _address, payload, **_kwargs: _complete_roster(
+            payload,
+            [
                 {
                     "alias": target_alias,
                     "provider": "claude",
@@ -3313,7 +3342,7 @@ def test_wrapped_message_limit_rejects_before_intent_creation(
                     "session_key": "a" * 64,
                 }
             ],
-        },
+        ),
     )
     source = Route.create(
         provider="codex",
@@ -3323,6 +3352,7 @@ def test_wrapped_message_limit_rejects_before_intent_creation(
         pid=os.getpid(),
     )
     Registry(tmp_path).upsert(source)
+    monkeypatch.setattr(runtime, "request_socket", _healthy_source_courier(source))
 
     with pytest.raises(ChatError, match="16 KiB"):
         send(tmp_path, source, target_alias, "x" * (16 * 1024))
@@ -4072,7 +4102,9 @@ def test_exact_token_send_refuses_when_the_handle_moved_to_another_node(
     )
     Registry(tmp_path).upsert(source)
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
+    with pytest.raises(
+        ChatError, match="selected recipient could not be verified; nothing was delivered"
+    ):
         send(tmp_path, source, remote_token("nOwner", handle, generation), "hello")
 
     assert contacted == ["100.64.0.11"]

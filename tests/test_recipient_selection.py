@@ -573,7 +573,9 @@ def test_token_send_refuses_when_the_node_stopped_claiming_the_handle(
         },
     )
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
+    with pytest.raises(
+        ChatError, match="selected recipient could not be verified; nothing was delivered"
+    ):
         send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hi")
 
     assert [str(payload.get("operation")) for _a, payload in calls] == ["peers"]
@@ -590,7 +592,9 @@ def test_stale_generation_is_refused_before_effect(
         rosters={OWNER: [_peer(REMOTE_ALIAS, "studio", handle, str(uuid4()))]},
     )
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
+    with pytest.raises(
+        ChatError, match="selected recipient could not be verified; nothing was delivered"
+    ):
         send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hi")
 
     assert [str(payload.get("operation")) for _a, payload in calls] == ["peers"]
@@ -1004,8 +1008,8 @@ def test_broker_partial_local_roster_cannot_make_a_remote_alias_unique(
 ) -> None:
     """A responding broker must carry its own missed-twin coverage to the sender."""
     requester, broker = tmp_path / "requester", tmp_path / "broker"
-    requester.mkdir()
-    broker.mkdir()
+    requester.mkdir(mode=0o700)
+    broker.mkdir(mode=0o700)
     source = _source(requester)
     first, second = _route(broker, provider="devin"), _route(broker, provider="devin")
     assert first.alias == second.alias
@@ -1231,7 +1235,7 @@ def _alias_send_fixture(
     sequence = iter(identities)
     monkeypatch.setattr(runtime, "tailnet_identity", lambda: next(sequence))
     monkeypatch.setattr(runtime, "request_tailnet", _remote_wire(calls, rosters))
-    monkeypatch.setattr(runtime, "request_socket", _courier([]))
+    monkeypatch.setattr(runtime, "request_socket", _courier([source]))
     return source, calls
 
 
@@ -1322,7 +1326,9 @@ def test_alias_send_refuses_when_the_generation_changed_after_selection(
 
     monkeypatch.setattr(runtime, "request_tailnet", wire)
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
+    with pytest.raises(
+        ChatError, match="selected recipient could not be verified; nothing was delivered"
+    ):
         send(tmp_path, source, REMOTE_ALIAS, "hello")
 
 

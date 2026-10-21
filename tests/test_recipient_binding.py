@@ -342,7 +342,9 @@ def test_a_stale_token_is_replaced_only_by_a_fresh_listing(
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
+    with pytest.raises(
+        ChatError, match="selected recipient could not be verified; nothing was delivered"
+    ):
         send(tmp_path, source, remote_token(OWNER_NODE, handle, stale), "hello")
     assert deliveries == []
     assert not (tmp_path / "intents.json").exists()
@@ -393,7 +395,9 @@ def test_the_selected_node_not_claiming_refuses_before_any_effect(
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    with pytest.raises(ChatError, match="unavailable or changed; nothing was delivered"):
+    with pytest.raises(
+        ChatError, match="selected recipient could not be verified; nothing was delivered"
+    ):
         send(
             tmp_path,
             source,
@@ -450,7 +454,9 @@ def test_the_selected_node_serving_other_keys_refuses(
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
+    with pytest.raises(
+        ChatError, match="selected recipient could not be verified; nothing was delivered"
+    ):
         send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hello")
 
     assert deliveries == []
@@ -491,7 +497,9 @@ def test_the_selected_node_may_reclaim_its_handle(
     source = _source(tmp_path)
     token = remote_token(OWNER_NODE, handle, generation)
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
+    with pytest.raises(
+        ChatError, match="selected recipient could not be verified; nothing was delivered"
+    ):
         send(tmp_path, source, token, "hello")
 
     claiming = True

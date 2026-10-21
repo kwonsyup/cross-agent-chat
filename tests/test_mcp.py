@@ -377,8 +377,15 @@ def test_chat_peers_query_filters_alias_and_title_and_reports_scope(
 
     responses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     unfiltered = _tool_result_payload(responses[1])
-    # The no-argument response keeps its exact prior shape: no filter key.
-    assert set(unfiltered) == {"schema_version", "peers", "remote_discovery", "sender"}
+    # The no-argument response reports coverage without adding a filter key.
+    assert set(unfiltered) == {
+        "schema_version",
+        "peers",
+        "local_discovery",
+        "remote_discovery",
+        "sender",
+    }
+    assert unfiltered["local_discovery"] == "complete"
     unfiltered_peers = unfiltered["peers"]
     assert isinstance(unfiltered_peers, list)
     assert len(unfiltered_peers) == 4
