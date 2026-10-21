@@ -26,7 +26,7 @@ jobs:
       - name: Smoke built wheel in a fresh environment
         run: |
           python -m venv "$RUNNER_TEMP/wheel-smoke"
-          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install --upgrade pip 'setuptools==83.0.0'
           "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install dist/*.whl
           test "$("$RUNNER_TEMP/wheel-smoke/bin/cross-agent-chat" --version)" = "cross-agent-chat 0.5.7"
           mkdir -p "$RUNNER_TEMP/doctor-home"
