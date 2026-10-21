@@ -300,7 +300,7 @@ def test_broker_listing_emits_only_the_layer_the_remote_reader_negotiated(
 ) -> None:
     """The broker path is internal: its output must honor the remote reader's
     own flag, or an old reader's closed set drops the whole route."""
-    monkeypatch.setattr(runtime, "local_targets", lambda *_a, **_k: [_acp_target()])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([_acp_target()], True))
 
     def row(*, tool_boundary: bool, acp_host: bool = False) -> dict[str, object]:
         listing = runtime.peers(

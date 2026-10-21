@@ -303,7 +303,7 @@ def test_a_complete_listing_with_two_claimants_refuses(
             self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER, OTHER_NODE: OTHER}
         ),
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *a, **k: ([], True))
     monkeypatch.setattr(runtime, "request_tailnet", request)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
 
@@ -337,7 +337,7 @@ def test_a_stale_token_is_replaced_only_by_a_fresh_listing(
         "tailnet_identity",
         lambda: TailnetIdentity(self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER}),
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *a, **k: ([], True))
     monkeypatch.setattr(runtime, "request_tailnet", request)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
     source = _source(tmp_path)
@@ -691,7 +691,7 @@ def test_no_recipients_file_is_ever_created(
         "tailnet_identity",
         lambda: TailnetIdentity(self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER}),
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *a, **k: ([], True))
     monkeypatch.setattr(runtime, "request_tailnet", request)
     source = _source(tmp_path)
 
@@ -700,7 +700,7 @@ def test_no_recipients_file_is_ever_created(
     assert send(tmp_path, source, item["handle"], "hello")["status"] == "TRANSPORT_ACCEPTED"
 
     target = _target(tmp_path)
-    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [_public_target(target)])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *a, **k: ([_public_target(target)], True))
     monkeypatch.setattr(runtime, "request_socket", _courier(target))
     event_id = str(uuid4())
     source_generation = str(uuid4())
@@ -769,7 +769,7 @@ def test_inbound_v2_reply_token_binds_the_verified_sender(
         "tailnet_identity",
         lambda: TailnetIdentity(self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER}),
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [_public_target(target)])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *a, **k: ([_public_target(target)], True))
     monkeypatch.setattr(runtime, "request_tailnet", _authorize)
     monkeypatch.setattr(runtime, "request_socket", _courier(target))
 
@@ -828,7 +828,7 @@ def test_an_inbound_reply_token_that_does_not_match_the_source_is_refused(
             self_node_id=SELF_NODE, peers={OWNER_NODE: OWNER, OTHER_NODE: OTHER}
         ),
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [_public_target(target)])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *a, **k: ([_public_target(target)], True))
     monkeypatch.setattr(runtime, "request_tailnet", _authorize)
     monkeypatch.setattr(runtime, "request_socket", courier)
 
@@ -879,7 +879,7 @@ def test_an_inbound_v1_envelope_still_delivers_byte_for_byte(
             "provider": "codex",
         }
 
-    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [_public_target(target)])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *a, **k: ([_public_target(target)], True))
     monkeypatch.setattr(runtime, "request_tailnet", _authorize)
     monkeypatch.setattr(runtime, "request_socket", courier)
 
@@ -916,7 +916,7 @@ def test_an_inbound_free_text_handle_line_is_content_only(
             "provider": "codex",
         }
 
-    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [_public_target(target)])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *a, **k: ([_public_target(target)], True))
     monkeypatch.setattr(runtime, "request_tailnet", _authorize)
     monkeypatch.setattr(runtime, "request_socket", courier)
 
@@ -953,7 +953,7 @@ def test_a_listing_mints_one_opaque_token_per_remote_row(
     )
     monkeypatch.setattr(runtime, "request_tailnet", request)
     monkeypatch.setattr(runtime, "request_socket", _unavailable_courier)
-    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *a, **k: ([], True))
 
     targets = remote_targets(tmp_path, include_devin=True)
     assert [target.tailnet_node_id for target in targets] == [OWNER_NODE, OWNER_NODE]
@@ -1083,7 +1083,7 @@ def test_wire_request_and_response_key_sets_are_unchanged(
             "payload_digest": payload["payload_digest"],
         }
 
-    monkeypatch.setattr(runtime, "local_targets", lambda *a, **k: [_public_target(target)])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *a, **k: ([_public_target(target)], True))
     monkeypatch.setattr(runtime, "request_tailnet", authorize)
     monkeypatch.setattr(
         runtime,

@@ -2928,7 +2928,8 @@ def _local_target_before_deadline(root: Path, route: Route, deadline: float) -> 
     return _local_target(root, route, timeout=min(HEALTH_TIMEOUT_SECONDS, remaining))
 
 
-def local_targets(root: Path, *, handle: str | None = None) -> list[Target]:
+def _local_discovery(root: Path, *, handle: str | None = None) -> tuple[list[Target], bool]:
+    """Retain healthy rows and whether every eligible local route attested."""
     routes = [
         route
         for route in Registry(root).routes()
@@ -2938,7 +2939,7 @@ def local_targets(root: Path, *, handle: str | None = None) -> list[Target]:
         and not NativeHelperStore(root).is_helper_lineage(route)
     ]
     if not routes:
-        return []
+        return [], True
     deadline = time.monotonic() + LOCAL_DISCOVERY_TIMEOUT_SECONDS
     workers = ThreadPoolExecutor(max_workers=min(LOCAL_DISCOVERY_WORKERS, len(routes)))
     futures: list[Future[Target | None]] = []
@@ -2962,7 +2963,14 @@ def local_targets(root: Path, *, handle: str | None = None) -> list[Target]:
         for future in futures:
             future.cancel()
         workers.shutdown(wait=False, cancel_futures=True)
-    return [target for target in results if target is not None]
+    targets = [target for target in results if target is not None]
+    # Missing, queued and unsubmitted probes all leave a None slot. A partial
+    # healthy roster remains useful, but cannot establish name uniqueness.
+    return targets, len(targets) == len(routes)
+
+
+def local_targets(root: Path, *, handle: str | None = None) -> list[Target]:
+    return (_local_discovery(root) if handle is None else _local_discovery(root, handle=handle))[0]
 
 
 def _with_codex_titles(root: Path, targets: list[Target], deadline: float) -> list[Target]:
@@ -4229,7 +4237,13 @@ def send(
         raise ChatError(
             "recipient handles are now opaque tokens; call chat_peers and send to the fresh handle"
         )
-    local = _local_endpoint_targets(root) if include_external else local_targets(root)
+    local, local_complete = (
+        _local_endpoint_discovery(root) if include_external else _local_discovery(root)
+    )
+    if not local_complete:
+        raise ChatError(
+            "local peer discovery is incomplete; use an exact available recipient handle"
+        )
     remote, remote_complete = _remote_discovery(
         include_title=True, **_external_option(include_external)
     )
@@ -4671,14 +4685,27 @@ def external_targets(root: Path, *, handle: str | None = None) -> list[Target]:
     ]
 
 
-def _local_endpoint_targets(root: Path, *, handle: str | None = None) -> list[Target]:
-    native = local_targets(root) if handle is None else local_targets(root, handle=handle)
+def _local_endpoint_discovery(
+    root: Path, *, handle: str | None = None
+) -> tuple[list[Target], bool]:
+    native, complete = (
+        _local_discovery(root) if handle is None else _local_discovery(root, handle=handle)
+    )
     if handle is not None and native:
-        return native
+        return native, complete
     try:
-        return [*native, *external_targets(root, handle=handle)]
+        return [*native, *external_targets(root, handle=handle)], complete
     except ChatError:
-        return native
+        return native, False
+
+
+def _local_endpoint_targets(root: Path, *, handle: str | None = None) -> list[Target]:
+    targets, complete = _local_endpoint_discovery(root, handle=handle)
+    if handle is None and not complete:
+        raise ChatError(
+            "local peer discovery is incomplete; use an exact available recipient handle"
+        )
+    return targets
 
 
 def _accept_external(
@@ -4872,7 +4899,7 @@ def peers(
     if include_remote:
         identity = tailnet_identity()
         with ThreadPoolExecutor(max_workers=2) as workers:
-            local = workers.submit(local_targets, root, handle=handle)
+            local = workers.submit(_local_discovery, root, handle=handle)
             remote = workers.submit(
                 _remote_discovery,
                 include_delivery_mode=include_delivery_mode,
@@ -4887,14 +4914,15 @@ def peers(
                 **_external_option(include_external),
             )
             remote_targets, remote_complete = remote.result()
-            targets = [*local.result(), *remote_targets]
+            local_targets, local_complete = local.result()
+            targets = [*local_targets, *remote_targets]
         # Without a verified local StableNodeID this node cannot mint the source
         # reply token a remote send needs, so remote rows are unselectable.
         if not internal and (identity is None or identity.self_node_id is None):
             targets = [target for target in targets if not target.remote]
         remote_discovery = "complete" if remote_complete else "incomplete"
     else:
-        targets = local_targets(root, handle=handle)
+        targets, local_complete = _local_discovery(root, handle=handle)
         remote_discovery = "not_requested"
     external_discovery = "not_requested"
     if include_external:
@@ -4965,6 +4993,7 @@ def peers(
             # missing title can explain a zero match even when that row is hidden.
             result["title_metadata"] = title_metadata
     if not internal:
+        result["local_discovery"] = "complete" if local_complete else "incomplete"
         result["remote_discovery"] = remote_discovery
         if include_external and external_discovery == "unavailable":
             result["external_discovery"] = external_discovery

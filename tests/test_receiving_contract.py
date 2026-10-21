@@ -201,7 +201,7 @@ def test_exact_title_selects_one_original_and_duplicate_title_refuses_before_eff
         )
 
     rows = [target(first)]
-    monkeypatch.setattr(runtime, "local_targets", lambda *_a, **_k: rows)
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: (rows, True))
     monkeypatch.setattr(runtime, "_with_codex_titles", lambda _root, targets, _deadline: targets)
     monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
     selected: list[runtime.Target] = []
@@ -296,7 +296,7 @@ def test_title_dispatch_refuses_a_hidden_remote_duplicate_when_title_enrichment_
         "tailnet_identity",
         lambda: TailnetIdentity(self_node_id="nLocal", peers={"nRemote": "100.64.0.2"}),
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda *_a, **_k: [local])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([local], True))
     monkeypatch.setattr(runtime, "_with_codex_titles", lambda _r, rows, _d: rows)
 
     def capture(
@@ -345,8 +345,8 @@ def test_title_metadata_failure_preserves_exact_alias_selection(
     effects: list[runtime.Target] = []
     monkeypatch.setattr(
         runtime,
-        "local_targets",
-        lambda *_a, **_k: [selected] + ([] if unknown_is_remote else [unknown]),
+        "_local_discovery",
+        lambda *_a, **_k: ([selected] + ([] if unknown_is_remote else [unknown]), True),
     )
     monkeypatch.setattr(
         runtime, "_remote_discovery", lambda **_: ([unknown] if unknown_is_remote else [], True)

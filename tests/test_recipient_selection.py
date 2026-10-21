@@ -791,7 +791,7 @@ def test_duplicate_local_aliases_are_ambiguous_and_cannot_shadow_a_remote_token(
         cwd=str(tmp_path),
         pid=os.getpid(),
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda *_args, **_kwargs: [duplicate])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_args, **_kwargs: ([duplicate], True))
 
     calls.clear()
     monkeypatch.setattr(
@@ -810,6 +810,161 @@ def test_duplicate_local_aliases_are_ambiguous_and_cannot_shadow_a_remote_token(
 
 
 # --- Alias sends revalidate like token sends --------------------------------
+
+
+@pytest.mark.parametrize("sender", [send, send_local], ids=["send", "send_local"])
+def test_local_discovery_health_miss_cannot_hide_duplicate_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sender: Callable[[Path, Route, str, str], dict[str, object]],
+) -> None:
+    """Partial health cannot make a legitimate duplicate full alias unique."""
+    first = _route(tmp_path, provider="devin")
+    second = _route(tmp_path, provider="devin")
+    assert first.alias == second.alias
+    assert first.session_id != second.session_id
+    routes = {item.generation: item for item in [first, second]}
+    missing: set[str] = set()
+    probes: list[str] = []
+    selected: list[str] = []
+    monkeypatch.setattr(Route, "process_is_live", lambda _route: True)
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_kwargs: ([], True))
+
+    def health(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        assert payload["operation"] == "health"
+        route = routes[str(payload["generation"])]
+        probes.append(route.generation)
+        if route.generation in missing:
+            raise ChatError("fixture live courier health timed out")
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+        }
+
+    def select(
+        _root: Path,
+        _source: runtime.SourceIdentity,
+        target: Target,
+        _message: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        selected.append(target.session_key)
+        return {"status": "DRY_RUN_SELECTION_ONLY"}
+
+    monkeypatch.setattr(runtime, "request_socket", health)
+    monkeypatch.setattr(runtime, "_send_local_target", select)
+    complete = peers(tmp_path, include_remote=False, query=first.alias)
+    assert complete["local_discovery"] == "complete"
+    assert len(cast(list[dict[str, str]], complete["peers"])) == 2
+    with pytest.raises(ChatError, match="ambiguous"):
+        sender(tmp_path, first, first.alias, "fixture only")
+    missing.add(second.generation)
+    partial = peers(tmp_path, include_remote=False, query=first.alias)
+    assert partial["local_discovery"] == "incomplete"
+    (healthy,) = cast(list[dict[str, str]], partial["peers"])
+    assert _public_handle(healthy).handle == session_key("devin", first.session_id)
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        sender(tmp_path, first, first.alias, "fixture only")
+    # Even the endpoint-extension path must not accept this partial alias.
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        send(tmp_path, first, first.alias, "fixture only", include_external=True)
+    assert selected == []
+    probes.clear()
+    assert sender(tmp_path, first, healthy["handle"], "fixture only")["status"] == (
+        "DRY_RUN_SELECTION_ONLY"
+    )
+    assert probes == [first.generation]
+    # Scoped endpoint discovery also keeps an exact healthy native token usable.
+    assert send(tmp_path, first, healthy["handle"], "fixture only", include_external=True)[
+        "status"
+    ] == "DRY_RUN_SELECTION_ONLY"
+    missing_token = local_token(
+        tmp_path, session_key("devin", second.session_id), second.generation
+    )
+    with pytest.raises(ChatError, match="unavailable or changed"):
+        sender(tmp_path, first, missing_token, "fixture only")
+    # A successor at the same session key never inherits the old generation.
+    successor = replace(first, generation=str(uuid4()))
+    Registry(tmp_path).upsert(successor)
+    routes[successor.generation] = successor
+    with pytest.raises(ChatError, match="unavailable or changed"):
+        sender(tmp_path, successor, healthy["handle"], "fixture only")
+    assert selected == [session_key("devin", first.session_id)] * 2
+    assert IntentStore(tmp_path).intents() == []
+    filtered = peers(tmp_path, include_remote=False, query="absent label")
+    assert filtered["peers"] == []
+    assert filtered["local_discovery"] == "incomplete"
+    internal = peers(tmp_path, include_remote=False, internal=True)
+    assert set(internal) == {"schema_version", "peers"}
+
+
+def test_local_discovery_incomplete_cannot_establish_unique_title(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    survivor = Target(
+        alias=source.alias,
+        provider="codex",
+        device=source.device,
+        project=source.project,
+        generation=source.generation,
+        session_key=session_key("codex", source.session_id),
+        remote=False,
+        title="Current coordinator",
+    )
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _root: ([survivor], False))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_kwargs: ([], True))
+    monkeypatch.setattr(
+        runtime, "_send_local_target", lambda *_args, **_kwargs: pytest.fail("selected a title")
+    )
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        send(tmp_path, source, "Current coordinator", "fixture only")
+
+
+def test_local_discovery_empty_registry_is_complete(tmp_path: Path) -> None:
+    assert runtime._local_discovery(tmp_path) == ([], True)
+
+
+def test_local_discovery_unsubmitted_probe_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _route(tmp_path, provider="devin")
+    monkeypatch.setattr(Route, "process_is_live", lambda _route: True)
+    monkeypatch.setattr(runtime, "LOCAL_DISCOVERY_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(
+        runtime, "request_socket", lambda *_args, **_kwargs: pytest.fail("probe started")
+    )
+    assert runtime._local_discovery(tmp_path) == ([], False)
+
+
+def test_local_discovery_external_failure_cannot_establish_unique_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    survivor = Target(
+        alias=source.alias,
+        provider="codex",
+        device=source.device,
+        project=source.project,
+        generation=source.generation,
+        session_key=session_key("codex", source.session_id),
+        remote=False,
+    )
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _root: ([survivor], True))
+
+    def unavailable(_root: Path, *, handle: str | None = None) -> list[Target]:
+        raise ChatError("fixture external registry unavailable")
+
+    monkeypatch.setattr(runtime, "external_targets", unavailable)
+    monkeypatch.setattr(
+        runtime, "_send_local_target", lambda *_args, **_kwargs: pytest.fail("selected an alias")
+    )
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        send_local(tmp_path, source, source.alias, "fixture only")
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        send(tmp_path, source, source.alias, "fixture only", include_external=True)
 
 
 def _alias_send_fixture(
@@ -1005,7 +1160,7 @@ def _receive_fixture(
         cwd=target.cwd,
         pid=target.pid,
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda *_args, **_kwargs: [public_target])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_args, **_kwargs: ([public_target], True))
     monkeypatch.setattr(
         runtime,
         "request_tailnet",

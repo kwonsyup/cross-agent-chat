@@ -288,14 +288,14 @@ def test_a_malformed_peers_query_is_refused_before_any_discovery(
     root = tmp_path / "state"
     probed: list[str] = []
 
-    def local_targets(*_args: object, **_kwargs: object) -> list[object]:
+    def local_discovery(*_args: object, **_kwargs: object) -> tuple[list[runtime.Target], bool]:
         probed.append("local")
-        return []
+        return [], True
 
     def tailnet_identity() -> None:
         probed.append("tailnet")
 
-    monkeypatch.setattr(runtime, "local_targets", local_targets)
+    monkeypatch.setattr(runtime, "_local_discovery", local_discovery)
     monkeypatch.setattr(runtime, "tailnet_identity", tailnet_identity)
 
     with pytest.raises(ChatError, match="peer query is invalid"):

@@ -1685,9 +1685,9 @@ def test_remote_receive_routes_registered_codex_original_to_its_helper(
         message="hello",
     )
     monkeypatch.setattr(
-        "cross_agent_chat.runtime.local_targets",
+        "cross_agent_chat.runtime._local_discovery",
         lambda _root, *, handle=None: (
-            [public_target] if handle == public_target.session_key else []
+            ([public_target] if handle == public_target.session_key else [], True)
         ),
     )
     monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
@@ -1764,9 +1764,9 @@ def test_remote_receive_authorization_spend_shrinks_the_accept_budget(
         message="hello",
     )
     monkeypatch.setattr(
-        "cross_agent_chat.runtime.local_targets",
+        "cross_agent_chat.runtime._local_discovery",
         lambda _root, *, handle=None: (
-            [public_target] if handle == public_target.session_key else []
+            ([public_target] if handle == public_target.session_key else [], True)
         ),
     )
     now = [1_000.0]
@@ -1825,9 +1825,9 @@ def test_remote_receive_spent_budget_refuses_before_any_accept(
         message="hello",
     )
     monkeypatch.setattr(
-        "cross_agent_chat.runtime.local_targets",
+        "cross_agent_chat.runtime._local_discovery",
         lambda _root, *, handle=None: (
-            [public_target] if handle == public_target.session_key else []
+            ([public_target] if handle == public_target.session_key else [], True)
         ),
     )
     now = [1_000.0]
@@ -1890,9 +1890,9 @@ def test_remote_claude_receipt_uses_fresh_discovery_alias_after_rename(
         message="fresh independent work",
     )
     monkeypatch.setattr(
-        "cross_agent_chat.runtime.local_targets",
+        "cross_agent_chat.runtime._local_discovery",
         lambda _root, *, handle=None: (
-            [public_target] if handle == public_target.session_key else []
+            ([public_target] if handle == public_target.session_key else [], True)
         ),
     )
     monkeypatch.setattr(
@@ -2429,9 +2429,9 @@ def test_remote_receiver_forwards_only_exact_claude_diagnostic(
         message="private message body",
     )
     monkeypatch.setattr(
-        "cross_agent_chat.runtime.local_targets",
+        "cross_agent_chat.runtime._local_discovery",
         lambda _root, *, handle=None: (
-            [public_target] if handle == public_target.session_key else []
+            ([public_target] if handle == public_target.session_key else [], True)
         ),
     )
     monkeypatch.setattr(
@@ -2565,9 +2565,9 @@ def test_remote_receiver_sanitizes_pre_effect_provider_error(
         message="hello",
     )
     monkeypatch.setattr(
-        "cross_agent_chat.runtime.local_targets",
+        "cross_agent_chat.runtime._local_discovery",
         lambda _root, *, handle=None: (
-            [public_target] if handle == public_target.session_key else []
+            ([public_target] if handle == public_target.session_key else [], True)
         ),
     )
 
@@ -2634,14 +2634,14 @@ def test_remote_send_surfaces_allowlisted_courier_reason(
         cwd=target.cwd,
         pid=target.pid,
     )
-    original_local_targets = runtime.local_targets
+    original_local_discovery = runtime._local_discovery
 
-    def select_targets(root: Path, *, handle: str | None = None) -> list[Target]:
+    def select_targets(root: Path, *, handle: str | None = None) -> tuple[list[Target], bool]:
         if root == receiver_root:
-            return [public_target]
-        return original_local_targets(root, handle=handle)
+            return [public_target], True
+        return original_local_discovery(root, handle=handle)
 
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", select_targets)
+    monkeypatch.setattr("cross_agent_chat.runtime._local_discovery", select_targets)
     sender_address = "100.64.0.10"
     receiver_address = "100.64.0.11"
 
@@ -2754,13 +2754,13 @@ def test_remote_receive_probes_only_the_addressed_generation(
     )
     probed: list[str | None] = []
 
-    def scoped(_root: Path, *, handle: str | None = None) -> list[Target]:
+    def scoped(_root: Path, *, handle: str | None = None) -> tuple[list[Target], bool]:
         probed.append(handle)
         if handle != session_key(target.provider, target.session_id):
-            return []
-        return [public_target]
+            return [], True
+        return [public_target], True
 
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", scoped)
+    monkeypatch.setattr("cross_agent_chat.runtime._local_discovery", scoped)
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_tailnet",
         lambda _address, payload, **_: (
@@ -2796,7 +2796,7 @@ def test_remote_receive_with_no_matching_generation_probes_nothing(
         message="hello",
     )
     monkeypatch.setattr(
-        "cross_agent_chat.runtime.local_targets",
+        "cross_agent_chat.runtime._local_discovery",
         lambda *_a, **_k: pytest.fail("discovery ran without a generation match"),
     )
 
@@ -3961,7 +3961,7 @@ def test_remote_queue_full_preserves_old_and_current_provider_wording(
         generation=target.generation,
         message="new harmless task",
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda _root, *, handle=None: [public_target])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _root, *, handle=None: ([public_target], True))
     monkeypatch.setattr(
         runtime,
         "request_tailnet",
