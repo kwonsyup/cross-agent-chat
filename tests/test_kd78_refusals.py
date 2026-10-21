@@ -150,7 +150,7 @@ def test_remote_consumer_suppresses_unrecognized_secret_reason(
     )
 
     assert response["status"] == "PRE_EFFECT_REJECTED"
-    assert response["error"] == "remote destination rejected before provider effect"
+    assert response["error"] == runtime.REMOTE_COURIER_REFUSAL
     assert reason not in str(response)
     assert "fixture-secret" not in str(response)
 

@@ -2730,7 +2730,7 @@ def test_remote_pre_effect_rejection_is_safe_and_does_not_block_fresh_send(
     intent = IntentStore(tmp_path).intents()[0]
     assert str(caught.value) == (
         "remote target rejected the message before provider effect: "
-        "remote destination rejected before provider effect; nothing was delivered; "
+        f"{runtime.REMOTE_LEGACY_REFUSAL}; nothing was delivered; "
         f"event {intent.event_id}"
     )
     assert intent.status == "PRE_EFFECT_REJECTED"
@@ -2808,7 +2808,7 @@ def test_remote_receiver_sanitizes_pre_effect_provider_error(
         "event_id": event_id,
         "status": "PRE_EFFECT_REJECTED",
         "provider": "codex",
-        "error": "remote destination rejected before provider effect",
+        "error": runtime.REMOTE_COURIER_REFUSAL,
     }
 
 

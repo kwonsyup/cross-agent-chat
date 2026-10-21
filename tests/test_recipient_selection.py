@@ -1722,7 +1722,7 @@ def test_remote_receive_never_reclassifies_an_unknown_reply_check_outcome(
     assert accepts == []
 
 
-def test_remote_receive_keeps_an_unrecognized_reply_verifier_failure_generic(
+def test_remote_receive_keeps_an_unrecognized_reply_verifier_failure_private(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     accepts: list[dict[str, object]] = []
@@ -1738,7 +1738,7 @@ def test_remote_receive_keeps_an_unrecognized_reply_verifier_failure_generic(
     response = receive_remote(tmp_path, envelope, OWNER)
     assert set(response) == {"schema_version", "event_id", "status", "provider", "error"}
     assert response["status"] == "PRE_EFFECT_REJECTED"
-    assert response["error"] == "remote destination rejected before provider effect"
+    assert response["error"] == runtime.REMOTE_REPLY_BINDING_FAILURE
     assert "fixture-private" not in str(response)
     assert accepts == []
 
