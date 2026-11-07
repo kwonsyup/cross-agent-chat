@@ -310,7 +310,7 @@ def test_new_ingress_mode_is_negotiated_and_old_health_consumers_keep_their_shap
         )
 
 
-@pytest.mark.parametrize("version", ["0.160.1", "0.162.0", "0.162.1", "0.163.0"])
+@pytest.mark.parametrize("version", ["0.160.1", "0.162.0", "0.162.1", "0.163.0", "0.167.0"])
 def test_default_qualification_does_not_start_a_daemon(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
@@ -348,6 +348,8 @@ def test_default_qualification_does_not_start_a_daemon(
         "0.162.2",
         "0.163.1",
         "0.164.0",
+        "0.167.1",
+        "0.167.0-alpha",
         "0.163.0-alpha.10.2",
         "0.162.1-alpha",
         "0.162.1-alpha.1",
