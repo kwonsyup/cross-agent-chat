@@ -734,6 +734,82 @@ def test_local_send_fails_closed_when_the_inventory_consumes_the_budget(
     assert IntentStore(root).intents() == []
 
 
+def test_begin_time_counts_against_the_accept_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow intents-lock begin leaves only the remaining accept budget."""
+    now = [1_000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    root = tmp_path / "state"
+    source = _claude_route(tmp_path, project="source")
+    target_route = _claude_route(tmp_path, project="target")
+    Registry(root).upsert(source)
+    Registry(root).upsert(target_route)
+    target = _local_target_for(target_route)
+    agent = _sender_agent(source)
+    monkeypatch.setattr(claude_runtime, "claude_agents", lambda *_a, **_k: [agent])
+    timeouts: list[float] = []
+
+    def accept(_path: Path, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        timeouts.append(timeout)
+        return {
+            "schema_version": 1,
+            "event_id": payload["event_id"],
+            "status": "TRANSPORT_ACCEPTED",
+            "to": target.alias,
+            "provider": "claude",
+        }
+
+    monkeypatch.setattr(runtime, "request_socket", accept)
+    real_begin = IntentStore.begin_identity
+
+    def slow_begin(self: IntentStore, **kwargs: object) -> str:
+        now[0] += 20.0
+        return real_begin(self, **kwargs)
+
+    monkeypatch.setattr(IntentStore, "begin_identity", slow_begin)
+
+    result = runtime._send_local_target(
+        root, source, target, "synthetic reply", deadline=now[0] + 60.0
+    )
+
+    assert result["status"] == "TRANSPORT_ACCEPTED"
+    assert timeouts == [40.0]
+
+
+def test_a_begin_that_spends_the_deadline_ends_decided_not_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No accept attempt starts once the deadline is gone; the row ends decided."""
+    now = [1_000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    root = tmp_path / "state"
+    source = _claude_route(tmp_path, project="source")
+    target_route = _claude_route(tmp_path, project="target")
+    Registry(root).upsert(source)
+    Registry(root).upsert(target_route)
+    target = _local_target_for(target_route)
+    agent = _sender_agent(source)
+    monkeypatch.setattr(claude_runtime, "claude_agents", lambda *_a, **_k: [agent])
+    monkeypatch.setattr(
+        runtime,
+        "request_socket",
+        lambda *_a, **_k: pytest.fail("accept ran after the send deadline"),
+    )
+    real_begin = IntentStore.begin_identity
+
+    def slow_begin(self: IntentStore, **kwargs: object) -> str:
+        now[0] += 61.0
+        return real_begin(self, **kwargs)
+
+    monkeypatch.setattr(IntentStore, "begin_identity", slow_begin)
+
+    with pytest.raises(ChatError, match="timed out"):
+        runtime._send_local_target(root, source, target, "synthetic reply", deadline=now[0] + 60.0)
+
+    assert [intent.status for intent in IntentStore(root).intents()] == ["PRE_EFFECT_REJECTED"]
+
+
 def test_inventory_timeout_is_typed_and_carries_no_provider_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
