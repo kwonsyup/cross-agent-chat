@@ -352,6 +352,77 @@ def test_compaction_index_rebuilds_once_when_the_index_is_damaged(
         assert store.lookup(event_id) is not None
 
 
+def test_month_files_without_an_index_fail_closed_until_compaction_rebuilds(
+    tmp_path: Path, small_compaction: None
+) -> None:
+    """Dated files without ids.json are a damaged store, not an empty one.
+
+    A crash between the month writes and the index write leaves archived
+    events a missing index would silently disown: a caller-chosen id could be
+    reused for a second delivery and a late outcome dropped. Reads refuse
+    until a compaction pass rebuilds the index by rescanning the dated files.
+    """
+    root = tmp_path / "state"
+    store = IntentStore(root)
+    source = route(tmp_path, project="source")
+    target = route(tmp_path, project="decided")
+
+    for _ in range(4):
+        _begin(store, source, target, "TRANSPORT_ACCEPTED")
+    _backdate(store, 40 * 86400)
+    trigger = _begin(store, source, target, "TRANSPORT_ACCEPTED")
+    first_month = (datetime.now(UTC) - timedelta(days=40)).strftime("%Y-%m")
+    first_ids = {
+        item["event_id"]
+        for item in json.loads((store.archive / f"{first_month}.json").read_text("utf-8"))
+    }
+    (store.archive / "ids.json").unlink()
+
+    # Damaged, not empty: archived-id lookups and caller-chosen id reuse both
+    # fail closed rather than report the events absent or available.
+    for event_id in first_ids:
+        with pytest.raises(ChatError, match="intent archive index is invalid"):
+            store.lookup(event_id)
+        with pytest.raises(ChatError, match="intent archive index is invalid"):
+            store.begin_identity(
+                source_key=session_key(source.provider, source.session_id),
+                source_generation=source.generation,
+                source_alias=source.alias,
+                target_key=session_key(target.provider, target.session_id),
+                target_generation=target.generation,
+                payload_digest="b" * 64,
+                event_id=event_id,
+            )
+    # The hot file still answers for its own rows.
+    assert store.lookup(trigger).status == "TRANSPORT_ACCEPTED"
+
+    # The next compaction pass rebuilds the missing index by rescanning the
+    # dated files, and every archived id is uniquely owned and findable again.
+    for _ in range(3):
+        _begin(store, source, target, "TRANSPORT_ACCEPTED")
+    _backdate(store, 10 * 86400)
+    _begin(store, source, target, "TRANSPORT_ACCEPTED")
+
+    index = json.loads((store.archive / "ids.json").read_text(encoding="utf-8"))
+    assert first_ids <= set(index["months"])
+    for event_id in first_ids:
+        assert store.lookup(event_id) is not None
+
+
+def test_a_non_dict_archive_index_is_a_chat_error(tmp_path: Path) -> None:
+    """A well-formed JSON index that is not an object is invalid, not a crash."""
+    root = tmp_path / "state"
+    store = IntentStore(root)
+    store.archive.mkdir(mode=0o700)
+    index = store.archive / "ids.json"
+
+    for payload in ('["not", "a", "dict"]', "7", '"index"'):
+        index.write_text(payload, encoding="utf-8")
+        index.chmod(0o600)
+        with pytest.raises(ChatError, match="intent archive index is invalid"):
+            store.lookup(str(uuid4()))
+
+
 def test_a_receipt_with_extra_keys_is_rejected(tmp_path: Path) -> None:
     root = tmp_path / "state"
     receipts = DeliveryReceiptStore(root)

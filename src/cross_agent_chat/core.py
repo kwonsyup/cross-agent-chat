@@ -698,10 +698,38 @@ class IntentStore:
             fail(f"{label} contains duplicate events")
         return intents
 
+    def _archive_month_files(self) -> set[str]:
+        """Months with a dated archive file on disk.
+
+        A missing archive directory means no archives; an unreadable one is
+        not proof of that, so it is a ChatError rather than an empty answer.
+        """
+        try:
+            entries = list(self.archive.iterdir())
+        except FileNotFoundError:
+            return set()
+        except OSError as error:
+            raise ChatError("intent archive is invalid") from error
+        return {
+            path.stem
+            for path in entries
+            if re.fullmatch(r"[0-9]{4}-[0-9]{2}\.json", path.name) is not None
+        }
+
     def _archived_months(self) -> dict[str, str]:
-        """The event-id -> archive month index; absent index means no archives."""
+        """The event-id -> archive month index.
+
+        A missing index means "no archives" only when no dated month file is
+        on disk; month files without their index are a damaged store -- the
+        crash window between the month writes and the index write -- so
+        id-reuse and lookup checks fail closed instead of reporting those
+        events absent. Compaction rebuilds the index by rescanning the dated
+        files (``_archive_index``).
+        """
         path = self.archive / "ids.json"
         if not path.exists():
+            if self._archive_month_files():
+                fail("intent archive index is invalid")
             return {}
         require_private_file(path)
         try:
@@ -710,7 +738,8 @@ class IntentStore:
             raise ChatError("intent archive index is invalid") from error
         months = raw.get("months") if isinstance(raw, dict) else None
         if (
-            raw.get("schema_version") != SCHEMA_VERSION
+            not isinstance(raw, dict)
+            or raw.get("schema_version") != SCHEMA_VERSION
             or set(raw) != {"schema_version", "months"}
             or not isinstance(months, dict)
             or not all(
@@ -1119,12 +1148,7 @@ class IntentStore:
         dated files, and entries for month files that no longer exist are
         dropped either way.
         """
-        archive_dir = self.archive
-        present = {
-            path.stem
-            for path in archive_dir.iterdir()
-            if re.fullmatch(r"[0-9]{4}-[0-9]{2}\.json", path.name) is not None
-        }
+        present = self._archive_month_files()
         try:
             months_index = self._archived_months()
         except ChatError:
