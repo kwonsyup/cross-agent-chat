@@ -16,6 +16,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -763,7 +764,7 @@ def test_begin_time_counts_against_the_accept_budget(
     monkeypatch.setattr(runtime, "request_socket", accept)
     real_begin = IntentStore.begin_identity
 
-    def slow_begin(self: IntentStore, **kwargs: object) -> str:
+    def slow_begin(self: IntentStore, **kwargs: Any) -> str:
         now[0] += 20.0
         return real_begin(self, **kwargs)
 
@@ -798,7 +799,7 @@ def test_a_begin_that_spends_the_deadline_ends_decided_not_pending(
     )
     real_begin = IntentStore.begin_identity
 
-    def slow_begin(self: IntentStore, **kwargs: object) -> str:
+    def slow_begin(self: IntentStore, **kwargs: Any) -> str:
         now[0] += 61.0
         return real_begin(self, **kwargs)
 

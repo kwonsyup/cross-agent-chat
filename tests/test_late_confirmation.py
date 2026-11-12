@@ -79,7 +79,19 @@ def _intent(
     return event_id
 
 
-def _receipt(store_root: Path, intent: Intent, *, target_key=None, target_generation=None) -> None:
+def _stored(store: IntentStore, event_id: str) -> Intent:
+    intent = store.lookup(event_id)
+    assert intent is not None
+    return intent
+
+
+def _receipt(
+    store_root: Path,
+    intent: Intent,
+    *,
+    target_key: str | None = None,
+    target_generation: str | None = None,
+) -> None:
     DeliveryReceiptStore(store_root).record(
         event_id=intent.event_id,
         targets=[
@@ -102,13 +114,13 @@ def test_owner_status_settles_undecided_custody_on_the_exact_transport_receipt(
     source = route(tmp_path, project="source")
     target = route(tmp_path, provider="claude")
     event_id = _intent(store, source, target, status)
-    _receipt(root, store.lookup(event_id))
+    _receipt(root, _stored(store, event_id))
 
     result = owner_event_status(root, event_id)
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     assert result["confirmed_late"] is True
-    assert store.lookup(event_id).status == "TRANSPORT_ACCEPTED"
+    assert _stored(store, event_id).status == "TRANSPORT_ACCEPTED"
     # The late confirmation stays visible; a repeat read does not change
     # custody again or rewrite the receipt's record.
     again = owner_event_status(root, event_id)
@@ -119,6 +131,7 @@ def test_owner_status_settles_undecided_custody_on_the_exact_transport_receipt(
         target_key=session_key(target.provider, target.session_id),
         target_generation=target.generation,
     )
+    assert receipt is not None
     assert receipt["confirmed"]["from_status"] == status
 
 
@@ -131,13 +144,13 @@ def test_authenticated_source_status_reports_the_same_late_settlement(
     store = IntentStore(root)
     target = route(tmp_path, provider="claude")
     event_id = _intent(store, source, target, "UNKNOWN_DELIVERY")
-    _receipt(root, store.lookup(event_id))
+    _receipt(root, _stored(store, event_id))
 
     result = event_status(root, source, event_id)
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     assert result["confirmed_late"] is True
-    assert store.lookup(event_id).status == "TRANSPORT_ACCEPTED"
+    assert _stored(store, event_id).status == "TRANSPORT_ACCEPTED"
 
 
 @pytest.mark.parametrize("status", ["PENDING", "UNKNOWN_DELIVERY"])
@@ -148,7 +161,7 @@ def test_unrelated_evidence_never_settles_custody(tmp_path: Path, status: Intent
     source = route(tmp_path, project="source")
     target = route(tmp_path, provider="claude")
     event_id = _intent(store, source, target, status)
-    intent = store.lookup(event_id)
+    intent = _stored(store, event_id)
 
     # Another event's receipt.
     DeliveryReceiptStore(root).record(
@@ -170,7 +183,7 @@ def test_unrelated_evidence_never_settles_custody(tmp_path: Path, status: Intent
 
     assert result["status"] == status
     assert "confirmed_late" not in result
-    assert store.lookup(event_id).status == status
+    assert _stored(store, event_id).status == status
 
 
 def test_no_receipt_means_no_settlement(tmp_path: Path) -> None:
@@ -184,7 +197,7 @@ def test_no_receipt_means_no_settlement(tmp_path: Path) -> None:
 
     assert result["status"] == "UNKNOWN_DELIVERY"
     assert "confirmed_late" not in result
-    assert store.lookup(event_id).status == "UNKNOWN_DELIVERY"
+    assert _stored(store, event_id).status == "UNKNOWN_DELIVERY"
 
 
 @pytest.mark.parametrize("decided", ["TRANSPORT_ACCEPTED", "PRE_EFFECT_REJECTED"])
@@ -196,12 +209,12 @@ def test_a_decided_result_is_never_rewritten_by_late_evidence(
     source = route(tmp_path, project="source")
     target = route(tmp_path, provider="claude")
     event_id = _intent(store, source, target, decided)
-    _receipt(root, store.lookup(event_id))
+    _receipt(root, _stored(store, event_id))
 
     result = owner_event_status(root, event_id)
 
     assert result["status"] == decided
-    assert store.lookup(event_id).status == decided
+    assert _stored(store, event_id).status == decided
 
 
 def test_record_transport_receipt_writes_only_for_acceptance(tmp_path: Path) -> None:
@@ -311,11 +324,13 @@ def test_remote_inspect_carries_the_durable_receipt_without_a_courier(
     # No live courier observes this generation, yet the durable receipt still
     # answers: liveness and proof are independent.
     assert answer["observer"] == "none"
-    assert answer["delivery_receipt"] == {
+    receipt = answer["delivery_receipt"]
+    assert isinstance(receipt, dict)
+    assert receipt == {
         "event_id": event_id,
-        "recorded_at": answer["delivery_receipt"]["recorded_at"],
+        "recorded_at": receipt["recorded_at"],
     }
-    assert isinstance(answer["delivery_receipt"]["recorded_at"], str)
+    assert isinstance(receipt["recorded_at"], str)
 
 
 def test_remote_receipt_settles_undecided_custody_over_the_inspect_channel(
@@ -327,11 +342,11 @@ def test_remote_receipt_settles_undecided_custody_over_the_inspect_channel(
     source = route(tmp_path, project="source")
     target = route(tmp_path, provider="claude")
     event_id = _intent(store, source, target, "UNKNOWN_DELIVERY")
-    intent = store.lookup(event_id)
+    intent = _stored(store, event_id)
     token = remote_token("nBroker", intent.target_key, intent.target_generation)
     calls: list[dict[str, object]] = []
 
-    def broker(_address: str, payload: dict[str, object], *, timeout: float):
+    def broker(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         del timeout
         calls.append(payload)
         return {
@@ -357,7 +372,7 @@ def test_remote_receipt_settles_undecided_custody_over_the_inspect_channel(
 
     assert result["status"] == "TRANSPORT_ACCEPTED"
     assert result["confirmed_late"] is True
-    assert store.lookup(event_id).status == "TRANSPORT_ACCEPTED"
+    assert _stored(store, event_id).status == "TRANSPORT_ACCEPTED"
     # The probe was one bounded read-only inspect; nothing was sent.
     assert calls == [
         {
@@ -378,10 +393,10 @@ def test_a_remote_receipt_for_another_event_fails_the_observation(
     source = route(tmp_path, project="source")
     target = route(tmp_path, provider="claude")
     event_id = _intent(store, source, target, "PENDING")
-    intent = store.lookup(event_id)
+    intent = _stored(store, event_id)
     token = remote_token("nBroker", intent.target_key, intent.target_generation)
 
-    def broker(_address: str, payload: dict[str, object], *, timeout: float):
+    def broker(_address: str, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
         del timeout
         return {
             "schema_version": 1,
@@ -406,8 +421,10 @@ def test_a_remote_receipt_for_another_event_fails_the_observation(
 
     assert result["status"] == "PENDING"
     assert "confirmed_late" not in result
-    assert result["receiving_observation"]["reason"] == "remote_observation_invalid"
-    assert store.lookup(event_id).status == "PENDING"
+    observation = result["receiving_observation"]
+    assert isinstance(observation, dict)
+    assert observation["reason"] == "remote_observation_invalid"
+    assert _stored(store, event_id).status == "PENDING"
 
 
 def test_an_unwritable_store_reports_recorded_custody_instead_of_failing(
@@ -424,7 +441,7 @@ def test_an_unwritable_store_reports_recorded_custody_instead_of_failing(
     source = route(tmp_path, project="source")
     target = route(tmp_path, provider="claude")
     event_id = _intent(store, source, target, "PENDING")
-    _receipt(root, store.lookup(event_id))
+    _receipt(root, _stored(store, event_id))
 
     lock = root / ".intents.lock"
     lock.chmod(0o400)
@@ -435,4 +452,4 @@ def test_an_unwritable_store_reports_recorded_custody_instead_of_failing(
 
     assert result["status"] == "PENDING"
     assert "confirmed_late" not in result
-    assert store.lookup(event_id).status == "PENDING"
+    assert _stored(store, event_id).status == "PENDING"

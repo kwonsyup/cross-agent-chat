@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -21,6 +23,7 @@ from cross_agent_chat import core
 from cross_agent_chat.core import (
     ChatError,
     DeliveryReceiptStore,
+    Intent,
     IntentStatus,
     IntentStore,
     Route,
@@ -53,6 +56,12 @@ def _begin(store: IntentStore, source: Route, target: Route, status: IntentStatu
     if status != "PENDING":
         store.mark(event_id, status)
     return event_id
+
+
+def _stored(store: IntentStore, event_id: str) -> Intent:
+    intent = store.lookup(event_id)
+    assert intent is not None
+    return intent
 
 
 @pytest.fixture()
@@ -135,12 +144,12 @@ def test_decided_rows_archive_while_undecided_stay_and_custody_is_intact(
 
     # A late outcome still lands on an archived row, in its own dated file.
     store.mark(old_rejected, "TRANSPORT_ACCEPTED")
-    assert store.lookup(old_rejected).status == "TRANSPORT_ACCEPTED"
+    assert _stored(store, old_rejected).status == "TRANSPORT_ACCEPTED"
     assert {item.event_id for item in store.intents()} == hot
     # And an archived row left UNKNOWN by a late outcome still resolves.
     store.mark(old_rejected, "UNKNOWN_DELIVERY")
     assert store.resolve_by_owner(old_rejected) == "UNKNOWN_DELIVERY"
-    assert store.lookup(old_rejected).status == "RESOLVED_BY_OWNER"
+    assert _stored(store, old_rejected).status == "RESOLVED_BY_OWNER"
 
 
 def test_below_thresholds_nothing_moves(tmp_path: Path, small_compaction: None) -> None:
@@ -222,14 +231,14 @@ def test_undecided_writes_never_compact(tmp_path: Path, monkeypatch: pytest.Monk
     source = route(tmp_path, project="source")
     decided = route(tmp_path, project="decided")
 
-    def explode(_rows: list) -> None:
+    def explode(_rows: list[Intent]) -> None:
         raise ChatError("compaction must not run for an undecided write")
 
     monkeypatch.setattr(store, "_maybe_compact", explode)
 
     # The PENDING row lands and the send proceeds on a clean store.
     event_id = store.begin(source, decided, source_alias=source.alias, payload_digest="a" * 64)
-    assert store.lookup(event_id).status == "PENDING"
+    assert _stored(store, event_id).status == "PENDING"
 
     # The in-flight claim is an undecided transition; it does not compact.
     assert store.claim_remote_authorization(
@@ -240,7 +249,7 @@ def test_undecided_writes_never_compact(tmp_path: Path, monkeypatch: pytest.Monk
         target_generation=decided.generation,
         payload_digest="a" * 64,
     )
-    assert store.lookup(event_id).status == "REMOTE_AUTHORIZED"
+    assert _stored(store, event_id).status == "REMOTE_AUTHORIZED"
 
 
 def test_a_compaction_failure_still_lands_decided_writes(
@@ -265,12 +274,12 @@ def test_a_compaction_failure_still_lands_decided_writes(
 
     # The mark lands even though archiving the old rows fails underneath it.
     store.mark(first, "TRANSPORT_ACCEPTED")
-    assert store.lookup(first).status == "TRANSPORT_ACCEPTED"
+    assert _stored(store, first).status == "TRANSPORT_ACCEPTED"
 
     # An owner disposition lands the same way.
     second = _begin(store, source, other, "UNKNOWN_DELIVERY")
     assert store.resolve_by_owner(second) == "UNKNOWN_DELIVERY"
-    assert store.lookup(second).status == "RESOLVED_BY_OWNER"
+    assert _stored(store, second).status == "RESOLVED_BY_OWNER"
 
     # The suppressed failure leaves a diagnostic, not silence.
     diagnostic = json.loads(
@@ -298,7 +307,7 @@ def test_compaction_index_updates_only_the_months_it_writes(
     reads: list[str] = []
     real_read = IntentStore._read_archive
 
-    def spy(self: IntentStore, month: str) -> list:
+    def spy(self: IntentStore, month: str) -> list[Intent]:
         reads.append(month)
         return real_read(self, month)
 
@@ -394,7 +403,7 @@ def test_month_files_without_an_index_fail_closed_until_compaction_rebuilds(
                 event_id=event_id,
             )
     # The hot file still answers for its own rows.
-    assert store.lookup(trigger).status == "TRANSPORT_ACCEPTED"
+    assert _stored(store, trigger).status == "TRANSPORT_ACCEPTED"
 
     # The next compaction pass rebuilds the missing index by rescanning the
     # dated files, and every archived id is uniquely owned and findable again.
@@ -440,6 +449,7 @@ def test_a_receipt_with_extra_keys_is_rejected(tmp_path: Path) -> None:
     )
     path = receipts.dir / f"{event_id}.json"
 
+    tamper: Callable[[dict[str, Any]], None]
     for tamper in (
         lambda raw: raw.update(unexpected="x"),
         lambda raw: raw.update(confirmed="yes"),
@@ -473,6 +483,7 @@ def test_a_receipt_with_extra_keys_is_rejected(tmp_path: Path) -> None:
     receipt = receipts.receipt_for(
         event_id=event_id, target_key=target_key, target_generation=target_generation
     )
+    assert receipt is not None
     assert receipt["confirmed"]["from_status"] == "PENDING"
 
 
