@@ -132,7 +132,13 @@ alone proves that an active recipient consumed an envelope.
   exact handle.
 - **Durable effects:** `core.py` intent store — event IDs, digests, statuses;
   `resolve_by_owner` is the only owner disposition and never proves delivery
-  or makes resending equivalent uncertain work safe.
+  or makes resending equivalent uncertain work safe. A courier's
+  `DeliveryReceiptStore` file under `delivered/` is the transport's own
+  receipt for one accepted event and target generation; it is written before
+  the accept answer and may settle an undecided intent as `TRANSPORT_ACCEPTED`
+  on a later status read (`confirmed_late`). Decided intent rows age out of
+  `intents.json` into `intents-archive/YYYY-MM.json` with an `ids.json` index
+  so every event id stays uniquely owned and checkable.
 - **Owned configuration writes:** `install.py:_payloads` and the transaction
   layer around it; backups in `_backup` under `~/.cache/cross-agent-chat/`.
 - **Message bodies:** transient gate file (`claude_runtime.py`), courier

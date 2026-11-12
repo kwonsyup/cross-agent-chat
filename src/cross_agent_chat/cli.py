@@ -597,6 +597,9 @@ def _mcp_tools(provider: str, presence_enabled: bool) -> list[dict[str, object]]
                 "It does not contact a provider, replay "
                 "a message, or prove consumption; "
                 "not_observed is not a negative receipt. "
+                "A proven transport receipt for this "
+                "exact event records its late "
+                "confirmation here; it never sends. "
                 "The optional exact remote recipient "
                 "handle asks that one node for its own "
                 "volatile receiving observation."
@@ -938,7 +941,8 @@ def parser() -> argparse.ArgumentParser:
         "status",
         help=(
             "read the recorded custody and current receiving observation for one event "
-            "(read-only: it never sends, wakes, acknowledges, or mutates anything)"
+            "(it never sends, wakes, or acknowledges; a proven late transport "
+            "receipt records its confirmation as custody)"
         ),
     )
     status_parser.add_argument("event_id")
