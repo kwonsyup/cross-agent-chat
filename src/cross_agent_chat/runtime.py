@@ -63,6 +63,7 @@ from cross_agent_chat.core import (
     MAX_MESSAGE_BYTES,
     SCHEMA_VERSION,
     ChatError,
+    DeliveryReceiptStore,
     Intent,
     IntentStore,
     Provider,
@@ -2057,6 +2058,50 @@ def courier_accept(
         }
 
 
+def _record_transport_receipt(root: Path, route: Route, response: dict[str, object]) -> None:
+    """Durably record one transport acceptance for exact later confirmation.
+
+    The caller's answer can be lost after the provider hand-off (timeout, kill,
+    emit failure); the receipt is what proves the decided effect afterward. It
+    binds the event id to the identity the sender's intent names -- the
+    addressed session's (key, generation) -- plus this courier's own identity,
+    which for a native helper is a different generation than the original the
+    sender addressed. Only TRANSPORT_ACCEPTED writes a receipt; a rejected or
+    unknown outcome must leave no positive proof. Bookkeeping failure never
+    disturbs a decided answer already computed.
+    """
+    if response.get("status") != "TRANSPORT_ACCEPTED":
+        return
+    event_id = response.get("event_id")
+    if not isinstance(event_id, str):
+        return
+    try:
+        identifier = valid_uuid(event_id, "event id")
+        targets = [
+            {
+                "target_key": session_key(route.provider, route.session_id),
+                "target_generation": route.generation,
+                "provider": route.provider,
+            }
+        ]
+        for binding in NativeHelperStore(root).bindings():
+            if (
+                binding.state == "REGISTERED"
+                and binding.helper_session_id == route.session_id
+                and binding.helper_generation == route.generation
+            ):
+                targets.append(
+                    {
+                        "target_key": session_key("codex", binding.original_session_id),
+                        "target_generation": binding.original_generation,
+                        "provider": "codex",
+                    }
+                )
+        DeliveryReceiptStore(root).record(event_id=identifier, targets=targets)
+    except (ChatError, OSError):
+        pass
+
+
 FORWARDABLE_PRE_EFFECT_REASONS: Final = frozenset(
     {
         "Claude ListAgents discovery timed out",
@@ -2595,20 +2640,21 @@ def courier_server(
                                     },
                                 )
                             else:
-                                emit_frame_safely(
-                                    connection,
-                                    courier_accept(
-                                        route,
-                                        courier,
-                                        event_id,
-                                        message,
-                                        **(
-                                            {"daemon_ingress": daemon_ingress}
-                                            if daemon_ingress
-                                            else {}
-                                        ),
+                                response = courier_accept(
+                                    route,
+                                    courier,
+                                    event_id,
+                                    message,
+                                    **(
+                                        {"daemon_ingress": daemon_ingress} if daemon_ingress else {}
                                     ),
                                 )
+                                # The receipt must land before the answer: a
+                                # caller whose emit or read fails after the
+                                # provider hand-off needs this exact proof to
+                                # settle its durable custody record later.
+                                _record_transport_receipt(root, route, response)
+                                emit_frame_safely(connection, response)
                         finally:
                             accept_lock.release()
                     else:
@@ -3813,8 +3859,11 @@ def destination_receiving(target: Target | None) -> dict[str, object]:
     return result
 
 
-def _existing_delivery(intent: Intent, target: Target) -> dict[str, object]:
-    return {
+def _existing_delivery(root: Path, intent: Intent, target: Target) -> dict[str, object]:
+    # A retried request re-reads its recorded intent; a proven late transport
+    # receipt settles the row here too rather than re-reporting stale custody.
+    intent, late = _confirm_transport_receipt(root, intent)
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "event_id": intent.event_id,
         "status": intent.status,
@@ -3825,6 +3874,9 @@ def _existing_delivery(intent: Intent, target: Target) -> dict[str, object]:
         # Current health cannot establish a historical event's receiving path.
         "destination_receiving": destination_receiving(None),
     }
+    if late:
+        payload["confirmed_late"] = True
+    return payload
 
 
 def canonical_source_alias(
@@ -3963,7 +4015,7 @@ def _send_local_target(
         event_id=event_id,
     )
     if previous is not None:
-        return _existing_delivery(previous, target)
+        return _existing_delivery(root, previous, target)
     if isinstance(source, ExternalEndpoint) and not _source_current(root, source):
         store.mark(event_id, "PRE_EFFECT_REJECTED")
         raise ChatError("sender changed before transport acceptance")
@@ -4345,7 +4397,7 @@ def _send_remote_target(
         event_id=event_id,
     )
     if previous is not None:
-        return _existing_delivery(previous, target)
+        return _existing_delivery(root, previous, target)
     if isinstance(source, ExternalEndpoint) and not _source_current(root, source):
         store.mark(event_id, "PRE_EFFECT_REJECTED")
         raise ChatError("sender changed before transport acceptance")
@@ -4779,7 +4831,7 @@ def _send_external_target(
         event_id=identifier,
     )
     if previous is not None:
-        return _existing_delivery(previous, target)
+        return _existing_delivery(root, previous, target)
     try:
         if not _source_current(root, source):
             raise ChatError("sender changed before effect; nothing was delivered")
@@ -5839,18 +5891,40 @@ def _remote_receiving_observation(intent: Intent, recipient: str) -> dict[str, o
     base = {"schema_version", "status", "event_id", "observer"}
     observed = base | {"event_state", "courier_version", "courier_incarnation"}
     observer = response.get("observer")
+    raw_receipt = response.get("delivery_receipt")
+    receipt = (
+        raw_receipt
+        if (
+            isinstance(raw_receipt, dict)
+            and set(raw_receipt) == {"event_id", "recorded_at"}
+            and raw_receipt["event_id"] == intent.event_id
+            and isinstance(raw_receipt["recorded_at"], str)
+        )
+        else None
+    )
+    # A malformed receipt field fails the whole observation rather than being
+    # silently dropped: the remote node's answer must be exactly what this
+    # reader understands, not approximately so.
+    receipt_field_valid = ("delivery_receipt" not in response) or receipt is not None
     valid_failure = (
-        set(response) == base | {"reason"}
+        set(response) <= base | {"reason", "delivery_receipt"}
+        and "reason" in response
         and observer == "none"
         and isinstance(response.get("reason"), str)
         and response.get("reason") in _REMOTE_INSPECT_REASONS
+        and receipt_field_valid
     )
     valid_observation = (
         isinstance(observer, str)
         and observer in {"original_courier", "native_helper"}
         and observed <= set(response)
         and set(response) - observed
-        <= {"pending_count", "oldest_pending_age_seconds", "dispatch_claim"}
+        <= {
+            "pending_count",
+            "oldest_pending_age_seconds",
+            "dispatch_claim",
+            "delivery_receipt",
+        }
         and ("pending_count" in response) == ("oldest_pending_age_seconds" in response)
         and response.get("dispatch_claim", "UNKNOWN") == "UNKNOWN"
         and isinstance(response.get("courier_version"), str)
@@ -5858,6 +5932,7 @@ def _remote_receiving_observation(intent: Intent, recipient: str) -> dict[str, o
         and isinstance(response.get("event_state"), str)
         and response.get("event_state") in _COURIER_EVENT_STATES
         and _pending_fields_valid(response)
+        and receipt_field_valid
     )
     if (
         response.get("schema_version") != SCHEMA_VERSION
@@ -5872,9 +5947,12 @@ def _remote_receiving_observation(intent: Intent, recipient: str) -> dict[str, o
         )
     if observer == "none":
         reason = cast(str, response["reason"])
-        return _receiving_unknown(
+        observation = _receiving_unknown(
             _REMOTE_INSPECT_REASON_NAMES[reason], _REMOTE_INSPECT_DETAILS[reason]
         )
+        if receipt is not None:
+            observation["delivery_receipt"] = receipt
+        return observation
     fields = {
         "event_state": response["event_state"],
         "courier_version": response["courier_version"],
@@ -5888,6 +5966,8 @@ def _remote_receiving_observation(intent: Intent, recipient: str) -> dict[str, o
     )
     if "dispatch_claim" in response:
         observation["native_dispatch_claim"] = "UNKNOWN"
+    if receipt is not None:
+        observation["delivery_receipt"] = receipt
     return observation
 
 
@@ -5909,6 +5989,20 @@ def inspect_remote_receiving(
         "status": "INSPECTED",
         "event_id": identifier,
     }
+    # This node's own durable transport receipt is proof independent of courier
+    # liveness; it rides the same exact (event, target) binding the requester
+    # already authenticated, and carries no message content.
+    try:
+        receipt = DeliveryReceiptStore(root).receipt_for(
+            event_id=identifier, target_key=target_key, target_generation=generation
+        )
+    except ChatError:
+        receipt = None
+    if receipt is not None:
+        answer["delivery_receipt"] = {
+            "event_id": identifier,
+            "recorded_at": receipt["recorded_at"],
+        }
     original, delivery, observer, failure = _receiving_delivery(
         root, Registry(root).routes(), target_key, generation
     )
@@ -5927,10 +6021,63 @@ def inspect_remote_receiving(
     return answer
 
 
+# Custody values a late transport receipt may still settle. Decided rows never
+# change: a receipt cannot launder or alter a recorded result, and
+# RESOLVED_BY_OWNER is settled by the transport's mark precedence, not here.
+_LATE_UPGRADABLE_STATUSES: Final = frozenset({"PENDING", "REMOTE_AUTHORIZED", "UNKNOWN_DELIVERY"})
+
+
+def _receipt_late_flag(root: Path, intent: Intent) -> bool:
+    """Whether this event's transport receipt carries a late-confirmation mark."""
+    try:
+        receipt = DeliveryReceiptStore(root).receipt_for(
+            event_id=intent.event_id,
+            target_key=intent.target_key,
+            target_generation=intent.target_generation,
+        )
+    except ChatError:
+        return False
+    return isinstance(receipt, dict) and receipt.get("confirmed") is not None
+
+
+def _confirm_transport_receipt(root: Path, intent: Intent) -> tuple[Intent, bool]:
+    """Settle undecided custody on the transport's own exact receipt, once.
+
+    A courier records its durable receipt before answering an accept request,
+    so a caller that timed out or died still finds the decided proof here.
+    Only an exact (event id, target key, target generation) match upgrades
+    custody; nothing is sent, replayed, woken, or guessed, and an absent or
+    unrelated receipt changes nothing. The receipt is annotated so the late
+    confirmation stays visible on later reads. Returns the row to report and
+    whether a durable upgrade just happened.
+    """
+    if intent.status not in _LATE_UPGRADABLE_STATUSES:
+        return intent, _receipt_late_flag(root, intent)
+    try:
+        receipt = DeliveryReceiptStore(root).receipt_for(
+            event_id=intent.event_id,
+            target_key=intent.target_key,
+            target_generation=intent.target_generation,
+        )
+    except ChatError:
+        # A receipt that fails validation is no proof; it must not wedge the
+        # read or settle anything on a parse that could not be trusted.
+        return intent, False
+    if receipt is None:
+        return intent, False
+    IntentStore(root).mark(intent.event_id, "TRANSPORT_ACCEPTED")
+    # The durable upgrade already landed; the lateness annotation is
+    # best-effort bookkeeping on top of it.
+    with suppress(ChatError, OSError):
+        DeliveryReceiptStore(root).confirm(intent.event_id, from_status=intent.status)
+    return replace(intent, status="TRANSPORT_ACCEPTED"), True
+
+
 def _event_status_payload(
     root: Path, intent: Intent, *, recipient: str | None = None
 ) -> dict[str, object]:
-    return {
+    intent, late = _confirm_transport_receipt(root, intent)
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "event_id": intent.event_id,
         "status": intent.status,
@@ -5941,6 +6088,20 @@ def _event_status_payload(
         "delivery_observation": "not_observed",
         "receiving_observation": _receiving_observation(root, intent, recipient=recipient),
     }
+    if intent.status in _LATE_UPGRADABLE_STATUSES:
+        # The receiving node attests its own durable transport receipt over the
+        # authenticated inspect channel; the same exact (event, target) binding
+        # applies, so this is still transport proof, never a guess.
+        observation = payload["receiving_observation"]
+        receipt = observation.get("delivery_receipt") if isinstance(observation, dict) else None
+        if isinstance(receipt, dict) and receipt.get("event_id") == intent.event_id:
+            IntentStore(root).mark(intent.event_id, "TRANSPORT_ACCEPTED")
+            payload["status"] = "TRANSPORT_ACCEPTED"
+            payload["confirmed_late"] = True
+            return payload
+    if late:
+        payload["confirmed_late"] = True
+    return payload
 
 
 def event_status(
@@ -5966,17 +6127,17 @@ def event_status(
 def owner_event_status(
     root: Path, event_id: str, *, recipient: str | None = None
 ) -> dict[str, object]:
-    """Body-free status for one owner-side event id, exactly as read-only as
-    ``event_status``: the owner already sees every recorded row, and this adds
-    only the same volatile receiving observation -- no durable write, no wake,
-    no acknowledgement. ``recipient`` asks the exact remote node that presented
-    the recorded target for its own read."""
+    """Body-free status for one owner-side event id. It reads the same durable
+    row and volatile receiving observation as ``event_status`` and can record
+    one proven late transport receipt as custody -- nothing is sent, woken,
+    acknowledged, or guessed. ``recipient`` asks the exact remote node that
+    presented the recorded target for its own read."""
 
     identifier = valid_uuid(event_id, "event id")
-    matches = [item for item in IntentStore(root).intents() if item.event_id == identifier]
-    if len(matches) != 1:
+    intent = IntentStore(root).lookup(identifier)
+    if intent is None:
         raise ChatError("event is unavailable")
-    return _event_status_payload(root, matches[0], recipient=recipient)
+    return _event_status_payload(root, intent, recipient=recipient)
 
 
 def codex_stop(pid: int, state_root_value: str | None) -> None:
