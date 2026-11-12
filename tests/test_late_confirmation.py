@@ -408,3 +408,31 @@ def test_a_remote_receipt_for_another_event_fails_the_observation(
     assert "confirmed_late" not in result
     assert result["receiving_observation"]["reason"] == "remote_observation_invalid"
     assert store.lookup(event_id).status == "PENDING"
+
+
+def test_an_unwritable_store_reports_recorded_custody_instead_of_failing(
+    tmp_path: Path,
+) -> None:
+    """A status read on a store that cannot take the write lock still answers.
+
+    The receipt proof is real but the durable settlement cannot land, so the
+    read reports the recorded custody rather than crashing -- and it never
+    reports an upgrade the record did not take.
+    """
+    root = tmp_path / "state"
+    store = IntentStore(root)
+    source = route(tmp_path, project="source")
+    target = route(tmp_path, provider="claude")
+    event_id = _intent(store, source, target, "PENDING")
+    _receipt(root, store.lookup(event_id))
+
+    lock = root / ".intents.lock"
+    lock.chmod(0o400)
+    try:
+        result = owner_event_status(root, event_id)
+    finally:
+        lock.chmod(0o600)
+
+    assert result["status"] == "PENDING"
+    assert "confirmed_late" not in result
+    assert store.lookup(event_id).status == "PENDING"

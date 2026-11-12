@@ -20,6 +20,7 @@ import pytest
 from cross_agent_chat import core
 from cross_agent_chat.core import (
     ChatError,
+    DeliveryReceiptStore,
     IntentStatus,
     IntentStore,
     Route,
@@ -182,8 +183,6 @@ def test_compaction_is_atomic_safe_against_partial_archive(
 
 
 def test_receipt_pruning_ages_out_only_old_receipts(tmp_path: Path, small_compaction: None) -> None:
-    from cross_agent_chat.core import DeliveryReceiptStore
-
     root = tmp_path / "state"
     store = IntentStore(root)
     receipts = DeliveryReceiptStore(root)
@@ -209,3 +208,215 @@ def test_receipt_pruning_ages_out_only_old_receipts(tmp_path: Path, small_compac
 
     assert not (receipts.dir / f"{old_receipt}.json").exists()
     assert (receipts.dir / f"{new_receipt}.json").exists()
+
+
+def test_undecided_writes_never_compact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compaction never runs in the pre-send or in-flight window.
+
+    A compaction failure after begin's save would leave a PENDING row no
+    courier ever saw, which wedges every later send from that source to that
+    target; an in-flight claim has the same shape. Neither write may compact.
+    """
+    root = tmp_path / "state"
+    store = IntentStore(root)
+    source = route(tmp_path, project="source")
+    decided = route(tmp_path, project="decided")
+
+    def explode(_rows: list) -> None:
+        raise ChatError("compaction must not run for an undecided write")
+
+    monkeypatch.setattr(store, "_maybe_compact", explode)
+
+    # The PENDING row lands and the send proceeds on a clean store.
+    event_id = store.begin(source, decided, source_alias=source.alias, payload_digest="a" * 64)
+    assert store.lookup(event_id).status == "PENDING"
+
+    # The in-flight claim is an undecided transition; it does not compact.
+    assert store.claim_remote_authorization(
+        event_id=event_id,
+        source_generation=source.generation,
+        source_alias=source.alias,
+        target_key=session_key(decided.provider, decided.session_id),
+        target_generation=decided.generation,
+        payload_digest="a" * 64,
+    )
+    assert store.lookup(event_id).status == "REMOTE_AUTHORIZED"
+
+
+def test_a_compaction_failure_still_lands_decided_writes(
+    tmp_path: Path, small_compaction: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a decided transition, compaction is best-effort with a diagnostic."""
+    root = tmp_path / "state"
+    store = IntentStore(root)
+    source = route(tmp_path, project="source")
+    decided = route(tmp_path, project="decided")
+    other = route(tmp_path, project="other")
+
+    first = _begin(store, source, decided, "REMOTE_AUTHORIZED")
+    for _ in range(3):
+        _begin(store, source, other, "TRANSPORT_ACCEPTED")
+    _backdate(store, 7200)
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise ChatError("injected compaction failure")
+
+    monkeypatch.setattr(IntentStore, "_read_archive", explode)
+
+    # The mark lands even though archiving the old rows fails underneath it.
+    store.mark(first, "TRANSPORT_ACCEPTED")
+    assert store.lookup(first).status == "TRANSPORT_ACCEPTED"
+
+    # An owner disposition lands the same way.
+    second = _begin(store, source, other, "UNKNOWN_DELIVERY")
+    assert store.resolve_by_owner(second) == "UNKNOWN_DELIVERY"
+    assert store.lookup(second).status == "RESOLVED_BY_OWNER"
+
+    # The suppressed failure leaves a diagnostic, not silence.
+    diagnostic = json.loads(
+        (root / "intents-compaction-diagnostic.json").read_text(encoding="utf-8")
+    )
+    assert "injected compaction failure" in diagnostic["error"]
+
+
+def test_compaction_index_updates_only_the_months_it_writes(
+    tmp_path: Path, small_compaction: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each compaction merges the months it wrote, not a full archive rescan."""
+    root = tmp_path / "state"
+    store = IntentStore(root)
+    source = route(tmp_path, project="source")
+    target = route(tmp_path, project="decided")
+
+    for _ in range(4):
+        _begin(store, source, target, "TRANSPORT_ACCEPTED")
+    _backdate(store, 40 * 86400)
+    _begin(store, source, target, "TRANSPORT_ACCEPTED")  # first compaction
+    first_month = (datetime.now(UTC) - timedelta(days=40)).strftime("%Y-%m")
+    first_ids = {item.event_id for item in store._read_archive(first_month)}
+
+    reads: list[str] = []
+    real_read = IntentStore._read_archive
+
+    def spy(self: IntentStore, month: str) -> list:
+        reads.append(month)
+        return real_read(self, month)
+
+    monkeypatch.setattr(IntentStore, "_read_archive", spy)
+
+    for _ in range(3):
+        _begin(store, source, target, "TRANSPORT_ACCEPTED")
+    _backdate(store, 10 * 86400)
+    _begin(store, source, target, "TRANSPORT_ACCEPTED")  # second compaction
+    second_month = (datetime.now(UTC) - timedelta(days=10)).strftime("%Y-%m")
+
+    index = json.loads((store.archive / "ids.json").read_text(encoding="utf-8"))
+    assert first_ids <= set(index["months"])
+    assert set(index["months"].values()) == {first_month, second_month}
+    # The second pass merged only its own month; the earlier archived month
+    # was never re-parsed.
+    assert first_month not in reads
+    assert second_month in reads
+
+
+def test_compaction_index_rebuilds_once_when_the_index_is_damaged(
+    tmp_path: Path, small_compaction: None
+) -> None:
+    """A corrupt ids.json heals by rescanning the dated files once."""
+    root = tmp_path / "state"
+    store = IntentStore(root)
+    source = route(tmp_path, project="source")
+    target = route(tmp_path, project="decided")
+
+    for _ in range(4):
+        _begin(store, source, target, "TRANSPORT_ACCEPTED")
+    _backdate(store, 40 * 86400)
+    _begin(store, source, target, "TRANSPORT_ACCEPTED")
+    first_month = (datetime.now(UTC) - timedelta(days=40)).strftime("%Y-%m")
+    first_ids = {
+        item["event_id"]
+        for item in json.loads((store.archive / f"{first_month}.json").read_text("utf-8"))
+    }
+    damaged = store.archive / "ids.json"
+    damaged.write_text("{corrupt", encoding="utf-8")
+    damaged.chmod(0o600)
+
+    for _ in range(3):
+        _begin(store, source, target, "TRANSPORT_ACCEPTED")
+    _backdate(store, 10 * 86400)
+    _begin(store, source, target, "TRANSPORT_ACCEPTED")
+
+    index = json.loads((store.archive / "ids.json").read_text(encoding="utf-8"))
+    assert first_ids <= set(index["months"])
+    for event_id in first_ids:
+        assert store.lookup(event_id) is not None
+
+
+def test_a_receipt_with_extra_keys_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    receipts = DeliveryReceiptStore(root)
+    event_id = str(uuid4())
+    target_key, target_generation = "a" * 64, str(uuid4())
+    receipts.record(
+        event_id=event_id,
+        targets=[
+            {
+                "target_key": target_key,
+                "target_generation": target_generation,
+                "provider": "claude",
+            }
+        ],
+    )
+    path = receipts.dir / f"{event_id}.json"
+
+    for tamper in (
+        lambda raw: raw.update(unexpected="x"),
+        lambda raw: raw.update(confirmed="yes"),
+        lambda raw: raw.update(confirmed={"from_status": "PENDING"}),
+        lambda raw: raw.update(confirmed={"from_status": "PENDING", "at": "now", "x": 1}),
+    ):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw.pop("confirmed", None)
+        tamper(raw)
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        path.chmod(0o600)
+        with pytest.raises(ChatError, match="delivery receipt is invalid"):
+            receipts.receipt_for(
+                event_id=event_id,
+                target_key=target_key,
+                target_generation=target_generation,
+            )
+
+    # The store's own lateness annotation is the only accepted extra key.
+    receipts.record(
+        event_id=event_id,
+        targets=[
+            {
+                "target_key": target_key,
+                "target_generation": target_generation,
+                "provider": "claude",
+            }
+        ],
+    )
+    receipts.confirm(event_id, from_status="PENDING")
+    receipt = receipts.receipt_for(
+        event_id=event_id, target_key=target_key, target_generation=target_generation
+    )
+    assert receipt["confirmed"]["from_status"] == "PENDING"
+
+
+def test_prune_never_follows_a_symlinked_receipt_dir(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    root.mkdir()
+    root.chmod(0o700)
+    receipts = DeliveryReceiptStore(root)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    foreign = elsewhere / f"{uuid4()}.json"
+    foreign.write_text("{}")
+    old = datetime.now(UTC).timestamp() - (91 * 86400)
+    os.utime(foreign, (old, old))
+    receipts.dir.symlink_to(elsewhere)
+
+    assert receipts.prune(90.0 * 86400.0) == 0
+    assert foreign.exists()

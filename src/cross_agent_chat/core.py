@@ -866,7 +866,6 @@ class IntentStore:
             )
             rows = [*existing, intent]
             atomic_json(self.path, [item.to_dict() for item in rows])
-            self._maybe_compact(rows)
         return identifier
 
     def claim_remote_authorization(
@@ -923,7 +922,6 @@ class IntentStore:
                 for item in existing
             ]
             atomic_json(self.path, [item.to_dict() for item in updated])
-            self._maybe_compact(updated)
             return True
 
     def mark(self, event_id: str, status: IntentStatus) -> None:
@@ -1036,7 +1034,31 @@ class IntentStore:
         return updated
 
     def _maybe_compact(self, rows: list[Intent]) -> None:
-        """Archive decided rows past the horizon while the intents lock is held.
+        """Best-effort archival while the intents lock is held.
+
+        Compaction only ever runs after a decided transition has already
+        landed durably. It is housekeeping, so a failure is recorded as a
+        diagnostic instead of raised: a compaction error can never undo the
+        transition that triggered it. It never runs in a pre-send or in-flight
+        window (``begin_identity``, ``claim_remote_authorization``), where a
+        failed post-write step could orphan an undecided row no courier ever
+        saw.
+        """
+        try:
+            self._compact(rows)
+        except (ChatError, OSError) as error:
+            with suppress(OSError, ChatError):
+                atomic_json(
+                    self.root / "intents-compaction-diagnostic.json",
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "at": utc_now(),
+                        "error": f"{type(error).__name__}: {error}",
+                    },
+                )
+
+    def _compact(self, rows: list[Intent]) -> None:
+        """Archive decided rows past the horizon; caller holds the lock.
 
         The hot file is what every send and status call pays to parse; decided
         rows older than INTENT_ARCHIVE_AGE_SECONDS move to dated
@@ -1064,6 +1086,7 @@ class IntentStore:
             month = _parse_timestamp(item.timestamp).strftime("%Y-%m")
             grouped.setdefault(month, {})[item.event_id] = item
         ensure_private_dir(self.archive)
+        written: dict[str, dict[str, Intent]] = {}
         for month, group in sorted(grouped.items()):
             merged = {item.event_id: item for item in self._read_archive(month)}
             merged.update(group)
@@ -1074,16 +1097,10 @@ class IntentStore:
                     for item in sorted(merged.values(), key=lambda entry: entry.timestamp)
                 ],
             )
-        months_index: dict[str, str] = {}
-        archive_dir = self.archive
-        for path in sorted(archive_dir.iterdir()):
-            if re.fullmatch(r"[0-9]{4}-[0-9]{2}\.json", path.name) is None:
-                continue
-            for item in self._read_archive(path.stem):
-                months_index[item.event_id] = path.stem
+            written[month] = merged
         atomic_json(
-            archive_dir / "ids.json",
-            {"schema_version": SCHEMA_VERSION, "months": months_index},
+            self.archive / "ids.json",
+            {"schema_version": SCHEMA_VERSION, "months": self._archive_index(written)},
         )
         moved = {item.event_id for item in movable}
         atomic_json(
@@ -1091,6 +1108,37 @@ class IntentStore:
             [item.to_dict() for item in rows if item.event_id not in moved],
         )
         DeliveryReceiptStore(self.root).prune(RECEIPT_RETENTION_SECONDS)
+
+    def _archive_index(self, written: dict[str, dict[str, Intent]]) -> dict[str, str]:
+        """Merge this pass's archived months into the durable id index.
+
+        The index only ever gains entries -- archived rows are immutable
+        custody and never leave their dated file -- so updating the months
+        just written keeps it exact without re-parsing every archive under
+        the lock. An index that cannot be parsed is rebuilt once from the
+        dated files, and entries for month files that no longer exist are
+        dropped either way.
+        """
+        archive_dir = self.archive
+        present = {
+            path.stem
+            for path in archive_dir.iterdir()
+            if re.fullmatch(r"[0-9]{4}-[0-9]{2}\.json", path.name) is not None
+        }
+        try:
+            months_index = self._archived_months()
+        except ChatError:
+            months_index = {}
+            for month in sorted(present):
+                for item in self._read_archive(month):
+                    months_index[item.event_id] = month
+        months_index = {
+            event_id: month for event_id, month in months_index.items() if month in present
+        }
+        for month, merged in written.items():
+            for event_id in merged:
+                months_index[event_id] = month
+        return months_index
 
 
 class DeliveryReceiptStore:
@@ -1148,7 +1196,9 @@ class DeliveryReceiptStore:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ChatError("delivery receipt is invalid") from error
-        if not isinstance(raw, dict) or not self._RECEIPT_KEYS.issubset(set(raw)):
+        if not isinstance(raw, dict) or not self._RECEIPT_KEYS <= set(raw) <= (
+            self._RECEIPT_KEYS | {"confirmed"}
+        ):
             fail("delivery receipt is invalid")
         if (
             raw.get("schema_version") != SCHEMA_VERSION
@@ -1166,7 +1216,15 @@ class DeliveryReceiptStore:
                 for target in raw["targets"]
             )
             or not isinstance(raw.get("recorded_at"), str)
-            or (raw.get("confirmed") is not None and not isinstance(raw["confirmed"], dict))
+            or (
+                raw.get("confirmed") is not None
+                and (
+                    not isinstance(raw["confirmed"], dict)
+                    or set(raw["confirmed"]) != {"from_status", "at"}
+                    or not isinstance(raw["confirmed"]["from_status"], str)
+                    or not isinstance(raw["confirmed"]["at"], str)
+                )
+            )
         ):
             fail("delivery receipt is invalid")
         return cast(dict[str, Any], raw)
@@ -1200,7 +1258,9 @@ class DeliveryReceiptStore:
 
     def prune(self, retention_seconds: float) -> int:
         """Drop receipts past the retention horizon; best-effort and bounded."""
-        if not self.dir.is_dir():
+        # A symlinked directory or entry is never followed: pruning must only
+        # ever remove regular files the store itself wrote inside its root.
+        if self.dir.is_symlink() or not self.dir.is_dir():
             return 0
         cutoff = datetime.now(UTC).timestamp() - retention_seconds
         pruned = 0
@@ -1208,7 +1268,10 @@ class DeliveryReceiptStore:
             if re.fullmatch(r"[0-9a-f-]{36}\.json", path.name) is None:
                 continue
             try:
-                if path.stat().st_mtime < cutoff:
+                metadata = path.lstat()
+                if not stat.S_ISREG(metadata.st_mode):
+                    continue
+                if metadata.st_mtime < cutoff:
                     path.unlink()
                     pruned += 1
             except OSError:

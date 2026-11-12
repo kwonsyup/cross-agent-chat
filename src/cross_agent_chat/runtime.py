@@ -4003,7 +4003,6 @@ def _send_local_target(
         target.provider,
         source_title=_source_display_title(root, source, deadline),
     )
-    timeout = _remaining_operation_timeout(deadline, ACCEPT_TIMEOUT_SECONDS)
     store = IntentStore(root)
     previous = _begin_delivery(
         store,
@@ -4019,6 +4018,15 @@ def _send_local_target(
     if isinstance(source, ExternalEndpoint) and not _source_current(root, source):
         store.mark(event_id, "PRE_EFFECT_REJECTED")
         raise ChatError("sender changed before transport acceptance")
+    try:
+        # The intents-lock wait inside begin spends this send's deadline too;
+        # the accept budget is only what remains after it, never a fresh one.
+        timeout = _remaining_operation_timeout(deadline, ACCEPT_TIMEOUT_SECONDS)
+    except ChatError:
+        # No delivery attempt has started, so the recorded row ends decided,
+        # not PENDING.
+        store.mark(event_id, "PRE_EFFECT_REJECTED")
+        raise
     retry_delay = PRE_EFFECT_RETRY_SECONDS
     while True:
         try:
@@ -4385,7 +4393,6 @@ def _send_remote_target(
         target.provider,
         source_title=_source_display_title(root, source, deadline),
     )
-    timeout = _remaining_operation_timeout(deadline, REMOTE_TIMEOUT_SECONDS)
     store = IntentStore(root)
     previous = _begin_delivery(
         store,
@@ -4401,6 +4408,15 @@ def _send_remote_target(
     if isinstance(source, ExternalEndpoint) and not _source_current(root, source):
         store.mark(event_id, "PRE_EFFECT_REJECTED")
         raise ChatError("sender changed before transport acceptance")
+    try:
+        # The intents-lock wait inside begin spends this send's deadline too;
+        # the remote budget is only what remains after it, never a fresh one.
+        timeout = _remaining_operation_timeout(deadline, REMOTE_TIMEOUT_SECONDS)
+    except ChatError:
+        # No delivery attempt has started, so the recorded row ends decided,
+        # not PENDING.
+        store.mark(event_id, "PRE_EFFECT_REJECTED")
+        raise
     envelope = remote_envelope(
         event_id=event_id,
         source_alias=source_alias,
@@ -6065,7 +6081,12 @@ def _confirm_transport_receipt(root: Path, intent: Intent) -> tuple[Intent, bool
         return intent, False
     if receipt is None:
         return intent, False
-    IntentStore(root).mark(intent.event_id, "TRANSPORT_ACCEPTED")
+    try:
+        IntentStore(root).mark(intent.event_id, "TRANSPORT_ACCEPTED")
+    except (ChatError, OSError):
+        # An unwritable store cannot durably settle the row; report the
+        # recorded custody rather than failing the whole status read.
+        return intent, False
     # The durable upgrade already landed; the lateness annotation is
     # best-effort bookkeeping on top of it.
     with suppress(ChatError, OSError):
@@ -6095,7 +6116,12 @@ def _event_status_payload(
         observation = payload["receiving_observation"]
         receipt = observation.get("delivery_receipt") if isinstance(observation, dict) else None
         if isinstance(receipt, dict) and receipt.get("event_id") == intent.event_id:
-            IntentStore(root).mark(intent.event_id, "TRANSPORT_ACCEPTED")
+            try:
+                IntentStore(root).mark(intent.event_id, "TRANSPORT_ACCEPTED")
+            except (ChatError, OSError):
+                # The remote proof is real, but an unwritable store cannot
+                # durably settle it; report the recorded custody instead.
+                return payload
             payload["status"] = "TRANSPORT_ACCEPTED"
             payload["confirmed_late"] = True
             return payload
