@@ -418,6 +418,97 @@ def test_month_files_without_an_index_fail_closed_until_compaction_rebuilds(
         assert store.lookup(event_id) is not None
 
 
+def test_an_interrupted_first_compaction_never_wedges_the_store(
+    tmp_path: Path, small_compaction: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A kill between the month write and the index write must not wedge.
+
+    The first archive pass lands an empty index before its first dated file,
+    so a pass interrupted there still reads as "no archives yet": every row
+    is still hot, a caller-chosen event id is not refused, unknown ids read
+    absent, and the next completed pass converges the archive normally.
+    """
+    root = tmp_path / "state"
+    store = IntentStore(root)
+    source = route(tmp_path, project="source")
+    target = route(tmp_path, project="decided")
+
+    seeded = [_begin(store, source, target, "TRANSPORT_ACCEPTED") for _ in range(4)]
+    _backdate(store, 40 * 86400)
+
+    real_atomic_json = core.atomic_json
+
+    def explode_index_write(path: Path, value: object) -> None:
+        if path.name == "ids.json" and isinstance(value, dict) and value.get("months"):
+            raise OSError("interrupted between the month write and the index write")
+        real_atomic_json(path, value)
+
+    monkeypatch.setattr(core, "atomic_json", explode_index_write)
+    trigger = _begin(store, source, target, "TRANSPORT_ACCEPTED")
+
+    # The month file landed; the populated index never did -- the pre-landed
+    # empty index is what remains, and it reads as "no archives yet".
+    first_month = (datetime.now(UTC) - timedelta(days=40)).strftime("%Y-%m")
+    assert (store.archive / f"{first_month}.json").exists()
+    assert (root / "intents-compaction-diagnostic.json").exists()
+
+    # Sends are not wedged: a caller-chosen id checks an empty index, unknown
+    # ids read absent, and every row is still findable in the hot file.
+    fresh = store.begin_identity(
+        source_key=session_key(source.provider, source.session_id),
+        source_generation=source.generation,
+        source_alias=source.alias,
+        target_key=session_key(target.provider, target.session_id),
+        target_generation=target.generation,
+        payload_digest="b" * 64,
+        event_id=str(uuid4()),
+    )
+    assert store.lookup(str(uuid4())) is None
+    for event_id in (*seeded, trigger, fresh):
+        assert store.lookup(event_id) is not None
+    assert json.loads((store.archive / "ids.json").read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "months": {},
+    }
+
+    # A completed pass converges: the interrupted month's ids join the index
+    # and the hot file finally shrinks.
+    monkeypatch.setattr(core, "atomic_json", real_atomic_json)
+    final = _begin(store, source, route(tmp_path, project="other"), "TRANSPORT_ACCEPTED")
+
+    index = json.loads((store.archive / "ids.json").read_text(encoding="utf-8"))
+    assert set(index["months"]) >= set(seeded)
+    assert set(index["months"].values()) == {first_month}
+    assert {item.event_id for item in store.intents()} == {trigger, fresh, final}
+    for event_id in seeded:
+        assert store.lookup(event_id) is not None
+
+
+def test_an_empty_archive_index_without_month_files_is_no_archives(tmp_path: Path) -> None:
+    """An index alone is an empty archive, not damage."""
+    root = tmp_path / "state"
+    store = IntentStore(root)
+    source = route(tmp_path, project="source")
+    target = route(tmp_path, project="decided")
+    store.archive.mkdir(mode=0o700)
+    index = store.archive / "ids.json"
+    index.write_text(json.dumps({"schema_version": 1, "months": {}}), encoding="utf-8")
+    index.chmod(0o600)
+
+    event_id = store.begin_identity(
+        source_key=session_key(source.provider, source.session_id),
+        source_generation=source.generation,
+        source_alias=source.alias,
+        target_key=session_key(target.provider, target.session_id),
+        target_generation=target.generation,
+        payload_digest="b" * 64,
+        event_id=str(uuid4()),
+    )
+    assert store.lookup(event_id) is not None
+    assert store.lookup(str(uuid4())) is None
+    assert store.archived(str(uuid4())) is None
+
+
 def test_a_non_dict_archive_index_is_a_chat_error(tmp_path: Path) -> None:
     """A well-formed JSON index that is not an object is invalid, not a crash."""
     root = tmp_path / "state"

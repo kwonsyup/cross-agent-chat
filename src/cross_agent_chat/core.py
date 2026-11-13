@@ -720,11 +720,11 @@ class IntentStore:
         """The event-id -> archive month index.
 
         A missing index means "no archives" only when no dated month file is
-        on disk; month files without their index are a damaged store -- the
-        crash window between the month writes and the index write -- so
-        id-reuse and lookup checks fail closed instead of reporting those
-        events absent. Compaction rebuilds the index by rescanning the dated
-        files (``_archive_index``).
+        on disk; month files without their index are a damaged store -- an
+        index that had existed was lost, since compaction lands the index
+        before its first dated file -- so id-reuse and lookup checks fail
+        closed instead of reporting those events absent. Compaction rebuilds
+        the index by rescanning the dated files (``_archive_index``).
         """
         path = self.archive / "ids.json"
         if not path.exists():
@@ -1096,7 +1096,9 @@ class IntentStore:
         rows -- anything a late receipt or owner disposition could still
         change -- never leave the hot file. Archives and their index land
         before the hot file shrinks, so a crash mid-compaction can only
-        duplicate a row (active lookup wins), never lose one.
+        duplicate a row (active lookup wins), never lose one. A first pass
+        lands an empty index before its first dated file, so interruption
+        still reads as "no archives yet" instead of wedging every later read.
         """
         if len(rows) < INTENT_COMPACTION_MIN_ROWS:
             return
@@ -1115,6 +1117,14 @@ class IntentStore:
             month = _parse_timestamp(item.timestamp).strftime("%Y-%m")
             grouped.setdefault(month, {})[item.event_id] = item
         ensure_private_dir(self.archive)
+        index_path = self.archive / "ids.json"
+        if not index_path.exists() and not self._archive_month_files():
+            # Land an empty index before the first dated file: a pass
+            # interrupted after its first month write then still reads as "no
+            # archives yet" -- every archived row is also still hot -- and
+            # dated files without ids.json can only mean a later index loss,
+            # which reads refuse and a later pass rescans to rebuild.
+            atomic_json(index_path, {"schema_version": SCHEMA_VERSION, "months": {}})
         written: dict[str, dict[str, Intent]] = {}
         for month, group in sorted(grouped.items()):
             merged = {item.event_id: item for item in self._read_archive(month)}
@@ -1128,7 +1138,7 @@ class IntentStore:
             )
             written[month] = merged
         atomic_json(
-            self.archive / "ids.json",
+            index_path,
             {"schema_version": SCHEMA_VERSION, "months": self._archive_index(written)},
         )
         moved = {item.event_id for item in movable}
@@ -1145,15 +1155,17 @@ class IntentStore:
         custody and never leave their dated file -- so updating the months
         just written keeps it exact without re-parsing every archive under
         the lock. An index that cannot be parsed is rebuilt once from the
-        dated files, and entries for month files that no longer exist are
-        dropped either way.
+        dated files this pass did not just write, and entries for month files
+        that no longer exist are dropped either way.
         """
         present = self._archive_month_files()
         try:
             months_index = self._archived_months()
         except ChatError:
             months_index = {}
-            for month in sorted(present):
+            # Files this pass just wrote are already in memory; only dated
+            # files it did not touch need re-parsing to rebuild the index.
+            for month in sorted(present.difference(written)):
                 for item in self._read_archive(month):
                     months_index[item.event_id] = month
         months_index = {

@@ -19,6 +19,11 @@
   pass rebuilds it; a well-formed index that is not an object is a ChatError,
   not a crash. Caller-chosen event ids stay uniquely owned across the archive
   horizon, and late outcomes land on archived rows.
+- Land an empty `ids.json` before the first archive month write, so a first
+  compaction interrupted mid-pass still reads as "no archives yet" instead
+  of wedging every later send and lookup behind the fail-closed
+  damaged-index refusal; an index rebuild rescans only the dated files the
+  pass did not just write.
 - Send and status timeouts are computed after the intents-lock `begin`
   returns, so a slow begin spends the same deadline rather than granting a
   fresh budget. A read-only status observation cannot mutate custody it did
