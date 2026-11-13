@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.9 - 2026-11-12
+
+- Record a durable transport receipt before a courier answers an accept
+  request. If the answer is lost after the provider hand-off, an exact
+  (event id, target key, target generation) receipt settles an undecided
+  intent on a later `status` read -- never on a guess or an unrelated
+  receipt. Every courier acceptance path records the receipt, including the
+  qualified Codex owning-daemon ingress; a rejected or unknown outcome
+  leaves no positive proof. A remote node attests its own receipt over the
+  read-only inspect channel. Receipts older than 90 days are pruned
+  best-effort and a symlinked receipt directory is never followed.
+- Compact decided intents out of the hot file into dated
+  `intents-archive/YYYY-MM.json` files with an `ids.json` index. Undecided
+  rows never move, compaction only runs after a decided write, and a
+  compaction failure leaves a diagnostic without disturbing the write. A
+  missing index over present month files fails closed until a compaction
+  pass rebuilds it; a well-formed index that is not an object is a ChatError,
+  not a crash. Caller-chosen event ids stay uniquely owned across the archive
+  horizon, and late outcomes land on archived rows.
+- Land an empty `ids.json` before the first archive month write, so a first
+  compaction interrupted mid-pass still reads as "no archives yet" instead
+  of wedging every later send and lookup behind the fail-closed
+  damaged-index refusal; an index rebuild rescans only the dated files the
+  pass did not just write.
+- Send and status timeouts are computed after the intents-lock `begin`
+  returns, so a slow begin spends the same deadline rather than granting a
+  fresh budget. A read-only status observation cannot mutate custody it did
+  not settle, and the remote receipt field must validate exactly or the
+  whole observation fails.
+
 ## 0.5.8 - 2026-10-20
 
 - Preserve healthy peers when local discovery is incomplete, report

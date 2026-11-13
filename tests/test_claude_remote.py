@@ -882,10 +882,20 @@ def test_gate_consumed_converts_marker_io_errors_to_unknown(
     gate.mkdir()
     gate.chmod(0o700)
     _write_private_marker(gate / "consumed", b"consumed\n")
-    monkeypatch.setattr(
-        f"cross_agent_chat.claude_runtime.os.{operation}",
-        lambda *_: (_ for _ in ()).throw(OSError("EIO")),
-    )
+    # The fault must be scoped to the marker descriptor: patching the shared
+    # os module globally would also fault unrelated reads (the test runner's
+    # own capture files), masking the boundary this test exercises.
+    marker = (gate / "consumed").stat()
+    real_io = getattr(os, operation)
+    real_fstat = os.fstat
+
+    def fault_on_marker(descriptor: int, *args: object) -> object:
+        meta = real_fstat(descriptor)
+        if meta.st_dev == marker.st_dev and meta.st_ino == marker.st_ino:
+            raise OSError("EIO")
+        return real_io(descriptor, *args)
+
+    monkeypatch.setattr(f"cross_agent_chat.claude_runtime.os.{operation}", fault_on_marker)
 
     with pytest.raises(ClaudeSendMessageUnknownDelivery) as error:
         gate_consumed(gate)

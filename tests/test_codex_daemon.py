@@ -24,7 +24,14 @@ import pytest
 from cross_agent_chat import codex_daemon, runtime
 from cross_agent_chat.codex import CodexCourier
 from cross_agent_chat.codex_daemon import CodexDaemonIngress
-from cross_agent_chat.core import ChatError, Registry, Route, UnknownDeliveryError
+from cross_agent_chat.core import (
+    ChatError,
+    DeliveryReceiptStore,
+    Registry,
+    Route,
+    UnknownDeliveryError,
+    session_key,
+)
 from cross_agent_chat.native_helper import (
     NATIVE_QUEUE_BINARY_ENV_VAR,
     NATIVE_QUEUE_ENV_VALUE,
@@ -718,6 +725,51 @@ def test_no_env_and_no_owning_daemon_stays_stop_bound(
             ]
         finally:
             _stop_courier(root, ingress.route, worker)
+
+
+def test_daemon_ingress_accept_lands_the_receipt_before_the_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owning-daemon path proves acceptance durably before its answer is
+    observable, like every other courier acceptance path."""
+    with provider(tmp_path) as (ingress, calls, _):
+        root = tmp_path / "state"
+        Registry(root).upsert(ingress.route)
+        monkeypatch.setattr(runtime, "_route_owner_current", lambda *_args: True)
+        monkeypatch.setattr(runtime, "_courier_owner_binary", lambda *_args: Path("/bound/codex"))
+        monkeypatch.setattr(
+            codex_daemon.subprocess,
+            "run",
+            _running_daemon_report("0.167.0", ingress.endpoint),
+        )
+        worker = _started_courier(root, ingress.route)
+        path = runtime.socket_path(root, ingress.route)
+        event = str(uuid4())
+        try:
+            response = request_socket(
+                path,
+                {
+                    "schema_version": 1,
+                    "operation": "accept",
+                    "generation": ingress.route.generation,
+                    "event_id": event,
+                    "message": "deliver through the owning daemon",
+                },
+                timeout=30.0,
+            )
+            assert response["status"] == "TRANSPORT_ACCEPTED"
+        finally:
+            _stop_courier(root, ingress.route, worker)
+        # The answer is only observable after the exact durable receipt landed.
+        assert (
+            DeliveryReceiptStore(root).receipt_for(
+                event_id=event,
+                target_key=session_key("codex", ingress.route.session_id),
+                target_generation=ingress.route.generation,
+            )
+            is not None
+        )
+        assert [c["method"] for c in calls].count("thread/queue/add") == 1
 
 
 def test_uncertain_daemon_effect_never_falls_through_to_the_queue(
