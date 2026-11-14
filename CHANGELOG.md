@@ -2,7 +2,19 @@
 
 ## 0.5.11 - 2026-11-14
 
-- Qualify Codex app-server 0.169.0 for owning-daemon input, including idle wake through `thread/queue/add` and active-turn steering through `turn/steer`.
+- Qualify Codex app-server 0.169.0 for owning-daemon input, including idle
+  wake through `thread/queue/add` and active-turn steering through `turn/steer`.
+- Keep the owning-daemon route bound to the exact provider owner, profile,
+  thread, cwd, originator, and expected-turn identity. Unqualified or
+  standalone sessions remain stop-bound.
+- Preserve pre-effect refusal for detached `codex exec` sessions and report
+  the consumer classification without injecting peer content into them.
+- Keep durable custody, exact-generation routing, lost-index recovery, and
+  no-replay handling from the 0.5.9 and 0.5.10 repairs.
+- Clarify upgrade adoption: already-running provider sessions retain their
+  loaded CAC tools until their supported process or MCP reload boundary.
+- Update the macOS beta support and installation documentation for the
+  qualified provider boundaries and the transactional installer.
 
 ## 0.5.10 - 2026-11-14
 

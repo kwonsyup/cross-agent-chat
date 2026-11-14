@@ -281,8 +281,14 @@ def test_instructions_separate_first_install_from_upgrade() -> None:
     # A session that predates CAC's first install has no CAC tools at all;
     # only an upgrade leaves older tools loaded. Collapsing the two told a
     # fresh session it was "running older tools" that do not exist.
-    assert "before a CAC install has no CAC tools" in cli.MCP_INSTRUCTIONS
-    assert "before a CAC upgrade keeps its older loaded tools" in cli.MCP_INSTRUCTIONS
+    assert "before an install has no CAC tools" in cli.MCP_INSTRUCTIONS
+    assert "before an upgrade keeps its previously loaded CAC tools" in cli.MCP_INSTRUCTIONS
+    assert (
+        "Finish the current turn and never kill productive work for adoption"
+        in cli.MCP_INSTRUCTIONS
+    )
+    assert "fresh provider/app-server process or explicit MCP reload" in cli.MCP_INSTRUCTIONS
+    assert "Devin resume behavior is unproven" in cli.MCP_INSTRUCTIONS
     assert "install or upgrade runs its older tools" not in cli.MCP_INSTRUCTIONS
 
 

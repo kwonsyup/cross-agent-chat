@@ -27,6 +27,25 @@ sh -n install.sh
 
 These are the same checks CI runs on every push and pull request.
 
+### Manual release procedure
+
+After the release commit is merged and release approval is recorded, create the
+version tag and build the two published artifacts from that exact checkout:
+
+```bash
+VERSION=0.5.11
+git tag -a "v$VERSION" -m "Cross Agent Chat $VERSION"
+git push origin "v$VERSION"
+python -m build
+shasum -a 256 dist/*.whl dist/*.tar.gz > SHA256SUMS
+gh release create "v$VERSION" dist/*.whl dist/*.tar.gz SHA256SUMS \
+  --title "Cross Agent Chat $VERSION" --generate-notes
+```
+
+The release assets are the wheel, source archive, and `SHA256SUMS`. Verify the
+tag, artifact names, and checksums before publishing; this repository does not
+create releases automatically.
+
 ## Contained vs. live testing
 
 The default suite is contained: `tests/conftest.py` redirects `HOME`,
