@@ -282,7 +282,13 @@ def test_instructions_separate_first_install_from_upgrade() -> None:
     # only an upgrade leaves older tools loaded. Collapsing the two told a
     # fresh session it was "running older tools" that do not exist.
     assert "before a CAC install has no CAC tools" in cli.MCP_INSTRUCTIONS
-    assert "before a CAC upgrade keeps its older loaded tools" in cli.MCP_INSTRUCTIONS
+    assert "before the 0.5.11 upgrade keeps its older loaded 0.5.9 tools" in cli.MCP_INSTRUCTIONS
+    assert (
+        "finish its current turn, then start a new conversation or relaunch the provider"
+        in cli.MCP_INSTRUCTIONS
+    )
+    assert "do not kill or restart productive work" in cli.MCP_INSTRUCTIONS
+    assert "until that normal boundary" in cli.MCP_INSTRUCTIONS
     assert "install or upgrade runs its older tools" not in cli.MCP_INSTRUCTIONS
 
 

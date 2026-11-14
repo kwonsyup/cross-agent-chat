@@ -111,7 +111,11 @@ MCP_INSTRUCTIONS: Final = (
     "rename while the handle stays bound to one session generation. Unavailable title "
     "metadata refuses title selection; use the exact handle or full alias instead. "
     "Sessions load CAC when they start, so a session opened before a CAC install has no "
-    "CAC tools at all and one opened before a CAC upgrade keeps its older loaded tools; "
+    "CAC tools at all and one opened before the 0.5.11 upgrade keeps its older loaded "
+    "0.5.9 tools. Let that session finish its current turn, then start a new conversation "
+    "or relaunch the provider and resume it; do not kill or restart productive work just "
+    "to adopt the upgrade. Until that normal boundary, its discovery and tools remain "
+    "on the loaded version; "
     "a Reply handle minted before v0.4.0 cannot be answered, and a "
     "request carrying one must not be replayed. When your local user has assigned you to "
     "answer a named peer's requests, do that work within your task and permissions and reply "
@@ -257,8 +261,9 @@ def _print_setup_completion(installer: Installer) -> None:
     steps: list[str] = []
     if sessions:
         steps.append(
-            f"open new {' or '.join(sessions)} sessions when convenient; "
-            "sessions already running keep what they loaded"
+            f"finish the current turn, then open a new {' or '.join(sessions)} session "
+            "or relaunch the provider and resume it; sessions already running keep "
+            "what they loaded until that normal boundary"
         )
     if "devin" in installer.providers:
         steps.append("submit a prompt in Devin")
@@ -286,7 +291,10 @@ def _doctor_next(installer: Installer | None, healthy: bool) -> str:
         if provider in _SESSION_PROVIDERS
     ]
     if fresh:
-        clause = f"start a fresh {' or '.join(fresh)} session"
+        clause = (
+            f"finish the current turn, then start a fresh {' or '.join(fresh)} session "
+            "or relaunch the provider and resume the existing one"
+        )
         if "codex" in installer.providers:
             joiner = " and " if fresh == ["Codex"] else "; "
             clause += (

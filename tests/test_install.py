@@ -284,17 +284,16 @@ def test_published_install_references_match_package_version() -> None:
 
     assert isinstance(version, str)
     assert f'__version__ = "{version}"' in (root / "src/cross_agent_chat/__init__.py").read_text()
-    assert (
-        f"git+https://github.com/kwonsyup/cross-agent-chat.git@v{version}"
-        in (root / "install.sh").read_text()
-    )
+    install_script = (root / "install.sh").read_text()
+    assert "git+https://github.com/kwonsyup/cross-agent-chat.git@v0.5.7" in install_script
     readme = (root / "README.md").read_text()
-    assert f"Install v{version} with:" in readme
-    install_url = (
-        f"https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v{version}/install.sh"
+    assert "Install the latest published release, v0.5.7, with:" in readme
+    assert "https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.7/install.sh" in readme
+    assert (
+        "The current 0.5.11 source is on `main` but has no Git tag or GitHub release yet."
+        in readme
     )
-    assert install_url in readme
-    assert f"released `v{version}` tag" in readme
+    assert "raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.11/install.sh" not in readme
     changelog_versions = re.findall(
         r"^## (\d+\.\d+\.\d+) -", (root / "CHANGELOG.md").read_text(), flags=re.MULTILINE
     )
@@ -709,7 +708,8 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "codex_native_queue": "experimental",
         "integration": "healthy",
         "local_broker": "healthy",
-        "next": "start a fresh Claude Code or Codex session; "
+        "next": "finish the current turn, then start a fresh Claude Code or Codex session "
+        "or relaunch the provider and resume the existing one; "
         "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
         "submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
@@ -748,7 +748,8 @@ def test_doctor_reports_an_inherited_claude_child_session_marker(
         "should be relaunched normally (not from inside a Claude session)."
     )
     assert result["next"] == (
-        "start a fresh Claude Code or Codex session; "
+        "finish the current turn, then start a fresh Claude Code or Codex session "
+        "or relaunch the provider and resume the existing one; "
         "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
         "submit a prompt in Devin"
     )
@@ -765,7 +766,8 @@ def test_doctor_reports_an_inherited_claude_child_session_marker(
         "should be relaunched normally (not from inside a Claude session)." in lines
     )
     assert (
-        "next: start a fresh Claude Code or Codex session; "
+        "next: finish the current turn, then start a fresh Claude Code or Codex session "
+        "or relaunch the provider and resume the existing one; "
         "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
         "submit a prompt in Devin" in lines
     )
@@ -825,7 +827,8 @@ def test_doctor_omits_the_terminal_diagnostic_without_the_marker(
         "codex_native_queue": "stop-bound",
         "integration": "healthy",
         "local_broker": "healthy",
-        "next": "start a fresh Claude Code or Codex session; "
+        "next": "finish the current turn, then start a fresh Claude Code or Codex session "
+        "or relaunch the provider and resume the existing one; "
         "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
         "submit a prompt in Devin",
         "remote_trust": "tailscale_acl",
@@ -2450,7 +2453,8 @@ def test_doctor_json_reports_no_codex_hook_trust_verdict(
     }
     assert report["integration"] == "healthy"
     assert report["next"] == (
-        "start a fresh Claude Code or Codex session; "
+        "finish the current turn, then start a fresh Claude Code or Codex session "
+        "or relaunch the provider and resume the existing one; "
         "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks)"
     )
     # doctor is read-only against the provider files it inspects.
@@ -2478,7 +2482,10 @@ def test_doctor_next_is_scoped_to_selected_providers(
     report = json.loads(capsys.readouterr().out)
     assert report["integration"] == "healthy"
     assert "codex_hooks" not in report
-    assert report["next"] == "start a fresh Claude Code session"
+    assert report["next"] == (
+        "finish the current turn, then start a fresh Claude Code session "
+        "or relaunch the provider and resume the existing one"
+    )
 
     # An unhealthy profile points setup at the actual executable, not a bare
     # command the PATH may not resolve.
@@ -2508,7 +2515,7 @@ def test_setup_completion_reports_installed_not_ready_and_scopes_advice(
     assert "is ready" not in output
     assert "Cross Agent Chat installed for Claude Code and Codex on studio." in output
     assert "Existing provider logins were left unchanged." in output
-    assert "open new Claude Code or Codex sessions" in output
+    assert "finish the current turn, then open a new Claude Code or Codex session" in output
     # The advice is conditional on a Codex prompt, not on observed trust
     # state, and names the exact selected Codex root and the no-hand-edit
     # rule.

@@ -24,26 +24,37 @@ secrets those files hold (see [setup and data handling](SECURITY.md)).
 Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
 limits the set.
 
-Install v0.5.11 with:
+Install the latest published release, v0.5.7, with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.11/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.7/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
-This builds the released `v0.5.11` tag and installs the command at
+This builds the published `v0.5.7` tag and installs the command at
 `~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
 Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
 not found in your shell, use the full path the installer reports. Run it on
 each participating Mac.
 
-**Then open a new conversation, or relaunch the provider and resume an
-existing one when convenient** — sessions load Cross Agent Chat when they
-start and already-running ones keep what they loaded, so don't interrupt
-ongoing work just to activate it. A local Devin conversation joins the peer
-list after its first prompt.
+**Then finish the current turn and open a new conversation, or relaunch the
+provider and resume an existing one when convenient** — sessions load Cross
+Agent Chat when they start and already-running ones keep what they loaded
+until that normal boundary. Do not kill or restart productive work just to
+activate an upgrade. A local Devin conversation joins the peer list after its
+first prompt.
+
+The current 0.5.11 source is on `main` but has no Git tag or GitHub release
+yet. Do not use a `v0.5.11` install URL. To test the exact accepted head before
+publication, fetch the installer from `main` and pin the source explicitly:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/main/install.sh \
+  | CROSS_AGENT_CHAT_SOURCE=git+https://github.com/kwonsyup/cross-agent-chat.git@af8c76ce05562ea71d03349cbaefa46174abad1f \
+    CROSS_AGENT_CHAT_APPROVE=1 sh
+```
 
 **Codex:** newly installed hooks may need a one-time review in the selected
 profile through its normal hook-review flow (the CLI documents `/hooks`).
@@ -84,7 +95,7 @@ harness and mode:
 | Coding surface on macOS | Parked/idle wake | Active-turn input | Deferred behavior | Qualification |
 |---|---|---|---|---|
 | Claude Code | Qualified idle wake and new-turn input | Between tool calls; a running tool is not interrupted | — | Supported desktop-launched contexts; a session inside a remote SSH shell registered but could not receive |
-| Codex CLI 0.160.1 / 0.162.0 / 0.162.1 / 0.163.0 / 0.167.0 (owning app-server daemon) | Queued input wakes the parked original | Direct input reaches the expected active turn | — | Only a `codex-tui` 0.160.1, 0.162.0, 0.162.1, 0.163.0, or 0.167.0 conversation already owned by its own daemon, verified by route PID, profile, thread, cwd, and originator over a private owner-only socket; CAC starts no daemon and uses no UI relay |
+| Codex CLI 0.160.1 / 0.162.0 / 0.162.1 / 0.163.0 / 0.167.0 / 0.169.0 (owning app-server daemon) | Queued input wakes the parked original | Direct input reaches the expected active turn | — | Only a `codex-tui` conversation on one of these versions already owned by its own daemon, verified by route PID, profile, thread, cwd, and originator over a private owner-only socket; CAC starts no daemon and uses no UI relay |
 | Codex CLI `--no-daemon` or any unqualified version (older or newer) | No | No | Stop-bound: the current turn's end or the next prompt | Default when no owning daemon is present |
 | Codex Native App (managed helper) | Qualified on the listed host tuples | Qualified on the listed host tuples | — | Intel macOS, Codex 0.159.2 in Native app 26.928.21956, trusted hooks available. Also qualified 17 Oct 2026 UTC on M1 MacBook Pro with CAC 0.5.7: Native app 26.1013.31256/build 20586, embedded Codex 0.163.0-alpha.10.2; ordinary idle and same-turn input observed in the original. These dated observations do not qualify other host/version tuples |
 | Codex CLI experimental native queue | Unknown: provider queue acceptance alone does not qualify wake | Unknown | May wait behind the current turn or until resume | Only under explicit `setup --enable-experimental-codex-native-queue`; not active by default. A qualified owning daemon on the same route takes precedence over this queue |
