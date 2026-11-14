@@ -288,7 +288,7 @@ def test_instructions_separate_first_install_from_upgrade() -> None:
         in cli.MCP_INSTRUCTIONS
     )
     assert "do not kill or restart productive work" in cli.MCP_INSTRUCTIONS
-    assert "until that normal boundary" in cli.MCP_INSTRUCTIONS
+    assert "Until that normal boundary" in cli.MCP_INSTRUCTIONS
     assert "install or upgrade runs its older tools" not in cli.MCP_INSTRUCTIONS
 
 
