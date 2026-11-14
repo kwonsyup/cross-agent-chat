@@ -52,9 +52,11 @@ from cross_agent_chat.claude_runtime import (
     sendmessage,
 )
 from cross_agent_chat.codex import (
+    CodexConsumerKind,
     CodexCourier,
     hook_context,
     native_account_digest,
+    native_thread_consumer_kind,
     native_thread_titles,
 )
 from cross_agent_chat.codex_daemon import CodexDaemonIngress, discover_daemon_ingress
@@ -167,6 +169,9 @@ COURIER_STARTUP_SECONDS: Final = 15.0
 MAX_COURIER_DIAGNOSTIC_BYTES: Final = 1024
 BOOTSTRAP_FRAME_TIMEOUT_SECONDS: Final = 0.1
 COURIER_BUSY_PRE_EFFECT_REASON: Final = "session courier is busy with another delivery"
+COURIER_EXEC_PRE_EFFECT_REASON: Final = (
+    "Codex exec session is non-deliverable; no interactive consumer is available"
+)
 # A frame whose read finished after shutdown or a route generation change was
 # never effect-admitted; the decided pre-effect rejection tells its sender so.
 COURIER_STOPPED_PRE_EFFECT_REASON: Final = "session courier stopped before admitting a delivery"
@@ -683,6 +688,7 @@ class Target:
     delivery_mechanism: DeliveryMechanism | None = None
     title: str | None = None
     current_boundary: DevinCurrentBoundary | None = None
+    consumer_kind: CodexConsumerKind | None = None
 
     def public(
         self,
@@ -727,6 +733,8 @@ class Target:
             result["delivery_mode"] = "unknown" if mode is None else mode
             if include_delivery_mechanism:
                 result["delivery_mechanism"] = "unknown" if mechanism is None else mechanism
+                if self.provider == "codex" and self.consumer_kind is not None:
+                    result["consumer_kind"] = self.consumer_kind
         # The negotiated content-free restriction is emitted only to a reader
         # that asked for it; its absence stays "unobserved", never "held".
         if include_current_boundary and self.current_boundary is not None:
@@ -1995,12 +2003,15 @@ def courier_accept(
     message: str,
     *,
     daemon_ingress: CodexDaemonIngress | None = None,
+    consumer_kind: CodexConsumerKind | None = None,
 ) -> dict[str, object]:
     """Attempt one provider delivery and report its exact effect boundary."""
     try:
         identifier = valid_uuid(event_id, "event id")
         body = bounded_message(message)
         if route.provider == "codex":
+            if consumer_kind == "exec":
+                raise ChatError(COURIER_EXEC_PRE_EFFECT_REASON)
             if daemon_ingress is not None:
                 response = daemon_ingress.accept(identifier, body)
                 # Only a decided provider-boundary handoff counts as retired:
@@ -2118,6 +2129,7 @@ FORWARDABLE_PRE_EFFECT_REASONS: Final = frozenset(
         "Claude SendMessage was refused before delivery",
         "session courier is still bootstrapping",
         COURIER_BUSY_PRE_EFFECT_REASON,
+        COURIER_EXEC_PRE_EFFECT_REASON,
         COURIER_STOPPED_PRE_EFFECT_REASON,
         "Codex courier is unavailable",
         "Codex courier queue is full",  # Older receivers used this for every provider.
@@ -2276,6 +2288,7 @@ def courier_health(
     devin_acp_host_observed: bool = False,
     include_current_boundary: bool = False,
     devin_current_boundary: DevinCurrentBoundary | None = None,
+    consumer_kind: CodexConsumerKind | None = None,
 ) -> dict[str, object]:
     alias = route.alias
     if route.provider == "claude":
@@ -2303,6 +2316,8 @@ def courier_health(
         response["delivery_mechanism"] = _delivery_mechanism(
             route, courier, native_helper=native_helper
         )
+        if route.provider == "codex" and consumer_kind is not None:
+            response["consumer_kind"] = consumer_kind
     if daemon_ingress is not None and include_owning_daemon:
         if include_delivery_mode:
             response["delivery_mode"] = "codex_daemon_input"
@@ -2397,6 +2412,7 @@ def courier_server(
             path.unlink()
         raise
     native_queue: tuple[Path, dict[str, str], str] | None = None
+    consumer_kind: CodexConsumerKind | None = None
     helper_lineage = provider == "codex" and NativeHelperStore(root).is_helper_lineage(route)
     helper_queue = False
     if helper_lineage:
@@ -2421,6 +2437,25 @@ def courier_server(
                 },
                 route.session_id,
             )
+    if provider == "codex" and not helper_lineage:
+        try:
+            metadata_binary = _courier_owner_binary(root, route)
+            if (
+                metadata_binary is not None
+                and metadata_binary.is_file()
+                and metadata_binary.name == "codex"
+            ):
+                consumer_kind = native_thread_consumer_kind(
+                    binary=metadata_binary,
+                    environment={
+                        **dict(os.environ),
+                        "CODEX_HOME": route.profile_root or recipient_profile_root("codex"),
+                    },
+                    thread_id=route.session_id,
+                    deadline=time.monotonic() + NATIVE_TITLE_TIMEOUT_SECONDS,
+                )
+        except (ChatError, OSError):
+            consumer_kind = None
     courier = (
         CodexCourier(
             alias=route.alias,
@@ -2603,6 +2638,7 @@ def courier_server(
                                     and request.get("include_current_boundary") is True
                                     else None
                                 ),
+                                consumer_kind=consumer_kind,
                                 native_helper=(
                                     NativeHelperStore(root).helper_for_original(
                                         route, Registry(root).routes()
@@ -2671,15 +2707,17 @@ def courier_server(
                                     },
                                 )
                             else:
-                                response = courier_accept(
-                                    route,
-                                    courier,
-                                    event_id,
-                                    message,
-                                    **(
-                                        {"daemon_ingress": daemon_ingress} if daemon_ingress else {}
-                                    ),
-                                )
+                                if daemon_ingress is None and consumer_kind is None:
+                                    response = courier_accept(route, courier, event_id, message)
+                                else:
+                                    response = courier_accept(
+                                        route,
+                                        courier,
+                                        event_id,
+                                        message,
+                                        daemon_ingress=daemon_ingress,
+                                        consumer_kind=consumer_kind,
+                                    )
                                 # The receipt must land before the answer: a
                                 # caller whose emit or read fails after the
                                 # provider hand-off needs this exact proof to
@@ -2906,6 +2944,7 @@ def _local_target(
                 "generation": route.generation,
                 "include_delivery_mode": True,
                 "include_delivery_mechanism": True,
+                "include_consumer_kind": True,
                 "include_owning_daemon": True,
                 "include_devin_tool_boundary": True,
                 "include_devin_acp_host": True,
@@ -2919,6 +2958,7 @@ def _local_target(
     expected = {"schema_version", "status", "generation", "alias"}
     observed_mode = response.get("delivery_mode")
     observed_mechanism = response.get("delivery_mechanism")
+    observed_consumer_kind = response.get("consumer_kind")
     observed_boundary = response.get("current_boundary")
     if (
         set(response)
@@ -2927,6 +2967,8 @@ def _local_target(
             expected | {"delivery_mode"},
             expected | {"delivery_mode", "delivery_mechanism"},
             expected | {"delivery_mode", "delivery_mechanism", "current_boundary"},
+            expected | {"delivery_mode", "delivery_mechanism", "consumer_kind"},
+            expected | {"delivery_mode", "delivery_mechanism", "consumer_kind", "current_boundary"},
         )
         or response.get("schema_version") != SCHEMA_VERSION
         or response.get("status") != "READY"
@@ -2946,6 +2988,13 @@ def _local_target(
             }
         )
         or (observed_mechanism is not None and observed_mechanism not in DELIVERY_MECHANISMS)
+        or (
+            observed_consumer_kind is not None
+            and (
+                route.provider != "codex"
+                or observed_consumer_kind not in {"interactive", "exec", "unknown"}
+            )
+        )
         # The current restriction rides the mechanism layer and is only
         # meaningful on the Devin courier that publishes it; anything else is
         # an invalid shape, not a partial truth the reader may keep.
@@ -2985,6 +3034,11 @@ def _local_target(
             delivery_mechanism=(
                 cast(DeliveryMechanism, observed_mechanism)
                 if observed_mechanism is not None
+                else None
+            ),
+            consumer_kind=(
+                observed_consumer_kind
+                if observed_consumer_kind in {"interactive", "exec"}
                 else None
             ),
             # The reader shares the custody store's filesystem, so the local
@@ -3164,6 +3218,7 @@ def _targets_from_tailnet(
             required
             | ({"delivery_mode"} if include_delivery_mode else set())
             | ({"delivery_mechanism"} if include_delivery_mechanism else set())
+            | ({"consumer_kind"} if include_delivery_mechanism else set())
             | ({"current_boundary"} if include_current_boundary else set())
             | ({"title"} if include_title else set())
         )
@@ -3207,11 +3262,18 @@ def _targets_from_tailnet(
             raise ChatError("Tailnet peer returned invalid discovery")
         observed_mode = item.get("delivery_mode")
         observed_mechanism = item.get("delivery_mechanism")
+        observed_consumer_kind = item.get("consumer_kind")
         if "delivery_mechanism" in item and (
             not isinstance(observed_mechanism, str)
             or observed_mechanism not in DELIVERY_MECHANISMS | {"unknown"}
             or (observed_mechanism == "devin_tool_boundary" and not include_devin_tool_boundary)
             or (observed_mechanism == "devin_acp_host" and not include_devin_acp_host)
+        ):
+            raise ChatError("Tailnet peer returned invalid discovery")
+        if "consumer_kind" in item and (
+            not include_delivery_mechanism
+            or provider != "codex"
+            or observed_consumer_kind not in {"interactive", "exec", "unknown"}
         ):
             raise ChatError("Tailnet peer returned invalid discovery")
         title = item.get("title")
@@ -3247,6 +3309,12 @@ def _targets_from_tailnet(
                 delivery_mechanism=(
                     cast(DeliveryMechanism, observed_mechanism)
                     if isinstance(observed_mechanism, str) and observed_mechanism != "unknown"
+                    else None
+                ),
+                consumer_kind=(
+                    cast(CodexConsumerKind, observed_consumer_kind)
+                    if isinstance(observed_consumer_kind, str)
+                    and observed_consumer_kind != "unknown"
                     else None
                 ),
                 title=valid_name(title, "remote title") if isinstance(title, str) else None,
@@ -4045,6 +4113,8 @@ def _send_local_target(
         )
     if target.session_id is None or target.pid is None or target.cwd is None:
         raise ChatError("target route is incomplete")
+    if target.provider == "codex" and target.consumer_kind == "exec":
+        raise ChatError(f"{COURIER_EXEC_PRE_EFFECT_REASON}; nothing was delivered")
     receiving = destination_receiving(target)
     source_alias = canonical_source_alias(root, source, deadline=deadline)
     current_routes = Registry(root).routes()
@@ -4471,6 +4541,8 @@ def _send_remote_target(
 ) -> dict[str, object]:
     if target.tailnet_address is None:
         raise ChatError("remote target route is incomplete")
+    if target.provider == "codex" and target.consumer_kind == "exec":
+        raise ChatError(f"{COURIER_EXEC_PRE_EFFECT_REASON}; nothing was delivered")
     receiving = destination_receiving(target)
     source_alias = canonical_source_alias(root, source, deadline=deadline)
     event_id = str(uuid4()) if event_id is None else valid_uuid(event_id, "event id")
@@ -6376,6 +6448,8 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
                 "generation": route.generation,
                 "include_delivery_mode": True,
                 "include_direct_delivery_mode": True,
+                "include_delivery_mechanism": True,
+                "include_consumer_kind": True,
             },
         )
     except ChatError:
@@ -6394,6 +6468,16 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
         frozenset(base_health),
         frozenset((*base_health, "delivery_mode")),
         frozenset((*base_health, "delivery_mode", "direct_delivery_mode")),
+        frozenset((*base_health, "delivery_mode", "direct_delivery_mode", "delivery_mechanism")),
+        frozenset(
+            (
+                *base_health,
+                "delivery_mode",
+                "direct_delivery_mode",
+                "delivery_mechanism",
+                "consumer_kind",
+            )
+        ),
     }
     if frozenset(health) not in allowed or any(
         health.get(key) != value for key, value in base_health.items()
@@ -6401,6 +6485,9 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
         print("{}", flush=True)
         return
     direct_mode = health.get("direct_delivery_mode", health.get("delivery_mode"))
+    if health.get("consumer_kind") == "exec":
+        print("{}", flush=True)
+        return
     if direct_mode != "codex_stop_bound":
         print("{}", flush=True)
         return

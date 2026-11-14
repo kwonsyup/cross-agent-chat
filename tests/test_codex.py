@@ -68,6 +68,91 @@ def test_stop_without_registered_route_is_silent_noop(
     assert capsys.readouterr().out == "{}\n"
 
 
+def test_exec_courier_accept_is_decided_pre_effect() -> None:
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd="/tmp",
+        pid=os.getpid(),
+    )
+    courier = CodexCourier(alias=route.alias, generation=route.generation)
+
+    response = runtime.courier_accept(
+        route,
+        courier,
+        str(uuid4()),
+        "must not enter an exec session",
+        consumer_kind="exec",
+    )
+
+    assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response.get("error") == runtime.COURIER_EXEC_PRE_EFFECT_REASON
+    assert courier.peek() == []
+
+
+def test_interactive_courier_accept_remains_deliverable() -> None:
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd="/tmp",
+        pid=os.getpid(),
+    )
+    courier = CodexCourier(alias=route.alias, generation=route.generation)
+    event_id = str(uuid4())
+
+    response = runtime.courier_accept(
+        route, courier, event_id, "interactive delivery", consumer_kind="interactive"
+    )
+
+    assert response["status"] == "TRANSPORT_ACCEPTED"
+    assert [item["event_id"] for item in courier.peek()] == [event_id]
+
+
+def test_exec_stop_hook_does_not_peek_or_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+            )
+        ),
+    )
+    calls: list[str] = []
+
+    def request(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        calls.append(str(payload["operation"]))
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+            "delivery_mode": "codex_stop_bound",
+            "direct_delivery_mode": "codex_stop_bound",
+            "delivery_mechanism": "stop_bound",
+            "consumer_kind": "exec",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+    codex_stop(os.getpid(), str(root))
+
+    assert calls == ["health"]
+    assert capsys.readouterr().out == "{}\n"
+
+
 def test_stop_shares_one_deadline_across_health_peek_and_ack(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

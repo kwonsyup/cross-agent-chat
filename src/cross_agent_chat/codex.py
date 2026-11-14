@@ -13,7 +13,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
-from typing import Final, cast
+from typing import Final, Literal, cast
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import (
@@ -34,6 +34,7 @@ MAX_PEEK_FRAME_BYTES: Final = 64 * 1024
 NATIVE_QUEUE_TIMEOUT_SECONDS: Final = 15.0
 MAX_NATIVE_STDOUT_BYTES: Final = 64 * 1024
 NATIVE_METADATA_TIMEOUT_SECONDS: Final = 2.0
+CodexConsumerKind = Literal["interactive", "exec", "unknown"]
 
 
 def _client_info() -> dict[str, str]:
@@ -365,6 +366,109 @@ def native_thread_titles(
         selector.close()
         _reap_metadata_process(process)
     return titles
+
+
+def native_thread_consumer_kind(
+    *, binary: Path, environment: dict[str, str], thread_id: str, deadline: float
+) -> CodexConsumerKind:
+    """Read the provider's native session metadata and classify its consumer.
+
+    ``originator`` and ``source`` are provider-owned session fields.  A
+    ``codex_exec``/``exec`` session is detached from an interactive consumer;
+    it must never be woken by the Stop hook.  Missing or unrecognized metadata
+    stays ``unknown`` so older providers retain their existing behavior.
+    """
+    identifier = valid_uuid(thread_id, "Codex thread id")
+    if time.monotonic() >= deadline:
+        return "unknown"
+    try:
+        process = subprocess.Popen(
+            [str(binary), "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            close_fds=True,
+        )
+    except OSError:
+        return "unknown"
+    if process.stdin is None or process.stdout is None:
+        _reap_metadata_process(process)
+        return "unknown"
+    stdin, stdout = process.stdin, process.stdout
+    selector = selectors.DefaultSelector()
+    selector.register(stdout, selectors.EVENT_READ)
+    buffer = b""
+
+    def write(payload: dict[str, object]) -> None:
+        stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+        stdin.flush()
+
+    def read(response_id: int) -> dict[str, object] | None:
+        nonlocal buffer
+        while time.monotonic() < deadline:
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict) and value.get("id") == response_id:
+                    return cast(dict[str, object], value)
+            events = selector.select(max(0.0, deadline - time.monotonic()))
+            if events:
+                chunk = os.read(stdout.fileno(), 65536)
+                if not chunk:
+                    return None
+                buffer += chunk
+                if len(buffer) > MAX_NATIVE_STDOUT_BYTES:
+                    return None
+        return None
+
+    try:
+        write(
+            {
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": _client_info(),
+                    "capabilities": {"experimentalApi": True},
+                },
+            }
+        )
+        initialized = read(0)
+        result = initialized.get("result") if initialized is not None else None
+        expected_home = environment.get("CODEX_HOME")
+        reported_home = result.get("codexHome") if isinstance(result, dict) else None
+        if not isinstance(expected_home, str) or not isinstance(reported_home, str):
+            return "unknown"
+        if Path(reported_home).resolve() != Path(expected_home).resolve():
+            return "unknown"
+        write({"method": "initialized"})
+        write(
+            {
+                "id": 1,
+                "method": "thread/read",
+                "params": {"threadId": identifier, "includeTurns": False},
+            }
+        )
+        response = read(1)
+        result = response.get("result") if response is not None else None
+        thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(thread, dict) or thread.get("id") != identifier:
+            return "unknown"
+        originator = thread.get("originator")
+        source = thread.get("source")
+        if originator == "codex_exec" or source == "exec":
+            return "exec"
+        if originator == "codex-tui" or source in {"vscode", "native", "tui"}:
+            return "interactive"
+        return "unknown"
+    except (OSError, ValueError):
+        return "unknown"
+    finally:
+        selector.close()
+        _reap_metadata_process(process)
 
 
 class CodexCourier:

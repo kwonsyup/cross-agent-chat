@@ -157,6 +157,50 @@ def test_internal_title_disabled_listing_keeps_the_exact_old_shape(
     ]
 
 
+def test_codex_discovery_exposes_exec_consumer_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    target = runtime.Target(
+        alias=route.alias,
+        provider="codex",
+        device=route.device,
+        project=route.project,
+        generation=route.generation,
+        session_key=session_key("codex", route.session_id),
+        remote=False,
+        session_id=route.session_id,
+        cwd=route.cwd,
+        pid=route.pid,
+        consumer_kind="exec",
+    )
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([target], True))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_k: ([], True))
+
+    listing = runtime.peers(
+        tmp_path / "state",
+        include_remote=False,
+        include_delivery_mode=True,
+        include_delivery_mechanism=True,
+    )
+
+    [row] = cast(list[dict[str, str]], listing["peers"])
+    assert row["alias"] == route.alias
+    assert row["consumer_kind"] == "exec"
+    assert row["delivery_mode"] == "unknown"
+    assert row["delivery_mechanism"] == "unknown"
+    token = parse_recipient_token(row["handle"])
+    assert token is not None
+    assert token.handle == target.session_key
+    assert token.generation == target.generation
+
+
 def test_identical_devin_aliases_stay_unselectable_and_tokens_stay_pinned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
