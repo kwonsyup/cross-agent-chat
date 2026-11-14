@@ -91,6 +91,41 @@ def test_exec_courier_accept_is_decided_pre_effect() -> None:
     assert courier.peek() == []
 
 
+def test_exec_stop_authority_upgrades_unknown_courier_kind_before_rejection() -> None:
+    courier = CodexCourier(
+        alias="codex@studio:exec:123456789abc",
+        generation=str(uuid4()),
+        consumer_kind="unknown",
+    )
+    event_id = str(uuid4())
+    courier.accept(event_id, "queued before metadata timeout")
+
+    assert courier.update_consumer_kind("exec") is True
+    rejected, unknown = courier.reject_pending()
+
+    assert courier.consumer_kind == "exec"
+    assert rejected == [event_id]
+    assert unknown == []
+
+
+def test_courier_kind_updates_never_downgrade_known_values() -> None:
+    interactive = CodexCourier(
+        alias="codex@studio:interactive:123456789abc",
+        generation=str(uuid4()),
+        consumer_kind="interactive",
+    )
+    exec_courier = CodexCourier(
+        alias="codex@studio:exec:123456789abc",
+        generation=str(uuid4()),
+        consumer_kind="exec",
+    )
+
+    assert interactive.update_consumer_kind("exec") is False
+    assert interactive.consumer_kind == "interactive"
+    assert exec_courier.update_consumer_kind("interactive") is False
+    assert exec_courier.consumer_kind == "exec"
+
+
 def test_interactive_courier_accept_remains_deliverable() -> None:
     route = Route.create(
         provider="codex",
@@ -304,6 +339,63 @@ def test_unknown_consumer_kind_defers_stop_and_records_pending_reason(
     codex_stop(os.getpid(), str(root))
 
     assert calls == ["health", "defer_stop"]
+    assert capsys.readouterr().out == "{}\n"
+
+
+def test_exec_hook_source_upgrades_unknown_cached_kind_and_rejects_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "source": "exec",
+                }
+            )
+        ),
+    )
+    calls: list[tuple[str, object]] = []
+
+    def request(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        calls.append((str(payload["operation"]), payload.get("consumer_kind")))
+        if payload["operation"] == "health":
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "generation": route.generation,
+                "alias": route.alias,
+                "delivery_mode": "codex_stop_bound",
+                "direct_delivery_mode": "codex_stop_bound",
+                "delivery_mechanism": "stop_bound",
+                "consumer_kind": "unknown",
+            }
+        return {
+            "schema_version": 1,
+            "status": "EXEC_PENDING_REJECTED",
+            "generation": route.generation,
+            "event_ids": [],
+            "unknown_event_ids": [],
+            "reason": runtime.COURIER_EXEC_PENDING_REFUSAL_REASON,
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+    codex_stop(os.getpid(), str(root))
+
+    assert calls == [("health", None), ("reject_exec_pending", "exec")]
     assert capsys.readouterr().out == "{}\n"
 
 

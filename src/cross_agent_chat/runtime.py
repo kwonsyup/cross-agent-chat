@@ -2465,7 +2465,7 @@ def courier_server(
                     deadline=time.monotonic() + NATIVE_TITLE_TIMEOUT_SECONDS,
                 )
         except (ChatError, OSError):
-            consumer_kind = None
+            consumer_kind = "unknown"
     courier = (
         CodexCourier(
             alias=route.alias,
@@ -2473,6 +2473,7 @@ def courier_server(
             native_queue=native_queue,
             native_helper=helper_lineage,
             provider=cast(Provider, provider),
+            consumer_kind=consumer_kind,
         )
         if provider in {"codex", "devin"}
         else None
@@ -2654,7 +2655,9 @@ def courier_server(
                                     and request.get("include_current_boundary") is True
                                     else None
                                 ),
-                                consumer_kind=consumer_kind,
+                                consumer_kind=(
+                                    courier.consumer_kind if courier is not None else consumer_kind
+                                ),
                                 native_helper=(
                                     NativeHelperStore(root).helper_for_original(
                                         route, Registry(root).routes()
@@ -2678,7 +2681,19 @@ def courier_server(
                         },
                     )
                 elif operation == "reject_exec_pending":
-                    if route.provider != "codex" or consumer_kind != "exec" or courier is None:
+                    if route.provider != "codex" or courier is None:
+                        return
+                    if request.get("consumer_kind") != "exec":
+                        return
+                    if not courier.update_consumer_kind("exec"):
+                        emit_frame_safely(
+                            connection,
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "status": "EXEC_KIND_CONFLICT",
+                                "generation": route.generation,
+                            },
+                        )
                         return
                     rejected, unknown = courier.reject_pending()
                     _mark_exec_stop_events(root, rejected, "PRE_EFFECT_REJECTED")
@@ -2945,7 +2960,7 @@ def courier_server(
         workers.shutdown(wait=True)
         refusals.shutdown(wait=True)
         if courier is not None:
-            if consumer_kind == "exec":
+            if courier.consumer_kind == "exec":
                 rejected, unknown = courier.reject_pending()
                 _mark_exec_stop_events(root, rejected, "PRE_EFFECT_REJECTED")
                 _mark_exec_stop_events(root, unknown, "UNKNOWN_DELIVERY")
@@ -6660,6 +6675,7 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
                     "schema_version": SCHEMA_VERSION,
                     "operation": "reject_exec_pending",
                     "generation": route.generation,
+                    "consumer_kind": "exec",
                 },
             )
             if rejected is not None and rejected.get("status") == "EXEC_PENDING_REJECTED":

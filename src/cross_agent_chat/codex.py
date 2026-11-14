@@ -483,6 +483,7 @@ class CodexCourier:
         native_queue: tuple[Path, dict[str, str], str] | None = None,
         native_helper: bool = False,
         provider: Provider = "codex",
+        consumer_kind: CodexConsumerKind | None = None,
     ) -> None:
         if capacity <= 0 or capacity > DEFAULT_CAPACITY:
             raise ChatError("Codex courier capacity is invalid")
@@ -492,6 +493,11 @@ class CodexCourier:
         self.native_queue = native_queue
         self.native_helper = native_helper
         self.provider = provider
+        self.consumer_kind: CodexConsumerKind | None = (
+            consumer_kind
+            if consumer_kind is not None
+            else ("unknown" if provider == "codex" else None)
+        )
         # Each pending body is stored with its monotonic enqueue time so a
         # read-only inspect can report the oldest pending age without the body.
         self._pending: OrderedDict[str, tuple[str, float]] = OrderedDict()
@@ -516,6 +522,16 @@ class CodexCourier:
         # accept is deliberately outside it so queue controls never wait on a
         # provider call.
         self._lock = threading.Lock()
+
+    def update_consumer_kind(self, kind: CodexConsumerKind) -> bool:
+        """Upgrade unknown metadata once; never overwrite a known kind."""
+        with self._lock:
+            if self.consumer_kind == kind:
+                return True
+            if self.consumer_kind == "unknown":
+                self.consumer_kind = kind
+                return True
+            return False
 
     def accept(self, event_id: str, message: str) -> dict[str, object]:
         identifier = valid_uuid(event_id, "event id")
