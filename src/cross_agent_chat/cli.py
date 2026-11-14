@@ -110,12 +110,15 @@ MCP_INSTRUCTIONS: Final = (
     "alias resolution requires complete remote discovery, and an alias can change on "
     "rename while the handle stays bound to one session generation. Unavailable title "
     "metadata refuses title selection; use the exact handle or full alias instead. "
-    "Sessions load CAC when they start, so a session opened before a CAC install has no "
-    "CAC tools at all and one opened before the 0.5.11 upgrade keeps its older loaded "
-    "0.5.9 tools. Let that session finish its current turn, then start a new conversation "
-    "or relaunch the provider and resume it; do not kill or restart productive work just "
-    "to adopt the upgrade. Until that normal boundary, its discovery and tools remain "
-    "on the loaded version; "
+    "Sessions load CAC when they start, so a session opened before an install has no CAC "
+    "tools and a session opened before an upgrade keeps its previously loaded CAC tools. "
+    "Finish the current turn and never kill productive work for adoption. For Claude, "
+    "relaunching then using --resume starts a new process and reloads MCP configuration. "
+    "For Codex, resume restores the thread but an already-running app-server may retain "
+    "its loaded MCP runtime; a fresh provider/app-server process or explicit MCP reload "
+    "is the reliable boundary. Devin resume behavior is unproven: it may restore the "
+    "conversation, but verify CAC tools with a version or discovery check and do not "
+    "treat resume as a fresh process; "
     "a Reply handle minted before v0.4.0 cannot be answered, and a "
     "request carrying one must not be replayed. When your local user has assigned you to "
     "answer a named peer's requests, do that work within your task and permissions and reply "
@@ -246,6 +249,25 @@ def _provider_names(providers: Iterable[str]) -> str:
     return ", ".join(names[:-1]) + ", and " + names[-1]
 
 
+def _session_adoption_guidance(providers: Iterable[str]) -> str:
+    """Describe provider-specific loaded-runtime adoption without overclaiming."""
+    selected = set(providers)
+    clauses: list[str] = ["finish the current turn; never kill productive sessions"]
+    if "claude" in selected:
+        clauses.append("Claude: relaunch, then use --resume to restore the conversation")
+    if "codex" in selected:
+        clauses.append(
+            "Codex: use a fresh provider/app-server process or explicit MCP reload; "
+            "resume alone may retain loaded CAC tools"
+        )
+    if "devin" in selected:
+        clauses.append(
+            "Devin: resume behavior is unproven; restore may work, but verify CAC tools "
+            "with a version or discovery check"
+        )
+    return "; ".join(clauses)
+
+
 def _print_setup_completion(installer: Installer) -> None:
     """Report what setup configured; never claim session or hook readiness."""
     lines = [
@@ -259,14 +281,8 @@ def _print_setup_completion(installer: Installer) -> None:
         if provider in _SESSION_PROVIDERS
     ]
     steps: list[str] = []
-    if sessions:
-        steps.append(
-            f"finish the current turn, then open a new {' or '.join(sessions)} session "
-            "or relaunch the provider and resume it; sessions already running keep "
-            "what they loaded until that normal boundary"
-        )
-    if "devin" in installer.providers:
-        steps.append("submit a prompt in Devin")
+    if sessions or "devin" in installer.providers:
+        steps.append(_session_adoption_guidance(installer.providers))
     lines.append("Next: " + "; ".join(steps) + ".")
     if "codex" in installer.providers:
         lines.append(
@@ -285,24 +301,10 @@ def _doctor_next(installer: Installer | None, healthy: bool) -> str:
     if not healthy:
         return f"{shlex.quote(str(installer.executable))} setup"
     clauses: list[str] = []
-    fresh = [
-        _PROVIDER_NAMES[provider]
-        for provider in installer.providers
-        if provider in _SESSION_PROVIDERS
-    ]
-    if fresh:
-        clause = (
-            f"finish the current turn, then start a fresh {' or '.join(fresh)} session "
-            "or relaunch the provider and resume the existing one"
-        )
-        if "codex" in installer.providers:
-            joiner = " and " if fresh == ["Codex"] else "; "
-            clause += (
-                f"{joiner}approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks)"
-            )
-        clauses.append(clause)
-    if "devin" in installer.providers:
-        clauses.append("submit a prompt in Devin")
+    if installer.providers:
+        clauses.append(_session_adoption_guidance(installer.providers))
+    if "codex" in installer.providers:
+        clauses.append("approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks)")
     return "; ".join(clauses)
 
 

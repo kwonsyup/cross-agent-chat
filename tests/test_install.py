@@ -285,13 +285,14 @@ def test_published_install_references_match_package_version() -> None:
     assert isinstance(version, str)
     assert f'__version__ = "{version}"' in (root / "src/cross_agent_chat/__init__.py").read_text()
     install_script = (root / "install.sh").read_text()
-    assert "git+https://github.com/kwonsyup/cross-agent-chat.git@v0.5.7" in install_script
+    assert f"git+https://github.com/kwonsyup/cross-agent-chat.git@v{version}" in install_script
     readme = (root / "README.md").read_text()
-    assert "Install the latest published release, v0.5.7, with:" in readme
-    assert "https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.7/install.sh" in readme
-    assert "The current 0.5.11 source is on `main`" in readme
-    assert "has no Git tag or GitHub release" in readme
-    assert "raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.11/install.sh" not in readme
+    assert f"Install v{version} with:" in readme
+    install_url = (
+        f"https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v{version}/install.sh"
+    )
+    assert install_url in readme
+    assert f"released `v{version}` tag" in readme
     changelog_versions = re.findall(
         r"^## (\d+\.\d+\.\d+) -", (root / "CHANGELOG.md").read_text(), flags=re.MULTILINE
     )
@@ -706,10 +707,12 @@ def test_doctor_reports_the_selected_profile_queue_mode(
         "codex_native_queue": "experimental",
         "integration": "healthy",
         "local_broker": "healthy",
-        "next": "finish the current turn, then start a fresh Claude Code or Codex session "
-        "or relaunch the provider and resume the existing one; "
-        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
-        "submit a prompt in Devin",
+        "next": "finish the current turn; never kill productive sessions; "
+        "Claude: relaunch, then use --resume to restore the conversation; "
+        "Codex: use a fresh provider/app-server process or explicit MCP reload; "
+        "resume alone may retain loaded CAC tools; Devin: resume behavior is unproven; "
+        "restore may work, but verify CAC tools with a version or discovery check; "
+        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks)",
         "remote_trust": "tailscale_acl",
         "version": "0.5.11",
     }
@@ -746,10 +749,12 @@ def test_doctor_reports_an_inherited_claude_child_session_marker(
         "should be relaunched normally (not from inside a Claude session)."
     )
     assert result["next"] == (
-        "finish the current turn, then start a fresh Claude Code or Codex session "
-        "or relaunch the provider and resume the existing one; "
-        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
-        "submit a prompt in Devin"
+        "finish the current turn; never kill productive sessions; "
+        "Claude: relaunch, then use --resume to restore the conversation; "
+        "Codex: use a fresh provider/app-server process or explicit MCP reload; "
+        "resume alone may retain loaded CAC tools; Devin: resume behavior is unproven; "
+        "restore may work, but verify CAC tools with a version or discovery check; "
+        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks)"
     )
 
     assert cli.run(parser().parse_args(["doctor"])) == 0
@@ -764,10 +769,12 @@ def test_doctor_reports_an_inherited_claude_child_session_marker(
         "should be relaunched normally (not from inside a Claude session)." in lines
     )
     assert (
-        "next: finish the current turn, then start a fresh Claude Code or Codex session "
-        "or relaunch the provider and resume the existing one; "
-        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
-        "submit a prompt in Devin" in lines
+        "next: finish the current turn; never kill productive sessions; "
+        "Claude: relaunch, then use --resume to restore the conversation; "
+        "Codex: use a fresh provider/app-server process or explicit MCP reload; "
+        "resume alone may retain loaded CAC tools; Devin: resume behavior is unproven; "
+        "restore may work, but verify CAC tools with a version or discovery check; "
+        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks)" in lines
     )
 
 
@@ -825,10 +832,12 @@ def test_doctor_omits_the_terminal_diagnostic_without_the_marker(
         "codex_native_queue": "stop-bound",
         "integration": "healthy",
         "local_broker": "healthy",
-        "next": "finish the current turn, then start a fresh Claude Code or Codex session "
-        "or relaunch the provider and resume the existing one; "
-        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks); "
-        "submit a prompt in Devin",
+        "next": "finish the current turn; never kill productive sessions; "
+        "Claude: relaunch, then use --resume to restore the conversation; "
+        "Codex: use a fresh provider/app-server process or explicit MCP reload; "
+        "resume alone may retain loaded CAC tools; Devin: resume behavior is unproven; "
+        "restore may work, but verify CAC tools with a version or discovery check; "
+        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks)",
         "remote_trust": "tailscale_acl",
         "version": "0.5.11",
     }
@@ -2451,9 +2460,11 @@ def test_doctor_json_reports_no_codex_hook_trust_verdict(
     }
     assert report["integration"] == "healthy"
     assert report["next"] == (
-        "finish the current turn, then start a fresh Claude Code or Codex session "
-        "or relaunch the provider and resume the existing one; "
-        "approve the new Cross Agent Chat hooks if Codex asks (Codex CLI: /hooks)"
+        "finish the current turn; never kill productive sessions; "
+        "Claude: relaunch, then use --resume to restore the conversation; "
+        "Codex: use a fresh provider/app-server process or explicit MCP reload; "
+        "resume alone may retain loaded CAC tools; approve the new Cross Agent Chat hooks "
+        "if Codex asks (Codex CLI: /hooks)"
     )
     # doctor is read-only against the provider files it inspects.
     assert installer.codex_config.read_bytes() == config_before
@@ -2481,8 +2492,8 @@ def test_doctor_next_is_scoped_to_selected_providers(
     assert report["integration"] == "healthy"
     assert "codex_hooks" not in report
     assert report["next"] == (
-        "finish the current turn, then start a fresh Claude Code session "
-        "or relaunch the provider and resume the existing one"
+        "finish the current turn; never kill productive sessions; "
+        "Claude: relaunch, then use --resume to restore the conversation"
     )
 
     # An unhealthy profile points setup at the actual executable, not a bare
@@ -2513,7 +2524,7 @@ def test_setup_completion_reports_installed_not_ready_and_scopes_advice(
     assert "is ready" not in output
     assert "Cross Agent Chat installed for Claude Code and Codex on studio." in output
     assert "Existing provider logins were left unchanged." in output
-    assert "finish the current turn, then open a new Claude Code or Codex session" in output
+    assert "finish the current turn; never kill productive sessions" in output
     # The advice is conditional on a Codex prompt, not on observed trust
     # state, and names the exact selected Codex root and the no-hand-edit
     # rule.
@@ -2597,7 +2608,7 @@ def test_setup_completion_names_only_the_selected_providers(
     assert "Cross Agent Chat installed for Devin on studio." in output
     assert "Claude" not in output.split("installed for", maxsplit=1)[1]
     assert "Codex" not in output.split("installed for", maxsplit=1)[1]
-    assert "submit a prompt in Devin" in output
+    assert "Devin: resume behavior is unproven" in output
     assert "Diagnostics: /opt/cross-agent-chat doctor --json" in output
 
     # A Claude-only selection emits no Codex review line at all.

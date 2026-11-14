@@ -24,37 +24,29 @@ secrets those files hold (see [setup and data handling](SECURITY.md)).
 Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
 limits the set.
 
-Install the latest published release, v0.5.7, with:
+Install v0.5.11 with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.7/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.11/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
-This builds the published `v0.5.7` tag and installs the command at
+This builds the released `v0.5.11` tag and installs the command at
 `~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
 Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
 not found in your shell, use the full path the installer reports. Run it on
 each participating Mac.
 
-**Then finish the current turn and open a new conversation, or relaunch the
-provider and resume an existing one when convenient** — sessions load Cross
-Agent Chat when they start and already-running ones keep what they loaded
-until that normal boundary. Do not kill or restart productive work just to
-activate an upgrade. A local Devin conversation joins the peer list after its
-first prompt.
-
-The current 0.5.11 source is on `main` but has no Git tag or GitHub release
-yet. Do not use a `v0.5.11` install URL. To test the exact accepted head before
-publication, fetch the installer from `main` and pin the source explicitly:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/main/install.sh \
-  | CROSS_AGENT_CHAT_SOURCE=git+https://github.com/kwonsyup/cross-agent-chat.git@af8c76ce05562ea71d03349cbaefa46174abad1f \
-    CROSS_AGENT_CHAT_APPROVE=1 sh
-```
+After upgrading, finish the current turn and never kill productive work for
+adoption. Claude: relaunch, then use `--resume` to restore the conversation;
+this starts a new process and reloads MCP configuration. Codex: `resume`
+restores the thread, but an already-running app-server may retain its loaded
+MCP runtime; a fresh provider/app-server process or explicit MCP reload is the
+reliable boundary. Devin resume behavior is unproven: it may restore the
+conversation, but verify CAC tools with a version or discovery check and do
+not treat resume as a fresh process.
 
 **Codex:** newly installed hooks may need a one-time review in the selected
 profile through its normal hook-review flow (the CLI documents `/hooks`).
