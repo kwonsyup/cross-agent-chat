@@ -24,16 +24,16 @@ secrets those files hold (see [setup and data handling](SECURITY.md)).
 Adding `CROSS_AGENT_CHAT_PROVIDERS=claude,codex` to the install command
 limits the set.
 
-Install v0.5.9 with:
+Install v0.5.10 with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.9/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
+curl -fsSL https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.10/install.sh | CROSS_AGENT_CHAT_APPROVE=1 sh
 ```
 
 Running the same command without `CROSS_AGENT_CHAT_APPROVE=1` only prints the
 planned effects and exits, so you can preview it first.
 
-This builds the released `v0.5.9` tag and installs the command at
+This builds the released `v0.5.10` tag and installs the command at
 `~/.local/bin/cross-agent-chat` by default (an existing owner-local Cross
 Agent Chat entrypoint is reused instead) — if a bare `cross-agent-chat` is
 not found in your shell, use the full path the installer reports. Run it on
@@ -346,6 +346,16 @@ event — it does not cancel work or make resending equivalent uncertain work
 safe. Turn-bound queues live
 in courier memory; a crash can lose a pending copy. See
 [SECURITY.md](SECURITY.md).
+
+**In v0.5.10:** `chat_peers` reports a Codex `consumer_kind` of `interactive`,
+`exec`, or `unknown`. Detached Codex exec sessions refuse `chat_send` before
+provider effect, and their Stop hooks never inject peer content. Stop-bound
+injection runs only after affirmative interactive classification; unknown
+metadata is deferred and remains pending. Queued events for a known exec
+session are settled as `PRE_EFFECT_REJECTED` when the body was never handed to
+the provider, or `UNKNOWN_DELIVERY` when handoff cannot be ruled out. Stop-bound
+Codex delivery remains next-turn/next-prompt behavior and does not promise an
+idle wake.
 
 </details>
 

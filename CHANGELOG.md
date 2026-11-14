@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.10 - 2026-11-14
+
+- Report Codex `consumer_kind` in discovery as `interactive`, `exec`, or
+  `unknown`. Detached `codex exec` recipients refuse before provider effect;
+  their Stop hooks never inject peer content.
+- Permit Stop-bound injection only after affirmative interactive
+  classification. Unknown or slow metadata stays pending and records a
+  body-free deferral reason; it never claims an idle wake.
+- Settle queued events for known exec sessions as `PRE_EFFECT_REJECTED` when
+  the body was never handed to the provider, or `UNKNOWN_DELIVERY` when a
+  provider handoff cannot be ruled out. Sender status exposes the terminal
+  refusal and reason.
+
 ## 0.5.9 - 2026-11-12
 
 - Record a durable transport receipt before a courier answers an accept
