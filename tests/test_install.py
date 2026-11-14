@@ -289,10 +289,7 @@ def test_published_install_references_match_package_version() -> None:
     readme = (root / "README.md").read_text()
     assert "Install the latest published release, v0.5.7, with:" in readme
     assert "https://raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.7/install.sh" in readme
-    assert (
-        "The current 0.5.11 source is on `main` but has no Git tag or GitHub release yet."
-        in readme
-    )
+    assert "The current 0.5.11 source is on `main` but has no Git tag or GitHub release yet." in readme
     assert "raw.githubusercontent.com/kwonsyup/cross-agent-chat/v0.5.11/install.sh" not in readme
     changelog_versions = re.findall(
         r"^## (\d+\.\d+\.\d+) -", (root / "CHANGELOG.md").read_text(), flags=re.MULTILINE
