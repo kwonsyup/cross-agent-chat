@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.11 - 2026-11-14
+
+- Qualify Codex app-server 0.169.0 for owning-daemon input, including idle wake through `thread/queue/add` and active-turn steering through `turn/steer`.
+
 ## 0.5.10 - 2026-11-14
 
 - Report Codex `consumer_kind` in discovery as `interactive`, `exec`, or

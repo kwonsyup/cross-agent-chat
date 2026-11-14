@@ -227,7 +227,7 @@ def test_sender_status_surfaces_exec_refusal_as_terminal_no_effect(
         lambda *_args: (
             {
                 "event_state": "pre_effect_rejected",
-                "courier_version": "0.5.10",
+                "courier_version": "0.5.11",
                 "courier_incarnation": str(uuid4()),
                 "reason": runtime.COURIER_EXEC_PENDING_REFUSAL_REASON,
             },
