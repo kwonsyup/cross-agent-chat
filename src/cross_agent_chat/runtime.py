@@ -10,6 +10,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -67,6 +68,7 @@ from cross_agent_chat.core import (
     ChatError,
     DeliveryReceiptStore,
     Intent,
+    IntentStatus,
     IntentStore,
     Provider,
     Registry,
@@ -171,6 +173,12 @@ BOOTSTRAP_FRAME_TIMEOUT_SECONDS: Final = 0.1
 COURIER_BUSY_PRE_EFFECT_REASON: Final = "session courier is busy with another delivery"
 COURIER_EXEC_PRE_EFFECT_REASON: Final = (
     "Codex exec session is non-deliverable; no interactive consumer is available"
+)
+COURIER_EXEC_PENDING_REFUSAL_REASON: Final = (
+    "Codex exec session is non-deliverable; queued event was refused before provider handoff"
+)
+COURIER_STOP_METADATA_UNKNOWN_REASON: Final = (
+    "Codex consumer kind is unknown; Stop delivery was deferred pending authoritative metadata"
 )
 # A frame whose read finished after shutdown or a route generation change was
 # never effect-admitted; the decided pre-effect rejection tells its sender so.
@@ -2130,6 +2138,7 @@ FORWARDABLE_PRE_EFFECT_REASONS: Final = frozenset(
         "session courier is still bootstrapping",
         COURIER_BUSY_PRE_EFFECT_REASON,
         COURIER_EXEC_PRE_EFFECT_REASON,
+        COURIER_EXEC_PENDING_REFUSAL_REASON,
         COURIER_STOPPED_PRE_EFFECT_REASON,
         "Codex courier is unavailable",
         "Codex courier queue is full",  # Older receivers used this for every provider.
@@ -2412,7 +2421,8 @@ def courier_server(
             path.unlink()
         raise
     native_queue: tuple[Path, dict[str, str], str] | None = None
-    consumer_kind: CodexConsumerKind | None = None
+    consumer_kind: CodexConsumerKind | None = "unknown" if provider == "codex" else None
+    stop_deferred_reason: str | None = None
     helper_lineage = provider == "codex" and NativeHelperStore(root).is_helper_lineage(route)
     helper_queue = False
     if helper_lineage:
@@ -2514,6 +2524,7 @@ def courier_server(
     )
 
     def serve_connection(connection: socket.socket) -> None:
+        nonlocal stop_deferred_reason
         try:
             with connection:
                 connection.settimeout(
@@ -2588,6 +2599,11 @@ def courier_server(
                                 "generation": route.generation,
                                 "courier_version": __version__,
                                 "courier_incarnation": incarnation,
+                                **(
+                                    {"reason": stop_deferred_reason}
+                                    if stop_deferred_reason is not None
+                                    else {}
+                                ),
                                 **observation,
                             },
                         )
@@ -2647,6 +2663,37 @@ def courier_server(
                                 ),
                             ),
                         )
+                elif operation == "defer_stop":
+                    reason = request.get("reason")
+                    if route.provider != "codex" or not isinstance(reason, str) or not reason:
+                        return
+                    stop_deferred_reason = reason
+                    emit_frame_safely(
+                        connection,
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            "status": "STOP_DEFERRED",
+                            "generation": route.generation,
+                            "reason": reason,
+                        },
+                    )
+                elif operation == "reject_exec_pending":
+                    if route.provider != "codex" or consumer_kind != "exec" or courier is None:
+                        return
+                    rejected, unknown = courier.reject_pending()
+                    _mark_exec_stop_events(root, rejected, "PRE_EFFECT_REJECTED")
+                    _mark_exec_stop_events(root, unknown, "UNKNOWN_DELIVERY")
+                    emit_frame_safely(
+                        connection,
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            "status": "EXEC_PENDING_REJECTED",
+                            "generation": route.generation,
+                            "event_ids": rejected,
+                            "unknown_event_ids": unknown,
+                            "reason": COURIER_EXEC_PENDING_REFUSAL_REASON,
+                        },
+                    )
                 elif operation == "shutdown":
                     # Publish the stop BEFORE its acknowledgement: the accept
                     # admission recheck reads this flag, so any caller that has
@@ -2898,6 +2945,10 @@ def courier_server(
         workers.shutdown(wait=True)
         refusals.shutdown(wait=True)
         if courier is not None:
+            if consumer_kind == "exec":
+                rejected, unknown = courier.reject_pending()
+                _mark_exec_stop_events(root, rejected, "PRE_EFFECT_REJECTED")
+                _mark_exec_stop_events(root, unknown, "UNKNOWN_DELIVERY")
             courier.clear()
         server.close()
         try:
@@ -3038,7 +3089,7 @@ def _local_target(
             ),
             consumer_kind=(
                 observed_consumer_kind
-                if observed_consumer_kind in {"interactive", "exec"}
+                if observed_consumer_kind in {"interactive", "exec", "unknown"}
                 else None
             ),
             # The reader shares the custody store's filesystem, so the local
@@ -3314,7 +3365,7 @@ def _targets_from_tailnet(
                 consumer_kind=(
                     cast(CodexConsumerKind, observed_consumer_kind)
                     if isinstance(observed_consumer_kind, str)
-                    and observed_consumer_kind != "unknown"
+                    and observed_consumer_kind in {"interactive", "exec", "unknown"}
                     else None
                 ),
                 title=valid_name(title, "remote title") if isinstance(title, str) else None,
@@ -5772,7 +5823,9 @@ INSPECT_TIMEOUT_SECONDS: Final = 1.0
 
 ReceivingObserver = Literal["original_courier", "native_helper"]
 
-_COURIER_EVENT_STATES: Final = frozenset({"pending", "handed_off", "unseen", "no_courier_queue"})
+_COURIER_EVENT_STATES: Final = frozenset(
+    {"pending", "handed_off", "unseen", "no_courier_queue", "pre_effect_rejected"}
+)
 # The failure tokens a remote inspect answer may carry; the requester maps each
 # to its own prose, so a peer can never inject body text into a status read.
 _RECEIVER_CHECK_ACTION: Final = (
@@ -5911,7 +5964,13 @@ def _inspect_receiving_courier(
     }
     state = response.get("event_state")
     if (
-        set(response) not in (expected, expected | {"pending_count", "oldest_pending_age_seconds"})
+        set(response)
+        not in (
+            expected,
+            expected | {"pending_count", "oldest_pending_age_seconds"},
+            expected | {"reason"},
+            expected | {"pending_count", "oldest_pending_age_seconds", "reason"},
+        )
         or response.get("schema_version") != SCHEMA_VERSION
         or response.get("status") != "INSPECTED"
         or response.get("generation") != route.generation
@@ -5920,6 +5979,7 @@ def _inspect_receiving_courier(
         or not isinstance(state, str)
         or state not in _COURIER_EVENT_STATES
         or not _pending_fields_valid(response)
+        or ("reason" in response and not isinstance(response["reason"], str))
     ):
         return None, "observation_invalid"
     fields: dict[str, object] = {
@@ -5930,6 +5990,8 @@ def _inspect_receiving_courier(
     if "pending_count" in response:
         fields["pending_count"] = response["pending_count"]
         fields["oldest_pending_age_seconds"] = response["oldest_pending_age_seconds"]
+    if "reason" in response:
+        fields["reason"] = response["reason"]
     return fields, None
 
 
@@ -5979,6 +6041,8 @@ def _receiving_state_observation(
         observation["pending_count"] = pending_count
         observation["oldest_pending_age_seconds"] = pending_age
         observation["detail"] = f"{holder} still holds the event; {boundary} has not taken it"
+        if isinstance(fields.get("reason"), str):
+            observation["reason"] = fields["reason"]
     elif state == "handed_off":
         observation["stage"] = "handed_off"
         if isinstance(pending_count, int):
@@ -6020,6 +6084,13 @@ def _receiving_state_observation(
         observation["detail"] = (
             f"the live {holder} holds no record of the event; a "
             "same-generation courier restart forgets volatile custody"
+        )
+    elif state == "pre_effect_rejected":
+        observation["stage"] = "pre_effect_rejected"
+        observation["reason"] = fields.get("reason", COURIER_EXEC_PENDING_REFUSAL_REASON)
+        observation["detail"] = (
+            "the receiving courier removed this event before provider handoff; "
+            "nothing was delivered"
         )
     else:
         observation["stage"] = "unknown"
@@ -6345,6 +6416,17 @@ def _event_status_payload(
         "delivery_observation": "not_observed",
         "receiving_observation": _receiving_observation(root, intent, recipient=recipient),
     }
+    observation = payload["receiving_observation"]
+    if (
+        intent.status == "TRANSPORT_ACCEPTED"
+        and isinstance(observation, dict)
+        and observation.get("stage") == "pre_effect_rejected"
+    ):
+        with suppress(ChatError, OSError):
+            IntentStore(root).mark(intent.event_id, "PRE_EFFECT_REJECTED")
+        payload["status"] = "PRE_EFFECT_REJECTED"
+        payload["delivery_observation"] = "pre_effect_rejected"
+        return payload
     if intent.status in _LATE_UPGRADABLE_STATUSES:
         # The receiving node attests its own durable transport receipt over the
         # authenticated inspect channel; the same exact (event, target) binding
@@ -6404,6 +6486,73 @@ def owner_event_status(
 
 CODEX_STOP_DEADLINE_SECONDS: Final = 2.0
 CODEX_STOP_FINISH_MARGIN_SECONDS: Final = 0.05
+
+
+def _hook_consumer_kind(raw: dict[str, object]) -> CodexConsumerKind:
+    """Use only provider-attested hook metadata as a Stop-time fallback."""
+    originator = raw.get("originator")
+    source = raw.get("source")
+    if originator == "codex_exec" or source == "exec":
+        return "exec"
+    if originator == "codex-tui" or source in {"vscode", "native", "tui"}:
+        return "interactive"
+    return "unknown"
+
+
+def _process_consumer_kind(pid: int) -> CodexConsumerKind:
+    """Classify only the owning Codex process argv, never cwd or display text."""
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-ww", "-p", str(pid), "-o", "command="],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+    except (AssertionError, OSError, subprocess.SubprocessError):
+        return "unknown"
+    if result.returncode != 0:
+        return "unknown"
+    try:
+        argv = shlex.split(result.stdout.strip())
+    except ValueError:
+        return "unknown"
+    codex_index = next(
+        (index for index, token in enumerate(argv) if Path(token).name == "codex"), None
+    )
+    if codex_index is None:
+        return "unknown"
+    tail = argv[codex_index + 1 :]
+    if tail and tail[0] == "exec":
+        return "exec"
+    if not tail:
+        return "interactive"
+    return "unknown"
+
+
+def _mark_exec_stop_events(root: Path, event_ids: list[str], status: IntentStatus) -> None:
+    for event_id in event_ids:
+        with suppress(ChatError, OSError):
+            IntentStore(root).mark(event_id, status)
+
+
+def _defer_unknown_codex_stop(root: Path, route: Route, *, deadline: float, reason: str) -> None:
+    """Record a body-free Stop deferral in the live courier for status reads."""
+    timeout = deadline - time.monotonic() - CODEX_STOP_FINISH_MARGIN_SECONDS
+    if timeout <= 0:
+        return
+    with suppress(ChatError):
+        request_socket(
+            socket_path(root, route),
+            {
+                "schema_version": SCHEMA_VERSION,
+                "operation": "defer_stop",
+                "generation": route.generation,
+                "reason": reason,
+            },
+            timeout=timeout,
+        )
 
 
 def codex_stop(pid: int, state_root_value: str | None) -> None:
@@ -6478,6 +6627,16 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
                 "consumer_kind",
             )
         ),
+        frozenset((*base_health, "consumer_kind")),
+        frozenset((*base_health, "delivery_mode", "consumer_kind")),
+        frozenset(
+            (
+                *base_health,
+                "delivery_mode",
+                "direct_delivery_mode",
+                "consumer_kind",
+            )
+        ),
     }
     if frozenset(health) not in allowed or any(
         health.get(key) != value for key, value in base_health.items()
@@ -6485,7 +6644,46 @@ def codex_stop(pid: int, state_root_value: str | None) -> None:
         print("{}", flush=True)
         return
     direct_mode = health.get("direct_delivery_mode", health.get("delivery_mode"))
-    if health.get("consumer_kind") == "exec":
+    observed_consumer_kind = health.get("consumer_kind")
+    consumer_kind = (
+        observed_consumer_kind
+        if observed_consumer_kind in {"interactive", "exec"}
+        else _hook_consumer_kind(raw)
+    )
+    if consumer_kind == "unknown":
+        consumer_kind = _process_consumer_kind(pid)
+    if consumer_kind == "exec":
+        try:
+            rejected = request_before_deadline(
+                socket_path(root, route),
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "operation": "reject_exec_pending",
+                    "generation": route.generation,
+                },
+            )
+            if rejected is not None and rejected.get("status") == "EXEC_PENDING_REJECTED":
+                raw_event_ids = rejected.get("event_ids", [])
+                _mark_exec_stop_events(
+                    root,
+                    [
+                        valid_uuid(event_id, "event id")
+                        for event_id in (raw_event_ids if isinstance(raw_event_ids, list) else [])
+                        if isinstance(event_id, str)
+                    ],
+                    "PRE_EFFECT_REJECTED",
+                )
+        except ChatError:
+            pass
+        print("{}", flush=True)
+        return
+    if consumer_kind != "interactive":
+        _defer_unknown_codex_stop(
+            root,
+            route,
+            deadline=deadline,
+            reason=COURIER_STOP_METADATA_UNKNOWN_REASON,
+        )
         print("{}", flush=True)
         return
     if direct_mode != "codex_stop_bound":

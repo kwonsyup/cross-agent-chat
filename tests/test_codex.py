@@ -20,7 +20,7 @@ from cross_agent_chat.codex import (
     native_thread_titles,
     queue_native_input,
 )
-from cross_agent_chat.core import ChatError, Registry, Route, UnknownDeliveryError
+from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, UnknownDeliveryError
 from cross_agent_chat.runtime import MAX_FRAME_BYTES, codex_stop, register, unregister
 
 FAKE_SERVER_READY_SECONDS = 30.0
@@ -110,7 +110,154 @@ def test_interactive_courier_accept_remains_deliverable() -> None:
     assert [item["event_id"] for item in courier.peek()] == [event_id]
 
 
+def test_exec_queued_event_is_terminalized_before_courier_teardown(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(source)
+    Registry(root).upsert(target)
+    event_id = IntentStore(root).begin(
+        source,
+        target,
+        source_alias=source.alias,
+        payload_digest="a" * 64,
+        event_id=str(uuid4()),
+    )
+    IntentStore(root).mark(event_id, "TRANSPORT_ACCEPTED")
+    courier = CodexCourier(alias=target.alias, generation=target.generation)
+    courier.accept(event_id, "queued exec body")
+
+    rejected, unknown = courier.reject_pending()
+    for identifier in rejected:
+        IntentStore(root).mark(identifier, "PRE_EFFECT_REJECTED")
+    for identifier in unknown:
+        IntentStore(root).mark(identifier, "UNKNOWN_DELIVERY")
+    courier.clear()
+
+    assert rejected == [event_id]
+    assert unknown == []
+    intent = IntentStore(root).lookup(event_id)
+    assert intent is not None
+    assert intent.status == "PRE_EFFECT_REJECTED"
+
+
+def test_sender_status_surfaces_exec_refusal_as_terminal_no_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(source)
+    Registry(root).upsert(target)
+    event_id = IntentStore(root).begin(
+        source,
+        target,
+        source_alias=source.alias,
+        payload_digest="b" * 64,
+        event_id=str(uuid4()),
+    )
+    IntentStore(root).mark(event_id, "TRANSPORT_ACCEPTED")
+    monkeypatch.setattr(
+        runtime,
+        "_receiving_delivery",
+        lambda *_args: (target, target, "original_courier", None),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_inspect_receiving_courier",
+        lambda *_args: (
+            {
+                "event_state": "pre_effect_rejected",
+                "courier_version": "0.5.10",
+                "courier_incarnation": str(uuid4()),
+                "reason": runtime.COURIER_EXEC_PENDING_REFUSAL_REASON,
+            },
+            None,
+        ),
+    )
+
+    status = runtime.owner_event_status(root, event_id)
+
+    assert status["status"] == "PRE_EFFECT_REJECTED"
+    assert status["delivery_observation"] == "pre_effect_rejected"
+    intent = IntentStore(root).lookup(event_id)
+    assert intent is not None
+    assert intent.status == "PRE_EFFECT_REJECTED"
+
+
 def test_exec_stop_hook_does_not_peek_or_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
+            )
+        ),
+    )
+    calls: list[str] = []
+
+    def request(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        calls.append(str(payload["operation"]))
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+            "delivery_mode": "codex_stop_bound",
+            "direct_delivery_mode": "codex_stop_bound",
+            "delivery_mechanism": "stop_bound",
+            "consumer_kind": "exec",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+    codex_stop(os.getpid(), str(root))
+
+    assert calls == ["health", "reject_exec_pending"]
+    assert capsys.readouterr().out == "{}\n"
+
+
+def test_unknown_consumer_kind_defers_stop_and_records_pending_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = tmp_path / "state"
@@ -135,22 +282,49 @@ def test_exec_stop_hook_does_not_peek_or_ack(
 
     def request(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
         calls.append(str(payload["operation"]))
+        if payload["operation"] == "health":
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "generation": route.generation,
+                "alias": route.alias,
+                "delivery_mode": "codex_stop_bound",
+                "direct_delivery_mode": "codex_stop_bound",
+                "delivery_mechanism": "stop_bound",
+                "consumer_kind": "unknown",
+            }
         return {
             "schema_version": 1,
-            "status": "READY",
+            "status": "STOP_DEFERRED",
             "generation": route.generation,
-            "alias": route.alias,
-            "delivery_mode": "codex_stop_bound",
-            "direct_delivery_mode": "codex_stop_bound",
-            "delivery_mechanism": "stop_bound",
-            "consumer_kind": "exec",
+            "reason": runtime.COURIER_STOP_METADATA_UNKNOWN_REASON,
         }
 
     monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
     codex_stop(os.getpid(), str(root))
 
-    assert calls == ["health"]
+    assert calls == ["health", "defer_stop"]
     assert capsys.readouterr().out == "{}\n"
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["/usr/local/bin/codex", "exec", "prompt"], "exec"),
+        (["/usr/local/bin/codex"], "interactive"),
+        (["/usr/local/bin/codex", "--cd", "/tmp"], "unknown"),
+    ],
+)
+def test_process_consumer_kind_uses_only_codex_argv(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str], expected: str
+) -> None:
+    class Result:
+        returncode = 0
+        stdout = " ".join(argv)
+
+    monkeypatch.setattr("cross_agent_chat.runtime.subprocess.run", lambda *args, **kwargs: Result())
+
+    assert runtime._process_consumer_kind(os.getpid()) == expected
 
 
 def test_stop_shares_one_deadline_across_health_peek_and_ack(
@@ -170,7 +344,12 @@ def test_stop_shares_one_deadline_across_health_peek_and_ack(
         "sys.stdin",
         io.StringIO(
             json.dumps(
-                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
             )
         ),
     )
@@ -224,7 +403,12 @@ def test_stop_does_not_ack_without_remaining_budget_and_reports_unknown_ack_once
         "sys.stdin",
         io.StringIO(
             json.dumps(
-                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
             )
         ),
     )
@@ -273,7 +457,12 @@ def test_stop_does_not_ack_without_remaining_budget_and_reports_unknown_ack_once
         "sys.stdin",
         io.StringIO(
             json.dumps(
-                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
             )
         ),
     )
@@ -299,7 +488,12 @@ def test_stop_deadline_bounds_slow_real_unix_socket_exchanges(
         "sys.stdin",
         io.StringIO(
             json.dumps(
-                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
             )
         ),
     )
@@ -404,6 +598,7 @@ def test_stop_skips_legacy_experimental_native_queue_without_peeking(
                     "hook_event_name": "Stop",
                     "session_id": route.session_id,
                     "cwd": route.cwd,
+                    "originator": "codex-tui",
                 }
             )
         ),
@@ -447,7 +642,12 @@ def test_stop_requires_exact_stop_bound_health_before_peeking(
         "sys.stdin",
         io.StringIO(
             json.dumps(
-                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
             )
         ),
     )
@@ -494,7 +694,12 @@ def test_stop_uses_direct_stop_mode_when_helper_routing_mode_is_experimental(
         "sys.stdin",
         io.StringIO(
             json.dumps(
-                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
             )
         ),
     )
@@ -546,7 +751,12 @@ def test_stop_rejects_a_health_answer_carrying_an_unrequested_key(
         "sys.stdin",
         io.StringIO(
             json.dumps(
-                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
             )
         ),
     )

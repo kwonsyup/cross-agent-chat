@@ -510,6 +510,7 @@ class CodexCourier:
         # never saw -- or one a same-generation restart or bound eviction
         # forgot -- stays "unseen" instead of being misreported as delivered.
         self._retired: OrderedDict[str, float] = OrderedDict()
+        self._pre_effect_rejected: OrderedDict[str, float] = OrderedDict()
         # The courier listener and the one delivery worker share this queue, so
         # every read or mutation takes the short lock; the native-queue RPC in
         # accept is deliberately outside it so queue controls never wait on a
@@ -676,6 +677,8 @@ class CodexCourier:
         with self._lock:
             if identifier in self._handed_off or identifier in self._retired:
                 state = "handed_off"
+            elif identifier in self._pre_effect_rejected:
+                state = "pre_effect_rejected"
             elif identifier in self._pending:
                 state = "pending"
             else:
@@ -706,12 +709,33 @@ class CodexCourier:
         with self._lock:
             return list(self._pending)
 
+    def reject_pending(self) -> tuple[list[str], list[str]]:
+        """Drop only queued bodies never handed to a provider boundary.
+
+        The first list is a decided no-effect refusal.  The second list is
+        conservatively unknown when a native dispatch claim already exists.
+        """
+        rejected: list[str] = []
+        unknown: list[str] = []
+        with self._lock:
+            for event_id in list(self._pending):
+                if event_id in self._handed_off:
+                    unknown.append(event_id)
+                else:
+                    rejected.append(event_id)
+                    self._pre_effect_rejected[event_id] = time.monotonic()
+                del self._pending[event_id]
+                self._unresolved.discard(event_id)
+                self._handed_off.discard(event_id)
+        return rejected, unknown
+
     def clear(self) -> None:
         with self._lock:
             self._pending.clear()
             self._unresolved.clear()
             self._handed_off.clear()
             self._retired.clear()
+            self._pre_effect_rejected.clear()
 
 
 def hook_context(messages: list[dict[str, str]]) -> str:
