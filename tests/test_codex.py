@@ -3,7 +3,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import sys
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -11,14 +13,14 @@ from uuid import uuid4
 
 import pytest
 
-from cross_agent_chat import __version__
+from cross_agent_chat import __version__, runtime
 from cross_agent_chat.codex import (
     CodexCourier,
     deliver_at_stop,
     native_thread_titles,
     queue_native_input,
 )
-from cross_agent_chat.core import ChatError, Registry, Route, UnknownDeliveryError
+from cross_agent_chat.core import ChatError, IntentStore, Registry, Route, UnknownDeliveryError
 from cross_agent_chat.runtime import MAX_FRAME_BYTES, codex_stop, register, unregister
 
 FAKE_SERVER_READY_SECONDS = 30.0
@@ -66,6 +68,607 @@ def test_stop_without_registered_route_is_silent_noop(
     assert capsys.readouterr().out == "{}\n"
 
 
+def test_exec_courier_accept_is_decided_pre_effect() -> None:
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd="/tmp",
+        pid=os.getpid(),
+    )
+    courier = CodexCourier(alias=route.alias, generation=route.generation)
+
+    response = runtime.courier_accept(
+        route,
+        courier,
+        str(uuid4()),
+        "must not enter an exec session",
+        consumer_kind="exec",
+    )
+
+    assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response.get("error") == runtime.COURIER_EXEC_PRE_EFFECT_REASON
+    assert courier.peek() == []
+
+
+def test_exec_stop_authority_upgrades_unknown_courier_kind_before_rejection() -> None:
+    courier = CodexCourier(
+        alias="codex@studio:exec:123456789abc",
+        generation=str(uuid4()),
+        consumer_kind="unknown",
+    )
+    event_id = str(uuid4())
+    courier.accept(event_id, "queued before metadata timeout")
+
+    assert courier.update_consumer_kind("exec") is True
+    rejected, unknown = courier.reject_pending()
+
+    assert courier.consumer_kind == "exec"
+    assert rejected == [event_id]
+    assert unknown == []
+
+
+def test_courier_kind_updates_never_downgrade_known_values() -> None:
+    interactive = CodexCourier(
+        alias="codex@studio:interactive:123456789abc",
+        generation=str(uuid4()),
+        consumer_kind="interactive",
+    )
+    exec_courier = CodexCourier(
+        alias="codex@studio:exec:123456789abc",
+        generation=str(uuid4()),
+        consumer_kind="exec",
+    )
+
+    assert interactive.update_consumer_kind("exec") is False
+    assert interactive.consumer_kind == "interactive"
+    assert exec_courier.update_consumer_kind("interactive") is False
+    assert exec_courier.consumer_kind == "exec"
+
+
+def test_interactive_courier_accept_remains_deliverable() -> None:
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd="/tmp",
+        pid=os.getpid(),
+    )
+    courier = CodexCourier(alias=route.alias, generation=route.generation)
+    event_id = str(uuid4())
+
+    response = runtime.courier_accept(
+        route, courier, event_id, "interactive delivery", consumer_kind="interactive"
+    )
+
+    assert response["status"] == "TRANSPORT_ACCEPTED"
+    assert [item["event_id"] for item in courier.peek()] == [event_id]
+
+
+def test_exec_queued_event_is_terminalized_before_courier_teardown(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(source)
+    Registry(root).upsert(target)
+    event_id = IntentStore(root).begin(
+        source,
+        target,
+        source_alias=source.alias,
+        payload_digest="a" * 64,
+        event_id=str(uuid4()),
+    )
+    IntentStore(root).mark(event_id, "TRANSPORT_ACCEPTED")
+    courier = CodexCourier(alias=target.alias, generation=target.generation)
+    courier.accept(event_id, "queued exec body")
+
+    rejected, unknown = courier.reject_pending()
+    for identifier in rejected:
+        IntentStore(root).mark(identifier, "PRE_EFFECT_REJECTED")
+    for identifier in unknown:
+        IntentStore(root).mark(identifier, "UNKNOWN_DELIVERY")
+    courier.clear()
+
+    assert rejected == [event_id]
+    assert unknown == []
+    intent = IntentStore(root).lookup(event_id)
+    assert intent is not None
+    assert intent.status == "PRE_EFFECT_REJECTED"
+
+
+def test_sender_status_surfaces_exec_refusal_as_terminal_no_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    target = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(source)
+    Registry(root).upsert(target)
+    event_id = IntentStore(root).begin(
+        source,
+        target,
+        source_alias=source.alias,
+        payload_digest="b" * 64,
+        event_id=str(uuid4()),
+    )
+    IntentStore(root).mark(event_id, "TRANSPORT_ACCEPTED")
+    monkeypatch.setattr(
+        runtime,
+        "_receiving_delivery",
+        lambda *_args: (target, target, "original_courier", None),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_inspect_receiving_courier",
+        lambda *_args: (
+            {
+                "event_state": "pre_effect_rejected",
+                "courier_version": "0.5.10",
+                "courier_incarnation": str(uuid4()),
+                "reason": runtime.COURIER_EXEC_PENDING_REFUSAL_REASON,
+            },
+            None,
+        ),
+    )
+
+    status = runtime.owner_event_status(root, event_id)
+
+    assert status["status"] == "PRE_EFFECT_REJECTED"
+    assert status["delivery_observation"] == "pre_effect_rejected"
+    intent = IntentStore(root).lookup(event_id)
+    assert intent is not None
+    assert intent.status == "PRE_EFFECT_REJECTED"
+
+
+def test_exec_stop_hook_does_not_peek_or_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
+            )
+        ),
+    )
+    calls: list[str] = []
+
+    def request(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        calls.append(str(payload["operation"]))
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+            "delivery_mode": "codex_stop_bound",
+            "direct_delivery_mode": "codex_stop_bound",
+            "delivery_mechanism": "stop_bound",
+            "consumer_kind": "exec",
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+    codex_stop(os.getpid(), str(root))
+
+    assert calls == ["health", "reject_exec_pending"]
+    assert capsys.readouterr().out == "{}\n"
+
+
+def test_unknown_consumer_kind_defers_stop_and_records_pending_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+            )
+        ),
+    )
+    calls: list[str] = []
+
+    def request(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        calls.append(str(payload["operation"]))
+        if payload["operation"] == "health":
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "generation": route.generation,
+                "alias": route.alias,
+                "delivery_mode": "codex_stop_bound",
+                "direct_delivery_mode": "codex_stop_bound",
+                "delivery_mechanism": "stop_bound",
+                "consumer_kind": "unknown",
+            }
+        return {
+            "schema_version": 1,
+            "status": "STOP_DEFERRED",
+            "generation": route.generation,
+            "reason": runtime.COURIER_STOP_METADATA_UNKNOWN_REASON,
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+    codex_stop(os.getpid(), str(root))
+
+    assert calls == ["health", "defer_stop"]
+    assert capsys.readouterr().out == "{}\n"
+
+
+def test_exec_hook_source_upgrades_unknown_cached_kind_and_rejects_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "source": "exec",
+                }
+            )
+        ),
+    )
+    calls: list[tuple[str, object]] = []
+
+    def request(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        calls.append((str(payload["operation"]), payload.get("consumer_kind")))
+        if payload["operation"] == "health":
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "generation": route.generation,
+                "alias": route.alias,
+                "delivery_mode": "codex_stop_bound",
+                "direct_delivery_mode": "codex_stop_bound",
+                "delivery_mechanism": "stop_bound",
+                "consumer_kind": "unknown",
+            }
+        return {
+            "schema_version": 1,
+            "status": "EXEC_PENDING_REJECTED",
+            "generation": route.generation,
+            "event_ids": [],
+            "unknown_event_ids": [],
+            "reason": runtime.COURIER_EXEC_PENDING_REFUSAL_REASON,
+        }
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+    codex_stop(os.getpid(), str(root))
+
+    assert calls == [("health", None), ("reject_exec_pending", "exec")]
+    assert capsys.readouterr().out == "{}\n"
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["/usr/local/bin/codex", "exec", "prompt"], "exec"),
+        (["/usr/local/bin/codex"], "interactive"),
+        (["/usr/local/bin/codex", "--cd", "/tmp"], "unknown"),
+    ],
+)
+def test_process_consumer_kind_uses_only_codex_argv(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str], expected: str
+) -> None:
+    class Result:
+        returncode = 0
+        stdout = " ".join(argv)
+
+    monkeypatch.setattr("cross_agent_chat.runtime.subprocess.run", lambda *args, **kwargs: Result())
+
+    assert runtime._process_consumer_kind(os.getpid()) == expected
+
+
+def test_stop_shares_one_deadline_across_health_peek_and_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
+            )
+        ),
+    )
+    now = [100.0]
+    monkeypatch.setattr("cross_agent_chat.runtime.time.monotonic", lambda: now[0])
+    event_id = str(uuid4())
+    calls: list[tuple[str, float]] = []
+
+    def request(_path: Path, payload: dict[str, object], *, timeout: float) -> dict[str, object]:
+        operation = str(payload["operation"])
+        calls.append((operation, timeout))
+        if operation == "health":
+            now[0] += 0.8
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "generation": route.generation,
+                "alias": route.alias,
+                "delivery_mode": "codex_stop_bound",
+            }
+        if operation == "peek":
+            now[0] += 0.8
+            return {"messages": [{"event_id": event_id, "message": "hello"}]}
+        return {"schema_version": 1, "status": "ACKNOWLEDGED", "event_ids": [event_id]}
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+
+    codex_stop(os.getpid(), str(root))
+
+    assert [operation for operation, _ in calls] == ["health", "peek", "ack"]
+    assert calls[0][1] < 2.0
+    assert calls[1][1] < calls[0][1] - 0.79
+    assert 0 < calls[2][1] < calls[1][1] - 0.79
+    assert json.loads(capsys.readouterr().out)["decision"] == "block"
+
+
+def test_stop_does_not_ack_without_remaining_budget_and_reports_unknown_ack_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
+            )
+        ),
+    )
+    now = [200.0]
+    monkeypatch.setattr("cross_agent_chat.runtime.time.monotonic", lambda: now[0])
+    event_id = str(uuid4())
+    calls: list[str] = []
+
+    def request(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        operation = str(payload["operation"])
+        calls.append(operation)
+        if operation == "health":
+            return {
+                "schema_version": 1,
+                "status": "READY",
+                "generation": route.generation,
+                "alias": route.alias,
+                "delivery_mode": "codex_stop_bound",
+            }
+        if operation == "peek":
+            return {"messages": [{"event_id": event_id, "message": "hello"}]}
+        raise UnknownDeliveryError("delivery state is unknown")
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", request)
+    codex_stop(os.getpid(), str(root))
+    assert calls == ["health", "peek", "ack"]
+    captured = capsys.readouterr()
+    assert captured.out == "{}\n"
+    assert captured.err == "acknowledgement outcome unknown; not retried\n"
+
+    calls.clear()
+    now[0] = 300.0
+    original_request = request
+
+    def exhausted_before_ack(
+        path: Path, payload: dict[str, object], **kwargs: object
+    ) -> dict[str, object]:
+        if payload["operation"] == "peek":
+            response = original_request(path, payload, **kwargs)
+            now[0] += 2.0
+            return response
+        return original_request(path, payload, **kwargs)
+
+    monkeypatch.setattr("cross_agent_chat.runtime.request_socket", exhausted_before_ack)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
+            )
+        ),
+    )
+    codex_stop(os.getpid(), str(root))
+    assert calls == ["health", "peek"]
+    assert capsys.readouterr().out == "{}\n"
+
+
+def test_stop_deadline_bounds_slow_real_unix_socket_exchanges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "state"
+    route = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+    Registry(root).upsert(route)
+    monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
+            )
+        ),
+    )
+    event_id = str(uuid4())
+    path = runtime.socket_path(root, route)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    path.chmod(0o600)
+    listener.listen(3)
+    listener.settimeout(2.5)
+    ready = threading.Event()
+    operations: list[str] = []
+    failures: list[BaseException] = []
+
+    def serve_slowly() -> None:
+        try:
+            ready.set()
+            for delay in (0.45, 0.45, 2.0):
+                connection, _ = listener.accept()
+                with connection:
+                    frame = bytearray()
+                    while b"\n" not in frame:
+                        chunk = connection.recv(4096)
+                        if not chunk:
+                            raise AssertionError("request ended before its JSON frame")
+                        frame.extend(chunk)
+                    request = json.loads(frame.decode().split("\n", 1)[0])
+                    operation = request["operation"]
+                    operations.append(operation)
+                    time.sleep(delay)
+                    if operation == "health":
+                        response = {
+                            "schema_version": 1,
+                            "status": "READY",
+                            "generation": route.generation,
+                            "alias": route.alias,
+                            "delivery_mode": "codex_stop_bound",
+                        }
+                    elif operation == "peek":
+                        response = {
+                            "schema_version": 1,
+                            "status": "PEEKED",
+                            "generation": route.generation,
+                            "messages": [{"event_id": event_id, "message": "hello"}],
+                        }
+                    else:
+                        response = {
+                            "schema_version": 1,
+                            "status": "ACKNOWLEDGED",
+                            "event_ids": [event_id],
+                        }
+                    try:
+                        connection.sendall(json.dumps(response).encode() + b"\n")
+                    except OSError:
+                        # The final ACK intentionally completes after the hook's
+                        # total deadline, so the client may already have closed.
+                        if operation != "ack":
+                            raise
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            listener.close()
+
+    server = threading.Thread(target=serve_slowly, daemon=True)
+    server.start()
+    assert ready.wait(timeout=1)
+    started = time.monotonic()
+
+    codex_stop(os.getpid(), str(root))
+
+    elapsed = time.monotonic() - started
+    captured = capsys.readouterr()
+    assert operations == ["health", "peek", "ack"], (elapsed, operations, captured)
+    server.join(timeout=1.5)
+    path.unlink(missing_ok=True)
+    assert not server.is_alive()
+    assert failures == []
+    assert operations == ["health", "peek", "ack"]
+    assert elapsed < 2.3
+    assert captured.out == "{}\n"
+    assert captured.err == "acknowledgement outcome unknown; not retried\n"
+
+
 def test_stop_skips_legacy_experimental_native_queue_without_peeking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -87,6 +690,7 @@ def test_stop_skips_legacy_experimental_native_queue_without_peeking(
                     "hook_event_name": "Stop",
                     "session_id": route.session_id,
                     "cwd": route.cwd,
+                    "originator": "codex-tui",
                 }
             )
         ),
@@ -130,7 +734,12 @@ def test_stop_requires_exact_stop_bound_health_before_peeking(
         "sys.stdin",
         io.StringIO(
             json.dumps(
-                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
             )
         ),
     )
@@ -177,7 +786,12 @@ def test_stop_uses_direct_stop_mode_when_helper_routing_mode_is_experimental(
         "sys.stdin",
         io.StringIO(
             json.dumps(
-                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
             )
         ),
     )
@@ -229,7 +843,12 @@ def test_stop_rejects_a_health_answer_carrying_an_unrequested_key(
         "sys.stdin",
         io.StringIO(
             json.dumps(
-                {"hook_event_name": "Stop", "session_id": route.session_id, "cwd": route.cwd}
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": route.session_id,
+                    "cwd": route.cwd,
+                    "originator": "codex-tui",
+                }
             )
         ),
     )

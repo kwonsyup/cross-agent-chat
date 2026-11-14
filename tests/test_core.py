@@ -53,6 +53,7 @@ from cross_agent_chat.runtime import (
     REMOTE_DISCOVERY_TIMEOUT_SECONDS,
     REMOTE_TIMEOUT_SECONDS,
     Target,
+    _local_discovery,
     _local_target,
     canonical_source_alias,
     courier_health,
@@ -445,8 +446,8 @@ def test_local_delivery_wraps_reply_with_authenticated_sender_handle(
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         runtime,
-        "local_targets",
-        lambda _root, *, handle=None: [resolved] if handle == resolved.session_key else [],
+        "_local_discovery",
+        lambda _root, *, handle=None: ([resolved] if handle == resolved.session_key else [], True),
     )
 
     def accept(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
@@ -501,7 +502,7 @@ def test_remote_delivery_wraps_reply_with_authenticated_sender_handle(
         tailnet_node_id="nRemote",
     )
     captured: dict[str, object] = {}
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _: ([], True))
     monkeypatch.setattr(
         runtime,
         "tailnet_identity",
@@ -1235,8 +1236,8 @@ def test_peers_reports_remote_discovery_completeness(
     root = tmp_path / "state"
     monkeypatch.setattr(
         runtime,
-        "local_targets",
-        lambda *args, **kwargs: [local] if not complete else [],
+        "_local_discovery",
+        lambda *args, **kwargs: ([local] if not complete else [], True),
     )
     monkeypatch.setattr(
         runtime, "_remote_discovery", lambda **_: ([remote] if not complete else [], complete)
@@ -1278,8 +1279,8 @@ def test_local_send_by_exact_token_skips_remote_discovery_and_title_metadata(
         pid=target.pid,
     )
     monkeypatch.setattr(
-        "cross_agent_chat.runtime.local_targets",
-        lambda _root, *, handle=None: [local] if handle == local.session_key else [],
+        "cross_agent_chat.runtime._local_discovery",
+        lambda _root, *, handle=None: ([local] if handle == local.session_key else [], True),
     )
     monkeypatch.setattr(
         "cross_agent_chat.runtime.remote_targets",
@@ -1335,8 +1336,8 @@ def test_new_local_send_after_unknown_keeps_old_event_quarantined(
         pid=target.pid,
     )
     monkeypatch.setattr(
-        "cross_agent_chat.runtime.local_targets",
-        lambda _root, *, handle=None: [resolved] if handle == resolved.session_key else [],
+        "cross_agent_chat.runtime._local_discovery",
+        lambda _root, *, handle=None: ([resolved] if handle == resolved.session_key else [], True),
     )
     monkeypatch.setattr(
         "cross_agent_chat.runtime.request_socket",
@@ -1386,8 +1387,8 @@ def test_local_claude_receipt_uses_fresh_discovery_alias_after_rename(
         pid=target.pid,
     )
     monkeypatch.setattr(
-        "cross_agent_chat.runtime.local_targets",
-        lambda _root, *, handle=None: [resolved] if handle == resolved.session_key else [],
+        "cross_agent_chat.runtime._local_discovery",
+        lambda _root, *, handle=None: ([resolved] if handle == resolved.session_key else [], True),
     )
     monkeypatch.setattr("cross_agent_chat.runtime._route_current", lambda *_args: True)
     monkeypatch.setattr(
@@ -1428,7 +1429,7 @@ def test_alias_send_rejects_incomplete_global_discovery(
         session_key=session_key(target.provider, target.session_id),
         remote=False,
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda _: [local])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _: ([local], True))
     monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], False))
 
     with pytest.raises(ChatError, match="discovery is incomplete"):
@@ -1453,7 +1454,7 @@ def test_duplicate_codex_aliases_are_ambiguous_after_complete_discovery(
         )
         for _ in range(2)
     ]
-    monkeypatch.setattr(runtime, "local_targets", lambda _: aliases)
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _: (aliases, True))
     monkeypatch.setattr(runtime, "_remote_discovery", lambda **_: ([], True))
 
     with pytest.raises(ChatError, match="ambiguous"):
@@ -2765,7 +2766,7 @@ def test_local_discovery_deadline_cancels_queued_work_without_waiting_for_shutdo
     monkeypatch.setattr("cross_agent_chat.runtime.ThreadPoolExecutor", TimedOutWorkers)
     monkeypatch.setattr("cross_agent_chat.runtime.as_completed", expired)
 
-    assert local_targets(root) == []
+    assert _local_discovery(root) == ([], False)
     assert len(workers) == 1
     assert len(workers[0].futures) == 33
     assert all(future.cancelled() for future in workers[0].futures)
@@ -2823,7 +2824,7 @@ def test_local_discovery_returns_completed_targets_before_deadline(
     monkeypatch.setattr("cross_agent_chat.runtime.ThreadPoolExecutor", PartialWorkers)
     monkeypatch.setattr("cross_agent_chat.runtime.as_completed", completed_then_expired)
 
-    assert local_targets(root) == [expected]
+    assert _local_discovery(root) == ([expected], False)
     assert len(workers) == 1
     assert workers[0].shutdown_calls == [(False, True)]
     assert all(future.cancelled() for future in workers[0].futures[1:])
@@ -3136,7 +3137,7 @@ def test_local_pre_effect_response_closes_intent_and_allows_fresh_send(
         cwd=target.cwd,
         pid=target.pid,
     )
-    monkeypatch.setattr("cross_agent_chat.runtime.local_targets", lambda _: [resolved])
+    monkeypatch.setattr("cross_agent_chat.runtime._local_discovery", lambda _: ([resolved], True))
 
     def reject(_path: Path, payload: dict[str, object], **_: object) -> dict[str, object]:
         return {
@@ -3309,8 +3310,8 @@ def test_disappeared_courier_closes_intent_as_pre_effect(
     )
     monkeypatch.setattr(
         runtime,
-        "local_targets",
-        lambda _root, *, handle=None: [target] if handle == target.session_key else [],
+        "_local_discovery",
+        lambda _root, *, handle=None: ([target] if handle == target.session_key else [], True),
     )
     with pytest.raises(ChatError) as error:
         runtime.send(

@@ -19,7 +19,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import Literal, NoReturn, cast
 from uuid import uuid4
 
 import pytest
@@ -30,6 +30,7 @@ from cross_agent_chat.core import (
     IntentStore,
     Registry,
     Route,
+    UnknownDeliveryError,
     session_key,
 )
 from cross_agent_chat.recipient import (
@@ -48,6 +49,7 @@ from cross_agent_chat.runtime import (
     wrapped_message,
 )
 from cross_agent_chat.tailnet import TailnetIdentity
+from cross_agent_chat.tailnet_broker import handle_broker_request
 from cross_agent_chat.transport import remote_envelope
 
 OWNER = "100.64.0.11"
@@ -112,7 +114,10 @@ def _remote_wire(
     def wire(address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         calls.append((address, dict(payload)))
         if payload.get("operation") == "peers":
-            return {"schema_version": 1, "peers": rosters.get(address, [])}
+            response: dict[str, object] = {"schema_version": 1, "peers": rosters.get(address, [])}
+            if payload.get("include_local_discovery") is True:
+                response["local_discovery"] = "complete"
+            return response
         if payload.get("operation") == "receive":
             return _accepted(json.loads(str(payload["envelope"])))
         raise ChatError("unexpected wire operation")
@@ -269,6 +274,96 @@ def test_non_token_values_are_not_parsed_as_tokens() -> None:
     assert parse_recipient_token("claude@studio:api:api-a1") is None
     assert parse_recipient_token("f" * 64) is None
     assert parse_recipient_token("cac1.legacy") is None
+
+
+@pytest.mark.parametrize("sender", [send, send_local], ids=["send", "send_local"])
+@pytest.mark.parametrize(
+    "recipient",
+    [
+        "cac2.not-base64!",
+        _encode_token({"v": 2, "s": "remote", "h": "f" * 64, "n": OWNER_NODE}),
+    ],
+    ids=["invalid-encoding", "missing-generation"],
+)
+def test_malformed_recipient_refuses_before_intent_or_provider_without_settling_old_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sender: Callable[[Path, Route, str, str], dict[str, object]],
+    recipient: str,
+) -> None:
+    source, target = _source(tmp_path), _route(tmp_path)
+    store = IntentStore(tmp_path)
+    old_event = store.begin(source, target, source_alias=source.alias, payload_digest="a" * 64)
+    store.mark(old_event, "UNKNOWN_DELIVERY")
+    before = store.path.read_bytes()
+
+    def unexpected(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("malformed recipient reached discovery, intent admission or provider I/O")
+
+    for name in (
+        "_local_discovery",
+        "_remote_discovery",
+        "_begin_delivery",
+        "request_socket",
+        "request_tailnet",
+    ):
+        monkeypatch.setattr(runtime, name, unexpected)
+
+    with pytest.raises(ChatError) as refused:
+        sender(tmp_path, source, recipient, "new independent fixture request")
+
+    assert type(refused.value) is ChatError
+    assert str(refused.value) == (
+        "recipient token is invalid; nothing was delivered; "
+        "call chat_peers and choose a fresh exact recipient handle"
+    )
+    assert recipient not in str(refused.value)
+    assert store.path.read_bytes() == before
+    assert [(item.event_id, item.status) for item in store.intents()] == [
+        (old_event, "UNKNOWN_DELIVERY")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("sender", "scope"),
+    [(send, "local"), (send_local, "local"), (send, "remote")],
+    ids=["send-local", "send_local", "send-remote"],
+)
+def test_sender_does_not_reclassify_downstream_unknown_after_valid_recipient_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sender: Callable[[Path, Route, str, str], dict[str, object]],
+    scope: Literal["local", "remote"],
+) -> None:
+    source, target = _source(tmp_path), _route(tmp_path)
+    handle = session_key(target.provider, target.session_id)
+    recipient = (
+        local_token(tmp_path, handle, target.generation)
+        if scope == "local"
+        else remote_token(OWNER_NODE, handle, target.generation)
+    )
+    expected = parse_recipient_token(recipient)
+    assert expected is not None
+    unknown = UnknownDeliveryError("provider effect may have happened; do not replay")
+    selected: list[RecipientToken] = []
+
+    def downstream(
+        _root: Path,
+        _source: runtime.SourceIdentity,
+        token: RecipientToken,
+        _message: str,
+        **_kwargs: object,
+    ) -> NoReturn:
+        selected.append(token)
+        raise unknown
+
+    monkeypatch.setattr(runtime, f"_send_{scope}_token_target", downstream)
+    with pytest.raises(UnknownDeliveryError) as refused:
+        sender(tmp_path, source, recipient, "independent fixture request")
+
+    assert selected == [expected]
+    assert refused.value is unknown
+    assert "nothing was delivered" not in str(refused.value)
 
 
 # --- Public listing --------------------------------------------------------
@@ -478,7 +573,9 @@ def test_token_send_refuses_when_the_node_stopped_claiming_the_handle(
         },
     )
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
+    with pytest.raises(
+        ChatError, match="selected recipient could not be verified; nothing was delivered"
+    ):
         send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hi")
 
     assert [str(payload.get("operation")) for _a, payload in calls] == ["peers"]
@@ -495,7 +592,9 @@ def test_stale_generation_is_refused_before_effect(
         rosters={OWNER: [_peer(REMOTE_ALIAS, "studio", handle, str(uuid4()))]},
     )
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
+    with pytest.raises(
+        ChatError, match="selected recipient could not be verified; nothing was delivered"
+    ):
         send(tmp_path, source, remote_token(OWNER_NODE, handle, generation), "hi")
 
     assert [str(payload.get("operation")) for _a, payload in calls] == ["peers"]
@@ -791,7 +890,7 @@ def test_duplicate_local_aliases_are_ambiguous_and_cannot_shadow_a_remote_token(
         cwd=str(tmp_path),
         pid=os.getpid(),
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda *_args, **_kwargs: [duplicate])
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_args, **_kwargs: ([duplicate], True))
 
     calls.clear()
     monkeypatch.setattr(
@@ -812,6 +911,318 @@ def test_duplicate_local_aliases_are_ambiguous_and_cannot_shadow_a_remote_token(
 # --- Alias sends revalidate like token sends --------------------------------
 
 
+@pytest.mark.parametrize("sender", [send, send_local], ids=["send", "send_local"])
+def test_local_discovery_health_miss_cannot_hide_duplicate_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sender: Callable[[Path, Route, str, str], dict[str, object]],
+) -> None:
+    """Partial health cannot make a legitimate duplicate full alias unique."""
+    first = _route(tmp_path, provider="devin")
+    second = _route(tmp_path, provider="devin")
+    assert first.alias == second.alias
+    assert first.session_id != second.session_id
+    routes = {item.generation: item for item in [first, second]}
+    missing: set[str] = set()
+    probes: list[str] = []
+    selected: list[str] = []
+    monkeypatch.setattr(Route, "process_is_live", lambda _route: True)
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_kwargs: ([], True))
+
+    def health(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        assert payload["operation"] == "health"
+        route = routes[str(payload["generation"])]
+        probes.append(route.generation)
+        if route.generation in missing:
+            raise ChatError("fixture live courier health timed out")
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+        }
+
+    def select(
+        _root: Path,
+        _source: runtime.SourceIdentity,
+        target: Target,
+        _message: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        selected.append(target.session_key)
+        return {"status": "DRY_RUN_SELECTION_ONLY"}
+
+    monkeypatch.setattr(runtime, "request_socket", health)
+    monkeypatch.setattr(runtime, "_send_local_target", select)
+    complete = peers(tmp_path, include_remote=False, query=first.alias)
+    assert complete["local_discovery"] == "complete"
+    assert len(cast(list[dict[str, str]], complete["peers"])) == 2
+    with pytest.raises(ChatError, match="ambiguous"):
+        sender(tmp_path, first, first.alias, "fixture only")
+    missing.add(second.generation)
+    partial = peers(tmp_path, include_remote=False, query=first.alias)
+    assert partial["local_discovery"] == "incomplete"
+    (healthy,) = cast(list[dict[str, str]], partial["peers"])
+    assert _public_handle(healthy).handle == session_key("devin", first.session_id)
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        sender(tmp_path, first, first.alias, "fixture only")
+    # Even the endpoint-extension path must not accept this partial alias.
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        send(tmp_path, first, first.alias, "fixture only", include_external=True)
+    assert selected == []
+    probes.clear()
+    assert sender(tmp_path, first, healthy["handle"], "fixture only")["status"] == (
+        "DRY_RUN_SELECTION_ONLY"
+    )
+    assert probes == [first.generation]
+    # Scoped endpoint discovery also keeps an exact healthy native token usable.
+    assert (
+        send(tmp_path, first, healthy["handle"], "fixture only", include_external=True)["status"]
+        == "DRY_RUN_SELECTION_ONLY"
+    )
+    missing_token = local_token(
+        tmp_path, session_key("devin", second.session_id), second.generation
+    )
+    with pytest.raises(ChatError, match="unavailable or changed"):
+        sender(tmp_path, first, missing_token, "fixture only")
+    # A successor at the same session key never inherits the old generation.
+    successor = replace(first, generation=str(uuid4()))
+    Registry(tmp_path).upsert(successor)
+    routes[successor.generation] = successor
+    with pytest.raises(ChatError, match="unavailable or changed"):
+        sender(tmp_path, successor, healthy["handle"], "fixture only")
+    assert selected == [session_key("devin", first.session_id)] * 2
+    assert IntentStore(tmp_path).intents() == []
+    filtered = peers(tmp_path, include_remote=False, query="absent label")
+    assert filtered["peers"] == []
+    assert filtered["local_discovery"] == "incomplete"
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        peers(tmp_path, include_remote=False, internal=True)
+    internal = peers(tmp_path, include_remote=False, internal=True, include_local_discovery=True)
+    assert set(internal) == {"schema_version", "peers", "local_discovery"}
+    assert internal["local_discovery"] == "incomplete"
+
+
+def test_broker_partial_local_roster_cannot_make_a_remote_alias_unique(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A responding broker must carry its own missed-twin coverage to the sender."""
+    requester, broker = tmp_path / "requester", tmp_path / "broker"
+    requester.mkdir(mode=0o700)
+    broker.mkdir(mode=0o700)
+    source = _source(requester)
+    first, second = _route(broker, provider="devin"), _route(broker, provider="devin")
+    assert first.alias == second.alias
+    routes = {route.generation: route for route in (source, first, second)}
+    missing: set[str] = set()
+    selected: list[str] = []
+    monkeypatch.setattr(Route, "process_is_live", lambda _route: True)
+    monkeypatch.setattr(runtime, "_with_codex_titles", lambda _root, rows, _deadline: rows)
+    monkeypatch.setattr(runtime, "tailnet_identity", lambda: _identity(peers={OWNER_NODE: OWNER}))
+
+    def health(_path: Path, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        assert payload["operation"] == "health"
+        route = routes[str(payload["generation"])]
+        if route.generation in missing:
+            raise ChatError("fixture live courier health timed out")
+        return {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": route.generation,
+            "alias": route.alias,
+        }
+
+    def wire(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        assert payload["operation"] == "peers"
+        return handle_broker_request(broker, payload, "100.64.0.10")
+
+    def select(
+        _root: Path,
+        _source: runtime.SourceIdentity,
+        target: Target,
+        _message: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        selected.append(target.session_key)
+        return {"status": "DRY_RUN_SELECTION_ONLY"}
+
+    monkeypatch.setattr(runtime, "request_socket", health)
+    monkeypatch.setattr(runtime, "request_tailnet", wire)
+    monkeypatch.setattr(runtime, "_send_remote_target", select)
+    complete = peers(requester, query=first.alias)
+    assert complete["remote_discovery"] == "complete"
+    assert len(cast(list[object], complete["peers"])) == 2
+    with pytest.raises(ChatError, match="ambiguous"):
+        send(requester, source, first.alias, "fixture only")
+
+    missing.add(second.generation)
+    partial = peers(requester, query=first.alias)
+    assert partial["remote_discovery"] == "incomplete"
+    (healthy,) = cast(list[dict[str, str]], partial["peers"])
+    with pytest.raises(ChatError, match="remote peer discovery is incomplete"):
+        send(requester, source, first.alias, "fixture only")
+    assert selected == []
+    # An old caller cannot understand the new marker: the new broker must
+    # refuse its unscoped partial response, not emit a legacy-valid singleton.
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        handle_broker_request(
+            broker,
+            {"schema_version": 1, "operation": "peers", "include_devin": True},
+            "100.64.0.10",
+        )
+    assert send(requester, source, healthy["handle"], "fixture only")["status"] == (
+        "DRY_RUN_SELECTION_ONLY"
+    )
+    missing_token = remote_token(
+        OWNER_NODE, session_key(second.provider, second.session_id), second.generation
+    )
+    with pytest.raises(ChatError, match="nothing was delivered"):
+        send(requester, source, missing_token, "fixture only")
+    assert selected == [session_key(first.provider, first.session_id)]
+    assert IntentStore(requester).intents() == []
+
+
+@pytest.mark.parametrize("reject_unknown_flag", [False, True])
+def test_legacy_node_without_coverage_keeps_rows_but_cannot_justify_alias_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reject_unknown_flag: bool
+) -> None:
+    source = _source(tmp_path)
+    handle, generation = _remote_selection()
+    row = _peer(REMOTE_ALIAS, "studio", handle, generation)
+    selected: list[str] = []
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([], True))
+    monkeypatch.setattr(runtime, "_with_codex_titles", lambda _root, rows, _deadline: rows)
+    monkeypatch.setattr(runtime, "tailnet_identity", lambda: _identity(peers={OWNER_NODE: OWNER}))
+
+    def legacy(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        assert payload["operation"] == "peers"
+        if reject_unknown_flag and "include_local_discovery" in payload:
+            raise ChatError("legacy broker rejected unknown field")
+        return {"schema_version": 1, "peers": [row]}
+
+    def select(
+        _root: Path,
+        _source: runtime.SourceIdentity,
+        target: Target,
+        _message: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        selected.append(target.session_key)
+        return {"status": "DRY_RUN_SELECTION_ONLY"}
+
+    monkeypatch.setattr(runtime, "request_tailnet", legacy)
+    monkeypatch.setattr(runtime, "_send_remote_target", select)
+    listing = peers(tmp_path, query=REMOTE_ALIAS)
+    assert listing["remote_discovery"] == "incomplete"
+    (healthy,) = cast(list[dict[str, str]], listing["peers"])
+    with pytest.raises(ChatError, match="remote peer discovery is incomplete"):
+        send(tmp_path, source, REMOTE_ALIAS, "fixture only")
+    assert selected == []
+    assert send(tmp_path, source, healthy["handle"], "fixture only")["status"] == (
+        "DRY_RUN_SELECTION_ONLY"
+    )
+    assert selected == [handle]
+    assert IntentStore(tmp_path).intents() == []
+
+
+def test_remote_alias_refuses_when_title_pass_reveals_another_same_alias_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    handle, generation = _remote_selection()
+    first = _peer(REMOTE_ALIAS, "studio", handle, generation)
+    second = _peer(REMOTE_ALIAS, "studio", "b" * 64, str(uuid4()))
+    probes: list[dict[str, object]] = []
+    monkeypatch.setattr(runtime, "_local_discovery", lambda *_a, **_k: ([], True))
+    monkeypatch.setattr(runtime, "tailnet_identity", lambda: _identity(peers={OWNER_NODE: OWNER}))
+
+    def wire(_address: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        assert payload["operation"] == "peers"
+        probes.append(payload)
+        return {
+            "schema_version": 1,
+            "peers": [first, second] if payload.get("include_title") is True else [first],
+            "local_discovery": "complete",
+        }
+
+    def unexpected(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("a newer duplicate was hidden by the earlier singleton")
+
+    monkeypatch.setattr(runtime, "request_tailnet", wire)
+    monkeypatch.setattr(runtime, "_send_remote_target", unexpected)
+    with pytest.raises(ChatError, match="remote peer discovery is incomplete"):
+        send(tmp_path, source, REMOTE_ALIAS, "fixture only")
+    assert len(probes) == 2 and probes[-1]["include_title"] is True
+    assert IntentStore(tmp_path).intents() == []
+
+
+def test_local_discovery_incomplete_cannot_establish_unique_title(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    survivor = Target(
+        alias=source.alias,
+        provider="codex",
+        device=source.device,
+        project=source.project,
+        generation=source.generation,
+        session_key=session_key("codex", source.session_id),
+        remote=False,
+        title="Current coordinator",
+    )
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _root: ([survivor], False))
+    monkeypatch.setattr(runtime, "_remote_discovery", lambda **_kwargs: ([], True))
+    monkeypatch.setattr(
+        runtime, "_send_local_target", lambda *_args, **_kwargs: pytest.fail("selected a title")
+    )
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        send(tmp_path, source, "Current coordinator", "fixture only")
+
+
+def test_local_discovery_empty_registry_is_complete(tmp_path: Path) -> None:
+    assert runtime._local_discovery(tmp_path) == ([], True)
+
+
+def test_local_discovery_unsubmitted_probe_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _route(tmp_path, provider="devin")
+    monkeypatch.setattr(Route, "process_is_live", lambda _route: True)
+    monkeypatch.setattr(runtime, "LOCAL_DISCOVERY_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(
+        runtime, "request_socket", lambda *_args, **_kwargs: pytest.fail("probe started")
+    )
+    assert runtime._local_discovery(tmp_path) == ([], False)
+
+
+def test_local_discovery_external_failure_cannot_establish_unique_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    survivor = Target(
+        alias=source.alias,
+        provider="codex",
+        device=source.device,
+        project=source.project,
+        generation=source.generation,
+        session_key=session_key("codex", source.session_id),
+        remote=False,
+    )
+    monkeypatch.setattr(runtime, "_local_discovery", lambda _root: ([survivor], True))
+
+    def unavailable(_root: Path, *, handle: str | None = None) -> list[Target]:
+        raise ChatError("fixture external registry unavailable")
+
+    monkeypatch.setattr(runtime, "external_targets", unavailable)
+    monkeypatch.setattr(
+        runtime, "_send_local_target", lambda *_args, **_kwargs: pytest.fail("selected an alias")
+    )
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        send_local(tmp_path, source, source.alias, "fixture only")
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        send(tmp_path, source, source.alias, "fixture only", include_external=True)
+
+
 def _alias_send_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -824,7 +1235,7 @@ def _alias_send_fixture(
     sequence = iter(identities)
     monkeypatch.setattr(runtime, "tailnet_identity", lambda: next(sequence))
     monkeypatch.setattr(runtime, "request_tailnet", _remote_wire(calls, rosters))
-    monkeypatch.setattr(runtime, "request_socket", _courier([]))
+    monkeypatch.setattr(runtime, "request_socket", _courier([source]))
     return source, calls
 
 
@@ -905,14 +1316,19 @@ def test_alias_send_refuses_when_the_generation_changed_after_selection(
     def wire(address: str, payload: dict[str, object], **_: object) -> dict[str, object]:
         calls.append((address, dict(payload)))
         if payload.get("operation") == "peers":
-            return {"schema_version": 1, "peers": next(rosters_seen)}
+            response: dict[str, object] = {"schema_version": 1, "peers": next(rosters_seen)}
+            if payload.get("include_local_discovery") is True:
+                response["local_discovery"] = "complete"
+            return response
         if payload.get("operation") == "receive":
             pytest.fail("receive ran after a stale generation")
         raise ChatError("unexpected wire operation")
 
     monkeypatch.setattr(runtime, "request_tailnet", wire)
 
-    with pytest.raises(ChatError, match="unavailable or changed"):
+    with pytest.raises(
+        ChatError, match="selected recipient could not be verified; nothing was delivered"
+    ):
         send(tmp_path, source, REMOTE_ALIAS, "hello")
 
 
@@ -1005,7 +1421,9 @@ def _receive_fixture(
         cwd=target.cwd,
         pid=target.pid,
     )
-    monkeypatch.setattr(runtime, "local_targets", lambda *_args, **_kwargs: [public_target])
+    monkeypatch.setattr(
+        runtime, "_local_discovery", lambda *_args, **_kwargs: ([public_target], True)
+    )
     monkeypatch.setattr(
         runtime,
         "request_tailnet",
@@ -1192,6 +1610,7 @@ def test_remote_receive_rejects_malformed_v2_heads(
         envelope, _a, _g, _b = _v2_envelope(target, head_override=head)
         response = receive_remote(tmp_path, envelope, OWNER)
         assert response["status"] == "PRE_EFFECT_REJECTED"
+        assert response["error"] == "reply token is invalid"
     assert accepts == []
 
 
@@ -1212,6 +1631,7 @@ def test_remote_receive_rejects_a_local_scoped_reply_token(
     )
     response = receive_remote(tmp_path, envelope, OWNER)
     assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["error"] == "reply token scope is invalid"
     assert accepts == []
 
 
@@ -1231,6 +1651,7 @@ def test_remote_receive_rejects_a_reply_token_generation_mismatch(
     )
     response = receive_remote(tmp_path, envelope, OWNER)
     assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["error"] == "reply token does not match the envelope generation"
     assert accepts == []
 
 
@@ -1247,6 +1668,7 @@ def test_remote_receive_rejects_a_reply_token_from_the_wrong_address(
     envelope, _sa, _sg, _body = _v2_envelope(target)
     response = receive_remote(tmp_path, envelope, OWNER)
     assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["error"] == "reply token does not match the authenticated sender"
     assert accepts == []
 
 
@@ -1263,6 +1685,7 @@ def test_remote_receive_rejects_a_reply_token_for_an_absent_node(
     envelope, _sa, _sg, _body = _v2_envelope(target)
     response = receive_remote(tmp_path, envelope, OWNER)
     assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["error"] == "reply token does not match the authenticated sender"
     assert accepts == []
 
 
@@ -1274,6 +1697,49 @@ def test_remote_receive_rejects_a_reply_token_when_tailscale_is_unavailable(
     envelope, _sa, _sg, _body = _v2_envelope(target)
     response = receive_remote(tmp_path, envelope, OWNER)
     assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["error"] == "reply token does not match the authenticated sender"
+    assert accepts == []
+
+
+@pytest.mark.parametrize("boundary", ["_envelope_reply_token", "_verify_remote_reply_token"])
+def test_remote_receive_never_reclassifies_an_unknown_reply_check_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    accepts: list[dict[str, object]] = []
+    target = _receive_fixture(
+        tmp_path, monkeypatch, identity=_identity(peers={OTHER_NODE: OWNER}), accepts=accepts
+    )
+    envelope, _alias, _generation, _body = _v2_envelope(target)
+    unknown = UnknownDeliveryError("fixture reply-check outcome remains unknown")
+
+    def unresolved(*_args: object, **_kwargs: object) -> NoReturn:
+        raise unknown
+
+    monkeypatch.setattr(runtime, boundary, unresolved)
+    with pytest.raises(UnknownDeliveryError) as caught:
+        receive_remote(tmp_path, envelope, OWNER)
+    assert caught.value is unknown
+    assert accepts == []
+
+
+def test_remote_receive_keeps_an_unrecognized_reply_verifier_failure_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    accepts: list[dict[str, object]] = []
+    target = _receive_fixture(
+        tmp_path, monkeypatch, identity=_identity(peers={OTHER_NODE: OWNER}), accepts=accepts
+    )
+    envelope, _alias, _generation, _body = _v2_envelope(target)
+
+    def failed(*_args: object, **_kwargs: object) -> NoReturn:
+        raise ChatError("fixture-private read failure")
+
+    monkeypatch.setattr(runtime, "_verify_remote_reply_token", failed)
+    response = receive_remote(tmp_path, envelope, OWNER)
+    assert set(response) == {"schema_version", "event_id", "status", "provider", "error"}
+    assert response["status"] == "PRE_EFFECT_REJECTED"
+    assert response["error"] == runtime.REMOTE_REPLY_BINDING_FAILURE
+    assert "fixture-private" not in str(response)
     assert accepts == []
 
 

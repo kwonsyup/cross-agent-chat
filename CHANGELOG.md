@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.5.10 - 2026-11-14
+
+- Report Codex `consumer_kind` in discovery as `interactive`, `exec`, or
+  `unknown`. Detached `codex exec` recipients refuse before provider effect;
+  their Stop hooks never inject peer content.
+- Permit Stop-bound injection only after affirmative interactive
+  classification. Unknown or slow metadata stays pending and records a
+  body-free deferral reason; it never claims an idle wake.
+- Settle queued events for known exec sessions as `PRE_EFFECT_REJECTED` when
+  the body was never handed to the provider, or `UNKNOWN_DELIVERY` when a
+  provider handoff cannot be ruled out. Sender status exposes the terminal
+  refusal and reason.
+
+## 0.5.9 - 2026-11-12
+
+- Record a durable transport receipt before a courier answers an accept
+  request. If the answer is lost after the provider hand-off, an exact
+  (event id, target key, target generation) receipt settles an undecided
+  intent on a later `status` read -- never on a guess or an unrelated
+  receipt. Every courier acceptance path records the receipt, including the
+  qualified Codex owning-daemon ingress; a rejected or unknown outcome
+  leaves no positive proof. A remote node attests its own receipt over the
+  read-only inspect channel. Receipts older than 90 days are pruned
+  best-effort and a symlinked receipt directory is never followed.
+- Compact decided intents out of the hot file into dated
+  `intents-archive/YYYY-MM.json` files with an `ids.json` index. Undecided
+  rows never move, compaction only runs after a decided write, and a
+  compaction failure leaves a diagnostic without disturbing the write. A
+  missing index over present month files fails closed until a compaction
+  pass rebuilds it; a well-formed index that is not an object is a ChatError,
+  not a crash. Caller-chosen event ids stay uniquely owned across the archive
+  horizon, and late outcomes land on archived rows.
+- Land an empty `ids.json` before the first archive month write, so a first
+  compaction interrupted mid-pass still reads as "no archives yet" instead
+  of wedging every later send and lookup behind the fail-closed
+  damaged-index refusal; an index rebuild rescans only the dated files the
+  pass did not just write.
+- Send and status timeouts are computed after the intents-lock `begin`
+  returns, so a slow begin spends the same deadline rather than granting a
+  fresh budget. A read-only status observation cannot mutate custody it did
+  not settle, and the remote receipt field must validate exactly or the
+  whole observation fails.
+
+## 0.5.8 - 2026-10-20
+
+- Preserve healthy peers when local discovery is incomplete, report
+  `local_discovery`, and refuse alias/title selection until uniqueness can be
+  established. A fresh exact handle still checks only its bound endpoint;
+  unavailable or stale endpoints refuse.
+- Carry each responding node's local coverage through negotiated remote
+  discovery. Legacy responses without coverage retain healthy rows but cannot
+  prove name uniqueness. A new broker refuses an unnegotiated partial roster;
+  complete legacy responses and exact-token attestation keep their existing
+  shapes. Requested external endpoints count toward the same coverage.
+- Keep a qualified `no_courier_queue` observation unknown when the sender's
+  outcome is `UNKNOWN_DELIVERY` or the observer is a Native helper. No queue
+  does not prove provider custody or original-session use. Inspect the original
+  through its normal transcript or next natural turn; do not replay the event.
+- Share one 2-second deadline across Codex Stop health/peek/ACK IPC. This does
+  not bound interpreter or filesystem startup. An unknown ACK outcome ends
+  without retrying or emitting a continuation.
+- Include the recorded event ID after a validated remote no-effect refusal
+  so sender custody can be inspected with `chat_status`. Forward fixed v2
+  reply-binding guard causes without exposing private header or provider text;
+  other errors and unknown outcomes retain their existing classification.
+
 ## 0.5.7 - 2026-10-16
 
 - Qualify the exact Codex CLI owning-daemon version 0.163.0 after comparing

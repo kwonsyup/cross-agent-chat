@@ -76,7 +76,9 @@ def _remote_delivery(
 
     monkeypatch.setattr(runtime, "request_tailnet", authorize)
     monkeypatch.setattr(runtime, "request_socket", socket)
-    monkeypatch.setattr(runtime, "local_targets", lambda *_args, **_kwargs: [runtime_target])
+    monkeypatch.setattr(
+        runtime, "_local_discovery", lambda *_args, **_kwargs: ([runtime_target], True)
+    )
     return runtime.receive_remote(tmp_path, envelope, "100.64.0.11")
 
 
@@ -124,8 +126,16 @@ def test_remote_consumer_preserves_unknown_delivery(
         )
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "fixture-secret arbitrary provider payload",
+        "reply token is invalid",
+        "reply token does not match the authenticated sender",
+    ],
+)
 def test_remote_consumer_suppresses_unrecognized_secret_reason(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str
 ) -> None:
     response = _remote_delivery(
         tmp_path,
@@ -135,12 +145,13 @@ def test_remote_consumer_suppresses_unrecognized_secret_reason(
             "event_id": payload["event_id"],
             "status": "PRE_EFFECT_REJECTED",
             "provider": "claude",
-            "error": "fixture-secret arbitrary provider payload",
+            "error": reason,
         },
     )
 
     assert response["status"] == "PRE_EFFECT_REJECTED"
-    assert response["error"] == "remote destination rejected before provider effect"
+    assert response["error"] == runtime.REMOTE_COURIER_REFUSAL
+    assert reason not in str(response)
     assert "fixture-secret" not in str(response)
 
 

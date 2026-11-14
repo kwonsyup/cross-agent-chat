@@ -13,7 +13,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
-from typing import Final, cast
+from typing import Final, Literal, cast
 
 from cross_agent_chat import __version__
 from cross_agent_chat.core import (
@@ -34,6 +34,7 @@ MAX_PEEK_FRAME_BYTES: Final = 64 * 1024
 NATIVE_QUEUE_TIMEOUT_SECONDS: Final = 15.0
 MAX_NATIVE_STDOUT_BYTES: Final = 64 * 1024
 NATIVE_METADATA_TIMEOUT_SECONDS: Final = 2.0
+CodexConsumerKind = Literal["interactive", "exec", "unknown"]
 
 
 def _client_info() -> dict[str, str]:
@@ -367,6 +368,109 @@ def native_thread_titles(
     return titles
 
 
+def native_thread_consumer_kind(
+    *, binary: Path, environment: dict[str, str], thread_id: str, deadline: float
+) -> CodexConsumerKind:
+    """Read the provider's native session metadata and classify its consumer.
+
+    ``originator`` and ``source`` are provider-owned session fields.  A
+    ``codex_exec``/``exec`` session is detached from an interactive consumer;
+    it must never be woken by the Stop hook.  Missing or unrecognized metadata
+    stays ``unknown`` so older providers retain their existing behavior.
+    """
+    identifier = valid_uuid(thread_id, "Codex thread id")
+    if time.monotonic() >= deadline:
+        return "unknown"
+    try:
+        process = subprocess.Popen(
+            [str(binary), "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            close_fds=True,
+        )
+    except OSError:
+        return "unknown"
+    if process.stdin is None or process.stdout is None:
+        _reap_metadata_process(process)
+        return "unknown"
+    stdin, stdout = process.stdin, process.stdout
+    selector = selectors.DefaultSelector()
+    selector.register(stdout, selectors.EVENT_READ)
+    buffer = b""
+
+    def write(payload: dict[str, object]) -> None:
+        stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+        stdin.flush()
+
+    def read(response_id: int) -> dict[str, object] | None:
+        nonlocal buffer
+        while time.monotonic() < deadline:
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict) and value.get("id") == response_id:
+                    return cast(dict[str, object], value)
+            events = selector.select(max(0.0, deadline - time.monotonic()))
+            if events:
+                chunk = os.read(stdout.fileno(), 65536)
+                if not chunk:
+                    return None
+                buffer += chunk
+                if len(buffer) > MAX_NATIVE_STDOUT_BYTES:
+                    return None
+        return None
+
+    try:
+        write(
+            {
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": _client_info(),
+                    "capabilities": {"experimentalApi": True},
+                },
+            }
+        )
+        initialized = read(0)
+        result = initialized.get("result") if initialized is not None else None
+        expected_home = environment.get("CODEX_HOME")
+        reported_home = result.get("codexHome") if isinstance(result, dict) else None
+        if not isinstance(expected_home, str) or not isinstance(reported_home, str):
+            return "unknown"
+        if Path(reported_home).resolve() != Path(expected_home).resolve():
+            return "unknown"
+        write({"method": "initialized"})
+        write(
+            {
+                "id": 1,
+                "method": "thread/read",
+                "params": {"threadId": identifier, "includeTurns": False},
+            }
+        )
+        response = read(1)
+        result = response.get("result") if response is not None else None
+        thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(thread, dict) or thread.get("id") != identifier:
+            return "unknown"
+        originator = thread.get("originator")
+        source = thread.get("source")
+        if originator == "codex_exec" or source == "exec":
+            return "exec"
+        if originator == "codex-tui" or source in {"vscode", "native", "tui"}:
+            return "interactive"
+        return "unknown"
+    except (OSError, ValueError):
+        return "unknown"
+    finally:
+        selector.close()
+        _reap_metadata_process(process)
+
+
 class CodexCourier:
     """A destination-process queue with no durable message body state."""
 
@@ -379,6 +483,7 @@ class CodexCourier:
         native_queue: tuple[Path, dict[str, str], str] | None = None,
         native_helper: bool = False,
         provider: Provider = "codex",
+        consumer_kind: CodexConsumerKind | None = None,
     ) -> None:
         if capacity <= 0 or capacity > DEFAULT_CAPACITY:
             raise ChatError("Codex courier capacity is invalid")
@@ -388,6 +493,11 @@ class CodexCourier:
         self.native_queue = native_queue
         self.native_helper = native_helper
         self.provider = provider
+        self.consumer_kind: CodexConsumerKind | None = (
+            consumer_kind
+            if consumer_kind is not None
+            else ("unknown" if provider == "codex" else None)
+        )
         # Each pending body is stored with its monotonic enqueue time so a
         # read-only inspect can report the oldest pending age without the body.
         self._pending: OrderedDict[str, tuple[str, float]] = OrderedDict()
@@ -406,11 +516,22 @@ class CodexCourier:
         # never saw -- or one a same-generation restart or bound eviction
         # forgot -- stays "unseen" instead of being misreported as delivered.
         self._retired: OrderedDict[str, float] = OrderedDict()
+        self._pre_effect_rejected: OrderedDict[str, float] = OrderedDict()
         # The courier listener and the one delivery worker share this queue, so
         # every read or mutation takes the short lock; the native-queue RPC in
         # accept is deliberately outside it so queue controls never wait on a
         # provider call.
         self._lock = threading.Lock()
+
+    def update_consumer_kind(self, kind: CodexConsumerKind) -> bool:
+        """Upgrade unknown metadata once; never overwrite a known kind."""
+        with self._lock:
+            if self.consumer_kind == kind:
+                return True
+            if self.consumer_kind == "unknown":
+                self.consumer_kind = kind
+                return True
+            return False
 
     def accept(self, event_id: str, message: str) -> dict[str, object]:
         identifier = valid_uuid(event_id, "event id")
@@ -572,6 +693,8 @@ class CodexCourier:
         with self._lock:
             if identifier in self._handed_off or identifier in self._retired:
                 state = "handed_off"
+            elif identifier in self._pre_effect_rejected:
+                state = "pre_effect_rejected"
             elif identifier in self._pending:
                 state = "pending"
             else:
@@ -602,12 +725,33 @@ class CodexCourier:
         with self._lock:
             return list(self._pending)
 
+    def reject_pending(self) -> tuple[list[str], list[str]]:
+        """Drop only queued bodies never handed to a provider boundary.
+
+        The first list is a decided no-effect refusal.  The second list is
+        conservatively unknown when a native dispatch claim already exists.
+        """
+        rejected: list[str] = []
+        unknown: list[str] = []
+        with self._lock:
+            for event_id in list(self._pending):
+                if event_id in self._handed_off:
+                    unknown.append(event_id)
+                else:
+                    rejected.append(event_id)
+                    self._pre_effect_rejected[event_id] = time.monotonic()
+                del self._pending[event_id]
+                self._unresolved.discard(event_id)
+                self._handed_off.discard(event_id)
+        return rejected, unknown
+
     def clear(self) -> None:
         with self._lock:
             self._pending.clear()
             self._unresolved.clear()
             self._handed_off.clear()
             self._retired.clear()
+            self._pre_effect_rejected.clear()
 
 
 def hook_context(messages: list[dict[str, str]]) -> str:
