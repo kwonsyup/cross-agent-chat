@@ -1,7 +1,7 @@
 """Exact original input through an already running, owning Codex CLI daemon.
 
 No daemon is started, thread resumed, permission changed, or failed effect retried.
-The qualified 0.160.1, 0.162.0, 0.162.1, 0.163.0, and 0.167.0 protocols use
+The qualified 0.160.1, 0.162.0, 0.162.1, 0.163.0, 0.167.0, and 0.169.0 protocols use
 a private Unix WebSocket.
 queue/add wakes an idle TUI original; steer targets the exact active turn without
 interrupting tools.
@@ -30,7 +30,9 @@ from cross_agent_chat.core import (
     valid_uuid,
 )
 
-SUPPORTED_VERSIONS: Final = frozenset({"0.160.1", "0.162.0", "0.162.1", "0.163.0", "0.167.0"})
+SUPPORTED_VERSIONS: Final = frozenset(
+    {"0.160.1", "0.162.0", "0.162.1", "0.163.0", "0.167.0", "0.169.0"}
+)
 PROBE_SECONDS: Final = 2.0
 ACCEPT_SECONDS: Final = 10.0
 MAX_RESPONSE_BYTES: Final = 256 * 1024
