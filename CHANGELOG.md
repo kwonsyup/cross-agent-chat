@@ -16,12 +16,15 @@
   instead of leaving it beside the managed entry. A leftover
   guarded-plus-unguarded pair collapses into the single managed entry;
   ambiguity refusal still applies to genuinely duplicate unguarded entries.
-- Mark a live Claude session the provider cannot address as UNSUPPORTED
+- Diagnose a live Claude session the provider cannot address as UNSUPPORTED
   instead of UNAVAILABLE. A session started as a hidden child (for example
   under an inherited `CLAUDE_CODE_CHILD_SESSION` marker) keeps its route but
-  never appears in `claude agents --json`; its courier now attests that
-  distinct status so local discovery stays complete for the addressable
-  roster, exact-handle sends to it refuse decided, and `doctor` lists it.
+  never appears in `claude agents --json`; its courier attests that distinct
+  status for the sender's reason text and `doctor`, and it keeps local
+  discovery incomplete so alias or title sends refuse rather than risk
+  resolving to a namesake. Exact-handle sends still work. A listed agent row
+  that cannot be the target -- a different kind or a drifted cwd -- stays
+  UNAVAILABLE, never UNSUPPORTED.
 - Keep durable custody, exact-generation routing, lost-index recovery, and
   no-replay handling from the 0.5.9 through 0.5.11 repairs.
 

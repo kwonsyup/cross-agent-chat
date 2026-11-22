@@ -2375,11 +2375,11 @@ def courier_health(
                 exact_agent(route.session_id, route.cwd),
             )
         except ClaudeAgentUnlisted:
-            # The provider inventory answered with no addressable row for a
-            # live session -- a hidden child or another unsupported kind. It
-            # keeps its route but can never carry a peer delivery, so the
-            # courier attests a decided status instead of poisoning local
-            # discovery with a perpetual UNAVAILABLE.
+            # The provider inventory answered with no row at all for a live
+            # session -- a hidden child. It keeps its route but can never
+            # carry a peer delivery, so the courier attests a decided status
+            # for diagnostics while discovery still counts the route as an
+            # unresolved probe.
             return {
                 "schema_version": SCHEMA_VERSION,
                 "status": "UNSUPPORTED" if route.process_is_live() else "UNAVAILABLE",
@@ -3267,11 +3267,10 @@ def _local_discovery(
             future.cancel()
         workers.shutdown(wait=False, cancel_futures=True)
     targets = [target for target in results if isinstance(target, Target)]
-    # Missing, queued and unsubmitted probes all leave a None slot. A partial
-    # healthy roster remains useful, but cannot establish name uniqueness. An
-    # UNSUPPORTED route attested as unaddressable still counts toward
-    # completeness: it can never carry a namesake, only witness absence.
-    return targets, all(result is not None for result in results)
+    # Missing, queued and unsubmitted probes all leave a non-target slot.
+    # UNSUPPORTED is diagnostic only: it is not a stable signal, so it must
+    # not complete discovery while a live route could still hide a namesake.
+    return targets, len(targets) == len(routes)
 
 
 def local_targets(root: Path, *, handle: str | None = None) -> list[Target]:

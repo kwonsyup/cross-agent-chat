@@ -421,9 +421,11 @@ def test_exact_agent_marks_an_absent_session_unlisted(
         claude_runtime.exact_agent(str(uuid4()), "/tmp")
 
 
-def test_exact_agent_marks_another_kind_row_unlisted(
+def test_exact_agent_row_under_another_kind_is_a_plain_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A listed row that cannot be the target is uncertain, not decided: only a
+    # session with no row at all is unlisted.
     session_id = str(uuid4())
     monkeypatch.setattr(
         claude_runtime,
@@ -432,16 +434,62 @@ def test_exact_agent_marks_another_kind_row_unlisted(
             {"session_id": session_id, "name": "hidden-1", "kind": "hidden", "cwd": "/tmp"}
         ],
     )
-    with pytest.raises(claude_runtime.ClaudeAgentUnlisted):
+    with pytest.raises(ChatError) as error:
         claude_runtime.exact_agent(session_id, "/tmp")
+    assert not isinstance(error.value, claude_runtime.ClaudeAgentUnlisted)
+
+
+def test_exact_agent_listed_row_with_drifted_cwd_is_a_plain_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A live interactive row under a different cwd (cwd drift) is a real row;
+    # it must not masquerade as an unlisted, decided-unsupported session.
+    session_id = str(uuid4())
+    monkeypatch.setattr(
+        claude_runtime,
+        "claude_agents",
+        lambda *a, **k: [
+            {
+                "session_id": session_id,
+                "name": "drift-1",
+                "kind": "interactive",
+                "cwd": "/var/elsewhere",
+            }
+        ],
+    )
+    with pytest.raises(ChatError) as error:
+        claude_runtime.exact_agent(session_id, "/tmp")
+    assert not isinstance(error.value, claude_runtime.ClaudeAgentUnlisted)
+
+
+def test_targeted_parse_preserves_a_row_whose_cwd_cannot_resolve() -> None:
+    # A listed row with a dead cwd still counts as present, so presence is
+    # decided only by an inventory that genuinely has no row for the session.
+    session_id = str(uuid4())
+    rows = claude_runtime._parse_targeted_claude_agents(
+        json.dumps(
+            [
+                {
+                    "sessionId": session_id,
+                    "name": "gone-1",
+                    "kind": "interactive",
+                    "cwd": "/definitely/not/a/real/path/kd270",
+                }
+            ]
+        ),
+        session_id,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == session_id
 
 
 def test_live_unlisted_session_reports_unsupported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A hidden child session keeps a live route but holds no addressable
-    # `claude agents --json` row: its courier attests UNSUPPORTED, not the
-    # generic UNAVAILABLE that discovery would count against completeness.
+    # A hidden child session keeps a live route but holds no row at all in
+    # `claude agents --json`: its courier attests the diagnostic UNSUPPORTED
+    # status rather than an uncertain UNAVAILABLE.
     route = _claude_route(tmp_path, "hidden")
     monkeypatch.setattr(runtime, "exact_agent", _unlisted_exact_agent)
 
@@ -466,40 +514,70 @@ def test_dead_owner_stays_unavailable(tmp_path: Path, monkeypatch: pytest.Monkey
     assert runtime.courier_health(route)["status"] == "UNAVAILABLE"
 
 
-def test_discovery_excludes_unsupported_routes_from_completeness(
+def _unsupported_and_healthy_probes(
+    monkeypatch: pytest.MonkeyPatch, hidden: Route, healthy: Route
+) -> None:
+    monkeypatch.setattr(
+        runtime,
+        "request_socket",
+        lambda _path, payload, timeout=None: {
+            hidden.generation: {
+                "schema_version": 1,
+                "status": "UNSUPPORTED",
+                "generation": hidden.generation,
+            },
+            healthy.generation: {
+                "schema_version": 1,
+                "status": "READY",
+                "generation": healthy.generation,
+                "alias": f"{healthy.alias}:healthy-1",
+                "delivery_mode": "claude_native_cross_session",
+                "delivery_mechanism": "claude_native",
+            },
+        }[str(payload["generation"])],
+    )
+
+
+def test_discovery_stays_incomplete_while_an_unsupported_route_is_live(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A hidden session's route attests UNSUPPORTED: it is neither a peer
-    # target nor a strike against local discovery completeness.
+    # UNSUPPORTED is diagnostic only: it is not a stable signal, so a live
+    # unaddressable route keeps discovery incomplete rather than pretending
+    # the addressable roster is fully known.
     root = tmp_path / "state"
     hidden = _claude_route(tmp_path, "hidden")
     healthy = _claude_route(tmp_path, "healthy")
     registry = Registry(root)
     registry.upsert(hidden)
     registry.upsert(healthy)
-
-    responses = {
-        hidden.generation: {
-            "schema_version": 1,
-            "status": "UNSUPPORTED",
-            "generation": hidden.generation,
-        },
-        healthy.generation: {
-            "schema_version": 1,
-            "status": "READY",
-            "generation": healthy.generation,
-            "alias": f"{healthy.alias}:healthy-1",
-            "delivery_mode": "claude_native_cross_session",
-            "delivery_mechanism": "claude_native",
-        },
-    }
-    monkeypatch.setattr(
-        runtime,
-        "request_socket",
-        lambda _path, payload, timeout=None: responses[str(payload["generation"])],
-    )
+    _unsupported_and_healthy_probes(monkeypatch, hidden, healthy)
 
     targets, complete = runtime._local_discovery(root)
 
-    assert complete
+    assert not complete
     assert [target.alias for target in targets] == [f"{healthy.alias}:healthy-1"]
+
+
+def test_alias_send_refuses_while_an_unsupported_route_is_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The namesake hazard: an alias that uniquely matched one attested target
+    # could silently re-resolve to the wrong session while its real owner sat
+    # unaddressable. Incomplete discovery refuses any name-based send instead.
+    root = tmp_path / "state"
+    hidden = _claude_route(tmp_path, "hidden")
+    healthy = _claude_route(tmp_path, "healthy")
+    registry = Registry(root)
+    registry.upsert(hidden)
+    registry.upsert(healthy)
+    _unsupported_and_healthy_probes(monkeypatch, hidden, healthy)
+    source = Route.create(
+        provider="codex",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(tmp_path),
+        pid=os.getpid(),
+    )
+
+    with pytest.raises(ChatError, match="local peer discovery is incomplete"):
+        runtime.send(root, source, f"{healthy.alias}:healthy-1", "must not resolve")
