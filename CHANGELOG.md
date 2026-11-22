@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.12 - 2026-11-22
+
+- Silence the Claude-provider hook when another harness invokes it. Devin CLI
+  imports the installed Claude hooks through `read_config_from` and fires them
+  for its own lifecycle events with a payload that documents no `cwd` field,
+  so every Devin start logged "hook lacks session identity or cwd". The hook
+  now decides from its own invocation — the invoker's executable, or the
+  envelope's missing `cwd`/`transcript_path` fields when the invoker is
+  already gone — and exits silently with no effect. A real Claude session
+  nested under Devin still registers as itself, and Devin's own provider
+  hooks are unchanged.
+- Treat the manual `DEVIN_PROJECT_DIR` early-exit guard applied to owned
+  Claude hook commands as still owned, so setup replaces the workaround
+  instead of leaving it beside the managed entry. A leftover
+  guarded-plus-unguarded pair collapses into the single managed entry;
+  ambiguity refusal still applies to genuinely duplicate unguarded entries.
+- Diagnose a live Claude session the provider cannot address as UNSUPPORTED
+  instead of UNAVAILABLE. A session started as a hidden child (for example
+  under an inherited `CLAUDE_CODE_CHILD_SESSION` marker) keeps its route but
+  never appears in `claude agents --json`; its courier attests that distinct
+  status for the sender's reason text and `doctor`, and it keeps local
+  discovery incomplete so alias or title sends refuse rather than risk
+  resolving to a namesake. Exact-handle sends still work. A listed agent row
+  that cannot be the target -- a different kind or a drifted cwd -- stays
+  UNAVAILABLE, never UNSUPPORTED.
+- Keep durable custody, exact-generation routing, lost-index recovery, and
+  no-replay handling from the 0.5.9 through 0.5.11 repairs.
+
 ## 0.5.11 - 2026-11-14
 
 - Qualify Codex app-server 0.169.0 for owning-daemon input, including idle

@@ -250,7 +250,21 @@ def _parse_targeted_claude_agents(text: str, session_id: str) -> list[ClaudeAgen
         candidate = item.get("sessionId")
         if not isinstance(candidate, str) or candidate.casefold() != target:
             continue
-        agents.extend(parse_claude_agents(json.dumps([item])))
+        parsed = parse_claude_agents(json.dumps([item]))
+        if not parsed:
+            # The row exists but its cwd cannot resolve; it is still a listed
+            # row for this session and must not look absent to the presence
+            # check. Its unusable cwd can never equal a canonical target cwd.
+            agents.append(
+                {
+                    "session_id": candidate,
+                    "name": cast(str, item["name"]),
+                    "kind": cast(str, item["kind"]),
+                    "cwd": cast(str, item["cwd"]),
+                }
+            )
+        else:
+            agents.extend(parsed)
     return agents
 
 
@@ -294,18 +308,36 @@ def claude_agents(
     return _parse_targeted_claude_agents(completed.stdout, session_id)
 
 
+ADDRESSABLE_AGENT_KINDS: Final = frozenset({"interactive", "background"})
+
+
+class ClaudeAgentUnlisted(ChatError):
+    """The provider inventory answered but lists no row at all for the session.
+
+    ``claude agents --json`` omits hidden child sessions entirely; a live
+    session absent from that inventory is decidedly unaddressable, unlike a
+    preflight failure which proves nothing. A listed row that cannot be the
+    exact target -- a different kind, a drifted or unusable cwd -- is a plain
+    failure instead, so an unstable presence signal never masquerades as
+    decided unaddressability.
+    """
+
+
 def exact_agent(session_id: str, cwd: str, timeout: float = AGENTS_TIMEOUT_SECONDS) -> ClaudeAgent:
     valid_uuid(session_id, "Claude session id")
+    agents = claude_agents(session_id, timeout=timeout)
     matches = [
         agent
-        for agent in claude_agents(session_id, timeout=timeout)
+        for agent in agents
         if agent["session_id"] == session_id
-        and agent["kind"] in {"interactive", "background"}
+        and agent["kind"] in ADDRESSABLE_AGENT_KINDS
         and agent["cwd"] == cwd
     ]
-    if len(matches) != 1:
-        raise ChatError("Claude target is not one exact live supported session")
-    return matches[0]
+    if len(matches) == 1:
+        return matches[0]
+    if not agents:
+        raise ClaudeAgentUnlisted("Claude target is not one exact live supported session")
+    raise ChatError("Claude target is not one exact live supported session")
 
 
 def claude_alias(device: str, project: str, agent: ClaudeAgent) -> str:

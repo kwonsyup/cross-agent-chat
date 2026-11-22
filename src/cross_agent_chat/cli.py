@@ -59,6 +59,7 @@ from cross_agent_chat.runtime import (
     state_root,
     unregister,
     unregister_devin,
+    unsupported_local_sessions,
 )
 from cross_agent_chat.tailnet import known_tailnet_address
 from cross_agent_chat.tailnet_broker import broker_server
@@ -1193,6 +1194,17 @@ def run(arguments: argparse.Namespace) -> int:
             "remote_trust": "tailscale_acl",
             "next": _doctor_next(doctor_installer, healthy),
         }
+        # Read-only: report unaddressable sessions without creating state.
+        default_root = Path.home() / ".local/state/cross-agent-chat"
+        unsupported = unsupported_local_sessions(default_root) if default_root.is_dir() else []
+        if unsupported:
+            doctor_result["unsupported_sessions"] = unsupported
+            doctor_result["unsupported_detail"] = (
+                "these Claude sessions are not addressable agents (hidden "
+                "child sessions or another unsupported kind); they cannot "
+                "send or receive as peers and are excluded from discovery "
+                "completeness"
+            )
         if os.environ.get(CLAUDE_CHILD_SESSION_ENV):
             doctor_result["terminal"] = CLAUDE_CHILD_SESSION_DIAGNOSTIC
         print(
