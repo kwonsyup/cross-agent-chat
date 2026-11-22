@@ -21,9 +21,14 @@ from uuid import uuid4
 
 import pytest
 
-from cross_agent_chat import cli, runtime
-from cross_agent_chat.core import ChatError, Registry
-from cross_agent_chat.install import Installer, _hook_group, _owned_hook
+from cross_agent_chat import claude_runtime, cli, runtime
+from cross_agent_chat.core import ChatError, Registry, Route
+from cross_agent_chat.install import (
+    Installer,
+    SettingsError,
+    _hook_group,
+    _owned_hook,
+)
 
 OWNER = "a" * 64
 DEVIN_BINARY = Path("/opt/devin/bin/devin")
@@ -61,7 +66,13 @@ def _feed_stdin(monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]) -> 
 
 
 def _invoker(monkeypatch: pytest.MonkeyPatch, binary: Path | None) -> None:
-    monkeypatch.setattr(runtime, "_hook_invoker_binary", lambda _pid: binary)
+    # The stub honours the pid argument: hooks pass their harness pid through,
+    # and a lookup for any other pid must not silently claim the same invoker.
+    monkeypatch.setattr(
+        runtime,
+        "_hook_invoker_binary",
+        lambda pid: binary if pid == os.getpid() else None,
+    )
     monkeypatch.setattr(runtime, "devin_binaries", lambda: (DEVIN_BINARY,))
 
 
@@ -124,6 +135,40 @@ def test_foreign_envelope_is_a_distinct_refusal(monkeypatch: pytest.MonkeyPatch)
     _feed_stdin(monkeypatch, _devin_envelope("SessionStart"))
     with pytest.raises(runtime.ForeignHookInput):
         runtime.hook_input("SessionStart")
+
+
+def test_transcript_without_cwd_is_a_plain_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Boundary: session identity plus an owning-harness transcript_path but no
+    # cwd is malformed input from the owning harness, not a foreign envelope.
+    _feed_stdin(
+        monkeypatch,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": str(uuid4()),
+            "transcript_path": "/tmp/t.jsonl",
+        },
+    )
+    with pytest.raises(ChatError, match="lacks session identity or cwd") as error:
+        runtime.hook_input("SessionStart")
+    assert not isinstance(error.value, runtime.ForeignHookInput)
+
+
+def test_hook_invoker_binary_resolves_the_running_process() -> None:
+    # proc_pidpath reports the real interpreter image, not a venv shim.
+    resolved = runtime._hook_invoker_binary(os.getpid())
+    assert resolved is not None
+    assert resolved.is_file()
+    assert resolved.name.lower().startswith("python")
+
+
+def test_devin_hook_invocation_matches_binary_name_without_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Detection cannot depend on an inherited PATH: a resolved executable
+    # named devin counts even when devin_binaries() finds nothing.
+    monkeypatch.setattr(runtime, "_hook_invoker_binary", lambda pid: Path("/elsewhere/devin"))
+    monkeypatch.setattr(runtime, "devin_binaries", lambda: (DEVIN_BINARY,))
+    assert runtime._devin_hook_invocation(os.getpid())
 
 
 def test_malformed_owning_harness_envelope_keeps_the_plain_failure(
@@ -287,3 +332,174 @@ def test_setup_replaces_the_devin_guarded_workaround(tmp_path: Path) -> None:
             _hook_group(installer.executable, "claude", "studio", event)["hooks"],
         )[0]
         assert command == expected["command"]
+
+
+def test_setup_collapses_a_guarded_and_unguarded_twin(tmp_path: Path) -> None:
+    # A setup run under an installer that could not see the guard appended an
+    # unguarded twin beside the guarded command. Both are ours: the merge must
+    # collapse them into one clean entry, not refuse on ambiguous ownership.
+    home = tmp_path / "home"
+    installer = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        providers=("claude",),
+    )
+    installer.claude_settings.parent.mkdir(parents=True)
+    guarded: dict[str, object] = {"theme": "dark", "hooks": {}}
+    hook_map = cast(dict[str, object], guarded["hooks"])
+    for event in ("SessionStart", "SessionEnd"):
+        group = _hook_group(installer.executable, "claude", "studio", event)
+        guarded_group = copy.deepcopy(group)
+        hook = cast(list[dict[str, object]], guarded_group["hooks"])[0]
+        hook["command"] = '[ -n "$DEVIN_PROJECT_DIR" ] && exit 0; ' + str(hook["command"])
+        hook_map[event] = [
+            guarded_group,
+            group,
+            {"hooks": [{"type": "command", "command": "keep-me"}]},
+        ]
+    installer.claude_settings.write_text(json.dumps(guarded))
+
+    installer.setup()
+
+    settings = json.loads(installer.claude_settings.read_text())
+    for event in ("SessionStart", "SessionEnd"):
+        groups = settings["hooks"][event]
+        assert any(item["hooks"][0]["command"] == "keep-me" for item in groups)
+        owned = [item for item in groups if _owned_hook(item)]
+        assert len(owned) == 1
+        assert "DEVIN_PROJECT_DIR" not in owned[0]["hooks"][0]["command"]
+
+
+def test_setup_still_refuses_two_unguarded_owned_entries(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    installer = Installer(
+        home=home,
+        executable=Path("/opt/cross-agent-chat"),
+        device="studio",
+        providers=("claude",),
+    )
+    installer.claude_settings.parent.mkdir(parents=True)
+    group = _hook_group(installer.executable, "claude", "studio", "SessionStart")
+    installer.claude_settings.write_text(
+        json.dumps({"hooks": {"SessionStart": [group, copy.deepcopy(group)]}})
+    )
+
+    with pytest.raises(SettingsError, match="ownership is ambiguous"):
+        installer.setup()
+
+
+def _claude_route(tmp_path: Path, name: str) -> Route:
+    cwd = tmp_path / name
+    cwd.mkdir()
+    return Route.create(
+        provider="claude",
+        session_id=str(uuid4()),
+        device="studio",
+        cwd=str(cwd),
+        pid=os.getpid(),
+        owner_identity=OWNER,
+        profile_root=str(tmp_path / "profile"),
+    )
+
+
+def _no_exact_agent(*_args: object, **_kwargs: object) -> claude_runtime.ClaudeAgent:
+    raise ChatError("Claude target is not one exact live supported session")
+
+
+def _unlisted_exact_agent(*_args: object, **_kwargs: object) -> claude_runtime.ClaudeAgent:
+    raise claude_runtime.ClaudeAgentUnlisted(
+        "Claude target is not one exact live supported session"
+    )
+
+
+def test_exact_agent_marks_an_absent_session_unlisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claude_runtime, "claude_agents", lambda *a, **k: [])
+    with pytest.raises(claude_runtime.ClaudeAgentUnlisted):
+        claude_runtime.exact_agent(str(uuid4()), "/tmp")
+
+
+def test_exact_agent_marks_another_kind_row_unlisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    monkeypatch.setattr(
+        claude_runtime,
+        "claude_agents",
+        lambda *a, **k: [
+            {"session_id": session_id, "name": "hidden-1", "kind": "hidden", "cwd": "/tmp"}
+        ],
+    )
+    with pytest.raises(claude_runtime.ClaudeAgentUnlisted):
+        claude_runtime.exact_agent(session_id, "/tmp")
+
+
+def test_live_unlisted_session_reports_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A hidden child session keeps a live route but holds no addressable
+    # `claude agents --json` row: its courier attests UNSUPPORTED, not the
+    # generic UNAVAILABLE that discovery would count against completeness.
+    route = _claude_route(tmp_path, "hidden")
+    monkeypatch.setattr(runtime, "exact_agent", _unlisted_exact_agent)
+
+    assert runtime.courier_health(route)["status"] == "UNSUPPORTED"
+
+
+def test_failed_agents_inventory_stays_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unreadable inventory is not evidence of unaddressability.
+    route = _claude_route(tmp_path, "project")
+    monkeypatch.setattr(runtime, "exact_agent", _no_exact_agent)
+
+    assert runtime.courier_health(route)["status"] == "UNAVAILABLE"
+
+
+def test_dead_owner_stays_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    route = _claude_route(tmp_path, "project")
+    monkeypatch.setattr(Route, "process_is_live", lambda _self: False)
+    monkeypatch.setattr(runtime, "exact_agent", _unlisted_exact_agent)
+
+    assert runtime.courier_health(route)["status"] == "UNAVAILABLE"
+
+
+def test_discovery_excludes_unsupported_routes_from_completeness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A hidden session's route attests UNSUPPORTED: it is neither a peer
+    # target nor a strike against local discovery completeness.
+    root = tmp_path / "state"
+    hidden = _claude_route(tmp_path, "hidden")
+    healthy = _claude_route(tmp_path, "healthy")
+    registry = Registry(root)
+    registry.upsert(hidden)
+    registry.upsert(healthy)
+
+    responses = {
+        hidden.generation: {
+            "schema_version": 1,
+            "status": "UNSUPPORTED",
+            "generation": hidden.generation,
+        },
+        healthy.generation: {
+            "schema_version": 1,
+            "status": "READY",
+            "generation": healthy.generation,
+            "alias": f"{healthy.alias}:healthy-1",
+            "delivery_mode": "claude_native_cross_session",
+            "delivery_mechanism": "claude_native",
+        },
+    }
+    monkeypatch.setattr(
+        runtime,
+        "request_socket",
+        lambda _path, payload, timeout=None: responses[str(payload["generation"])],
+    )
+
+    targets, complete = runtime._local_discovery(root)
+
+    assert complete
+    assert [target.alias for target in targets] == [f"{healthy.alias}:healthy-1"]

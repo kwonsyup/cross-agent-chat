@@ -702,6 +702,18 @@ def _owned_hook(value: object) -> bool:
     )
 
 
+def _devin_env_guarded(value: object) -> bool:
+    """Whether a hook entry still carries the pre-0.5.12 DEVIN_PROJECT_DIR guard."""
+
+    if not isinstance(value, dict):
+        return False
+    hooks = value.get("hooks")
+    if not isinstance(hooks, list) or not hooks or not isinstance(hooks[0], dict):
+        return False
+    command = hooks[0].get("command")
+    return isinstance(command, str) and _DEVIN_ENV_GUARD_PREFIX.match(command) is not None
+
+
 def _owned_hook_native_queue(value: object) -> bool:
     if not _owned_hook(value):
         return False
@@ -713,6 +725,7 @@ def _owned_hook_native_queue(value: object) -> bool:
     command = hooks[0].get("command")
     if not isinstance(command, str):
         return False
+    command = _DEVIN_ENV_GUARD_PREFIX.sub("", command)
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -826,7 +839,10 @@ def _merge_hook(config: dict[str, object], event: str, owned: dict[str, object])
     if not isinstance(existing, list):
         raise SettingsError(f"provider hook {event} must be a list")
     owned_indices = [index for index, item in enumerate(existing) if _owned_hook(item)]
-    if len(owned_indices) > 1:
+    unguarded_indices = [
+        index for index in owned_indices if not _devin_env_guarded(existing[index])
+    ]
+    if len(unguarded_indices) > 1:
         raise SettingsError(f"provider hook {event} ownership is ambiguous")
     merged: list[object] = []
     replaced = False

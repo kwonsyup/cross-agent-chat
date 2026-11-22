@@ -294,15 +294,30 @@ def claude_agents(
     return _parse_targeted_claude_agents(completed.stdout, session_id)
 
 
+ADDRESSABLE_AGENT_KINDS: Final = frozenset({"interactive", "background"})
+
+
+class ClaudeAgentUnlisted(ChatError):
+    """The provider inventory answered but lists no addressable agent row.
+
+    ``claude agents --json`` omits hidden child sessions entirely; a live
+    session absent from that inventory (or present only under another kind)
+    is decidedly unaddressable, unlike a preflight failure which proves
+    nothing.
+    """
+
+
 def exact_agent(session_id: str, cwd: str, timeout: float = AGENTS_TIMEOUT_SECONDS) -> ClaudeAgent:
     valid_uuid(session_id, "Claude session id")
     matches = [
         agent
         for agent in claude_agents(session_id, timeout=timeout)
         if agent["session_id"] == session_id
-        and agent["kind"] in {"interactive", "background"}
+        and agent["kind"] in ADDRESSABLE_AGENT_KINDS
         and agent["cwd"] == cwd
     ]
+    if not matches:
+        raise ClaudeAgentUnlisted("Claude target is not one exact live supported session")
     if len(matches) != 1:
         raise ChatError("Claude target is not one exact live supported session")
     return matches[0]

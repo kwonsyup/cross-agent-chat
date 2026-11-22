@@ -43,6 +43,7 @@ from cross_agent_chat.claude_runtime import (
     DISCOVERY_TIMEOUT_SECONDS,
     SEND_TIMEOUT_SECONDS,
     ClaudeAgentsPreflightTimeout,
+    ClaudeAgentUnlisted,
     ClaudeSendMessageRefused,
     ClaudeSendMessageUnknownDelivery,
     claude_alias,
@@ -1454,6 +1455,8 @@ def _devin_hook_invocation(pid: int) -> bool:
     binary = _hook_invoker_binary(pid)
     if binary is None:
         return False
+    if binary.name == "devin":
+        return True
     try:
         return binary in devin_binaries()
     except ChatError:
@@ -2371,6 +2374,17 @@ def courier_health(
                 route.project,
                 exact_agent(route.session_id, route.cwd),
             )
+        except ClaudeAgentUnlisted:
+            # The provider inventory answered with no addressable row for a
+            # live session -- a hidden child or another unsupported kind. It
+            # keeps its route but can never carry a peer delivery, so the
+            # courier attests a decided status instead of poisoning local
+            # discovery with a perpetual UNAVAILABLE.
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "status": "UNSUPPORTED" if route.process_is_live() else "UNAVAILABLE",
+                "generation": route.generation,
+            }
         except ChatError:
             return {
                 "schema_version": SCHEMA_VERSION,
@@ -3060,9 +3074,16 @@ def shutdown_couriers(root: Path) -> None:
             raise ChatError("courier shutdown failed")
 
 
-def _local_target(
+class _UnsupportedRoute:
+    """A live route whose session the provider cannot address as a peer."""
+
+
+UNSUPPORTED_ROUTE: Final = _UnsupportedRoute()
+
+
+def _local_target_probe(
     root: Path, route: Route, *, timeout: float = HEALTH_TIMEOUT_SECONDS
-) -> Target | None:
+) -> Target | _UnsupportedRoute | None:
     if not route.cwd_is_available():
         return None
     try:
@@ -3084,6 +3105,15 @@ def _local_target(
         )
     except ChatError:
         return None
+    if (
+        response.get("schema_version") == SCHEMA_VERSION
+        and response.get("status") == "UNSUPPORTED"
+        and response.get("generation") == route.generation
+        and set(response) == {"schema_version", "status", "generation"}
+    ):
+        # Attested but never a target: an unaddressable session cannot widen
+        # or break peer discovery for the routes that remain.
+        return UNSUPPORTED_ROUTE
     alias = response.get("alias")
     expected = {"schema_version", "status", "generation", "alias"}
     observed_mode = response.get("delivery_mode")
@@ -3182,11 +3212,20 @@ def _local_target(
         return None
 
 
-def _local_target_before_deadline(root: Path, route: Route, deadline: float) -> Target | None:
+def _local_target_before_deadline(
+    root: Path, route: Route, deadline: float
+) -> Target | _UnsupportedRoute | None:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return None
-    return _local_target(root, route, timeout=min(HEALTH_TIMEOUT_SECONDS, remaining))
+    return _local_target_probe(root, route, timeout=min(HEALTH_TIMEOUT_SECONDS, remaining))
+
+
+def _local_target(
+    root: Path, route: Route, *, timeout: float = HEALTH_TIMEOUT_SECONDS
+) -> Target | None:
+    target = _local_target_probe(root, route, timeout=timeout)
+    return target if isinstance(target, Target) else None
 
 
 def _local_discovery(
@@ -3206,9 +3245,9 @@ def _local_discovery(
         return [], True
     deadline = time.monotonic() + LOCAL_DISCOVERY_TIMEOUT_SECONDS
     workers = ThreadPoolExecutor(max_workers=min(LOCAL_DISCOVERY_WORKERS, len(routes)))
-    futures: list[Future[Target | None]] = []
-    results: list[Target | None] = [None] * len(routes)
-    future_indexes: dict[Future[Target | None], int] = {}
+    futures: list[Future[Target | _UnsupportedRoute | None]] = []
+    results: list[Target | _UnsupportedRoute | None] = [None] * len(routes)
+    future_indexes: dict[Future[Target | _UnsupportedRoute | None], int] = {}
     try:
         for index, route in enumerate(routes):
             if time.monotonic() >= deadline:
@@ -3227,14 +3266,48 @@ def _local_discovery(
         for future in futures:
             future.cancel()
         workers.shutdown(wait=False, cancel_futures=True)
-    targets = [target for target in results if target is not None]
+    targets = [target for target in results if isinstance(target, Target)]
     # Missing, queued and unsubmitted probes all leave a None slot. A partial
-    # healthy roster remains useful, but cannot establish name uniqueness.
-    return targets, len(targets) == len(routes)
+    # healthy roster remains useful, but cannot establish name uniqueness. An
+    # UNSUPPORTED route attested as unaddressable still counts toward
+    # completeness: it can never carry a namesake, only witness absence.
+    return targets, all(result is not None for result in results)
 
 
 def local_targets(root: Path, *, handle: str | None = None) -> list[Target]:
     return (_local_discovery(root) if handle is None else _local_discovery(root, handle=handle))[0]
+
+
+def unsupported_local_sessions(root: Path) -> list[str]:
+    """Aliases of live local routes the provider cannot address as peers."""
+
+    if not root.exists():
+        return []
+    aliases: list[str] = []
+    for route in Registry(root).routes():
+        if route.provider != "claude" or not route.process_is_live():
+            continue
+        path = socket_path(root, route)
+        if not path.exists():
+            continue
+        try:
+            response = request_socket(
+                path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "operation": "health",
+                    "generation": route.generation,
+                },
+                timeout=HEALTH_TIMEOUT_SECONDS,
+            )
+        except ChatError:
+            continue
+        if (
+            response.get("status") == "UNSUPPORTED"
+            and response.get("generation") == route.generation
+        ):
+            aliases.append(route.alias)
+    return aliases
 
 
 def _with_codex_titles(root: Path, targets: list[Target], deadline: float) -> list[Target]:
@@ -5435,6 +5508,15 @@ def sender_readiness_for_route(root: Path, source: Route) -> dict[str, str]:
         )
     except ChatError:
         return {"status": "unavailable", "reason": "sender courier is unavailable", **label}
+    if response.get("status") == "UNSUPPORTED" and response.get("generation") == source.generation:
+        return {
+            "status": "unavailable",
+            "reason": (
+                "this session is not listed as an addressable Claude agent "
+                "(hidden or unsupported session kind)"
+            ),
+            **label,
+        }
     if response.get("status") != "READY" or response.get("generation") != source.generation:
         return {"status": "unavailable", "reason": "sender courier is not ready", **label}
     alias = response.get("alias")

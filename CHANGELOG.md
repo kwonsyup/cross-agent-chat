@@ -13,7 +13,15 @@
   hooks are unchanged.
 - Treat the manual `DEVIN_PROJECT_DIR` early-exit guard applied to owned
   Claude hook commands as still owned, so setup replaces the workaround
-  instead of leaving it beside the managed entry.
+  instead of leaving it beside the managed entry. A leftover
+  guarded-plus-unguarded pair collapses into the single managed entry;
+  ambiguity refusal still applies to genuinely duplicate unguarded entries.
+- Mark a live Claude session the provider cannot address as UNSUPPORTED
+  instead of UNAVAILABLE. A session started as a hidden child (for example
+  under an inherited `CLAUDE_CODE_CHILD_SESSION` marker) keeps its route but
+  never appears in `claude agents --json`; its courier now attests that
+  distinct status so local discovery stays complete for the addressable
+  roster, exact-handle sends to it refuse decided, and `doctor` lists it.
 - Keep durable custody, exact-generation routing, lost-index recovery, and
   no-replay handling from the 0.5.9 through 0.5.11 repairs.
 
