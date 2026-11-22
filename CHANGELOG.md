@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.12 - 2026-11-22
+
+- Silence the Claude-provider hook when another harness invokes it. Devin CLI
+  imports the installed Claude hooks through `read_config_from` and fires them
+  for its own lifecycle events with a payload that documents no `cwd` field,
+  so every Devin start logged "hook lacks session identity or cwd". The hook
+  now decides from its own invocation — the invoker's executable, or the
+  envelope's missing `cwd`/`transcript_path` fields when the invoker is
+  already gone — and exits silently with no effect. A real Claude session
+  nested under Devin still registers as itself, and Devin's own provider
+  hooks are unchanged.
+- Treat the manual `DEVIN_PROJECT_DIR` early-exit guard applied to owned
+  Claude hook commands as still owned, so setup replaces the workaround
+  instead of leaving it beside the managed entry.
+- Keep durable custody, exact-generation routing, lost-index recovery, and
+  no-replay handling from the 0.5.9 through 0.5.11 repairs.
+
 ## 0.5.11 - 2026-11-14
 
 - Qualify Codex app-server 0.169.0 for owning-daemon input, including idle

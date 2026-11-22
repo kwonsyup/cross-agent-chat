@@ -962,6 +962,21 @@ def _hook_json_record() -> str:
     return "".join(characters)
 
 
+class ForeignHookInput(ChatError):
+    """A well-formed lifecycle envelope arrived without the fields its owning
+    harness always sends: another harness imported and invoked this hook."""
+
+
+def _foreign_hook_envelope(raw: dict[object, object]) -> bool:
+    """Whether the envelope lacks every field the owning harness always sends.
+
+    Claude Code includes ``cwd`` and ``transcript_path`` in every lifecycle
+    payload.  A valid event envelope missing both was produced by a different
+    harness that imported this hook command (Devin's ``read_config_from``).
+    """
+    return "cwd" not in raw and "transcript_path" not in raw
+
+
 def hook_input(expected_event: str) -> dict[str, object]:
     text = _hook_json_record()
     try:
@@ -973,6 +988,8 @@ def hook_input(expected_event: str) -> dict[str, object]:
     session_id = raw.get("session_id", raw.get("sessionId"))
     cwd = raw.get("cwd")
     if not isinstance(session_id, str) or not isinstance(cwd, str):
+        if _foreign_hook_envelope(raw):
+            raise ForeignHookInput("hook lacks session identity or cwd")
         raise ChatError("hook lacks session identity or cwd")
     raw["session_id"] = valid_uuid(session_id, "session id")
     raw["_cwd_unavailable"] = False
@@ -1414,6 +1431,35 @@ def _spawn_courier(root: Path, route: Route) -> None:
             stderr.close()
 
 
+def _hook_invoker_binary(pid: int) -> Path | None:
+    """Resolve the executable of the process that spawned this hook command."""
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+    path_buffer = ctypes.create_string_buffer(4096)
+    if libproc.proc_pidpath(pid, path_buffer, len(path_buffer)) <= 0:
+        return None
+    try:
+        return Path(path_buffer.value.decode()).resolve(strict=True)
+    except OSError:
+        return None
+
+
+def _devin_hook_invocation(pid: int) -> bool:
+    """Whether the harness process that invoked this hook is a Devin binary.
+
+    Devin imports the installed Claude hooks through ``read_config_from`` and
+    fires them for its own lifecycle events.  The invoker's executable -- not
+    an inherited environment variable -- identifies that harness, so a Claude
+    session nested under Devin still registers as itself.
+    """
+    binary = _hook_invoker_binary(pid)
+    if binary is None:
+        return False
+    try:
+        return binary in devin_binaries()
+    except ChatError:
+        return False
+
+
 def register(provider: str, device: str, pid: int, state_root_value: str | None) -> Route | None:
     if not presence_is_enabled():
         return None
@@ -1421,7 +1467,15 @@ def register(provider: str, device: str, pid: int, state_root_value: str | None)
         raise ChatError("provider is invalid")
     if isinstance(pid, bool) or pid <= 0:
         raise ChatError("provider process is invalid")
-    raw = hook_input("SessionStart")
+    if provider == "claude":
+        if _devin_hook_invocation(pid):
+            return None
+        try:
+            raw = hook_input("SessionStart")
+        except ForeignHookInput:
+            return None
+    else:
+        raw = hook_input("SessionStart")
     session_id = valid_session_id(provider, cast(str, raw["session_id"]))
     root = state_root(state_root_value)
     with (
@@ -1522,7 +1576,17 @@ def unregister(provider: str, pid: int, state_root_value: str | None) -> None:
         return
     if provider not in {"claude", "codex", "devin"}:
         raise ChatError("provider is invalid")
-    raw = hook_input("SessionEnd")
+    if isinstance(pid, bool) or pid <= 0:
+        raise ChatError("provider process is invalid")
+    if provider == "claude":
+        if _devin_hook_invocation(pid):
+            return
+        try:
+            raw = hook_input("SessionEnd")
+        except ForeignHookInput:
+            return
+    else:
+        raw = hook_input("SessionEnd")
     root = state_root(state_root_value)
     session_id = cast(str, raw["session_id"])
     cwd = cast(str, raw["cwd"])

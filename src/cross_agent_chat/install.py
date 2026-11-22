@@ -83,6 +83,13 @@ DEVIN_PRETOOL_MATCHER: Final = (
     "^(mcp__cross-agent-chat__(chat_peers|chat_send|chat_status)|run_subagent)$"
 )
 REGISTRATION_HOOK_TIMEOUT_SECONDS: Final = 30
+# Pre-0.5.12 local workaround: operators guarded an owned Claude hook command
+# with an early exit so Devin's imported invocation stayed silent. The runtime
+# now detects that foreign invocation itself, so the guarded command remains
+# owned and is replaced like any other managed entry.
+_DEVIN_ENV_GUARD_PREFIX: Final = re.compile(
+    r"^\[\s+-n\s+\"?\$\{?DEVIN_PROJECT_DIR\}?\"?\s+\]\s*&&\s*exit\s+0\s*;?\s*"
+)
 _PROVIDER_PATH_NAMES: Final[dict[str, tuple[str, ...]]] = {
     "claude": ("claude_settings", "claude_config"),
     "codex": ("codex_config", "codex_hooks"),
@@ -671,6 +678,7 @@ def _owned_hook(value: object) -> bool:
     command = hook.get("command")
     if not isinstance(command, str):
         return False
+    command = _DEVIN_ENV_GUARD_PREFIX.sub("", command)
     try:
         tokens = shlex.split(command)
     except ValueError:

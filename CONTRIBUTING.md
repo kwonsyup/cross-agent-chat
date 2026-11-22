@@ -33,7 +33,7 @@ After the release commit is merged and release approval is recorded, create the
 version tag and build the two published artifacts from that exact checkout:
 
 ```bash
-VERSION=0.5.11
+VERSION=0.5.12
 git tag -a "v$VERSION" -m "Cross Agent Chat $VERSION"
 git push origin "v$VERSION"
 python -m build
